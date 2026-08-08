@@ -18,6 +18,40 @@ from typing import Iterable
 
 ZIP_NAME = "auto-foundry-agentic-e2e-v0.2.1.zip"
 
+# The release deliberately replaces the old deterministic optimizer report
+# helper with the evidence collector.  Keep this check explicit so a stale
+# build directory cannot make an obsolete optimizer entry look installable.
+REQUIRED_SKILL_MEMBERS = {
+    "scripts/dashboard_renderer.py",
+    "scripts/optimizer_evidence_collector.py",
+}
+DELETED_OPTIMIZER_MEMBERS = {
+    "scripts/experimental_optimizer.py",
+    "assets/EXPERIMENTAL_OPTIMIZER_REPORT_TEMPLATE.md",
+}
+REQUIRED_CORE_MODULES = {
+    "auto_foundry_core/__init__.py",
+    "auto_foundry_core/__main__.py",
+    "auto_foundry_core/aggregation.py",
+    "auto_foundry_core/artifacts.py",
+    "auto_foundry_core/cache.py",
+    "auto_foundry_core/capabilities.py",
+    "auto_foundry_core/catalog.py",
+    "auto_foundry_core/cli.py",
+    "auto_foundry_core/contracts.py",
+    "auto_foundry_core/enterprise_model.py",
+    "auto_foundry_core/identity.py",
+    "auto_foundry_core/normalization.py",
+    "auto_foundry_core/populations.py",
+    "auto_foundry_core/profiling.py",
+    "auto_foundry_core/relationships.py",
+    "auto_foundry_core/reproduction.py",
+    "auto_foundry_core/runtime.py",
+    "auto_foundry_core/sources.py",
+    "auto_foundry_core/telemetry.py",
+    "auto_foundry_core/workspace.py",
+}
+
 
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -64,6 +98,12 @@ def _validate_zip(zip_path: Path, skill_root: Path) -> dict[str, object]:
         actual = {name.removeprefix("auto-foundry-agentic-e2e/"): archive.read(name) for name in names}
         if set(actual) != set(expected):
             raise ValueError(f"ZIP skill file set differs: missing={sorted(set(expected)-set(actual))}, extra={sorted(set(actual)-set(expected))}")
+        missing_required = sorted(REQUIRED_SKILL_MEMBERS - set(actual))
+        if missing_required:
+            raise ValueError(f"ZIP required skill files missing: {missing_required}")
+        stale_optimizer = sorted(DELETED_OPTIMIZER_MEMBERS & set(actual))
+        if stale_optimizer:
+            raise ValueError(f"ZIP contains deleted optimizer members: {stale_optimizer}")
         mismatches = [relative for relative in expected if _sha256_bytes(actual[relative]) != _sha256_bytes(expected[relative])]
         if mismatches:
             raise ValueError(f"ZIP per-file SHA mismatch: {mismatches}")
@@ -109,8 +149,7 @@ def _validate_wheel(wheel_path: Path) -> dict[str, object]:
         metadata = _metadata(archive.read(metadata_name).decode("utf-8"))
         if metadata.get("Name") != "auto_foundry_core" or metadata.get("Version") != "0.1.0":
             raise ValueError(f"wheel metadata mismatch: {metadata.get('Name')} {metadata.get('Version')}")
-        package_files = {"auto_foundry_core/__init__.py", "auto_foundry_core/cli.py", "auto_foundry_core/catalog.py"}
-        missing = sorted(package_files - set(names))
+        missing = sorted(REQUIRED_CORE_MODULES - set(names))
         if missing:
             raise ValueError(f"wheel package files missing: {missing}")
         return {
@@ -132,7 +171,14 @@ def _offline_install_smoke(wheel_path: Path) -> dict[str, object]:
         env["PYTHONPATH"] = str(install_target)
         command = [sys.executable, "-m", "pip", "install", "--no-index", "--no-deps", "--target", str(install_target), str(wheel_path)]
         subprocess.run(command, check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        import_result = subprocess.run([sys.executable, "-c", "import auto_foundry_core; print(auto_foundry_core.__version__)"], check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        import_script = (
+            "import auto_foundry_core as core; "
+            "from auto_foundry_core import CoreExecutionResult, CoreRuntime, LEMRef, RunContext; "
+            "assert not hasattr(core, 'Workspace'); "
+            "assert core.capability_catalog(); "
+            "print(core.__version__)"
+        )
+        import_result = subprocess.run([sys.executable, "-c", import_script], check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         cli_result = subprocess.run([sys.executable, "-m", "auto_foundry_core", "catalog", "list"], check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if import_result.stdout.strip() != "0.1.0":
             raise ValueError(f"installed import version mismatch: {import_result.stdout!r}")

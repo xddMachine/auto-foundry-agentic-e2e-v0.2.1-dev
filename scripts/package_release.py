@@ -14,6 +14,12 @@ from pathlib import Path
 
 
 ZIP_NAME = "auto-foundry-agentic-e2e-v0.2.1.zip"
+REQUIRED_SKILL_FILES = (
+    "SKILL.md",
+    "README.md",
+    "scripts/dashboard_renderer.py",
+    "scripts/optimizer_evidence_collector.py",
+)
 
 
 def _sha256(path: Path) -> str:
@@ -39,6 +45,10 @@ def _skill_files(skill_root: Path) -> list[Path]:
 
 def _write_deterministic_zip(skill_root: Path, destination: Path) -> dict[str, object]:
     files = _skill_files(skill_root)
+    relative_files = {path.relative_to(skill_root).as_posix() for path in files}
+    missing = sorted(set(REQUIRED_SKILL_FILES) - relative_files)
+    if missing:
+        raise RuntimeError(f"required skill files missing: {missing}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for path in files:
