@@ -1,16 +1,51 @@
 {
   "run_id": "RUN-...",
   "skill_name": "auto-foundry-agentic-e2e",
-  "skill_version": "0.2.0",
-  "mode": "fresh|clean_room|resume",
-  "status": "initialized|running|final_product|completed|global_failure",
-  "active_question_id": null,
-  "questions": [
-    {
-      "question_id": "Q-001",
-      "original_text": "...",
-      "status": "queued|active|answered|answered_with_limits|partial_answer|null_finding|blocked_by_evidence|unsupported|technical_failure",
-      "knowledge_update": "pending|promoted|promoted_with_limits|none"
-    }
-  ]
+  "skill_version": "0.2.1",
+  "core_name": "auto_foundry_core",
+  "core_version": "0.1.0",
+  "mode": "question|requirement",
+  "status": "initialized|running|products_frozen|completed|global_failure",
+  "allowed_roots": ["/current/run", "/supplied/input", "/approved/tool"],
+  "clean_room": {
+    "enabled": false,
+    "empty_lem_at_start": true,
+    "empty_cache_at_start": true,
+    "incidents": []
+  },
+  "active_item_id": null,
+  "questions": [],
+  "requirements": [],
+  "foundation_tasks": [],
+  "portfolio_plan": {
+    "planner": "semantic_portfolio_planner",
+    "ordered_item_ids": [],
+    "rationale_refs": [],
+    "replans": []
+  },
+  "lem": {
+    "enterprise_ontology": "lem/enterprise_ontology.jsonl",
+    "prepared_data_registry": "lem/prepared_data_registry.jsonl",
+    "knowledge_delta_status": "pending|promoted|promoted_with_limits|no_change"
+  },
+  "indexes": {
+    "ontology": "indexes/ontology_index.json",
+    "prepared": "indexes/prepared_index.json"
+  },
+  "telemetry": {
+    "path": "telemetry/events.jsonl",
+    "status": "open|closed",
+    "passive": true
+  },
+  "products": {
+    "status": "pending|built|reviewed",
+    "dashboard_manifest": null,
+    "traceability_check": null
+  },
+  "optimizer": {
+    "status": "not_ready|ready|written",
+    "report": null,
+    "evidence_appendix": null,
+    "read_only": true
+  }
 }

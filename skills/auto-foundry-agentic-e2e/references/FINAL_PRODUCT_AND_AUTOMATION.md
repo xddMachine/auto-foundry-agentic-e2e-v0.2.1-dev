@@ -1,109 +1,77 @@
-# Final Product and Automation
+# Final product, dashboard, and optimizer
 
-## Start gate
+## Product start condition
 
-Begin final product work after every supplied question has one outcome, including limited, blocked, unsupported, or technical outcomes.
+Start product work only after every supplied question or requirement has a
+terminal outcome, including limited, blocked, unsupported, or technical
+outcomes. Freeze the reviewed answer references, LEM snapshot, prepared-data
+registry, and closed telemetry before building products.
 
-Do not require every question to be fully answered.
+## Cross-item synthesis
 
-## Cross-question synthesis
+Synthesize reviewed results only. Show common findings, compatible trends,
+important concentrations, contradictions, unanswered components, evidence
+gaps, limits, and safe next actions. Do not introduce a new metric or silently
+re-run source analysis during synthesis.
 
-Synthesize reviewed results only.
+## Local dashboard prototype
 
-Show:
+Build a static, offline local prototype rather than a production application.
+Organize the information architecture by business domain and decision flow,
+not by input file or requirement order. Where the reviewed outputs support it,
+include:
 
-- common findings;
-- important concentrations;
-- compatible trends;
-- contradictions;
-- limitations;
-- unanswered components;
-- missing data or definitions;
-- safe next actions.
+- overview and decision KPI cards;
+- trends, distributions, and concentration charts;
+- segment/entity tables with periods, units, and populations;
+- partial/blocked findings and evidence-readiness gaps;
+- visible working-definition, proxy, and limitation callouts;
+- links from each claim/metric to the reviewed item, output, and evidence.
 
-## Management dashboard
+The prototype may render static JSON/CSV/HTML supplied by the run, but it must
+not calculate new business results. Keep all images, styles, and scripts local;
+validate internal links and anchors without network access. Use the reusable
+[dashboard contract](../assets/DASHBOARD_PROTOTYPE_TEMPLATE.md) and
+[offline style asset](../assets/dashboard.css).
 
-Use reviewed question results.
+## Audit/trace view
 
-Include:
-
-- executive overview;
-- key metrics and findings;
-- segment or entity breakdowns;
-- trends and distributions;
-- limited and partial findings;
-- blocked components;
-- evidence-readiness gaps;
-- visible assumptions and proxy labels.
-
-## Audit / technical view
-
-Include:
-
-- source inventory;
-- question-by-question method;
-- evidence references;
-- population and denominator;
-- joins and coverage;
-- document use;
-- scripts and outputs;
-- reviewer verdicts;
-- reusable knowledge;
-- limitations;
-- traceability to dashboard elements.
+Include source manifest and allowed roots; exact Navigator IDs; population and
+denominator; joins and coverage; document/rule scope; scripts and commands;
+self-check and reviewer verdict; review availability; Knowledge Delta; passive
+telemetry references; dashboard element lineage; and all limitations. Structured
+JSON remains authoritative for status.
 
 ## Product review
 
-Use one independent Product Reviewer.
+Use one independent Product Reviewer when available. Check values, labels,
+periods, populations, units/currencies, claim strength, visible limitations,
+offline rendering, internal links, and traceability. A presentation defect is
+fixed in the product. A genuine analytical defect returns to the originating
+item for its single permitted repair; do not create a second review pipeline.
 
-Check:
+## Post-run optimizer
 
-- values;
-- labels;
-- periods;
-- populations;
-- units and currencies;
-- claim strength;
-- visibility of limitations;
-- traceability.
+The optimizer runs only after answers, LEM, prepared registry, dashboard, and
+telemetry are frozen. It studies Auto Foundry workflow/substrate evidence, not
+client business-process automation. It writes exactly two report artifacts:
 
-Presentation errors return to the Product Builder. A genuine analytical defect returns to the originating question for one targeted correction.
+- `optimizer/experimental_optimizer_report.md`;
+- `optimizer/evidence_appendix.md`.
 
-## Automation-candidate report
-
-Study the natural work across all questions.
-
-For each candidate:
+Each candidate or recommendation records:
 
 ```text
-Operation
-Observed questions
-Repetition
-Artifacts/scripts
-Mechanical versus semantic content
-Failure modes
-Proposed deterministic helper
-Expected time/token savings
-Confidence
+Observed evidence
+Hypothesis
 Recommendation
+Expected benefit
+Risk
+Generality
+Evidence references
 ```
 
-Classify:
-
-- `mechanical_now`;
-- `deterministic_after_more_runs`;
-- `keep_agentic`;
-- `do_not_automate`.
-
-Examples likely to emerge:
-
-- file and sheet inventory;
-- basic table profiling;
-- date normalization after format selection;
-- exact key-overlap measurement;
-- duplicate summaries;
-- population reconciliation;
-- execution logging;
-- standard dashboard rendering.
-
-Do not assume these are candidates until the actual run demonstrates repetition.
+Separate observed repetition from speculation. A recommendation may be
+classified `mechanical_now`, `deterministic_after_more_runs`, `keep_agentic`,
+or `do_not_automate`. No benchmark is invented, and no code, configuration,
+source, state, LEM, prepared asset, or product is mutated or auto-promoted.

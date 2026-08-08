@@ -1,27 +1,54 @@
-# Question Result
+# Active item result
 
-## Question
+## Item identity
 
-## Direct answer
+- Mode: `question` | `requirement`
+- Item ID:
+- Original user text:
+- Priority/source (Requirement Mode):
+- Scope classification (Requirement Mode): `analytics_in_scope` |
+  `analytics_requires_missing_data` | `out_of_analytics_scope`
 
-## Headline findings
+## User-owned request
 
-## Scope and period
+- Objective and decision context:
+- Expected analytical outputs:
+- Expected visual outputs:
+- Internal tasks/dependencies:
+- Shared foundation dependencies:
+- Data/ontology/prepared-data needs:
 
-## Working definitions and proxies
+## Selected evidence
 
-## Method
+- Navigator exact ontology IDs:
+- Navigator exact prepared-data IDs:
+- Deterministic bundle validation:
+- Capability Catalog inspection and selected fit:
 
-## Population and denominator
+## Analysis
 
-## Supported components
+- Concise plan:
+- Direct answer:
+- Headline findings:
+- Scope, period, units, and population:
+- Working definitions/proxies:
+- Method and reproduction references:
+- Supported components:
+- Unsupported components:
+- Limitations and next evidence:
 
-## Unsupported components
+## Review and outcome
 
-## Limitations
+- Lead Analyst self-check:
+- Reviewer route:
+- `review_status`:
+- `review_strength`:
+- Reviewer verdict:
+- Repair used: `none` | `one_targeted_repair`
+- Final outcome:
 
-## Reviewer verdict
+## Knowledge and telemetry
 
-## Final outcome
-
-## Reusable knowledge update
+- Knowledge Delta: `promoted` | `promoted_with_limits` | `no_change`
+- Atomic application receipt:
+- Telemetry event references:

@@ -1,183 +1,161 @@
-# Question Analysis Playbook
+# Question and requirement analysis playbook
 
-## Purpose
+This playbook supports natural, bounded analysis. It is not a mandatory stage
+pipeline and does not create acceptance gates.
 
-This playbook helps the Lead Analyst choose a minimal, natural route for one business question. It is not a mandatory stage pipeline.
+## 1. Register the active item
 
-## 1. Interpret the question
+In Question Mode, retain the exact user wording and queue position. In
+Requirement Mode, retain the full user-owned record:
 
-Identify:
+```text
+requirement_id
+original_text
+priority and priority_source
+objective and decision context
+expected analytical outputs
+expected visual outputs
+internal tasks and dependencies
+shared foundation dependencies
+data, ontology, and prepared-data needs
+working definitions and limits
+status and outcome
+```
+
+The Portfolio Planner sees the full Requirement Mode portfolio, classifies each
+item semantically as `analytics_in_scope`,
+`analytics_requires_missing_data`, or `out_of_analytics_scope`, and records its
+rationale. Do not use a keyword dictionary or keyword router. Honor explicit
+priority; order unprioritized items only when dependency or safe reuse evidence
+supports the ordering. Replan briefly between items and execute one item at a
+time. Trace shared foundation work separately from user requirements.
+
+## 2. Navigator bundle
+
+Read compact ontology and prepared-data indexes before reading full records.
+Select only the bounded exact IDs relevant to the active item. Validate each
+ID deterministically for existence, layer/type, current-run ownership,
+allowed-root scope, effective period, and evidence references. A failed
+validation is recorded and does not justify an unbounded read.
+
+## 3. Interpret the decision
+
+Identify only what is material:
 
 - decision or business use;
-- requested measures;
-- entities and dimensions;
-- period or as-of date;
-- expected comparison or ranking;
-- causal language versus descriptive language;
-- requested cross-source attribution;
-- policy or contract dependence.
+- requested measures, dimensions, entities, grain, period, and as-of date;
+- expected visual output;
+- descriptive versus causal language;
+- cross-source attribution;
+- policy, contract, or process dependence;
+- evidence needed to support or limit each claim.
 
-Resolve only what is material to the answer.
+Use source-local definitions or working proxies when clearly labelled. When two
+reasonable meanings remain, use scenarios rather than silently choosing one.
 
-## 2. Choose an answer strategy
+## 4. Choose a minimal answer strategy
 
-Use one or more:
+Choose one or more routes:
 
 - direct source-local measurement;
+- prepared-data reuse;
 - source-local proxy;
-- alternative-definition scenario analysis;
+- alternative-definition scenario;
 - descriptive association;
-- policy scenario;
-- partial answer;
-- evidence blocker for unsupported components.
+- policy or process scenario;
+- partial answer with an evidence blocker;
+- `analytics_requires_missing_data` response;
+- `out_of_analytics_scope` response.
 
-Prefer a useful answer with explicit limitations over a complete refusal.
+Do not dispatch a specialist or create an artifact merely because a capability
+exists. Stop when the evidence is sufficient for a bounded answer.
 
-## 3. Evidence selection
+## 5. Inspect the Capability Catalog
 
-Start with the most likely relevant sources. Deeply inspect only those sources and expand when evidence indicates a need.
+Record a catalog inspection before using deterministic core operations. Use a
+catalog capability only when it fits the evidence and question. Generic forms
+are:
 
-Do not open hundreds of files merely to prove completeness.
+```bash
+python -m auto_foundry_core catalog ...
+python -m auto_foundry_core run ...
+```
 
-## 4. Semantics
+The exact operation ID comes from the current catalog. If no capability fits,
+record a capability gap and use preserved custom code when useful. Custom code
+must retain inputs, outputs, assumptions, and reproduction details.
 
-For every material field, record:
+## 6. Semantics and relationships
 
-- observed name;
-- working business meaning;
-- grain;
-- evidence;
-- evidence level;
-- limitation.
+For every material field, record observed name, working meaning, grain,
+evidence, effective period, and limitation. For every material link, measure:
 
-When two meanings remain plausible, calculate separate scenarios when practical.
-
-## 5. Relationships
-
-For every material join or cross-source link, measure:
-
-- overlap count and rate;
-- left/right uniqueness;
-- one-to-one, one-to-many, or many-to-many shape;
-- fanout;
+- key overlap and coverage;
+- left/right uniqueness and multiplicity;
+- fanout and duplicates;
 - unmatched records;
-- duplicate keys;
-- date or period alignment;
-- transformations applied to keys.
+- date/period alignment;
+- transformations applied to keys;
+- conflicts or contradictory source claims.
 
-Use a `strong_source_local` relationship only when empirical support is high enough for the specific question. State coverage and exclusions.
+Use a relationship for quantitative claims only at an evidence level supported
+for that item. State coverage and exclusions. Missing identity may block a
+combined ranking while leaving source-local counts usable.
 
-## 6. Documents and rules
+## 7. Documents, rules, processes, and quality
 
-For a document-dependent result, separate:
+For a document-dependent result, separate what the document says, whether it is
+applicable, its effective period and precedence, operational evidence, a
+possible scenario, and any unsupported compliance claim.
 
-- what the document says;
-- whether it is applicable;
-- whether it is authoritative;
-- whether required operational evidence exists;
-- what can be calculated as a scenario;
-- what cannot be claimed as compliance.
+For a process result, define case, events, timestamps/timezone, ordering,
+repeated events, incomplete cases, and exclusions. For quality, investigate
+only risks that can change the active answer: missing denominators, duplicate
+keys, invalid dates, impossible sequences, unit/currency mismatch, unstable
+joins, coverage gaps, or stale periods.
 
-## 7. Processes
+## 8. Cleaning and population
 
-Define:
+Use the least invasive transformation: normalization, explicit mapping,
+evidence-supported correction, exclusion with a count, or quarantine. Preserve
+raw values and write derived assets to the Prepared Data Registry.
 
-- case;
-- event;
-- initial and terminal event;
-- timestamps;
-- timezone;
-- ordering;
-- repeated events;
-- incomplete cases;
-- exclusions.
+Record base population, eligible population, exclusions by reason, unresolved
+records, denominator, grain, period, dimensions, units, and coverage.
 
-When process authority is incomplete, label the result source-local.
+## 9. Analysis and answer
 
-## 8. Quality
+Suitable outputs include counts, shares, trends, distributions, rankings,
+concentrations, cycle times, transitions, scenario ranges, descriptive
+associations, and null findings. Use causal language only when the evidence
+supports it.
 
-Investigate only material quality risks:
-
-- missing measure or denominator fields;
-- duplicate business keys;
-- invalid dates;
-- impossible sequence;
-- unit or currency inconsistency;
-- unstable joins;
-- coverage gaps;
-- stale periods;
-- biased or incomplete populations.
-
-## 9. Cleaning
-
-Use the least invasive transformation:
-
-1. normalization;
-2. explicit mapping;
-3. correction supported by evidence;
-4. exclusion with count;
-5. quarantine.
-
-Never overwrite raw evidence.
-
-## 10. Population
-
-Record:
-
-- base count;
-- eligible count;
-- exclusion counts by reason;
-- unresolved count;
-- denominator;
-- grain;
-- period;
-- coverage.
-
-## 11. Analysis
-
-Suitable outputs include:
-
-- counts and shares;
-- trends;
-- distributions;
-- rankings;
-- cohorts;
-- concentrations;
-- cycle times;
-- process transitions;
-- scenario ranges;
-- correlations or descriptive associations;
-- null findings.
-
-Use causal language only with adequate design and evidence.
-
-## 12. Answer structure
-
-A strong final answer contains:
+The draft and final answer should separate:
 
 1. direct business answer;
-2. headline findings;
-3. supported breakdowns;
-4. working definitions and proxies;
-5. method and population;
-6. limitations;
-7. unsupported components;
-8. next evidence needed.
+2. headline findings and expected visual outputs;
+3. scope, period, population, denominator, and units;
+4. definitions, proxies, and method;
+5. supported components;
+6. unsupported components and missing evidence;
+7. limitations and safe next actions.
 
-## 13. Partial-answer examples
+## 10. Review and Knowledge Delta
 
-### Missing cross-system join
+One Lead Analyst self-check precedes one routed Independent Reviewer. Route an
+independent fresh context first, an alternate independent route second, and a
+fresh same-family route third. If all are unavailable, disclose
+`review_status=unavailable` and `review_strength=none` and continue.
 
-Return source-local findings from both sources and block only the combined attribution.
+The reviewer may accept, accept with limits, request one targeted repair, or
+block specific claims. Apply at most one repair and recheck only the repaired
+points. Then apply one reviewed Knowledge Delta atomically by code to the
+appropriate LEM layer, or record `no_change`.
 
-### Missing official metric definition
+## 11. Queue continuation
 
-Choose a reasonable working definition, label it, and optionally show alternative scenarios.
-
-### Incomplete policy authority
-
-Run a policy scenario and block only the compliance conclusion.
-
-### Missing causal evidence
-
-Report associations and avoid causal claims.
+Terminal outcomes include `answered`, `answered_with_limits`, `partial_answer`,
+`null_finding`, `blocked_by_evidence`, `unsupported`,
+`analytics_requires_missing_data`, `out_of_analytics_scope`, and
+`technical_failure`. Preserve supported work and continue to the next item.
+Only a global infrastructure failure may prevent remaining items.

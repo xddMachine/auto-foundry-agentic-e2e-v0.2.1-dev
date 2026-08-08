@@ -1,28 +1,41 @@
 # Changelog
 
-## 0.2.0 — Natural analysis first
-
-Removed or replaced:
-
-- mandatory outcome artifact for every analytical stage;
-- independent review of every intermediate stage;
-- multi-generation candidate and rethink loops;
-- ontology finalization as a queue gate;
-- Markdown-based lifecycle verification;
-- all-or-nothing answers;
-- enterprise-authority requirement for all source-local analysis;
-- control failure represented as business failure.
+## 0.2.1 — Progressive reuse and requirement mode
 
 Added:
 
-- one Lead Analyst per question;
-- adaptive analytical route;
-- one final review per question;
-- maximum one repair;
-- source-local working definitions and proxies;
-- partial answers;
-- component-level blockers;
-- explicit technical-failure outcome;
-- non-blocking lightweight ontology updates;
-- final automation-candidate analysis based on actual work;
-- required skill version marker.
+- exact run markers for skill `0.2.1` and core `0.1.0`;
+- analytics-only Requirement Mode with user-owned requirement records,
+  semantic portfolio planning, dependency-aware unprioritized ordering, and
+  sequential execution;
+- progressive two-layer run-local Living Enterprise Model: Enterprise
+  Ontology plus Prepared Data Registry;
+- semantic Navigator bundles, compact indexes, and deterministic exact-ID
+  validation;
+- Capability Catalog inspection, fit-driven core use, reproducible custom code,
+  and capability-gap recording;
+- reviewer routing, unavailable disclosure, clean-room allowlists, and
+  discarded-lane incident records;
+- reviewed-output-only local dashboard prototype guidance, offline asset, and
+  traceability contract;
+- passive telemetry and a strictly read-only evidence-based optimizer report.
+
+Preserved:
+
+- natural analysis freedom and Question Mode wording/order;
+- one Lead Analyst self-check, one item review, at most one repair, partial
+  answers, and queue continuation after limited or failed outcomes;
+- source-local definitions and explicit proxy/limitation labels;
+- structured JSON lifecycle authority and read-only source handling.
+
+Removed or prohibited:
+
+- v0.2.0 lifecycle instructions, compatibility wrappers, per-stage acceptance
+  gates, ontology-closing work, fixed business-term dictionaries, cross-run
+  caches, unreviewed dashboard calculations, and optimizer mutation or client
+  business automation.
+
+## 0.2.0
+
+The previous release is superseded directly by 0.2.1. Install one skill folder
+named `auto-foundry-agentic-e2e` and verify the new run markers.

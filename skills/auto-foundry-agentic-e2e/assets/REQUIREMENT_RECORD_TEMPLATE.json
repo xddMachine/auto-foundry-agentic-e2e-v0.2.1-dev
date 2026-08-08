@@ -1,0 +1,38 @@
+{
+  "requirement_id": "R-...",
+  "original_text": "...",
+  "priority": {
+    "value": null,
+    "source": "user|unset",
+    "explicit": false
+  },
+  "objective": "...",
+  "expected_outputs": {
+    "analytical": [],
+    "visual": []
+  },
+  "internal_tasks": [],
+  "dependencies": [],
+  "foundation_dependencies": [],
+  "needs": {
+    "data": [],
+    "ontology": [],
+    "prepared": []
+  },
+  "working_definitions": [],
+  "limits": [],
+  "scope_classification": "analytics_in_scope|analytics_requires_missing_data|out_of_analytics_scope",
+  "status": "queued|planned|active|answered|answered_with_limits|partial_answer|null_finding|blocked_by_evidence|unsupported|technical_failure",
+  "evidence_refs": [],
+  "planner": {
+    "rationale_refs": [],
+    "position": null
+  },
+  "review": {
+    "review_status": "pending|available|unavailable",
+    "review_strength": "pending|independent|same_family|none",
+    "verdict": null,
+    "repair_count": 0
+  },
+  "outcome": null
+}

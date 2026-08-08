@@ -1,35 +1,91 @@
-# Test Prompts
+# Offline test prompts
 
-## Clean-room full run
+These prompts are contract fixtures. They use fake rows or metadata only; do
+not call a real model, benchmark, external system, or current dataset.
+
+## Question Mode: clean-room queue
 
 ```text
-Use `$auto-foundry-agentic-e2e`.
+Use `$auto-foundry-agentic-e2e` in Question Mode.
 
-Start a completely fresh clean-room run using only the attached dataset and the supplied questions. Do not read or reuse previous runs, scripts, dashboards, reports, ontologies, caches, or agent outputs.
+Start a fresh clean-room run using only the attached generic enterprise files
+and these questions. Do not read sibling runs, previous-run caches, ontologies,
+scripts, reports, dashboards, prompts, or prior agent outputs. Declare the
+allowed roots and record any discarded-lane incident.
 
-At run start, report the loaded skill marker. It must be:
-
+At run start, write these exact markers to structured state and the final
+report:
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.2.0
+skill_version: 0.2.1
+core_name: auto_foundry_core
+core_version: 0.1.0
 
-Process the supplied questions in exact order. Produce the strongest supported answer for each. Use clearly labelled source-local definitions or working proxies when official definitions are unavailable. Preserve supported partial answers and block only unsupported parts. Continue after limited, blocked, unsupported, or technical outcomes.
+Process the questions in exactly this order, preserving each original string:
+1. Count fulfilled order lines by month from one supplied table.
+2. Compare invoice totals with a second source, but retain source-local
+   results when the identity link is incomplete.
+3. Normalize a small supplier-status field and report exclusions.
 
-Save material scripts only when created and used. Build the final dashboard, audit view, and automation-candidate report after the complete queue.
+For each item use one Lead Analyst self-check, one routed independent review,
+and at most one targeted repair. Continue after partial, blocked, unsupported,
+or technical outcomes. Build the final reviewed-output-only dashboard after
+the complete queue. Show periods, denominators, limitations, traceability, and
+review availability. Keep telemetry passive.
 ```
 
-## Minimal three-question regression
+## Requirement Mode: portfolio and reuse
 
-Use:
+```text
+Use `$auto-foundry-agentic-e2e` in analytics-only Requirement Mode.
 
-1. a simple one-table numerical question;
-2. a question with a genuine cross-source linkage gap;
-3. a question requiring small derived cleaning.
+Treat each manager requirement below as a primary user-owned record. Preserve
+original text, explicit priority, objective, expected analytical output,
+expected visual output, internal tasks, dependencies, foundation dependencies,
+data/ontology/prepared needs, working definitions, limits, and status.
 
-Acceptance:
+R-001 (priority=1): Decide whether late shipments are concentrated by carrier;
+the answer needs a reviewed rate table and a trend chart.
+R-002 (priority=unset): Reconcile payment and invoice records; reuse any
+reviewed identity mapping but report missing fields.
+R-003 (priority=unset): Create a local evidence-readiness dashboard for the
+first two answers; this is a visual analytics deliverable, not a new metric.
+R-004 (priority=unset): Change the customer payment process automatically.
 
-- at least one reviewed numerical answer;
-- partial answer on the linkage-gap question;
-- one cleaning result or an honest finding that cleaning is unnecessary;
-- queue completion;
-- non-blocking knowledge updates;
-- final dashboard and automation-candidate report.
+One semantic Portfolio Planner must see the full portfolio, honor R-001's
+explicit priority, classify each record as analytics_in_scope,
+analytics_requires_missing_data, or out_of_analytics_scope without a keyword
+dictionary, and record the rationale. It may order the unprioritized records
+for dependency/reuse reasons and must replan briefly between items. Execute
+one item at a time; shared foundation work is traceable but is not a user
+requirement.
+
+For each in-scope item, use Navigator-selected exact ontology/prepared IDs,
+deterministic validation, a catalog inspection, concise plan, natural analysis,
+optional core/custom code, self-check, one reviewer, at most one repair, final
+answer, and atomically applied reviewed Knowledge Delta. Build the static
+reviewed-output-only dashboard only after all items have terminal outcomes.
+After answers, LEM, prepared registry, dashboard, and telemetry are frozen,
+produce a read-only optimizer report and evidence appendix. Do not mutate the
+run or propose client business automation as Auto Foundry optimization.
+```
+
+## Minimal fake acceptance matrix
+
+The offline tests should demonstrate:
+
+- version and core markers in instructions and run-state template;
+- exact Question Mode wording/order, continuation, one self-check, one review,
+  and one-repair maximum;
+- Requirement Mode records, semantic scope classification, explicit priority,
+  whole-portfolio planning, foundation-task traceability, short replans, and
+  sequential execution;
+- LEM layer separation, scoped preparation, conflicts/effective periods,
+  `no_change`, compact indexes, and exact-ID bundles;
+- catalog-first-but-optional core use and reproducible custom code;
+- reviewer routing fallbacks, unavailable disclosure, and session release;
+- clean-room roots, path enforcement, and discarded-lane incidents;
+- dashboard reviewed-output traceability, limitations, offline assets, and no
+  new analytics;
+- passive telemetry plus frozen/read-only optimizer evidence fields;
+- prohibitions on dictionaries, cross-run caches, approval trees, lifecycle
+  prose authority, a second repair, client automation, and production apps.

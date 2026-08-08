@@ -1,0 +1,11 @@
+{
+  "event_id": "TEL-...",
+  "run_id": "RUN-...",
+  "item_id": "Q-...|R-...|foundation-...|product|optimizer",
+  "event_type": "item_started|operation|review_routed|review_completed|item_completed|product_built|optimizer_observed",
+  "occurred_at": "2026-01-01T00:00:00Z",
+  "status": "started|completed|failed|unavailable",
+  "artifact_refs": [],
+  "error_class": null,
+  "passive": true
+}

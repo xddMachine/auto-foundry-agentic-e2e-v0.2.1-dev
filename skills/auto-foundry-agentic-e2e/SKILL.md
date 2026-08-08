@@ -1,816 +1,312 @@
 ---
 name: auto-foundry-agentic-e2e
-description: Runs a natural, agent-native, end-to-end enterprise data analysis workflow from raw data and supplied business questions to reviewed answers, reusable business knowledge, management dashboards, an audit view, and a report of work that can later be automated. Use for SAP, databases, Excel, CSV, documents, APIs, and mixed enterprise data rooms. The skill processes one question at a time, uses adaptive analysis rather than mandatory stage gates, preserves material scripts when agents create them, permits clearly labelled source-local assumptions and proxies, returns partial answers when only part of a question is supported, and builds final dashboards after the complete supplied queue is processed.
+description: Runs a natural, reviewed, end-to-end enterprise analysis workflow for supplied questions or analytics-only manager requirements. It reuses a run-local Living Enterprise Model, selects bounded evidence semantically, keeps custom work reproducible, and builds a traceable offline dashboard after the queue.
 metadata:
   author: auto-foundry
-  version: "0.2.0"
-  architecture: lead-analyst-question-sequential
-  release: natural-analysis-first
+  version: "0.2.1"
+  core_name: auto_foundry_core
+  core_version: "0.1.0"
+  architecture: natural-analysis-with-question-and-requirement-modes
+  release: progressive-reuse-and-traceable-products
 ---
 
-# Auto Foundry Agentic E2E — Natural Analysis First
+# Auto Foundry Agentic E2E — v0.2.1
 
-## 0. Version marker
+## 0. Run identity and authority
 
-At the start of every new run, record:
+At the beginning of every run, write these exact markers to structured run
+state and repeat them in the final run report:
 
 ```text
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.2.0
+skill_version: 0.2.1
+core_name: auto_foundry_core
+core_version: 0.1.0
 ```
 
-Write these values into the run state and include them in the final run report. This prevents an old installed skill from being mistaken for this version.
+`run_state.json` is the lifecycle authority. It records the run identity,
+mode, allowed roots, queue/portfolio records, active item, outcomes, review
+status, product status, and optimizer status. Markdown is a human-readable
+view only; never infer lifecycle state, completion, or the next item from
+prose. Keep raw sources read-only and put derived work below the current run
+root.
 
-## 1. Mission
+## 1. Mission and modes
 
-Take a mixed enterprise data room and supplied business questions from raw evidence to useful, reviewed business answers.
+The skill turns supplied enterprise evidence into useful, bounded analysis,
+reviewed answers, reusable run-local knowledge, and a local management-facing
+prototype. Analysis stays natural: choose the smallest route that answers the
+active item, and do not manufacture stages or artifacts merely to satisfy a
+checklist.
 
-The intended workflow is:
+Use exactly one mode per run:
+
+### Question Mode
+
+Use when the user supplies business questions. Treat each supplied question as
+a user-owned record. Preserve its original wording and order, activate one
+question at a time, and do not discover extra questions. For every question:
+
+1. load only relevant reusable knowledge and prepared views;
+2. let one Lead Analyst choose and perform the useful work;
+3. run one concise Lead Analyst self-check;
+4. send the complete draft to one routed Independent Reviewer;
+5. make at most one targeted repair, then perform a short recheck when needed;
+6. record the final outcome and continue to the next supplied question.
+
+Continue after `answered_with_limits`, `partial_answer`, `null_finding`,
+`blocked_by_evidence`, `unsupported`, or `technical_failure`. Stop the queue
+only for a global infrastructure failure that makes every remaining item
+impossible. Build the final dashboard after the complete supplied queue.
+
+### Requirement Mode (analytics-only)
+
+Use only when the user supplies manager-style requirements. A requirement is
+not a prompt to automate a client business process: it is an analytics request
+whose records remain primary user-owned inputs. Record, without rewriting:
+
+- `requirement_id` and `original_text`;
+- explicit `priority` (including its source and tie handling);
+- `objective` and decision context;
+- expected analytical outputs and expected visual outputs;
+- internal analytical tasks and their dependencies;
+- shared foundation dependencies;
+- data needs, ontology needs, and prepared-data needs;
+- working definitions, assumptions, and limits;
+- `status`, outcome, review fields, and evidence references.
+
+Classify each record semantically as exactly one of:
+
+- `analytics_in_scope` — evidence and an analytical path can support the
+  objective;
+- `analytics_requires_missing_data` — the objective is analytical, but a
+  material source, field, period, definition, or prepared view is missing;
+- `out_of_analytics_scope` — the request is not an analytics deliverable for
+  this skill.
+
+The Portfolio Planner is one semantic planning pass over the full portfolio.
+It uses meaning, dependencies, evidence availability, and reusable knowledge;
+it never uses a fixed business-term dictionary or a keyword router. Explicit
+user priority is honored first. Among unprioritized records it may order work
+to satisfy dependencies or maximize safe reuse. It records the rationale and
+does a short replan between completed items. Requirement items execute one at
+a time, in the planned order. Shared foundation work is traceable and
+reusable, but is never silently promoted to a user requirement.
+
+## 2. Roles and item workflow
+
+The activating agent is the Run Director. The Run Director initializes state,
+keeps sources read-only, invokes the Portfolio Planner in Requirement Mode,
+and keeps the queue moving.
+
+- **Navigator** semantically selects a bounded bundle of relevant ontology and
+  prepared-data IDs from compact indexes.
+- **Lead Analyst** owns one active question or requirement, chooses the natural
+  route, records decisions, and writes the draft answer.
+- **Specialists** may be called for bounded semantic, relationship, document,
+  process, quality, cleaning, calculation, or visualization work. They advise
+  the active item and do not create a second item lifecycle.
+- **Independent Reviewer** checks the complete answer at the business-result
+  boundary.
+- **Product Builder** assembles final products only from reviewed outputs.
+- **Optimizer** is a post-run read-only observer of Auto Foundry workflow and
+  substrate evidence.
+
+For each Requirement Mode item, use this exact, progressive sequence:
 
 ```text
-SAP / databases / Excel / CSV / documents / APIs / business context
-                                ↓
-                    lightweight Evidence Foundation
-                                ↓
-                    supplied Question Registry
-                                ↓
-                    one active question at a time
-                                ↓
-              Lead Analyst chooses the minimum useful route
-                                ↓
-        semantics / relationships / documents / processes / quality
-        cleaning / analytical population / calculation as needed
-                                ↓
-               strongest supported answer, with limitations
-                                ↓
-                    one independent answer review
-                                ↓
-               lightweight reusable knowledge update
-                                ↓
-                         next supplied question
-                                ↓
-                    all supplied questions processed
-                                ↓
-          cross-question synthesis + management dashboards
-                                ↓
-             audit view + automation-candidate report
+portfolio record
+  → Navigator selects bounded IDs from compact indexes
+  → deterministic exact-ID bundle validation
+  → inspect Capability Catalog
+  → concise plan
+  → natural analysis
+  → optional specialists, core operations, or custom reproducible code
+  → one concise Lead Analyst self-check
+  → one routed Independent Reviewer
+  → at most one targeted repair
+  → final answer and outcome
+  → reviewed Knowledge Delta applied atomically by code
 ```
 
-The primary objective is to complete useful business analysis. Governance, review, state, and artifact creation support that objective; they must not become the main work.
+There is no capability-by-capability approval tree or separate ontology
+closing role. An item may finish early when its evidence is sufficient.
+Preserve supported parts when another part is blocked.
 
-## 2. Core operating model
+Every item plan and answer should distinguish: direct answer, expected output
+shape, scope and period, working definitions, population and denominator,
+method, evidence references, supported components, unsupported components,
+limitations, and next evidence needed. Use `technical_failure` for workflow or
+tool defects; never turn it into a claim about the data.
 
-### 2.1 Fixed conceptual architecture, adaptive execution
+## 3. Progressive Living Enterprise Model
 
-The following are permanent analytical capabilities:
+The Living Enterprise Model (LEM) is run-local and progressive. It has two
+linked, separately addressable layers:
 
-- Evidence Foundation
-- question interpretation and planning
-- semantic understanding
-- relationship investigation
-- business rules and documents
-- process and event understanding
-- data quality and fitness
-- cleaning and harmonization
-- analytical population
-- analysis and calculation
-- answer and claim review
-- reusable knowledge
-- final dashboards and audit
+1. **Enterprise Ontology** — an extensible map of business objects, fields,
+   grains, relationships, rules, processes, metrics, conflicts, and known
+   limitations. It is reusable business understanding, not a transaction copy
+   and not a dump of raw rows.
+2. **Prepared Data Registry** — reusable derived assets, profiles, mappings,
+   normalized values, relationship measurements, and prepared views with exact
+   source/evidence references. A prepared asset is reusable only within its
+   recorded scope and effective period.
 
-They are a checklist of possible work, not a mandatory sequence of independent acceptance gates.
+Keep reusable preparation distinct from a requirement-scoped view. Record
+source scope, effective periods, evidence, limits, transformations, and
+conflicts; preserve conflicting definitions instead of overwriting them. A
+review may produce `promoted`, `promoted_with_limits`, or `no_change`.
+`no_change` is a valid terminal update and never blocks the queue.
 
-For each question, the Lead Analyst selects only the work that is useful. A simple one-table question may need semantics, a quality check, a population, and a calculation. A complex question may need relationships, documents, process analysis, and cleaning. Do not dispatch agents or create artifacts merely to declare a capability `not_required`.
+The Navigator receives compact indexes first and returns exact IDs. The
+Run Director validates that every returned ID exists, belongs to the current
+run, is allowed for the item, and has the expected layer/type before reading
+the bundle. Do not silently broaden a bundle or invent IDs. In clean-room mode
+both layers start empty.
 
-### 2.2 One Lead Analyst owns each question
+## 4. Core Capability Catalog and custom work
 
-The Lead Analyst:
+Before choosing a deterministic operation, inspect the local Capability Catalog
+and record the catalog lookup. Use a catalog capability when it fits the task;
+never distort an analytical question to fit a capability. Generic discovery and
+execution forms are illustrative and intentionally do not assume unverified
+implementation IDs:
 
-- understands the question;
-- reads the current reusable knowledge;
-- chooses relevant evidence;
-- decides which analytical capabilities are needed;
-- performs or delegates the work;
-- selects tools and output formats;
-- creates scripts only when useful;
-- produces the draft answer;
-- records assumptions, proxies, limitations, and unsupported parts.
-
-The Lead Analyst may call specialist agents for bounded tasks. Specialists advise the active question; they do not create parallel question lifecycles.
-
-### 2.3 Review at the business-result boundary
-
-Every question receives one independent review after the draft answer and its material evidence are ready.
-
-Do not require a separate independent reviewer for every intermediate semantic, relationship, quality, cleaning, or population artifact.
-
-A targeted early specialist review is allowed only when a high-impact irreversible interpretation would invalidate all downstream work, such as a materially ambiguous join or a policy whose applicability determines the entire calculation. Even then, keep it narrow and do not create a second control pipeline.
-
-### 2.4 Maximum one repair cycle per question
-
-The normal cycle is:
-
-```text
-Lead Analyst draft
-→ Independent Reviewer
-→ accept / accept_with_limits / one targeted repair / block unsupported part
-→ one repair when requested
-→ short fresh recheck
-→ final answer
+```bash
+python -m auto_foundry_core catalog ...
+python -m auto_foundry_core run ...
 ```
 
-Do not create candidate-v1/v2/v3/v4 chains, repeated rethink waves, or reviewer-of-reviewer loops.
+Core operations are optional. Custom Python, SQL, shell, notebook, spreadsheet
+formula, or chart code is allowed when it is the clearest route. Preserve the
+code, inputs, outputs, assumptions, and a reproduction command in the current
+run. Record a capability gap when the catalog lacks a needed operation; do not
+silently substitute an unrelated operation or auto-promote custom code.
 
-If one repair does not resolve a genuine issue:
+## 5. Clean-room and path controls
 
-- preserve the supported parts;
-- state the unresolved part;
-- return `partial_answer`, `answered_with_limits`, `blocked_by_evidence`, or `technical_failure`;
-- continue to the next supplied question.
+For a fresh or clean-room run, create an empty run root, empty LEM layers, and
+an empty run cache before reading supplied evidence. Declare explicit allowed
+roots (current run root, supplied input roots, and approved core/tool roots) in
+structured state. The Run Director, Navigator, core, and custom tools enforce
+those paths.
 
-## 3. Non-negotiable rules
+Do not read or reuse sibling runs, previous-run caches, ontologies, scripts,
+reports, dashboards, hidden prompts, or prior agent outputs. Do not copy raw
+data into products when a reference or derived summary is sufficient. If a
+worker or specialist reads or writes outside its allowlist, discard that lane's
+outputs, record a `clean_room_incident` with the attempted path and disposition,
+and continue only with a clean replacement when safe. Prose assertions alone
+are not evidence of host-level sandboxing.
 
-### 3.1 Process supplied questions in order
+## 6. Review routing and disclosure
 
-When the user supplies questions:
+Route one review per item. Prefer an independent reviewer in a fresh context;
+if unavailable, try an alternate independent route; if that is unavailable,
+use a fresh same-family context. Do not hardcode model or provider names. Where
+the host supports it, release reviewer sessions after the verdict.
 
-- preserve their original wording;
-- preserve their order;
-- do not discover or activate additional business questions unless explicitly requested;
-- process exactly one active question at a time;
-- continue to the next supplied question after the current question receives a final outcome.
+If no reviewer can be obtained, continue with:
 
-Internal analytical subquestions are allowed. They are not new Question Registry items.
-
-### 3.2 Start clean when requested
-
-When the user requests a fresh, blind, or clean-room run:
-
-- create a new run identity and empty output root;
-- do not read previous runs, dashboards, reports, scripts, ontologies, caches, reviews, or prior agent outputs;
-- use only the current skill, current dataset, supplied context, and supplied questions;
-- do not infer answers from memory of a previous run.
-
-### 3.3 Keep sources read-only
-
-Do not modify raw files, source systems, SAP records, databases, APIs, or previous accepted artifacts.
-
-Create derived files in the new run workspace. External writes require explicit user instruction for the exact action.
-
-### 3.4 Produce the strongest supported answer
-
-Do not require a unique enterprise-authoritative definition before useful analysis can begin.
-
-When official authority is unavailable, use one of these clearly labelled evidence levels:
-
-1. `authoritative` — established by an applicable official source or unambiguous system authority;
-2. `confirmed_source_local` — strongly established within the selected source and scope;
-3. `working_proxy` — a reasonable analytical proxy chosen for this question;
-4. `exploratory_only` — useful for diagnostics but not for final quantitative claims.
-
-Final answers may use levels 1–3 when the level, scope, and limitation are explicit. Level 4 must remain diagnostic.
-
-Examples:
-
-- use a confirmed date field as a source-local completion event;
-- use a stated working definition of customer commitment;
-- calculate alternative scenarios when two reasonable definitions exist;
-- report a policy-based scenario without claiming full compliance when document authority is incomplete.
-
-Never present a proxy as an official enterprise definition.
-
-### 3.5 Partial answers are required when possible
-
-When only part of a question is supported:
-
-- answer the supported part;
-- identify the unsupported part;
-- explain exactly what evidence is missing;
-- do not block the whole question unless no material part can be answered safely.
-
-Example:
-
-```text
-Supported:
-719 of 1,220 support cases have no closed_at value.
-
-Limitation:
-Missing closed_at is not identical to operationally unresolved.
-
-Unsupported:
-Causal attribution to carriers and warehouses is not established.
+```json
+{"review_status":"unavailable","review_strength":"none"}
 ```
 
-### 3.6 A blocker must block only what it invalidates
+Disclose this limitation in the item result and final report. A reviewer may
+return `accept`, `accept_with_limits`, `repair_once`, or
+`block_specific_claims`; only the single permitted repair may follow.
 
-Missing cross-system identity may block a joined ranking while leaving source-local counts valid.
+## 7. Final products and dashboard prototype
 
-Missing document precedence may block a compliance conclusion while leaving a policy-scenario calculation valid.
+After every supplied question or requirement has a terminal outcome, freeze
+the reviewed answer references, LEM snapshot, prepared registry, and telemetry
+for product construction. The Product Builder creates a local static dashboard
+prototype (not a production application) and an audit/trace view. It must:
 
-Missing proof of causality must not block descriptive associations.
+- use only reviewed outputs and their evidence links;
+- add no new analytics or unreviewed calculations;
+- organize views by business domain and decision flow, not input order;
+- include multiple KPI cards, charts, and tables where supported;
+- show periods, populations, units, proxy labels, limitations, blocked
+  components, and evidence-readiness gaps visibly;
+- use offline local assets only and validate internal links/anchors;
+- expose traceability from every displayed metric or claim to its reviewed
+  item, output, and evidence reference.
 
-### 3.7 Continue after limited, blocked, or failed questions
+Use the reusable [dashboard prototype contract](assets/DASHBOARD_PROTOTYPE_TEMPLATE.md)
+and [offline dashboard asset](assets/dashboard.css) as a small deterministic
+starting point. This is a product-building aid, not a request to build a
+production dashboard.
 
-A question-level outcome must not stop the complete supplied queue.
+## 8. Passive telemetry and the optimizer
 
-Allowed outcomes:
+Record append-only, passive telemetry for material workflow events (item ID,
+operation/category, timestamps, status, artifact references, errors, and
+reviewer availability). Do not put raw business rows, secrets, or unnecessary
+personal data in telemetry. Telemetry observes the run; it does not choose
+routes, create gates, or change answers.
 
-- `answered`
-- `answered_with_limits`
-- `partial_answer`
-- `null_finding`
-- `blocked_by_evidence`
-- `unsupported`
-- `technical_failure`
+Only after reviewed answers and outcomes are frozen, the LEM and prepared
+registry are frozen, the dashboard prototype is complete, and telemetry is
+closed may the Optimizer inspect workflow/substrate evidence. It writes only:
 
-`technical_failure` describes a problem in the workflow, tool, parser, or agent execution. It must never be presented as a conclusion about the data.
+- `optimizer/experimental_optimizer_report.md`;
+- `optimizer/evidence_appendix.md`.
 
-Continue to the next independent question after recording any of these outcomes.
+Each recommendation records observed evidence, hypothesis, recommendation,
+expected benefit, risk, and generality. The optimizer is strictly read-only:
+it cannot edit source, run state, LEM, prepared data, products, code, or
+configuration; it cannot auto-promote code. Keep Auto Foundry substrate/workflow
+optimization separate from client business automation. If evidence is weak,
+say so and recommend another observation rather than inventing a benchmark.
 
-Stop the whole run only when a global infrastructure failure makes all remaining questions impossible.
+## 9. Run workspace
 
-### 3.8 Scripts are optional; preservation is mandatory when used
-
-Agents may create:
-
-- Python;
-- SQL;
-- shell;
-- notebooks;
-- spreadsheet formulas;
-- mappings;
-- transformed tables;
-- chart code;
-- dashboard code.
-
-Create them only when they improve accuracy, scale, repeatability, or clarity.
-
-If a script, query, formula, notebook, transformation, or material command affects a result, preserve:
-
-- its purpose;
-- the file itself;
-- material inputs;
-- material outputs;
-- assumptions;
-- limitations.
-
-Do not create code merely to satisfy the skill.
-
-### 3.9 Reusable knowledge is lightweight and non-blocking
-
-After a reviewed final answer, promote only reusable business knowledge:
-
-- business objects;
-- grains;
-- field meanings;
-- measured relationships;
-- rule applicability;
-- process definitions;
-- metric definitions;
-- reusable quality or cleaning knowledge;
-- known limitations.
-
-Do not store review IDs, repair generations, parser status, candidate freeze hashes, or lifecycle control data in the Living Ontology.
-
-A knowledge update may be:
-
-```text
-promoted
-promoted_with_limits
-none
-```
-
-`none` is valid and must never block the next question.
-
-Do not run a separate ontology-finalization review. The final answer review determines which knowledge is safe to promote.
-
-### 3.10 Build dashboards after the complete queue
-
-Do not publish management dashboards between questions.
-
-Exploratory charts are allowed during analysis.
-
-After every supplied question has an outcome, build:
-
-- a management dashboard or dashboard suite;
-- an audit / technical view;
-- a concise cross-question synthesis;
-- an automation-candidate report.
-
-Build these even when some questions are limited or blocked. A data-readiness and evidence-gap view is a legitimate part of the final product.
-
-## 4. Inputs
-
-Inputs may include:
-
-- ZIP data rooms;
-- SAP extracts or access metadata;
-- databases or data warehouses;
-- Excel, CSV, JSON, Parquet, or similar files;
-- PDF, DOCX, TXT, Markdown, email exports, policies, SOPs, contracts, or presentations;
-- APIs or application exports;
-- business context;
-- supplied business questions;
-- an optional prior Living Ontology, unless clean-room mode is requested.
-
-Work with what is available and state what is not.
-
-## 5. Roles
-
-### 5.1 Run Director
-
-The activating agent becomes the Run Director.
-
-The Run Director:
-
-- reads project instructions;
-- creates or resumes one run workspace;
-- records the skill version;
-- builds the lightweight Evidence Foundation;
-- registers supplied questions;
-- keeps one active question;
-- assigns a Lead Analyst;
-- calls specialists only when useful;
-- assigns one Independent Reviewer per question;
-- continues the queue after question-level blockers or technical failures;
-- triggers final product generation after the queue is complete;
-- creates the final automation-candidate report.
-
-### 5.2 Lead Analyst
-
-The Lead Analyst owns the natural analytical workflow for one question.
-
-### 5.3 Optional Specialists
-
-Possible specialist missions include:
-
-- data exploration;
-- semantic interpretation;
-- relationship measurement;
-- document interpretation;
-- process analysis;
-- quality assessment;
-- cleaning;
-- calculation;
-- visualization.
-
-Specialists return concise findings and material artifacts to the Lead Analyst. Their work does not require separate stage acceptance unless the Lead Analyst explicitly identifies a high-impact risk.
-
-### 5.4 Independent Reviewer
-
-The Independent Reviewer checks the complete draft answer, evidence, assumptions, relationships, calculations, and statement strength.
-
-The Reviewer must not demand enterprise authority where a clearly labelled source-local or proxy answer is valid.
-
-### 5.5 Product Builder and Product Reviewer
-
-After all questions, the Product Builder creates the final dashboards and audit view. One Product Reviewer checks that published values and statements match reviewed question results.
-
-## 6. Minimal workspace
-
-Use the simplest useful workspace. A recommended structure is:
+Create only directories that contain an artifact. A minimal run may contain:
 
 ```text
 run/
 ├── run_state.json
-├── RUN_SUMMARY.md
-├── inputs/
-│   └── source_manifest.md
-├── evidence/
-│   ├── inventory.csv
-│   └── evidence_summary.md
-├── questions/
-│   ├── QUESTION_REGISTRY.md
-│   └── Q-001/
-│       ├── question.md
-│       ├── plan.md
-│       ├── analysis_trace.md
-│       ├── scripts/
-│       ├── outputs/
-│       ├── draft_answer.md
-│       ├── review.md
-│       └── final_answer.md
-├── knowledge/
-│   ├── living_ontology.jsonl
-│   └── ontology_summary.md
-└── final/
-    ├── management_dashboard.*
-    ├── audit_report.md
-    ├── cross_question_synthesis.md
-    ├── automation_candidates.md
-    └── final_run_report.md
+├── inputs/source_manifest.json
+├── indexes/ontology_index.json
+├── indexes/prepared_index.json
+├── planning/portfolio_plan.json          # Requirement Mode only
+├── lem/enterprise_ontology.jsonl
+├── lem/prepared_data_registry.jsonl
+├── cache/                                 # current run only, when used
+├── telemetry/events.jsonl                 # when events exist
+├── questions/Q-001/...                    # Question Mode, optional
+├── requirements/R-001/...                 # Requirement Mode, optional
+├── products/...
+└── optimizer/...                          # only after optimizer preconditions
 ```
 
-Do not create empty folders or files. Do not create separate stage directories unless the actual work benefits from them.
-
-`run_state.json` is the authoritative lifecycle state. Markdown is a human-readable view only. Never parse free-form Markdown to determine active question, terminal status, or next action.
-
-## 7. Run lifecycle
-
-### Phase A — Initialize
-
-1. Read repository and project instructions.
-2. Determine whether the run is fresh, clean-room, or resume.
-3. Create `run_state.json` with:
-   - run ID;
-   - skill name and version;
-   - input references;
-   - question mode;
-   - current active question;
-   - question statuses;
-   - output root.
-4. Establish read-only source behavior.
-5. Preserve the original supplied questions.
-
-### Phase B — Lightweight Evidence Foundation
-
-Build a broad physical map:
-
-- files and source types;
-- tables, sheets, documents, and broad business areas;
-- date coverage;
-- obvious identifiers, currencies, units, and source systems;
-- inaccessible or malformed inputs;
-- major limitations.
-
-Do not deeply profile every file before the first answer. Inventory globally, investigate deeply only for the active question.
-
-Reuse profiles and extracts across later questions.
-
-### Phase C — Question Registry
-
-When questions are supplied:
-
-- use `user_supplied` origin;
-- preserve exact wording and order;
-- disable discovery;
-- activate the first question;
-- leave the rest queued.
-
-### Phase D — Sequential question loop
-
-For each active question:
-
-#### D1. Load reusable knowledge
-
-Read the current Living Ontology. Reuse items that remain applicable. Validate only the knowledge material to this question.
-
-#### D2. Create a minimal analysis plan
-
-Write one concise `plan.md` containing:
-
-- what the question is asking;
-- the expected answer shape;
-- relevant evidence;
-- required analytical capabilities;
-- working definitions or scenarios;
-- material risks;
-- likely scripts or tools;
-- what will be considered sufficient.
-
-Do not create a separate plan artifact for every analytical capability.
-
-#### D3. Execute a natural analytical pass
-
-The Lead Analyst may perform any of the following as needed:
-
-- inspect relevant sources;
-- clarify semantics;
-- measure relationships;
-- read policies or contracts;
-- reconstruct events or processes;
-- assess quality;
-- create derived cleaning;
-- define population and denominator;
-- calculate;
-- visualize;
-- delegate specialist missions.
-
-Record the natural work in `analysis_trace.md`:
-
-- evidence used;
-- tools used;
-- scripts created;
-- key decisions;
-- assumptions and proxies;
-- outputs;
-- unresolved issues.
-
-#### D4. Produce the draft answer
-
-The draft must separate:
-
-- direct answer;
-- key numbers or findings;
-- scope and period;
-- working definitions;
-- methodology;
-- supported parts;
-- unsupported parts;
-- limitations;
-- association versus causality;
-- next evidence needed.
-
-#### D5. Independent review
-
-The Reviewer checks:
-
-- source relevance;
-- material semantic choices;
-- join quality and fanout where applicable;
-- population and denominator;
-- calculations and reproducibility;
-- use of documents;
-- assumptions and proxy labels;
-- claim strength;
-- whether a partial answer is possible.
-
-The Reviewer returns one of:
-
-- `accept`
-- `accept_with_limits`
-- `repair_once`
-- `block_specific_claims`
-
-#### D6. Repair once when needed
-
-Make one targeted repair. Preserve the original draft and review. Perform a short fresh recheck of the repaired points only.
-
-#### D7. Finalize the question
-
-Write `final_answer.md` and assign one question outcome.
-
-Update `run_state.json`.
-
-#### D8. Update reusable knowledge
-
-Promote reviewed reusable business knowledge, or record `none`. Do not block the queue.
-
-Activate the next supplied question.
-
-### Phase E — Cross-question synthesis
-
-After all questions have outcomes:
-
-- identify common themes;
-- distinguish supported findings from limitations;
-- reconcile compatible metrics;
-- expose contradictions;
-- summarize business implications;
-- list missing data and definitions.
-
-Do not create new calculations in synthesis. Return to the source question only when a genuine material defect is found.
-
-### Phase F — Final products
-
-Create:
-
-1. management dashboard or dashboard suite;
-2. audit / technical report;
-3. cross-question synthesis;
-4. final run report;
-5. automation-candidate report.
-
-Use the simplest format supported by the environment. Prefer the existing project stack. Static HTML, Markdown, or a lightweight local app are acceptable when they are genuinely usable.
-
-## 8. Adaptive analytical capability checklist
-
-Use `references/QUESTION_ANALYSIS_PLAYBOOK.md` for details.
-
-### 8.1 Semantic understanding
-
-Needed when field, object, date, amount, status, unit, or grain meaning is material.
-
-A source-local working meaning is sufficient when labelled and evidenced.
-
-### 8.2 Relationships
-
-Needed when multiple tables or sources contribute to a result.
-
-Measure:
-
-- key overlap;
-- uniqueness;
-- coverage;
-- multiplicity;
-- fanout;
-- unmatched records;
-- temporal consistency;
-- contradictions.
-
-Relationship evidence levels:
-
-- `confirmed`;
-- `strong_source_local`;
-- `exploratory_only`;
-- `unsupported`.
-
-Final quantitative analysis may use `confirmed` or `strong_source_local` relationships when limitations are explicit.
-
-### 8.3 Documents and rules
-
-Needed when a policy, contract, SLA, SOP, or approval rule changes the answer.
-
-When authority is incomplete:
-
-- provide a document-based scenario;
-- do not claim full compliance;
-- state missing version, precedence, effective-date, or approval evidence.
-
-### 8.4 Processes and events
-
-Needed for delays, transitions, cycle time, handoffs, rework, or incomplete cases.
-
-Use source-local process definitions when enterprise-wide authority is unavailable.
-
-### 8.5 Quality and fitness
-
-Assess only issues that can materially change the active answer.
-
-Do not produce a generic quality score as a substitute for analysis.
-
-### 8.6 Cleaning
-
-Clean only when material to the answer.
-
-Preserve raw values and create a derived result. Distinguish normalization, correction, exclusion, and quarantine.
-
-### 8.7 Analytical population
-
-Define:
-
-- base population;
-- eligible population;
-- exclusions;
-- unresolved records;
-- denominator;
-- grain;
-- period;
-- dimensions.
-
-### 8.8 Analysis
-
-Use actual data. Prefer saved scripts for material, repeated, or complex calculations. Record enough method detail to reproduce simple calculations.
-
-## 9. Review protocol
-
-Use `references/REVIEW_PROTOCOL.md`.
-
-The Reviewer is not a governance engine. The purpose is to catch material analytical errors and overclaiming.
-
-The Reviewer must not reject a valid answer solely because:
-
-- no unique enterprise-wide definition exists;
-- a clearly labelled source-local proxy was used;
-- a supported partial answer does not cover the entire original question;
-- an ontology update is `none`;
-- a Markdown format differs from a template.
-
-Do not write verifier scripts that parse prose, bullets, backticks, headings, or wording to determine acceptance or lifecycle state.
-
-Mechanical checks may verify:
-
-- a file exists;
-- a script runs;
-- a calculation matches;
-- a required structured field exists;
-- raw sources are unchanged.
-
-Business judgment belongs to the Lead Analyst and Independent Reviewer.
-
-## 10. Living Ontology
-
-Use `references/KNOWLEDGE_AND_REUSE.md`.
-
-The Living Ontology exists to reduce repeated business interpretation.
-
-Each item should record:
-
-- item type;
-- business meaning;
-- source scope;
-- evidence references;
-- confidence/evidence level;
-- limitations;
-- originating question;
-- status.
-
-Before reuse, check scope and freshness.
-
-Do not make ontology promotion a separate multi-wave process.
-
-## 11. Artifact and efficiency policy
-
-Use `references/ARTIFACT_AND_EFFICIENCY_POLICY.md`.
-
-Before creating an artifact, ask:
-
-```text
-Does this materially help answer the question,
-preserve reproducibility,
-enable reuse,
-or communicate the result?
-```
-
-If not, do not create it.
-
-Efficiency rules:
-
-- batch related inspections;
-- reuse profiles and intermediate outputs;
-- do not reread the full data room for every question;
-- use scripts for repeated tabular work;
-- avoid repeated candidate versions;
-- avoid exhaustive formalism on small data;
-- stop specialist work when sufficient evidence exists;
-- keep review focused on material risks;
-- make workflow effort proportional to dataset and question complexity.
-
-## 12. Final dashboards and audit
-
-Use `references/FINAL_PRODUCT_AND_AUTOMATION.md`.
-
-The management dashboard should show:
-
-- reviewed answers;
-- key metrics;
-- segments and concentrations;
-- trends or distributions;
-- assumptions and limitations;
-- blocked components;
-- data-readiness gaps.
-
-The audit view should show:
-
-- source inventory;
-- question methods;
-- evidence references;
-- scripts and outputs when created;
-- assumptions and proxies;
-- reviewer verdicts;
-- reusable knowledge;
-- traceability from dashboard elements to question results.
-
-The Product Builder must not silently perform new analysis.
-
-## 13. Automation-candidate report
-
-This report is central to the skill.
-
-After the run, inspect the work agents actually performed.
-
-For each repeated operation, record:
-
-- operation;
-- questions where it occurred;
-- tools or scripts used;
-- approximate repetition or effort;
-- failure modes;
-- whether business judgment was required;
-- whether deterministic code could safely replace or assist it;
-- recommended next implementation;
-- expected benefit.
-
-Classify candidates:
-
-- `mechanical_now`;
-- `deterministic_after_more_runs`;
-- `keep_agentic`;
-- `do_not_automate`.
-
-Do not implement the candidates during the same analytical run.
-
-## 14. Completion criteria
-
-A run is complete when:
-
-- every supplied question has an outcome;
-- supported answers are delivered even when other parts are blocked;
-- one independent review has been resolved per question;
-- material scripts and outputs are preserved;
-- reusable knowledge has been updated or explicitly recorded as `none`;
-- the final dashboard and audit view exist;
-- the automation-candidate report exists;
-- the final report states skill version `0.2.0`.
-
-## 15. Anti-patterns
-
-Do not:
-
-- turn every analytical capability into a mandatory stage gate;
-- require independent review for every intermediate artifact;
-- create reviewer-of-reviewer loops;
-- create more than one repair cycle per question;
-- parse Markdown prose to determine state;
-- let a control failure masquerade as a data conclusion;
-- require enterprise authority before using a labelled working proxy;
-- block supported parts because another part is unsupported;
-- stop the supplied queue after one limited or blocked question;
-- make ontology promotion block the next question;
-- fill the ontology with lifecycle metadata;
-- create scripts only for formality;
-- create large candidate/review/freeze trees;
-- spend more effort proving workflow correctness than performing analysis;
-- build dashboards before the complete queue;
-- claim causality from association;
-- modify raw sources.
+`run_state.json`, indexes, LEM records, registry records, and telemetry use
+structured JSON or JSONL authority. Human-readable Markdown and HTML are
+derived views. Do not create empty directories, empty stage artifacts, or
+central/cross-run caches.
+
+## 10. Constraints
+
+- No real model calls, benchmark runs, or external publication are required by
+  this skill; use offline/fake tests for contract verification.
+- Do not copy raw data into the skill, embed current datasets, or add
+  domain-specific code, metrics, recipes, cloud/security/product
+  implementations, or deployment instructions.
+- Do not create a central ontology, cross-run cache, business-term dictionary,
+  mandatory helper use, wall-time deadline, extra review layer, a second review
+  of a review, or a second repair.
+- Do not mutate source files or prior runs, and do not treat prose documents as
+  lifecycle control.
+- Do not add compatibility wrappers or deprecated v0.2.0 instructions.
+- Do not auto-promote custom code or confuse client business automation with
+  the experimental Auto Foundry optimizer.
+
+See the focused references for implementation detail:
+
+- [Question and requirement playbook](references/QUESTION_ANALYSIS_PLAYBOOK.md)
+- [Knowledge and reuse](references/KNOWLEDGE_AND_REUSE.md)
+- [Review protocol](references/REVIEW_PROTOCOL.md)
+- [Artifact and efficiency policy](references/ARTIFACT_AND_EFFICIENCY_POLICY.md)
+- [Final product and optimizer](references/FINAL_PRODUCT_AND_AUTOMATION.md)
