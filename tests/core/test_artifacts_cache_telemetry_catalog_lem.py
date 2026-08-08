@@ -1,4 +1,5 @@
 from pathlib import Path
+import hashlib
 import json
 import subprocess
 import sys
@@ -9,7 +10,7 @@ from auto_foundry_core.artifacts import build_manifest, hash_value, write_artifa
 from auto_foundry_core.capabilities import execute
 from auto_foundry_core.cache import RunCache
 from auto_foundry_core.catalog import capability_catalog, get_capability, search_capabilities
-from auto_foundry_core.contracts import KnowledgeDelta, LEMRef, OperationSpec, PreparedAssetDescriptor
+from auto_foundry_core.contracts import KnowledgeDelta, LEMRef, OperationResultRef, OperationSpec, PreparedAssetDescriptor
 from auto_foundry_core.enterprise_model import LivingEnterpriseModel
 from auto_foundry_core.reproduction import compare_results, reproduce
 from auto_foundry_core.telemetry import TelemetryRecorder
@@ -162,7 +163,14 @@ def test_every_path_reading_catalog_capability_rejects_escape(tmp_path: Path):
         OperationSpec("relationships.measure", inputs=(str(outside), str(outside)), parameters={"left_key": "key", "allowed_roots": roots}),
         OperationSpec("aggregation.compute", inputs=(str(outside),), parameters={"operation": "count", "allowed_roots": roots}),
         OperationSpec("artifacts.write", parameters={"data": [{"ok": True}], "source_refs": [str(outside)], "allowed_roots": roots}),
-        OperationSpec("artifacts.reproduce", parameters={"expected": {"location": str(outside)}, "actual": {"location": str(outside)}, "allowed_roots": roots}),
+        OperationSpec(
+            "artifacts.reproduce",
+            parameters={
+                "expected": OperationResultRef(location=str(outside)).to_dict(),
+                "actual": OperationResultRef(location=str(outside)).to_dict(),
+                "allowed_roots": roots,
+            },
+        ),
     ]
     for spec in specs:
         with __import__("pytest").raises(AllowedRootError):
@@ -188,17 +196,29 @@ def test_execution_and_public_path_boundaries_require_roots(tmp_path: Path):
     assert compare_results("v1.0", "v1.0")["equal"]
     assert compare_results("example.com", "example.com")["equal"]
     assert compare_results("report.csv", "report.csv")["equal"]
+    ordinary_location = {"location": str(source)}
+    assert compare_results(ordinary_location, ordinary_location)["equal"]
     with pytest.raises(AllowedRootError):
-        compare_results({"location": str(source)}, {"location": str(source)})
+        compare_results(
+            OperationResultRef(location=str(source)).to_dict(),
+            OperationResultRef(location=str(source)).to_dict(),
+        )
     manifest = build_manifest(
         capability_id="artifacts.write",
         operation_spec=OperationSpec("artifacts.write"),
         inputs=["report.csv"],
-        outputs=[{"location": source}],
+        outputs=[ordinary_location],
         allowed_roots=(tmp_path,),
     )
     assert manifest["input_hashes"] == [hash_value("report.csv")]
-    assert manifest["output_hashes"]
+    assert manifest["output_hashes"] == [hash_value(ordinary_location)]
+    explicit_manifest = build_manifest(
+        capability_id="artifacts.write",
+        operation_spec=OperationSpec("artifacts.write"),
+        outputs=[OperationResultRef(location=source).to_dict()],
+        allowed_roots=(tmp_path,),
+    )
+    assert explicit_manifest["output_hashes"] == [hashlib.sha256(source.read_bytes()).hexdigest()]
 
 
 def test_cli_run_context_bounds_result_output(tmp_path: Path):

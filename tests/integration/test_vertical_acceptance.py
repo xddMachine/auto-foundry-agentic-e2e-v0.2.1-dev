@@ -157,6 +157,30 @@ def test_complete_generic_offline_vertical_path(tmp_path: Path) -> None:
     assert normalized.value["rows"][0]["amount_normalized"] == 10.0
     assert normalized.value["rows"][0]["event_date"] == "03/01/2026"
 
+    # A business record may legitimately carry both filesystem-looking field
+    # names.  It remains data end to end, while the explicitly tagged source
+    # reference in the same manifest is resolved and file-hashed.
+    business_record = {"location": "Berlin", "uri": "segment-a", "value": 1}
+    business_manifest = runtime.build_manifest(
+        capability_id="artifacts.reproduce",
+        operation_spec=OperationSpec("artifacts.reproduce"),
+        inputs=[business_record],
+        outputs=[business_record],
+    )
+    assert business_manifest["input_refs"] == [business_record]
+    assert business_manifest["input_hashes"] == [hash_value(business_record)]
+    assert business_manifest["output_hashes"] == [hash_value(business_record)]
+    assert runtime.reproduce(business_manifest, lambda: business_record)["reproduced"]
+    mixed_manifest = runtime.build_manifest(
+        capability_id="artifacts.reproduce",
+        operation_spec=OperationSpec("artifacts.reproduce"),
+        inputs=[business_record, registered["ledger.csv"].to_dict()],
+    )
+    assert mixed_manifest["input_refs"][0] == business_record
+    assert mixed_manifest["input_refs"][1]["__auto_foundry_ref__"] == "data_asset"
+    assert mixed_manifest["input_hashes"][0] == hash_value(business_record)
+    assert mixed_manifest["input_hashes"][1] == registered["ledger.csv"].content_hash
+
     # One deterministic operation proves the integrated miss -> hit path and
     # the cache/receipt/telemetry wiring, rather than only testing RunCache.
     preview_spec = OperationSpec("sources.preview", parameters={"path": "ledger.csv", "limit": 2})
