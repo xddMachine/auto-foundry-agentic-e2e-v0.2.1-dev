@@ -1,0 +1,17 @@
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local packaging/build metadata
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Local coverage and release scratch output
+.coverage
+htmlcov/
+coverage.xml

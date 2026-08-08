@@ -1,0 +1,29 @@
+{
+  "schema_name": "benchmark_a_comparison",
+  "schema_version": "0.1",
+  "required": {
+    "run_id": "string",
+    "skill_version": "string",
+    "core_version": "string",
+    "source_zip_sha256": "sha256",
+    "question_order": "array<string>",
+    "outcomes": "object",
+    "repairs": "object",
+    "ontology_items": "integer",
+    "custom_scripts": "object",
+    "reviewer_limitation": "object",
+    "wall_time": "observed_seconds_or_unknown",
+    "product_refs": "array<string>",
+    "q004_reproduction": "object"
+  },
+  "outcome_values": [
+    "answered_with_limits",
+    "partial_answer",
+    "null_finding",
+    "blocked_by_evidence",
+    "unsupported",
+    "technical_failure"
+  ],
+  "wall_time_contract": "Record only an observed end-to-end measurement from the run harness; otherwise use {status: unknown, observed: false}.",
+  "comparison_rule": "Do not compare runs unless source hash, question order, clean-room state, and v0.2.1/core0.1 markers match."
+}

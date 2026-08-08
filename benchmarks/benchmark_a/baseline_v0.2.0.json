@@ -1,0 +1,67 @@
+{
+  "benchmark_id": "benchmark-a",
+  "baseline": {
+    "skill_name": "auto-foundry-agentic-e2e",
+    "skill_version": "0.2.0",
+    "run_id": "RUN-20260807-agentic-e2e-cleanroom-019fdd6a",
+    "source_zip_sha256": "82e9c913bf437ac9e361d6890467a9aed9b1c6db9d887cfcf0cd659035a71ec2",
+    "question_count": 10,
+    "outcomes": {
+      "answered_with_limits": 8,
+      "partial_answer": 2,
+      "other": 0
+    },
+    "repairs": {
+      "total": 9,
+      "by_question": {
+        "Q-001": 0,
+        "Q-002": 1,
+        "Q-003": 1,
+        "Q-004": 1,
+        "Q-005": 1,
+        "Q-006": 1,
+        "Q-007": 1,
+        "Q-008": 1,
+        "Q-009": 1,
+        "Q-010": 1
+      }
+    },
+    "custom_scripts": {
+      "count": 10,
+      "loc_count": 8016,
+      "loc_method": "physical Python source line count in the ten run-local question scripts; comments and blanks included"
+    },
+    "ontology_items": 53,
+    "reviewer_limitation": {
+      "fresh_sol_review_available": false,
+      "scope": "Q-007 through Q-010",
+      "reason": "host thread limit",
+      "fallback": "read-only Luna/max rechecks; not independent Sol review"
+    },
+    "product_refs": [
+      "products/management_dashboard.html",
+      "products/audit_view.html",
+      "products/cross_question_synthesis.md",
+      "products/final_run_report.md",
+      "products/automation_candidates.md",
+      "products/product_manifest.json"
+    ],
+    "q004_reproduction_issue": {
+      "status": "reproduced_and_blocked",
+      "issue": "The strict primary forecast contains only the first weekly slice; a retained full-horizon stockout label is unsupported. The retained WH-02/SKU-0084-2 projected 34-unit label double-subtracts a reservation already reflected in WMS available.",
+      "impact": "Q-004 remains partial_answer; no full 14-day zero-stockout or 34-unit conclusion is accepted."
+    },
+    "wall_time": {
+      "status": "unknown",
+      "observed": false,
+      "reason": "The baseline evidence package records lifecycle timestamps but no measured end-to-end wall-time observation suitable for comparison."
+    }
+  },
+  "provenance": {
+    "source_manifest": "RUN-20260807-agentic-e2e-cleanroom-019fdd6a/inputs/source_manifest.md",
+    "run_summary": "RUN-20260807-agentic-e2e-cleanroom-019fdd6a/RUN_SUMMARY.md",
+    "product_manifest": "RUN-20260807-agentic-e2e-cleanroom-019fdd6a/products/product_manifest.json",
+    "raw_data_copied": false,
+    "analysis_reexecuted": false
+  }
+}
