@@ -1,0 +1,112 @@
+"""Passive facts-only telemetry for deterministic local runs."""
+
+from __future__ import annotations
+
+from collections import Counter
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+import time
+from typing import Any, Iterator, Mapping
+
+from .contracts import OperationReceipt, RunTelemetrySummary, TelemetryEvent
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class TelemetryRecorder:
+    """Collect observations without enforcing budgets or fabricating facts."""
+
+    def __init__(self, root: str | Path | None = None, *, run_id: str = "run") -> None:
+        self.root = Path(root).expanduser().resolve() if root is not None else None
+        if self.root is not None:
+            self.root.mkdir(parents=True, exist_ok=True)
+        self.run_id = run_id
+        self.started_at = _now()
+        self._started_clock = time.perf_counter()
+        self.events: list[TelemetryEvent] = []
+
+    @property
+    def event_path(self) -> Path | None:
+        return self.root / "events.jsonl" if self.root else None
+
+    def record(self, event_type: str, *, timestamp: str | None = None, **facts: Any) -> TelemetryEvent:
+        known = {
+            "capability_id", "spec_hash", "input_hashes", "output_hashes", "duration_ms",
+            "rows", "bytes_processed", "cache_status", "error",
+        }
+        kwargs = {key: facts.pop(key) for key in list(facts) if key in known}
+        supplied_facts = facts.pop("facts", None)
+        if isinstance(supplied_facts, Mapping):
+            facts = {**dict(supplied_facts), **facts}
+        event = TelemetryEvent(event_type=event_type, timestamp=timestamp or _now(), facts=facts, **kwargs)
+        self.events.append(event)
+        path = self.event_path
+        if path is not None:
+            with path.open("a", encoding="utf-8", newline="\n") as stream:
+                stream.write(event.to_json() + "\n")
+        return event
+
+    def record_operation(self, receipt: OperationReceipt) -> TelemetryEvent:
+        return self.record(
+            "operation",
+            capability_id=receipt.capability_id,
+            spec_hash=receipt.spec_hash,
+            input_hashes=receipt.input_hashes,
+            output_hashes=receipt.output_hashes,
+            duration_ms=receipt.duration_ms,
+            cache_status=receipt.cache_status,
+            error="; ".join(receipt.errors) if receipt.errors else None,
+            facts={"backend": receipt.backend, "limitations": list(receipt.limitations)},
+        )
+
+    @contextmanager
+    def operation(self, capability_id: str, *, spec_hash: str | None = None, input_hashes=()) -> Iterator[dict[str, Any]]:
+        started = time.perf_counter()
+        context: dict[str, Any] = {}
+        try:
+            yield context
+        except Exception as exc:
+            self.record("operation", capability_id=capability_id, spec_hash=spec_hash, input_hashes=tuple(input_hashes), duration_ms=(time.perf_counter() - started) * 1000, error=str(exc), facts={"failed": True})
+            raise
+        else:
+            self.record("operation", capability_id=capability_id, spec_hash=spec_hash, input_hashes=tuple(input_hashes), output_hashes=tuple(context.get("output_hashes", ())), duration_ms=(time.perf_counter() - started) * 1000, rows=context.get("rows"), bytes_processed=context.get("bytes_processed"), cache_status=context.get("cache_status"), facts={k: v for k, v in context.items() if k not in {"output_hashes", "rows", "bytes_processed", "cache_status"}})
+
+    def summary(self, *, ended_at: str | None = None, extra: Mapping[str, Any] | None = None) -> RunTelemetrySummary:
+        end = ended_at or _now()
+        capability_usage = Counter(event.capability_id for event in self.events if event.capability_id)
+        cache_hits = sum(event.event_type == "cache_hit" for event in self.events)
+        cache_misses = sum(event.event_type == "cache_miss" for event in self.events)
+        bytes_read = sum(event.bytes_processed or 0 for event in self.events if event.event_type in {"source_read", "operation"})
+        files_read = sum(event.event_type == "source_read" for event in self.events)
+        return RunTelemetrySummary(
+            run_id=self.run_id,
+            started_at=self.started_at,
+            ended_at=end,
+            wall_time_ms=(time.perf_counter() - self._started_clock) * 1000,
+            model_calls="unavailable",
+            model_wall_ms="unavailable",
+            tool_calls="unavailable",
+            files_read=files_read,
+            bytes_read=bytes_read,
+            cache_hits=cache_hits,
+            cache_misses=cache_misses,
+            capability_usage=dict(capability_usage),
+            custom_script_count="unavailable",
+            custom_script_loc="unavailable",
+            facts=dict(extra or {}),
+        )
+
+    def write_summary(self, path: str | Path | None = None, *, extra: Mapping[str, Any] | None = None) -> RunTelemetrySummary:
+        summary = self.summary(extra=extra)
+        destination = Path(path) if path is not None else (self.root / "summary.json" if self.root else None)
+        if destination is not None:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(summary.to_json() + "\n", encoding="utf-8")
+        return summary
+
+
+__all__ = ["TelemetryRecorder"]

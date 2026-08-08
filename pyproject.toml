@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "auto_foundry_core"
+version = "0.1.0"
+description = "Source-agnostic deterministic local analytics substrate"
+readme = "docs/CORE_ARCHITECTURE.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Auto Foundry"}]
+dependencies = []
+
+[project.optional-dependencies]
+io = ["pandas>=2.0", "openpyxl>=3.1", "pyarrow>=12"]
+
+[project.scripts]
+auto-foundry-core = "auto_foundry_core.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
