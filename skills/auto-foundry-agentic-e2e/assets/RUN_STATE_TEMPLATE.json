@@ -1,0 +1,16 @@
+{
+  "run_id": "RUN-...",
+  "skill_name": "auto-foundry-agentic-e2e",
+  "skill_version": "0.2.0",
+  "mode": "fresh|clean_room|resume",
+  "status": "initialized|running|final_product|completed|global_failure",
+  "active_question_id": null,
+  "questions": [
+    {
+      "question_id": "Q-001",
+      "original_text": "...",
+      "status": "queued|active|answered|answered_with_limits|partial_answer|null_finding|blocked_by_evidence|unsupported|technical_failure",
+      "knowledge_update": "pending|promoted|promoted_with_limits|none"
+    }
+  ]
+}
