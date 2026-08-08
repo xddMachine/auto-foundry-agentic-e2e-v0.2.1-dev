@@ -7,6 +7,7 @@
     "core_version": "string",
     "source_zip_sha256": "sha256",
     "question_order": "array<string>",
+    "question_order_sha256": "sha256",
     "outcomes": "object",
     "repairs": "object",
     "ontology_items": "integer",
@@ -14,7 +15,13 @@
     "reviewer_limitation": "object",
     "wall_time": "observed_seconds_or_unknown",
     "product_refs": "array<string>",
-    "q004_reproduction": "object"
+    "q004_reproduction": "object",
+    "answer_quality": "object",
+    "model_tool_workload": "object",
+    "core_cache_use": "object",
+    "prepared_data_reuse": "object",
+    "dashboard_quality": "object",
+    "source_immutability": "object"
   },
   "outcome_values": [
     "answered_with_limits",
@@ -24,6 +31,79 @@
     "unsupported",
     "technical_failure"
   ],
+  "answer_quality": {
+    "required_fields": [
+      "per_question_outcome",
+      "review_status_and_strength",
+      "repair_count",
+      "supported_claims",
+      "blocked_or_unsupported_claims",
+      "limitations_disclosed",
+      "evidence_traceability",
+      "denominator_and_period_disclosure"
+    ],
+    "allowed_outcomes": ["answered", "answered_with_limits", "partial_answer", "null_finding", "blocked_by_evidence", "unsupported", "technical_failure"]
+  },
+  "model_tool_workload": {
+    "required_fields": [
+      "analytical_model_calls",
+      "reviewer_calls",
+      "specialist_calls",
+      "core_operation_calls",
+      "custom_script_count",
+      "custom_script_loc",
+      "wall_time_seconds_or_unknown"
+    ],
+    "measurement_rule": "Count product-runtime calls only; coding-agent orchestration is outside this ledger. Use unknown where a run did not measure a field."
+  },
+  "core_cache_use": {
+    "required_fields": [
+      "core_capability_ids",
+      "core_operation_calls",
+      "run_local_cache_reads",
+      "run_local_cache_writes",
+      "cache_misses",
+      "cross_run_cache_reads"
+    ],
+    "clean_room_rule": "cross_run_cache_reads must be zero and any reuse must be current-run and provenance-bound."
+  },
+  "prepared_data_reuse": {
+    "required_fields": [
+      "reused_asset_ids",
+      "reused_asset_count",
+      "fresh_asset_count",
+      "extended_asset_count",
+      "no_change_count",
+      "conflict_or_supersession_count",
+      "reuse_evidence_refs"
+    ],
+    "scope_rule": "Record exact IDs, effective scope, evidence refs, and whether reuse, extension, fresh creation, no_change, or conflict/supersession occurred."
+  },
+  "dashboard_quality": {
+    "required_fields": [
+      "reviewed_outputs_only",
+      "new_analytics",
+      "widget_count_by_type",
+      "domain_decision_flow_order",
+      "traceability_coverage",
+      "limitations_visible",
+      "internal_links_checked",
+      "offline_assets_only"
+    ],
+    "quality_rule": "Every displayed KPI or claim must have reviewed item, reviewed output, and evidence/trace provenance."
+  },
+  "source_immutability": {
+    "required_fields": [
+      "source_zip_sha256_before",
+      "source_zip_sha256_after",
+      "source_members_modified",
+      "source_read_only_assertion",
+      "prior_run_reuse",
+      "cross_run_cache_reuse"
+    ],
+    "acceptance_rule": "Before/after source hashes match, source_members_modified is zero/false, and prior-run/cross-run reuse is false."
+  },
+  "question_order_hash_definition": "SHA-256 of UTF-8 bytes for canonical Q-###|<exact question> lines from questions.md joined by one newline and terminated by one newline.",
   "wall_time_contract": "Record only an observed end-to-end measurement from the run harness; otherwise use {status: unknown, observed: false}.",
   "comparison_rule": "Do not compare runs unless source hash, question order, clean-room state, and v0.2.1/core0.1 markers match."
 }

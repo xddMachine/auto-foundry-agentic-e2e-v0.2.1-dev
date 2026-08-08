@@ -54,6 +54,11 @@ def test_dashboard_renders_supplied_widgets_without_external_assets(tmp_path: Pa
             {"id": "table-1", "type": "table", "title": "Drill down", "columns": ["id", "status"], "rows": [{"id": "A", "status": "partial"}], "trace_refs": ["Q-008/final"]},
         ],
     }
+    for index, widget in enumerate(fixture["widgets"], 1):
+        question_ref = f"Q-{index:03d}/final_answer.md"
+        widget["reviewed_item_ref"] = f"Q-{index:03d}"
+        widget["reviewed_output_ref"] = question_ref
+        widget["evidence_refs"] = [f"Q-{index:03d}/evidence"]
     fixture_path = tmp_path / "fixture.json"
     html_path = tmp_path / "dashboard.html"
     manifest_path = tmp_path / "dashboard_manifest.json"
@@ -71,6 +76,24 @@ def test_dashboard_renders_supplied_widgets_without_external_assets(tmp_path: Pa
     assert "https://" not in document
     assert document.index("Second domain first") < document.index("First domain second")
     assert json.loads(manifest_path.read_text(encoding="utf-8"))["internal_links_checked"] is True
+    assert "unspecified" not in document.lower()
+    assert "trace reference not supplied" not in document.lower()
+
+    incomplete = json.loads(json.dumps(fixture))
+    del incomplete["widgets"][0]["reviewed_item_ref"]
+    with pytest.raises(ValueError, match="reviewed_item_ref"):
+        dashboard_renderer.render_dashboard(incomplete)
+
+    empty_output_ref = json.loads(json.dumps(fixture))
+    empty_output_ref["widgets"][0]["reviewed_output_ref"] = {}
+    with pytest.raises(ValueError, match="reviewed_output_ref"):
+        dashboard_renderer.render_dashboard(empty_output_ref)
+
+    no_provenance = json.loads(json.dumps(fixture))
+    no_provenance["widgets"][0].pop("evidence_refs")
+    no_provenance["widgets"][0].pop("trace_refs")
+    with pytest.raises(ValueError, match="evidence_refs or trace_refs"):
+        dashboard_renderer.render_dashboard(no_provenance)
 
 
 def _digest(path: Path) -> str:
@@ -148,8 +171,20 @@ def test_optimizer_requires_freeze_reports_categories_and_preserves_hashes(tmp_p
 def test_benchmark_a_is_preparation_only_and_links_resolve() -> None:
     expected = {"README.md", "questions.md", "run_config.example.json", "baseline_v0.2.0.json", "comparison_schema.json", "evaluation_checklist.md", "commands.md"}
     assert {path.name for path in BENCHMARK.iterdir() if path.is_file()} == expected
-    for path in BENCHMARK.glob("*.json"):
-        json.loads(path.read_text(encoding="utf-8"))
+    parsed = {path.name: json.loads(path.read_text(encoding="utf-8")) for path in BENCHMARK.glob("*.json")}
+    expected_question_hash = "3a40d2f7083f0d2f0e1b216d405a0ce6c38cd4913e157b9e48a99dfa96958236"
+    assert parsed["run_config.example.json"]["question_order_sha256"] == expected_question_hash
+    assert parsed["baseline_v0.2.0.json"]["baseline"]["question_order_sha256"] == expected_question_hash
+    required_comparison_fields = {
+        "answer_quality",
+        "model_tool_workload",
+        "core_cache_use",
+        "prepared_data_reuse",
+        "dashboard_quality",
+        "source_immutability",
+    }
+    assert required_comparison_fields.issubset(parsed["comparison_schema.json"]["required"])
+    assert expected_question_hash in (BENCHMARK / "questions.md").read_text(encoding="utf-8")
     for path in BENCHMARK.glob("*.md"):
         for target in re.findall(r"\[[^\]]+\]\(([^)]+)\)", path.read_text(encoding="utf-8")):
             target_path = target.split("#", 1)[0]
@@ -161,6 +196,7 @@ def test_benchmark_a_is_preparation_only_and_links_resolve() -> None:
     assert "not executed" in readme.lower()
     assert "PREPARE" in commands and "LAUNCH LATER" in commands
     assert "explicit confirmation" in commands.lower()
+    assert expected_question_hash in commands
     for marker in ("skill_name: auto-foundry-agentic-e2e", "skill_version: 0.2.1", "core_name: auto_foundry_core", "core_version: 0.1.0"):
         assert marker in commands
     assert "82e9c913bf437ac9e361d6890467a9aed9b1c6db9d887cfcf0cd659035a71ec2" in commands

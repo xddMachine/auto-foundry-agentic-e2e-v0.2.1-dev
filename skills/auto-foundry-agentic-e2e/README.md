@@ -60,6 +60,12 @@ python3 -m pytest -q tests/skill
 git diff --check
 ```
 
+The offline contract suite includes a deterministic fake-role Requirement Mode
+harness covering whole-portfolio planning, exact-ID navigation, bounded
+analyst routing, unavailable-reviewer disclosure, and LEM reuse/extension/
+fresh/conflict acceptance. It uses metadata fixtures only and never calls the
+core, a model, or a source.
+
 ### Offline helper scripts
 
 After reviewed outputs are frozen, the local dashboard helper can render a
@@ -74,7 +80,9 @@ python3 skills/auto-foundry-agentic-e2e/scripts/dashboard_renderer.py \
 
 The fixture supplies `widgets` (types `kpi`, `bar`, `line`,
 `stacked_composition`, `heatmap`, `scatter`, supplied `donut`, or `table`),
-already-reviewed values, trace references, limitations, and optional ordered
+already-reviewed values, non-empty `reviewed_item_ref`,
+`reviewed_output_ref`, and evidence/trace provenance references, plus limitations
+and optional ordered
 `domains`/`decision_flow` records. The renderer is stdlib-only, emits local
 HTML/CSS, and fails on broken internal links or external assets. It is a
 presentation helper, not an analytical engine.

@@ -20,9 +20,10 @@ Write a structured `dashboard_manifest.json` beside the prototype:
       "element_id": "kpi-orders-on-time",
       "kind": "kpi|chart|table|limitation|traceability",
       "title": "...",
-      "reviewed_item_id": "Q-...|R-...",
+      "reviewed_item_ref": "Q-...|R-...",
       "reviewed_output_ref": "...",
       "evidence_refs": ["..."],
+      "trace_refs": ["..."],
       "period": "...",
       "population": "...",
       "unit": "...",
@@ -43,6 +44,9 @@ Write a structured `dashboard_manifest.json` beside the prototype:
 
 ## Build and QA contract
 
+- Require every widget's non-empty `reviewed_item_ref`,
+  `reviewed_output_ref`, and at least one non-empty `evidence_refs` or
+  `trace_refs` provenance reference before claiming the manifest is valid.
 - Read the frozen reviewed-output manifest; never query raw sources or calculate
   a new metric while rendering.
 - Keep HTML, CSS, images, and scripts local and usable offline.

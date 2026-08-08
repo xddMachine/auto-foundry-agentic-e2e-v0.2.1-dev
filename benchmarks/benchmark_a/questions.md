@@ -3,6 +3,10 @@
 Use these ten user-supplied questions exactly as written and in this order.
 Do not discover, rewrite, split, or add questions.
 
+Frozen `question_order_sha256` (SHA-256 of the UTF-8 bytes of the canonical
+payload `Q-###|<exact question>` joined by `\n` and terminated by one `\n`):
+`3a40d2f7083f0d2f0e1b216d405a0ce6c38cd4913e157b9e48a99dfa96958236`.
+
 1. **Q-001** — How reliably are customer orders delivered on time and in full, and how does fulfillment performance vary by sales channel, region, warehouse, carrier, product category, and customer segment?
 2. **Q-002** — At which stages of the order-to-delivery process do delays, partial deliveries, cancellations, or failed operational handoffs most frequently occur, and which observable factors are most strongly associated with them?
 3. **Q-003** — As of the dataset’s latest reliable analysis date, which open sales orders are at greatest risk of missing their customer commitment, and is the immediate observable constraint inventory availability, supplier delay, warehouse execution, or carrier performance?

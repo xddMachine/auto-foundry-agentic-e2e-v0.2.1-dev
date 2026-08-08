@@ -82,6 +82,9 @@ The offline tests should demonstrate:
 - Requirement Mode records, semantic scope classification, explicit priority,
   whole-portfolio planning, foundation-task traceability, short replans, and
   sequential execution;
+- fake-role behavior for planner, exact-ID Navigator, bounded Lead Analyst,
+  unavailable-reviewer fallback, and LEM found/reuse, extend, fresh,
+  conflict/supersession, and scoped-rejection cases;
 - LEM layer separation, scoped preparation, conflicts/effective periods,
   `no_change`, compact indexes, and exact-ID bundles;
 - catalog-first-but-optional core use and reproducible custom code;

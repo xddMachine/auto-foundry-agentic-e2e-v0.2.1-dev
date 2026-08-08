@@ -241,7 +241,9 @@ production dashboard.
 
 For an executable local presentation helper, pass a reviewed widget fixture to
 `scripts/dashboard_renderer.py`. The fixture owns display values, trace refs,
-limitations, and (when supplied) the business-domain/decision-flow order;
+non-empty `reviewed_item_ref` and `reviewed_output_ref` values, and at least one
+evidence/trace provenance reference per widget, plus limitations and (when
+supplied) the business-domain/decision-flow order;
 the helper never reads raw sources or calculates a new metric. It supports
 KPI cards, generic bar/line/stacked/heatmap/scatter forms, a supplied
 small-category donut, and drill-down tables, all with local HTML/CSS and

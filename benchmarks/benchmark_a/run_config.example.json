@@ -8,6 +8,8 @@
   "source_zip": "/Users/fedorlebedev/Desktop/gen/08_final_release/01_ai_input_levels/level_4_full_dirty_dataset_with_pdfs_policies 2.zip",
   "source_sha256": "82e9c913bf437ac9e361d6890467a9aed9b1c6db9d887cfcf0cd659035a71ec2",
   "question_file": "benchmarks/benchmark_a/questions.md",
+  "question_order_sha256": "3a40d2f7083f0d2f0e1b216d405a0ce6c38cd4913e157b9e48a99dfa96958236",
+  "question_order_hash_definition": "SHA-256 of UTF-8 bytes for canonical Q-###|<exact question> lines joined by one newline and terminated by one newline",
   "allow_prior_run_reuse": false,
   "allow_cross_run_cache": false,
   "external_calls": false,

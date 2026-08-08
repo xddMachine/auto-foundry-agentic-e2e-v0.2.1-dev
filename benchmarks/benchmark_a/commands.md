@@ -9,7 +9,10 @@ preparing v0.2.1/core v0.1, and no Benchmark A run root was created here.
    placeholder with a newly created, empty directory.
 2. Verify the source ZIP SHA-256 is
    `82e9c913bf437ac9e361d6890467a9aed9b1c6db9d887cfcf0cd659035a71ec2`.
-3. Verify the question file and exact markers before analysis. Do not extract
+3. Verify the frozen question-order SHA-256 is
+   `3a40d2f7083f0d2f0e1b216d405a0ce6c38cd4913e157b9e48a99dfa96958236` using
+   the canonical payload definition in `comparison_schema.json`.
+4. Verify the question file and exact markers before analysis. Do not extract
    or inspect source data as part of this preparation package.
 
 Illustrative preparation checks (do not run as a benchmark launch):
@@ -39,7 +42,10 @@ core_version: 0.1.0
 Use the same immutable source ZIP and SHA-256 as the baseline:
 82e9c913bf437ac9e361d6890467a9aed9b1c6db9d887cfcf0cd659035a71ec2
 Use the ten questions from benchmarks/benchmark_a/questions.md in exactly the
-same order, without discovery or rewriting. Keep the source read-only and do
+same order, without discovery or rewriting. The expected question-order
+SHA-256 is:
+3a40d2f7083f0d2f0e1b216d405a0ce6c38cd4913e157b9e48a99dfa96958236
+Keep the source read-only and do
 not make external/model calls beyond the approved product runtime boundary.
 
 Before analysis begins, print the resolved empty run root, source path/hash,

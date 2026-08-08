@@ -73,9 +73,9 @@ def _trace_records(widget: Mapping[str, Any]) -> list[dict[str, str]]:
     """Normalize trace references without changing their reviewed meaning."""
 
     raw = widget.get("trace_refs")
-    if raw is None:
+    if not _as_list(raw):
         raw = widget.get("trace_ref")
-    if raw is None:
+    if not _as_list(raw):
         raw = widget.get("evidence_refs")
     records: list[dict[str, str]] = []
     seen: set[str] = set()
@@ -102,17 +102,40 @@ def _trace_records(widget: Mapping[str, Any]) -> list[dict[str, str]]:
             records.append({"anchor": anchor, "label": label or ref or href, "ref": ref or href})
             seen.add(anchor)
     if not records:
-        # Every widget still receives a trace target.  This makes an incomplete
-        # fixture visibly incomplete instead of silently untraceable.
         widget_id = _text(widget.get("id") or widget.get("title"), "widget")
-        records.append(
-            {
-                "anchor": "trace-" + _slug(widget_id),
-                "label": "Trace reference not supplied",
-                "ref": "missing",
-            }
-        )
+        raise ValueError(f"widget {widget_id} has no usable evidence or trace provenance")
     return records
+
+
+def _reference_values(value: Any) -> list[str]:
+    """Return non-empty reviewed references without inventing placeholders."""
+
+    values: list[str] = []
+    for item in _as_list(value):
+        if isinstance(item, Mapping):
+            candidate = item.get("id") or item.get("trace_id") or item.get("anchor") or item.get("href") or item.get("ref") or item.get("path")
+        else:
+            candidate = item
+        if candidate is None or not _text(candidate).strip():
+            continue
+        values.append(_text(candidate).strip())
+    return values
+
+
+def _validate_widget_provenance(widget: Mapping[str, Any]) -> None:
+    widget_id = _text(widget.get("id"), "widget")
+    reviewed_item_ref = widget.get("reviewed_item_ref")
+    reviewed_output_ref = widget.get("reviewed_output_ref")
+    if not _reference_values(reviewed_item_ref):
+        raise ValueError(f"widget {widget_id} requires reviewed_item_ref")
+    if not _reference_values(reviewed_output_ref):
+        raise ValueError(f"widget {widget_id} requires reviewed_output_ref")
+    evidence_refs = _reference_values(widget.get("evidence_refs"))
+    trace_refs = _reference_values(widget.get("trace_refs"))
+    if not trace_refs:
+        trace_refs = _reference_values(widget.get("trace_ref"))
+    if not evidence_refs and not trace_refs:
+        raise ValueError(f"widget {widget_id} requires evidence_refs or trace_refs")
 
 
 def _display_value(value: Any) -> str:
@@ -355,6 +378,7 @@ def render_dashboard(fixture: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
             raise ValueError(f"unsupported widget type: {kind}")
         if not widget.get("id"):
             raise ValueError("every widget requires a stable id")
+        _validate_widget_provenance(widget)
         widgets.append(widget)
     domains = _normalize_domains(fixture, widgets)
     ordered = _ordered_widgets(fixture, widgets, domains)
@@ -391,8 +415,8 @@ def render_dashboard(fixture: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
                 "element_id": f"widget-{widget_id}",
                 "kind": "kpi" if kind == "kpi" else kind,
                 "title": title,
-                "reviewed_item_id": _text(widget.get("reviewed_item_id") or widget.get("item_id"), "unspecified"),
-                "reviewed_output_ref": _text(widget.get("reviewed_output_ref"), "unspecified"),
+                "reviewed_item_ref": _text(widget.get("reviewed_item_ref")),
+                "reviewed_output_ref": _text(widget.get("reviewed_output_ref")),
                 "evidence_refs": [_text(v) for v in _as_list(widget.get("evidence_refs"))],
                 "trace_anchors": [record["anchor"] for record in records],
                 "period": _text(widget.get("period")),

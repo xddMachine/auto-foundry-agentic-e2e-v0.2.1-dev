@@ -15,6 +15,11 @@ This directory intentionally contains only the preparation contract:
 - [evaluation checklist](evaluation_checklist.md) — reviewer checks;
 - [commands](commands.md) — PREPARE and LAUNCH LATER instructions only.
 
+The frozen question-order SHA-256 is
+`3a40d2f7083f0d2f0e1b216d405a0ce6c38cd4913e157b9e48a99dfa96958236`; its
+canonicalization rule is recorded in `comparison_schema.json` and repeated in
+the later-launch prompt, config, and checklist.
+
 The later launch must use a new empty run root, the immutable source ZIP and
 hash recorded in the baseline, the exact question order, and zero prior-run
 reuse. Obtain an explicit confirmation immediately before analysis begins.

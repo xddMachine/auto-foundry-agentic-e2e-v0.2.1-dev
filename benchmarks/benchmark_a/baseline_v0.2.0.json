@@ -6,6 +6,7 @@
     "run_id": "RUN-20260807-agentic-e2e-cleanroom-019fdd6a",
     "source_zip_sha256": "82e9c913bf437ac9e361d6890467a9aed9b1c6db9d887cfcf0cd659035a71ec2",
     "question_count": 10,
+    "question_order_sha256": "3a40d2f7083f0d2f0e1b216d405a0ce6c38cd4913e157b9e48a99dfa96958236",
     "outcomes": {
       "answered_with_limits": 8,
       "partial_answer": 2,
