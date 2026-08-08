@@ -56,6 +56,11 @@ def test_run_state_template_is_structured_authority() -> None:
     assert state["clean_room"]["empty_cache_at_start"] is True
     assert state["telemetry"]["passive"] is True
     assert state["optimizer"]["read_only"] is True
+    assert state["optimizer"]["report"] == "optimizer/experimental_optimizer_report.md"
+    assert state["optimizer"]["experimental_optimizer_evidence_appendix"] == (
+        "optimizer/experimental_optimizer_evidence_appendix.md"
+    )
+    assert "evidence_appendix" not in state["optimizer"]
 
 
 def test_requirement_record_template_keeps_user_fields_structured() -> None:
@@ -216,7 +221,7 @@ def test_clean_room_dashboard_telemetry_and_optimizer_contract() -> None:
         "traceability",
         "passive telemetry",
         "experimental_optimizer_report.md",
-        "evidence_appendix.md",
+        "experimental_optimizer_evidence_appendix.md",
         "strictly read-only",
         "observed evidence",
         "hypothesis",

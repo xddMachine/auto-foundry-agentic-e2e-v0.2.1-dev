@@ -1,8 +1,17 @@
 # Experimental optimizer report
 
+Outputs are exactly `experimental_optimizer_report.md` and
+`experimental_optimizer_evidence_appendix.md` under the caller-provided
+optimizer directory.
+
 Run preconditions: reviewed answers frozen; Enterprise Ontology frozen;
 Prepared Data Registry frozen; dashboard manifest and link checks complete;
 telemetry closed.
+
+The structured precondition must carry these five boolean markers, each exactly
+`true`: `answers_frozen`, `living_enterprise_model_frozen` (or `lem_frozen`),
+`prepared_assets_frozen` (or `prepared_data_registry_frozen`),
+`dashboard_frozen`, and `telemetry_frozen`.
 
 ## Scope and read-only boundary
 

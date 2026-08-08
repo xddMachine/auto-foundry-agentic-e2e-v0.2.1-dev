@@ -60,6 +60,49 @@ python3 -m pytest -q tests/skill
 git diff --check
 ```
 
+### Offline helper scripts
+
+After reviewed outputs are frozen, the local dashboard helper can render a
+structured widget fixture without reading raw data or calculating metrics:
+
+```bash
+python3 skills/auto-foundry-agentic-e2e/scripts/dashboard_renderer.py \
+  --input reviewed_widgets.json \
+  --output products/dashboard.html \
+  --manifest-output products/dashboard_manifest.json
+```
+
+The fixture supplies `widgets` (types `kpi`, `bar`, `line`,
+`stacked_composition`, `heatmap`, `scatter`, supplied `donut`, or `table`),
+already-reviewed values, trace references, limitations, and optional ordered
+`domains`/`decision_flow` records. The renderer is stdlib-only, emits local
+HTML/CSS, and fails on broken internal links or external assets. It is a
+presentation helper, not an analytical engine.
+
+The development-only optimizer observes synthetic or run-local telemetry,
+traces, and scripts only after an explicit structured freeze mapping proves all
+five markers are true: `answers_frozen`,
+`living_enterprise_model_frozen` (or `lem_frozen`), `prepared_assets_frozen`
+(or `prepared_data_registry_frozen`), `dashboard_frozen`, and
+`telemetry_frozen`. A generic `frozen: true` or products-only marker is not
+enough:
+
+```bash
+python3 skills/auto-foundry-agentic-e2e/scripts/experimental_optimizer.py \
+  --products-manifest products/product_manifest.json \
+  --telemetry telemetry/events.jsonl \
+  --traces questions \
+  --scripts questions \
+  --optimizer-dir optimizer
+```
+
+It writes exactly `experimental_optimizer_report.md` and
+`experimental_optimizer_evidence_appendix.md`, proves analytical-input hashes
+are unchanged, and
+separates observed evidence, hypotheses, recommendations, expected benefit,
+risk, and generality. Client-business-automation classifications are rejected;
+no model or network call is possible.
+
 The supplied [test prompts](TEST_PROMPTS.md) exercise both modes without real
 model calls or benchmark execution. The [run-state template](assets/RUN_STATE_TEMPLATE.json)
 and [dashboard contract](assets/DASHBOARD_PROTOTYPE_TEMPLATE.md) are optional

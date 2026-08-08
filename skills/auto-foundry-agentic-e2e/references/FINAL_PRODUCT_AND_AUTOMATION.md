@@ -57,7 +57,7 @@ telemetry are frozen. It studies Auto Foundry workflow/substrate evidence, not
 client business-process automation. It writes exactly two report artifacts:
 
 - `optimizer/experimental_optimizer_report.md`;
-- `optimizer/evidence_appendix.md`.
+- `optimizer/experimental_optimizer_evidence_appendix.md`.
 
 Each candidate or recommendation records:
 

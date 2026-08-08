@@ -1,7 +1,10 @@
 # Offline test prompts
 
 These prompts are contract fixtures. They use fake rows or metadata only; do
-not call a real model, benchmark, external system, or current dataset.
+not call a real model, benchmark, external system, or current dataset. The
+offline dashboard and optimizer helper smoke fixtures follow the same rule:
+dashboard rendering is presentation of reviewed values, while optimization is
+explicitly frozen, passive, and run-local.
 
 ## Question Mode: clean-room queue
 

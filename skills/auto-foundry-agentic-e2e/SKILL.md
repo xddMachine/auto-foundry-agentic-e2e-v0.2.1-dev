@@ -239,6 +239,29 @@ and [offline dashboard asset](assets/dashboard.css) as a small deterministic
 starting point. This is a product-building aid, not a request to build a
 production dashboard.
 
+For an executable local presentation helper, pass a reviewed widget fixture to
+`scripts/dashboard_renderer.py`. The fixture owns display values, trace refs,
+limitations, and (when supplied) the business-domain/decision-flow order;
+the helper never reads raw sources or calculates a new metric. It supports
+KPI cards, generic bar/line/stacked/heatmap/scatter forms, a supplied
+small-category donut, and drill-down tables, all with local HTML/CSS and
+validated internal trace anchors.
+
+The development-only `scripts/experimental_optimizer.py` is a read-only
+observer of Auto Foundry workflow/substrate evidence. It requires an explicit
+structured freeze mapping with all five markers true:
+`answers_frozen`, `living_enterprise_model_frozen` (or `lem_frozen`),
+`prepared_assets_frozen` (or `prepared_data_registry_frozen`),
+`dashboard_frozen`, and `telemetry_frozen`. A generic `frozen: true` or
+products-only marker fails. It hashes analytical inputs before and after
+reading, writes only `experimental_optimizer_report.md` and
+`experimental_optimizer_evidence_appendix.md` in the caller's optimizer
+directory, and reports repeated code, repeated
+reads/context, cache misses, reviewer bottlenecks, and capability gaps when
+evidenced. Every recommendation separates observed evidence, hypothesis,
+recommendation, expected benefit, risk, and generality. It rejects a
+client-business-automation classification and makes no model calls.
+
 ## 8. Passive telemetry and the optimizer
 
 Record append-only, passive telemetry for material workflow events (item ID,
@@ -252,7 +275,7 @@ registry are frozen, the dashboard prototype is complete, and telemetry is
 closed may the Optimizer inspect workflow/substrate evidence. It writes only:
 
 - `optimizer/experimental_optimizer_report.md`;
-- `optimizer/evidence_appendix.md`.
+- `optimizer/experimental_optimizer_evidence_appendix.md`.
 
 Each recommendation records observed evidence, hypothesis, recommendation,
 expected benefit, risk, and generality. The optimizer is strictly read-only:

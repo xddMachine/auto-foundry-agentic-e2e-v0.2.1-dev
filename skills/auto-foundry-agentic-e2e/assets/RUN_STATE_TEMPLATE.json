@@ -44,8 +44,8 @@
   },
   "optimizer": {
     "status": "not_ready|ready|written",
-    "report": null,
-    "evidence_appendix": null,
+    "report": "optimizer/experimental_optimizer_report.md",
+    "experimental_optimizer_evidence_appendix": "optimizer/experimental_optimizer_evidence_appendix.md",
     "read_only": true
   }
 }
