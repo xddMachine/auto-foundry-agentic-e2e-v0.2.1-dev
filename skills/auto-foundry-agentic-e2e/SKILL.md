@@ -185,6 +185,27 @@ code, inputs, outputs, assumptions, and a reproduction command in the current
 run. Record a capability gap when the catalog lacks a needed operation; do not
 silently substitute an unrelated operation or auto-promote custom code.
 
+The normal local integration path uses one immutable `RunContext` and one
+`CoreRuntime`:
+
+```python
+from auto_foundry_core import CoreRuntime, OperationSpec, RunContext
+
+context = RunContext("RUN-example", run_root, (input_root,))
+execution = CoreRuntime(context).execute(
+    OperationSpec("sources.preview", parameters={"path": "rows.json", "limit": 20})
+)
+```
+
+That path resolves/validates input and run-relative paths, computes
+deterministic input hashes, checks the current run cache, invokes one catalog
+capability, records a receipt, and emits passive telemetry. Use the same
+context for the cache, telemetry, products, dashboard, and optimizer collector;
+do not assemble a second root-plumbing layer. The public core exports
+`RunContext`, `CoreRuntime`, `CoreExecutionResult`, `LEMRef`, and the immutable
+contracts. A normal skill run starts from the user's explicit task without a
+manual authorization ceremony or an extra confirmation step.
+
 ## 5. Clean-room and path controls
 
 For a fresh or clean-room run, create an empty run root, empty LEM layers, and
@@ -200,6 +221,10 @@ worker or specialist reads or writes outside its allowlist, discard that lane's
 outputs, record a `clean_room_incident` with the attempted path and disposition,
 and continue only with a clean replacement when safe. Prose assertions alone
 are not evidence of host-level sandboxing.
+
+The clean-room boundary is practical package validation, not host isolation:
+
+> A Coding Agent with unrestricted host shell/filesystem access cannot be fully sandboxed by this Python package. True isolation requires a separate workspace/container or host allowlist.
 
 ## 6. Review routing and disclosure
 
@@ -337,6 +362,11 @@ central/cross-run caches.
 - Do not add compatibility wrappers or deprecated v0.2.0 instructions.
 - Do not auto-promote custom code or confuse client business automation with
   the development-only evidence collector and later Optimization Agent.
+
+When the complete offline vertical proof and full suite pass, the release
+candidate is **v0.2.1-rc1 — ready for Benchmark A**. Benchmark A remains
+prepared and unexecuted here. This is an experimental release candidate, not a
+production-hardened system.
 
 See the focused references for implementation detail:
 

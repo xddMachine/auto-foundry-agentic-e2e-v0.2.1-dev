@@ -1,8 +1,28 @@
 # Installation and migration
 
-These instructions describe a local replacement. They were not executed in
-the preparation task, and they never install into this repository's Python
-environment or the Codex runtime automatically.
+These instructions describe a local replacement. The package/validator smoke
+uses a temporary offline install target only; it never installs into this
+repository's Python environment or the Codex runtime automatically.
+
+## Normal runtime path
+
+The supported integration path is deliberately small:
+
+```python
+from auto_foundry_core import CoreRuntime, OperationSpec, RunContext
+
+context = RunContext("RUN-example", run_root, (input_root,))
+execution = CoreRuntime(context).execute(
+    OperationSpec("sources.preview", parameters={"path": "rows.json", "limit": 20})
+)
+```
+
+The same context bounds source reads, products, cache, telemetry, and
+optimizer evidence. Public exports include `RunContext`, `CoreRuntime`,
+`CoreExecutionResult`, `LEMRef`, and the immutable contracts. The old mutable
+`Workspace` export is removed; callers should not keep a second root-plumbing
+layer. A normal run begins from the explicit task and does not require manual
+authorization or an extra confirmation step.
 
 ## Skill replacement (same name)
 
@@ -72,6 +92,15 @@ Rollback is similarly explicit: uninstall/restore the previously recorded
 `auto_foundry_core` wheel in the chosen target/environment, then rerun the
 version and catalog checks. If any check fails, stop and restore the backup;
 do not fetch packages or use a remote index.
+
+## Release candidate status
+
+After the complete offline vertical proof and full suite pass, use the status
+label **v0.2.1-rc1 — ready for Benchmark A**. Benchmark A is prepared but not
+run by this repository task. This remains an experimental release candidate,
+not a production-hardened sandbox.
+
+> A Coding Agent with unrestricted host shell/filesystem access cannot be fully sandboxed by this Python package. True isolation requires a separate workspace/container or host allowlist.
 
 ## Scope and publication boundary
 

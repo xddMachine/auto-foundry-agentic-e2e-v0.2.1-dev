@@ -49,6 +49,15 @@ and status. Scope is classified semantically as
   Agent; it studies Auto Foundry substrate/workflow evidence, not client
   business automation.
 
+The normal core path is one immutable `RunContext` passed to one
+`CoreRuntime.execute(OperationSpec)`. It resolves the run/input boundary,
+checks deterministic cache entries, records receipts and passive telemetry,
+and is the path used by the skill's integrated operations. The public core API
+exports `RunContext`, `CoreRuntime`, `CoreExecutionResult`, `LEMRef`, and the
+immutable contracts; the old mutable `Workspace` facade is not exported. A
+normal run follows the user's explicit task without a manual authorization
+ceremony or an extra confirmation step.
+
 ## Install and verify
 
 Install this folder as the single `auto-foundry-agentic-e2e` skill directory;
@@ -121,6 +130,13 @@ The supplied [test prompts](TEST_PROMPTS.md) exercise both modes without real
 model calls or benchmark execution. The [run-state template](assets/RUN_STATE_TEMPLATE.json)
 and [dashboard contract](assets/DASHBOARD_PROTOTYPE_TEMPLATE.md) are optional
 starting points; do not create unused empty directories.
+
+When `tests/integration/test_vertical_acceptance.py` and the full offline suite
+pass, the package status is **v0.2.1-rc1 — ready for Benchmark A**. Benchmark A
+is prepared but unexecuted. This is an experimental release candidate, not a
+production-hardened host sandbox.
+
+> A Coding Agent with unrestricted host shell/filesystem access cannot be fully sandboxed by this Python package. True isolation requires a separate workspace/container or host allowlist.
 
 ## Reference map
 
