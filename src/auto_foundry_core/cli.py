@@ -8,10 +8,10 @@ from pathlib import Path
 import sys
 from typing import Any
 
-from .capabilities import execute
 from .catalog import capability_catalog, get_capability, search_capabilities
 from .contracts import OperationSpec
-from .workspace import require_allowed_roots, validate_allowed_path
+from .runtime import CoreRuntime
+from .workspace import RunContext
 
 
 def _print(value: Any) -> None:
@@ -33,14 +33,10 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="execute one deterministic capability")
     run.add_argument("capability_id")
     run.add_argument("--spec", required=True, help="JSON operation specification path")
-    run.add_argument("--output", required=True, help="derived output directory")
-    run.add_argument(
-        "--allowed-root",
-        dest="allowed_roots",
-        action="append",
-        required=True,
-        help="declared filesystem root (repeat for multiple roots); applied before reading the spec",
-    )
+    run.add_argument("--run-root", required=True, help="current run directory")
+    run.add_argument("--input-root", action="append", default=[], help="source input root (repeatable)")
+    run.add_argument("--run-id", help="optional simple run identifier (defaults to the run-root name)")
+    run.add_argument("--output", help="optional run-relative result directory (defaults to products)")
     return parser
 
 
@@ -55,43 +51,38 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         _print(get_capability(args.capability_id))
         return 0
-    # Roots are deliberately out-of-band.  The spec cannot grant itself a
-    # broader read/write boundary, so validate both the control-plane spec and
-    # the result destination before opening, probing, or creating anything.
-    declared_roots = require_allowed_roots(args.allowed_roots, context="CLI run")
-    spec_path = validate_allowed_path(args.spec, declared_roots)
-    raw_output = validate_allowed_path(args.output, declared_roots)
-    output_dir = raw_output
-    result_path = validate_allowed_path(output_dir / "result.json", declared_roots)
+    run_root = Path(args.run_root).expanduser().resolve(strict=False)
+    run_id = args.run_id or run_root.name or "run"
+    context = RunContext(run_id=run_id, run_root=run_root, input_roots=tuple(args.input_root))
+    # Validate both the control-plane spec and the result destination before
+    # opening, probing, or creating anything.  The JSON spec cannot broaden
+    # this context.
+    spec_path = context.resolve_input(args.spec)
+    if args.output:
+        output_dir = context.resolve_product_path(args.output)
+    else:
+        output_dir = context.resolve_product_path("")
+    result_path = context.resolve_run_path(output_dir / "result.json")
     with spec_path.open("r", encoding="utf-8") as stream:
         payload = json.load(stream)
     payload["capability_id"] = args.capability_id
-    embedded_roots = []
-    for embedded_value in (
-        payload.get("allowed_roots") if "allowed_roots" in payload else None,
-        payload.get("parameters", {}).get("allowed_roots") if isinstance(payload.get("parameters"), dict) and "allowed_roots" in payload["parameters"] else None,
-    ):
-        if embedded_value is None:
-            continue
-        if isinstance(embedded_value, (str, Path)):
-            embedded_roots.append(embedded_value)
-        else:
-            embedded_roots.extend(embedded_value)
-    if embedded_roots:
-        # Embedded declarations may narrow the caller's roots, but they may
-        # never broaden them.  The effective value is always the CLI value.
-        for embedded_root in require_allowed_roots(embedded_roots, context="embedded CLI roots"):
-            validate_allowed_path(embedded_root, declared_roots)
     parameters = dict(payload.get("parameters") or {})
-    parameters["allowed_roots"] = declared_roots
+    # Legacy embedded root declarations are intentionally ignored: the run
+    # context is the sole normal-path boundary.
+    parameters.pop("allowed_roots", None)
     payload["parameters"] = parameters
-    payload["allowed_roots"] = declared_roots
+    payload.pop("allowed_roots", None)
     spec = OperationSpec.from_dict(payload)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    result = execute(spec, output_dir=str(output_dir), allowed_roots=declared_roots)
-    serialized = result.to_dict() if hasattr(result, "to_dict") else result
+    execution = CoreRuntime(context).execute(spec)
+    value = execution.value.to_dict() if hasattr(execution.value, "to_dict") else execution.value
+    serialized = {
+        "value": value,
+        "receipt": execution.receipt.to_dict(),
+        "cache_status": execution.cache_status,
+    }
     # Every CLI run has a small stable result envelope in the requested output
     # directory; capability-specific writers may add their own derived files.
+    result_path.parent.mkdir(parents=True, exist_ok=True)
     result_path.write_text(json.dumps(serialized, sort_keys=True, indent=2, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
     _print(serialized)
     return 0

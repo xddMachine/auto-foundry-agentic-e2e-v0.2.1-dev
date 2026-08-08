@@ -11,6 +11,7 @@ import tempfile
 from typing import Any, Callable, Iterable, Mapping
 
 from .contracts import OperationSpec
+from .workspace import RunContext
 
 
 def _jsonable(value: Any) -> Any:
@@ -46,10 +47,32 @@ class CacheEntry:
 class RunCache:
     """An immutable cache whose root must be unique to one run."""
 
-    def __init__(self, root: str | Path, *, core_version: str = "0.1.0", telemetry=None) -> None:
-        self.root = Path(root).expanduser().resolve()
+    def __init__(self, root: str | Path | None = None, *, context: RunContext | None = None, core_version: str | None = None, telemetry=None) -> None:
+        """Create a run-local cache.
+
+        Passing a ``RunContext`` derives the cache root from
+        ``context.run_root/cache`` and validates it before any directory is
+        created.  The root-only form remains a reusable low-level helper for
+        callers that intentionally manage their own filesystem boundary.
+        """
+
+        if isinstance(root, RunContext) and context is None:
+            context = root
+            root = None
+        if context is not None:
+            if root is None:
+                root_path = context.resolve_run_path("cache")
+            else:
+                root_path = context.resolve_run_path(root)
+            core_version = core_version or context.core_version
+        elif root is None:
+            raise ValueError("RunCache requires root or context")
+        else:
+            root_path = Path(root).expanduser().resolve(strict=False)
+        self.context = context
+        self.root = Path(root_path)
         self.root.mkdir(parents=True, exist_ok=True)
-        self.core_version = core_version
+        self.core_version = core_version or "0.1.0"
         self.telemetry = telemetry
 
     def key(self, spec: OperationSpec | Mapping[str, Any] | str, source_hashes: Iterable[str] = ()) -> str:

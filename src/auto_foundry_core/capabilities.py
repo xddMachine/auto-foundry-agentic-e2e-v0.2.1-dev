@@ -7,10 +7,10 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .contracts import CapabilityDescriptor, DataAssetRef, IdentityCandidate, IdentityDecision, OperationResultRef, OperationSpec
-from .workspace import require_allowed_roots
+from .workspace import RunContext, require_allowed_roots
 
 
-CapabilityHandler = Callable[[OperationSpec, str | None], Any]
+CapabilityHandler = Callable[[OperationSpec, str | None, RunContext | None], Any]
 
 
 def _allowed_roots(spec: OperationSpec):
@@ -53,23 +53,23 @@ def _source(spec: OperationSpec) -> Any:
     raise ValueError("operation requires a source path/input")
 
 
-def _register(spec: OperationSpec, output_dir: str | None) -> Any:
+def _register(spec: OperationSpec, output_dir: str | None, context: RunContext | None = None) -> Any:
     from .sources import register_source
     return register_source(_source(spec), allowed_roots=_required_roots(spec, context="sources.register"))
 
 
-def _preview(spec: OperationSpec, output_dir: str | None) -> Any:
+def _preview(spec: OperationSpec, output_dir: str | None, context: RunContext | None = None) -> Any:
     from .sources import preview
     return preview(_source(spec), limit=int(dict(spec.parameters).get("limit", 20)), allowed_roots=_required_roots(spec, context="sources.preview"))
 
 
-def _profile(spec: OperationSpec, output_dir: str | None) -> Any:
+def _profile(spec: OperationSpec, output_dir: str | None, context: RunContext | None = None) -> Any:
     from .profiling import profile_source
     parameters = dict(spec.parameters)
     return profile_source(_source(spec), sample_limit=int(parameters.get("sample_limit", 1000)), frequency_limit=int(parameters.get("frequency_limit", 20)), allowed_roots=_required_roots(spec, context="profiling.profile"))
 
 
-def _normalize(spec: OperationSpec, output_dir: str | None) -> Any:
+def _normalize(spec: OperationSpec, output_dir: str | None, context: RunContext | None = None) -> Any:
     from .normalization import normalize_rows
     p = dict(spec.parameters)
     rows = p.get("rows")
@@ -78,7 +78,7 @@ def _normalize(spec: OperationSpec, output_dir: str | None) -> Any:
     return normalize_rows(rows, fields=p.get("fields"), case=p.get("case", "lower"), return_metadata=bool(p.get("return_metadata", True)))
 
 
-def _identity_candidates(spec: OperationSpec, output_dir: str | None) -> Any:
+def _identity_candidates(spec: OperationSpec, output_dir: str | None, context: RunContext | None = None) -> Any:
     from .identity import generate_candidates
     p = dict(spec.parameters)
     left = p.get("left_rows")
@@ -91,7 +91,7 @@ def _identity_candidates(spec: OperationSpec, output_dir: str | None) -> Any:
     return [candidate.to_dict() for candidate in generate_candidates(_read_rows(left, allowed_roots=roots), _read_rows(right, allowed_roots=roots), object_type=p.get("object_type", "object"), compare_fields=p.get("compare_fields"), threshold=float(p.get("threshold", 0.55)), max_candidates=p.get("max_candidates"))]
 
 
-def _identity_apply(spec: OperationSpec, output_dir: str | None) -> Any:
+def _identity_apply(spec: OperationSpec, output_dir: str | None, context: RunContext | None = None) -> Any:
     from .identity import apply_decision
     p = dict(spec.parameters)
     candidate = IdentityCandidate.from_dict(p.get("candidate") or spec.inputs[0])
@@ -100,7 +100,7 @@ def _identity_apply(spec: OperationSpec, output_dir: str | None) -> Any:
     return result.to_dict() if hasattr(result, "to_dict") else {"mapping": result["mapping"].to_dict(), "rows": result["rows"], "raw_preserved": True}
 
 
-def _relationship(spec: OperationSpec, output_dir: str | None) -> Any:
+def _relationship(spec: OperationSpec, output_dir: str | None, context: RunContext | None = None) -> Any:
     from .relationships import measure_relationship
     p = dict(spec.parameters)
     left = p.get("left_rows", spec.inputs[0] if spec.inputs else None)
@@ -109,7 +109,7 @@ def _relationship(spec: OperationSpec, output_dir: str | None) -> Any:
     return measure_relationship(_read_rows(left, allowed_roots=roots), _read_rows(right, allowed_roots=roots), left_key=p["left_key"], right_key=p.get("right_key"), left_time_field=p.get("left_time_field"), right_time_field=p.get("right_time_field"))
 
 
-def _population(spec: OperationSpec, output_dir: str | None) -> Any:
+def _population(spec: OperationSpec, output_dir: str | None, context: RunContext | None = None) -> Any:
     from .populations import PopulationLedger
     p = dict(spec.parameters)
     if "base_ids" in p and "base" not in p:
@@ -117,7 +117,7 @@ def _population(spec: OperationSpec, output_dir: str | None) -> Any:
     return PopulationLedger(**p).reconcile()
 
 
-def _aggregation(spec: OperationSpec, output_dir: str | None) -> Any:
+def _aggregation(spec: OperationSpec, output_dir: str | None, context: RunContext | None = None) -> Any:
     from .aggregation import aggregate_rows
     p = dict(spec.parameters)
     rows = p.pop("rows", None)
@@ -127,7 +127,7 @@ def _aggregation(spec: OperationSpec, output_dir: str | None) -> Any:
     return aggregate_rows(rows, operation, **p)
 
 
-def _artifact(spec: OperationSpec, output_dir: str | None) -> Any:
+def _artifact(spec: OperationSpec, output_dir: str | None, context: RunContext | None = None) -> Any:
     from .artifacts import write_artifact
     p = dict(spec.parameters)
     data = p.pop("data", None)
@@ -135,18 +135,19 @@ def _artifact(spec: OperationSpec, output_dir: str | None) -> Any:
         data = spec.inputs[0]
     if data is None:
         raise ValueError("artifacts.write requires data")
-    path = Path(output_dir or ".") / str(p.pop("filename", "result.json"))
+    filename = str(p.pop("filename", "result.json"))
+    path = (context.resolve_product_path(filename) if context is not None else Path(output_dir or ".") / filename)
     p.setdefault("allowed_roots", _required_roots(spec, context="artifacts.write"))
-    result = write_artifact(data, path, operation_spec=spec, **p)
+    result = write_artifact(data, path, operation_spec=spec, context=context, **p)
     return result.to_dict()
 
 
-def _reproduce(spec: OperationSpec, output_dir: str | None) -> Any:
+def _reproduce(spec: OperationSpec, output_dir: str | None, context: RunContext | None = None) -> Any:
     from .reproduction import compare_results
     p = dict(spec.parameters)
     expected, actual = p.get("expected"), p.get("actual")
     roots = _required_roots(spec, context="artifacts.reproduce") if _is_path_reference(expected) or _is_path_reference(actual) else None
-    return compare_results(expected, actual, allowed_roots=roots)
+    return compare_results(expected, actual, allowed_roots=roots, context=context)
 
 
 def _descriptor(
@@ -223,7 +224,7 @@ def _is_path_reference(value: Any, *, strings_are_paths: bool = False) -> bool:
     return False
 
 
-def execute(spec: OperationSpec | Mapping[str, Any], *, output_dir: str | None = None, allowed_roots=None) -> Any:
+def execute(spec: OperationSpec | Mapping[str, Any], *, output_dir: str | None = None, allowed_roots=None, context: RunContext | None = None) -> Any:
     operation = spec if isinstance(spec, OperationSpec) else OperationSpec.from_dict(spec)
     if allowed_roots is not None:
         parameters = dict(operation.parameters)
@@ -233,7 +234,7 @@ def execute(spec: OperationSpec | Mapping[str, Any], *, output_dir: str | None =
         handler = HANDLERS[operation.capability_id]
     except KeyError as exc:
         raise KeyError(f"unknown capability: {operation.capability_id}") from exc
-    return handler(operation, output_dir)
+    return handler(operation, output_dir, context)
 
 
 __all__ = ["DESCRIPTORS", "HANDLERS", "descriptors", "execute"]

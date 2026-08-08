@@ -9,28 +9,33 @@ from typing import Any, Callable, Mapping
 from .artifacts import hash_value
 from .contracts import DataAssetRef, OperationResultRef
 from .sources import hash_file
-from .workspace import require_allowed_roots, validate_allowed_path
+from .workspace import RunContext, require_allowed_roots, validate_allowed_path
 
 
-def _fingerprint(value: Any, *, allowed_roots=None) -> str:
+def _fingerprint(value: Any, *, allowed_roots=None, context: RunContext | None = None) -> str:
     if isinstance(value, (list, tuple)):
         if any(_contains_file_ref(item) for item in value):
-            return hash_value([_fingerprint(item, allowed_roots=allowed_roots) for item in value])
+            return hash_value([_fingerprint(item, allowed_roots=allowed_roots, context=context) for item in value])
         return hash_value(value)
     if isinstance(value, Path):
-        roots = require_allowed_roots(allowed_roots, context="reproduction path hashing")
-        path = validate_allowed_path(value, roots)
+        roots = require_allowed_roots(tuple(str(root) for root in context.read_roots) if context is not None else allowed_roots, context="reproduction path hashing")
+        path = context.resolve_input(value) if context is not None else validate_allowed_path(value, roots)
         return hash_file(path, allowed_roots=roots)
     if isinstance(value, DataAssetRef):
-        roots = require_allowed_roots(allowed_roots, context="reproduction source hashing")
-        return hash_file(value.uri, allowed_roots=roots)
+        roots = require_allowed_roots(tuple(str(root) for root in context.read_roots) if context is not None else allowed_roots, context="reproduction source hashing")
+        path = context.resolve_input(value.uri) if context is not None else value.uri
+        return hash_file(path, allowed_roots=roots)
     if isinstance(value, OperationResultRef):
-        roots = require_allowed_roots(allowed_roots, context="reproduction result hashing")
-        return hash_file(value.location, allowed_roots=roots)
+        roots = require_allowed_roots((str(context.run_root),) if context is not None else allowed_roots, context="reproduction result hashing")
+        path = context.resolve_run_path(value.location) if context is not None else value.location
+        return hash_file(path, allowed_roots=roots)
     if isinstance(value, Mapping) and ("location" in value or "uri" in value):
         location = value.get("location", value.get("uri"))
-        roots = require_allowed_roots(allowed_roots, context="reproduction path hashing")
-        path = validate_allowed_path(location, roots)
+        roots = require_allowed_roots((str(context.run_root),) if context is not None and "location" in value and "uri" not in value else (tuple(str(root) for root in context.read_roots) if context is not None else allowed_roots), context="reproduction path hashing")
+        if context is not None:
+            path = context.resolve_run_path(location) if "location" in value and "uri" not in value else context.resolve_input(location)
+        else:
+            path = validate_allowed_path(location, roots)
         return hash_file(path, allowed_roots=roots)
     if isinstance(value, Mapping) and "content_hash" in value:
         return str(value["content_hash"])
@@ -53,9 +58,9 @@ def _contains_file_ref(value: Any) -> bool:
     return False
 
 
-def compare_results(expected: Any, actual: Any, *, allowed_roots=None) -> dict[str, Any]:
-    expected_hash = _fingerprint(expected, allowed_roots=allowed_roots)
-    actual_hash = _fingerprint(actual, allowed_roots=allowed_roots)
+def compare_results(expected: Any, actual: Any, *, allowed_roots=None, context: RunContext | None = None) -> dict[str, Any]:
+    expected_hash = _fingerprint(expected, allowed_roots=allowed_roots, context=context)
+    actual_hash = _fingerprint(actual, allowed_roots=allowed_roots, context=context)
     equal = expected_hash == actual_hash
     report: dict[str, Any] = {"equal": equal, "expected_hash": expected_hash, "actual_hash": actual_hash}
     if not equal and isinstance(expected, Mapping) and isinstance(actual, Mapping):
@@ -69,6 +74,7 @@ def reproduce(
     operation: Callable[..., Any],
     *args: Any,
     allowed_roots=None,
+    context: RunContext | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
     """Re-run a deterministic operation and compare against manifest outputs.
@@ -80,25 +86,25 @@ def reproduce(
     actual = operation(*args, **kwargs)
     expected = manifest.get("output_hashes", [])
     if isinstance(actual, (Path, DataAssetRef, OperationResultRef)):
-        actual_hashes = [_fingerprint(actual, allowed_roots=allowed_roots)]
+        actual_hashes = [_fingerprint(actual, allowed_roots=allowed_roots, context=context)]
     elif isinstance(actual, (list, tuple)) and actual and all(
         isinstance(v, (Path, DataAssetRef, OperationResultRef))
         for v in actual
     ):
-        actual_hashes = [_fingerprint(v, allowed_roots=allowed_roots) for v in actual]
+        actual_hashes = [_fingerprint(v, allowed_roots=allowed_roots, context=context) for v in actual]
     else:
-        actual_hashes = [_fingerprint(actual, allowed_roots=allowed_roots)]
+        actual_hashes = [_fingerprint(actual, allowed_roots=allowed_roots, context=context)]
     expected_hashes = [str(v) for v in expected]
     return {
         "reproduced": actual_hashes == expected_hashes,
         "expected_hashes": expected_hashes,
         "actual_hashes": actual_hashes,
-        "comparison": compare_results(expected_hashes, actual_hashes, allowed_roots=allowed_roots),
+        "comparison": compare_results(expected_hashes, actual_hashes, allowed_roots=allowed_roots, context=context),
     }
 
 
-def reproduction_report(manifest: Mapping[str, Any], actual: Any, *, allowed_roots=None) -> str:
-    result = compare_results(manifest.get("output_hashes", []), actual, allowed_roots=allowed_roots)
+def reproduction_report(manifest: Mapping[str, Any], actual: Any, *, allowed_roots=None, context: RunContext | None = None) -> str:
+    result = compare_results(manifest.get("output_hashes", []), actual, allowed_roots=allowed_roots, context=context)
     status = "PASS" if result["equal"] else "DIFFERENT"
     return f"reproduction={status} expected={result['expected_hash']} actual={result['actual_hash']}"
 

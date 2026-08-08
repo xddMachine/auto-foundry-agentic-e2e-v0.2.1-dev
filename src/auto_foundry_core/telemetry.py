@@ -11,6 +11,7 @@ import time
 from typing import Any, Iterator, Mapping
 
 from .contracts import OperationReceipt, RunTelemetrySummary, TelemetryEvent
+from .workspace import RunContext
 
 
 def _now() -> str:
@@ -20,8 +21,15 @@ def _now() -> str:
 class TelemetryRecorder:
     """Collect observations without enforcing budgets or fabricating facts."""
 
-    def __init__(self, root: str | Path | None = None, *, run_id: str = "run") -> None:
-        self.root = Path(root).expanduser().resolve() if root is not None else None
+    def __init__(self, root: str | Path | None = None, *, run_id: str | None = None, context: RunContext | None = None) -> None:
+        if isinstance(root, RunContext) and context is None:
+            context = root
+            root = None
+        if context is not None:
+            root = context.resolve_run_path("telemetry") if root is None else context.resolve_run_path(root)
+            run_id = run_id or context.run_id
+        self.context = context
+        self.root = Path(root).expanduser().resolve(strict=False) if root is not None else None
         self.storage_available = False
         self.dropped_events = 0
         self.write_errors: list[str] = []
@@ -31,7 +39,7 @@ class TelemetryRecorder:
                 self.storage_available = True
             except Exception as exc:  # telemetry must never block the caller
                 self._note_write_error(exc)
-        self.run_id = run_id
+        self.run_id = run_id or "run"
         self.started_at = _now()
         self._started_clock = time.perf_counter()
         self.events: list[TelemetryEvent] = []
