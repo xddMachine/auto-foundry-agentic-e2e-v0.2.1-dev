@@ -14,6 +14,7 @@
   stdlib-only presentation renderer. It
   accepts a reviewed widget fixture, preserves supplied values and order,
   requires per-widget reviewed-item/output and evidence/trace provenance,
+  requires non-empty ordered domain/decision-flow assignments for every widget,
   emits standalone HTML/CSS, and validates internal trace links. It calculates
   no analytical metric and reads no source.
 - `skills/auto-foundry-agentic-e2e/scripts/experimental_optimizer.py` is

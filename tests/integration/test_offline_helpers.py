@@ -39,9 +39,10 @@ def test_dashboard_renders_supplied_widgets_without_external_assets(tmp_path: Pa
             {
                 "id": "second",
                 "title": "Second domain first",
-                "decision_flow": [{"id": "flow", "title": "Decision flow supplied", "widget_ids": ["line-1"]}],
+                "order": 1,
+                "decision_flow": [{"id": "flow", "title": "Decision flow supplied", "order": 1, "widget_ids": ["line-1"]}],
             },
-            {"id": "first", "title": "First domain second", "decision_flow": [{"id": "flow", "widget_ids": ["kpi-1"]}]},
+            {"id": "first", "title": "First domain second", "order": 2, "decision_flow": [{"id": "flow", "title": "Second decision flow", "order": 1, "widget_ids": ["kpi-1", "bar-1", "stack-1", "heat-1", "scatter-1", "donut-1", "table-1"]}]},
         ],
         "widgets": [
             {"id": "kpi-1", "type": "kpi", "title": "Supplied KPI", "value": "4,032/4,093", "unit": "orders", "trace_refs": ["Q-001/final"], "reviewed_item_id": "Q-001"},
@@ -67,6 +68,12 @@ def test_dashboard_renders_supplied_widgets_without_external_assets(tmp_path: Pa
     document = html_path.read_text(encoding="utf-8")
     assert manifest["internal_links_checked"] is True
     assert manifest["new_analytics"] is False
+    assert manifest["organization"] == "business_domain_and_decision_flow"
+    assert manifest["domain_order"] == ["second", "first"]
+    assert manifest["decision_flow_order"] == [
+        {"domain_id": "second", "flow_id": "flow"},
+        {"domain_id": "first", "flow_id": "flow"},
+    ]
     for kind in ("kpi", "bar", "line", "stacked_composition", "heatmap", "scatter", "donut", "table"):
         assert f"widget-{kind}" in document
     assert "4,032/4,093" in document
@@ -76,6 +83,17 @@ def test_dashboard_renders_supplied_widgets_without_external_assets(tmp_path: Pa
     assert "https://" not in document
     assert document.index("Second domain first") < document.index("First domain second")
     assert json.loads(manifest_path.read_text(encoding="utf-8"))["internal_links_checked"] is True
+    manifest_item = next(item for item in manifest["items"] if item["element_id"] == "widget-kpi-1")
+    assert manifest_item["trace_refs"] == ["Q-001/final"]
+    assert manifest_item["evidence_refs"] == ["Q-001/evidence"]
+    assert manifest_item["trace_anchors"] == ["trace-Q-001-final"]
+    evidence_only = json.loads(json.dumps(fixture))
+    evidence_only["widgets"][0].pop("trace_refs")
+    _, evidence_only_manifest = dashboard_renderer.render_dashboard(evidence_only)
+    evidence_only_item = next(item for item in evidence_only_manifest["items"] if item["element_id"] == "widget-kpi-1")
+    assert evidence_only_item["trace_refs"] == []
+    assert evidence_only_item["evidence_refs"] == ["Q-001/evidence"]
+    assert evidence_only_item["trace_anchors"] == ["trace-Q-001-evidence"]
     assert "unspecified" not in document.lower()
     assert "trace reference not supplied" not in document.lower()
 
@@ -94,6 +112,26 @@ def test_dashboard_renders_supplied_widgets_without_external_assets(tmp_path: Pa
     no_provenance["widgets"][0].pop("trace_refs")
     with pytest.raises(ValueError, match="evidence_refs or trace_refs"):
         dashboard_renderer.render_dashboard(no_provenance)
+
+    absent_domains = json.loads(json.dumps(fixture))
+    absent_domains.pop("domains")
+    with pytest.raises(ValueError, match="domains"):
+        dashboard_renderer.render_dashboard(absent_domains)
+
+    unknown_domain = json.loads(json.dumps(fixture))
+    unknown_domain["widgets"][0]["domain_id"] = "not-a-domain"
+    with pytest.raises(ValueError, match="domain assignment"):
+        dashboard_renderer.render_dashboard(unknown_domain)
+
+    missing_order = json.loads(json.dumps(fixture))
+    missing_order["domains"][0].pop("order")
+    with pytest.raises(ValueError, match="order"):
+        dashboard_renderer.render_dashboard(missing_order)
+
+    invalid_flow = json.loads(json.dumps(fixture))
+    invalid_flow["domains"][0]["decision_flow"] = []
+    with pytest.raises(ValueError, match="decision_flow"):
+        dashboard_renderer.render_dashboard(invalid_flow)
 
 
 def _digest(path: Path) -> str:

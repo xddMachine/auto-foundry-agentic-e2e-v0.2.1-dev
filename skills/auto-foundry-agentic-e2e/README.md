@@ -82,8 +82,9 @@ The fixture supplies `widgets` (types `kpi`, `bar`, `line`,
 `stacked_composition`, `heatmap`, `scatter`, supplied `donut`, or `table`),
 already-reviewed values, non-empty `reviewed_item_ref`,
 `reviewed_output_ref`, and evidence/trace provenance references, plus limitations
-and optional ordered
-`domains`/`decision_flow` records. The renderer is stdlib-only, emits local
+and non-empty ordered `domains`/`decision_flow` records assigning every widget
+exactly once. Missing, unknown, duplicate, or invalid-order assignments fail
+validation. The renderer is stdlib-only, emits local
 HTML/CSS, and fails on broken internal links or external assets. It is a
 presentation helper, not an analytical engine.
 

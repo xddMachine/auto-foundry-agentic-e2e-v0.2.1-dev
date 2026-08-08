@@ -81,7 +81,7 @@ def _trace_records(widget: Mapping[str, Any]) -> list[dict[str, str]]:
     seen: set[str] = set()
     for value in _as_list(raw):
         if isinstance(value, Mapping):
-            ref = _text(value.get("id") or value.get("trace_id") or value.get("anchor") or value.get("href"))
+            ref = _text(value.get("id") or value.get("trace_id") or value.get("anchor") or value.get("href") or value.get("ref") or value.get("path"))
             label = _text(value.get("label") or value.get("title") or ref)
             href = _text(value.get("href"))
         else:
@@ -120,6 +120,13 @@ def _reference_values(value: Any) -> list[str]:
             continue
         values.append(_text(candidate).strip())
     return values
+
+
+def _widget_trace_refs(widget: Mapping[str, Any]) -> list[str]:
+    refs = _reference_values(widget.get("trace_refs"))
+    if not refs:
+        refs = _reference_values(widget.get("trace_ref"))
+    return refs
 
 
 def _validate_widget_provenance(widget: Mapping[str, Any]) -> None:
@@ -310,24 +317,80 @@ def _render_visual(widget: Mapping[str, Any]) -> str:
     raise ValueError(f"unsupported widget type: {kind}")
 
 
+def _ordered_positive_int(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{label} requires a positive integer order")
+    return value
+
+
 def _normalize_domains(fixture: Mapping[str, Any], widgets: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
     supplied = fixture.get("domains")
-    if isinstance(supplied, list) and supplied:
-        domains = []
-        for domain in supplied:
-            if not isinstance(domain, Mapping):
-                raise ValueError("each domain must be an object")
-            decisions = domain.get("decision_flow") or domain.get("decision_flows") or domain.get("flows") or []
-            if not decisions:
-                decisions = [{"id": "overview", "title": "Reviewed view", "widget_ids": domain.get("widget_ids", [])}]
-            domains.append({**domain, "decision_flow": decisions})
-        return domains
-    # A fixture without explicit domain ordering remains deterministic and is
-    # still driven by reviewed widget order, never by question discovery.
-    return [{"id": "reviewed", "title": "Reviewed outputs", "decision_flow": [{"id": "overview", "title": "Decision view", "widget_ids": [w.get("id") for w in widgets]}]}]
+    if not isinstance(supplied, list) or not supplied:
+        raise ValueError("fixture requires non-empty ordered domains metadata")
+    widget_ids = {_text(widget.get("id")) for widget in widgets}
+    seen_widget_ids: dict[str, tuple[str, str]] = {}
+    domains: list[dict[str, Any]] = []
+    domain_ids: set[str] = set()
+    domain_orders: list[int] = []
+    for domain in supplied:
+        if not isinstance(domain, Mapping):
+            raise ValueError("each domain must be an object")
+        domain_id = _text(domain.get("id"))
+        if not domain_id or domain_id in domain_ids:
+            raise ValueError("domains require unique non-empty ids")
+        domain_ids.add(domain_id)
+        domain_order = _ordered_positive_int(domain.get("order"), f"domain {domain_id}")
+        domain_orders.append(domain_order)
+        title = _text(domain.get("title"))
+        if not title:
+            raise ValueError(f"domain {domain_id} requires a title")
+        decisions = domain.get("decision_flow")
+        if not isinstance(decisions, list) or not decisions:
+            raise ValueError(f"domain {domain_id} requires non-empty decision_flow metadata")
+        flow_ids: set[str] = set()
+        flow_orders: list[int] = []
+        normalized_decisions: list[dict[str, Any]] = []
+        for flow in decisions:
+            if not isinstance(flow, Mapping):
+                raise ValueError(f"domain {domain_id} has invalid decision_flow entry")
+            flow_id = _text(flow.get("id"))
+            if not flow_id or flow_id in flow_ids:
+                raise ValueError(f"domain {domain_id} requires unique decision-flow ids")
+            flow_ids.add(flow_id)
+            flow_order = _ordered_positive_int(flow.get("order"), f"decision flow {domain_id}/{flow_id}")
+            flow_orders.append(flow_order)
+            flow_title = _text(flow.get("title"))
+            if not flow_title:
+                raise ValueError(f"decision flow {domain_id}/{flow_id} requires a title")
+            assigned = flow.get("widget_ids")
+            if not isinstance(assigned, list) or not assigned or any(not isinstance(item, str) or not item.strip() for item in assigned):
+                raise ValueError(f"decision flow {domain_id}/{flow_id} requires non-empty widget_ids")
+            for widget_id in assigned:
+                if widget_id not in widget_ids:
+                    raise ValueError(f"decision flow {domain_id}/{flow_id} references unknown widget {widget_id}")
+                if widget_id in seen_widget_ids:
+                    raise ValueError(f"widget {widget_id} is assigned more than once")
+                seen_widget_ids[widget_id] = (domain_id, flow_id)
+            normalized_decisions.append({**flow, "id": flow_id, "order": flow_order, "title": flow_title, "widget_ids": list(assigned)})
+        if sorted(flow_orders) != list(range(1, len(flow_orders) + 1)):
+            raise ValueError(f"domain {domain_id} decision-flow orders must be contiguous from 1")
+        domains.append({**domain, "id": domain_id, "order": domain_order, "title": title, "decision_flow": sorted(normalized_decisions, key=lambda flow: flow["order"])})
+    if sorted(domain_orders) != list(range(1, len(domain_orders) + 1)):
+        raise ValueError("domain orders must be contiguous from 1")
+    if set(seen_widget_ids) != widget_ids:
+        missing = sorted(widget_ids - set(seen_widget_ids))
+        raise ValueError(f"widgets require valid domain/decision-flow assignment: {missing}")
+    for widget in widgets:
+        widget_id = _text(widget.get("id"))
+        domain_id, flow_id = seen_widget_ids[widget_id]
+        if "domain_id" in widget and _text(widget.get("domain_id")) != domain_id:
+            raise ValueError(f"widget {widget_id} has unknown or mismatched domain assignment")
+        if "decision_flow_id" in widget and _text(widget.get("decision_flow_id")) != flow_id:
+            raise ValueError(f"widget {widget_id} has unknown or mismatched decision-flow assignment")
+    return sorted(domains, key=lambda domain: domain["order"])
 
 
-def _ordered_widgets(fixture: Mapping[str, Any], widgets: list[Mapping[str, Any]], domains: list[Mapping[str, Any]]) -> list[tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]]:
+def _ordered_widgets(widgets: list[Mapping[str, Any]], domains: list[Mapping[str, Any]]) -> list[tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]]:
     by_id = {_text(widget.get("id")): widget for widget in widgets}
     emitted: set[str] = set()
     output: list[tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]] = []
@@ -335,20 +398,15 @@ def _ordered_widgets(fixture: Mapping[str, Any], widgets: list[Mapping[str, Any]
         for flow in _as_list(domain.get("decision_flow")):
             if not isinstance(flow, Mapping):
                 continue
-            ids = flow.get("widget_ids") or flow.get("widgets") or []
-            if not ids:
-                ids = [widget.get("id") for widget in widgets if _text(widget.get("domain_id")) == _text(domain.get("id"))]
+            ids = flow.get("widget_ids")
             for widget_id in ids:
                 key = _text(widget_id.get("id") if isinstance(widget_id, Mapping) else widget_id)
                 widget = by_id.get(key)
                 if widget is not None and key not in emitted:
                     output.append((domain, flow, widget))
                     emitted.add(key)
-    for widget in widgets:
-        key = _text(widget.get("id"))
-        if key not in emitted:
-            output.append((domains[0], domains[0].get("decision_flow", [{}])[0], widget))
-            emitted.add(key)
+    if len(emitted) != len(widgets):
+        raise ValueError("every widget requires a valid ordered domain/decision-flow assignment")
     return output
 
 
@@ -381,7 +439,7 @@ def render_dashboard(fixture: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
         _validate_widget_provenance(widget)
         widgets.append(widget)
     domains = _normalize_domains(fixture, widgets)
-    ordered = _ordered_widgets(fixture, widgets, domains)
+    ordered = _ordered_widgets(widgets, domains)
 
     trace_records: list[dict[str, str]] = []
     trace_seen: set[str] = set()
@@ -417,7 +475,8 @@ def render_dashboard(fixture: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
                 "title": title,
                 "reviewed_item_ref": _text(widget.get("reviewed_item_ref")),
                 "reviewed_output_ref": _text(widget.get("reviewed_output_ref")),
-                "evidence_refs": [_text(v) for v in _as_list(widget.get("evidence_refs"))],
+                "evidence_refs": _reference_values(widget.get("evidence_refs")),
+                "trace_refs": _widget_trace_refs(widget),
                 "trace_anchors": [record["anchor"] for record in records],
                 "period": _text(widget.get("period")),
                 "population": _text(widget.get("population")),
@@ -489,6 +548,12 @@ def render_dashboard(fixture: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
         "internal_links_checked": True,
         "run_id": _text(fixture.get("run_id")),
         "skill_version": _text(fixture.get("skill_version"), "0.2.1"),
+        "domain_order": [domain["id"] for domain in domains],
+        "decision_flow_order": [
+            {"domain_id": domain["id"], "flow_id": flow["id"]}
+            for domain in domains
+            for flow in domain["decision_flow"]
+        ],
         "items": manifest_items,
         "limitations": [_text(value) for value in limitations],
     }

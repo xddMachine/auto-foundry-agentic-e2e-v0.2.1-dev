@@ -33,6 +33,14 @@ Write a structured `dashboard_manifest.json` beside the prototype:
 }
 ```
 
+The reviewed widget fixture must also supply non-empty, ordered `domains`.
+Each domain has a unique `id`, `title`, positive contiguous `order`, and a
+non-empty `decision_flow` list. Each decision-flow record has a unique `id`,
+`title`, positive contiguous `order`, and non-empty `widget_ids`. Every widget
+must appear exactly once in those ordered assignments. Missing, duplicate, or
+unknown assignments are validation errors; the renderer does not synthesize a
+domain or flow.
+
 ## Required visible regions
 
 1. overview with at least the supported KPI cards;
