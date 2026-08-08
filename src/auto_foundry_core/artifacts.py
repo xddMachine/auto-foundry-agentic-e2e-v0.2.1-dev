@@ -15,6 +15,11 @@ from .workspace import RunContext, require_allowed_roots, validate_allowed_path
 
 
 def _jsonable(value: Any) -> Any:
+    # Public contracts expose a mapping-proxy-backed ``to_dict`` view.  Use it
+    # before ``dataclasses.asdict``: ``asdict`` deep-copies mapping proxies and
+    # therefore cannot hash a freshly registered DataAssetRef in CoreRuntime.
+    if hasattr(value, "to_dict") and callable(value.to_dict):
+        return _jsonable(value.to_dict())
     if is_dataclass(value):
         return _jsonable(asdict(value))
     if isinstance(value, Mapping):

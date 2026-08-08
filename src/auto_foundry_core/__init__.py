@@ -18,6 +18,7 @@ from .contracts import (
     IdentityDecision,
     IdentityEvidence,
     KnowledgeDelta,
+    LEMRef,
     OntologyItem,
     OperationReceipt,
     OperationResultRef,
@@ -30,7 +31,7 @@ from .contracts import (
     TableRef,
     TelemetryEvent,
 )
-from .workspace import AllowedRootError, Workspace, require_allowed_roots
+from .workspace import AllowedRootError, RunContext, require_allowed_roots
 from .sources import discover, preview, register_source, read_rows
 from .profiling import profile_rows, profile_source
 from .normalization import normalize_rows, normalize_value, parse_date, parse_number
@@ -44,19 +45,20 @@ from .cache import RunCache
 from .telemetry import TelemetryRecorder
 from .enterprise_model import LivingEnterpriseModel
 from .catalog import capability_catalog, get_capability
+from .runtime import CoreExecutionResult, CoreRuntime
 
 __version__ = "0.1.0"
 
 __all__ = [
     "AggregationSpec", "AllowedRootError", "CanonicalMapping",
-    "CapabilityDescriptor", "DataAssetRef", "DocumentRef", "FieldRef",
+    "CapabilityDescriptor", "CoreExecutionResult", "CoreRuntime", "DataAssetRef", "DocumentRef", "FieldRef",
     "FoundationTask", "IdentityCandidate", "IdentityDecision",
-    "IdentityEvidence", "KnowledgeDelta", "LivingEnterpriseModel",
+    "IdentityEvidence", "KnowledgeDelta", "LEMRef", "LivingEnterpriseModel",
     "OntologyItem", "OperationReceipt", "OperationResultRef", "OperationSpec",
     "PopulationLedger", "PreparedAssetDescriptor", "PreparedAssetRef",
     "RequirementPortfolioPlan", "RequirementRecord", "RunCache",
     "RunTelemetrySummary", "TableRef", "TelemetryEvent", "TelemetryRecorder",
-    "Workspace", "aggregate_rows", "apply_decision", "capability_catalog",
+    "RunContext", "aggregate_rows", "apply_decision", "capability_catalog",
     "compare_results", "discover", "generate_candidates", "get_capability",
     "mapping_coverage", "measure_relationship", "normalize_rows",
     "normalize_value", "parse_date", "parse_number", "preview", "profile_rows",

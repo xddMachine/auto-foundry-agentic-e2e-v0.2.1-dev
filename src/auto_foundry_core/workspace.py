@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 import os
 from typing import Iterable
@@ -181,56 +181,4 @@ class RunContext:
         return destination
 
 
-@dataclass
-class Workspace:
-    """A bounded, local run workspace.
-
-    The workspace never mutates a source.  It creates only explicitly named
-    run-local directories on demand.
-    """
-
-    root: Path | str
-    allowed_roots: tuple[Path | str, ...] | None = None
-    run_id: str = "run"
-    _created: set[str] = field(default_factory=set, init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        self.root = _resolved(self.root)
-        roots = self.allowed_roots or (self.root,)
-        self.allowed_roots = tuple(_resolved(r) for r in roots)
-        validate_allowed_path(self.root, self.allowed_roots)
-        if not self.run_id or Path(self.run_id).name != self.run_id:
-            raise ValueError("run_id must be a simple path component")
-
-    @property
-    def run_dir(self) -> Path:
-        value = self.root / self.run_id
-        validate_allowed_path(value, self.allowed_roots)
-        return value
-
-    def source_path(self, path: str | os.PathLike[str]) -> Path:
-        return validate_allowed_path(path, self.allowed_roots)
-
-    def output_path(self, path: str | os.PathLike[str]) -> Path:
-        candidate = _resolved(path)
-        validate_allowed_path(candidate, (self.run_dir,))
-        return candidate
-
-    def ensure(self, relative: str = "") -> Path:
-        candidate = self.run_dir / relative
-        candidate = self.output_path(candidate)
-        candidate.mkdir(parents=True, exist_ok=True)
-        self._created.add(str(candidate))
-        return candidate
-
-    def cache_dir(self) -> Path:
-        return self.ensure("cache")
-
-    def telemetry_dir(self) -> Path:
-        return self.ensure("telemetry")
-
-    def manifest_dir(self) -> Path:
-        return self.ensure("manifests")
-
-
-__all__ = ["AllowedRootError", "RunContext", "Workspace", "require_allowed_roots", "validate_allowed_path"]
+__all__ = ["AllowedRootError", "RunContext", "require_allowed_roots", "validate_allowed_path"]

@@ -61,7 +61,10 @@ def _read_rows(
 def _source(spec: OperationSpec) -> Any:
     params = dict(spec.parameters)
     if "path" in params:
-        return params["path"]
+        value = params["path"]
+        if isinstance(value, Mapping) and "uri" in value:
+            return DataAssetRef.from_dict(value)
+        return value
     if spec.inputs:
         value = spec.inputs[0]
         if isinstance(value, Mapping) and "uri" in value:
