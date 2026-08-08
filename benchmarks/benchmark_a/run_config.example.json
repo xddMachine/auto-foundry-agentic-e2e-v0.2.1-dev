@@ -12,6 +12,5 @@
   "question_order_hash_definition": "SHA-256 of UTF-8 bytes for canonical Q-###|<exact question> lines joined by one newline and terminated by one newline",
   "allow_prior_run_reuse": false,
   "allow_cross_run_cache": false,
-  "external_calls": false,
-  "analysis_call": "LAUNCH LATER after explicit confirmation"
+  "external_calls": false
 }

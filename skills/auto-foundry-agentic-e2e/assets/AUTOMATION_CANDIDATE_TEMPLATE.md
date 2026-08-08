@@ -1,7 +1,8 @@
-# Experimental optimizer observation
+# Optimization follow-up candidate
 
-Use this template only for the post-run, read-only Auto Foundry optimizer. Do
-not classify a client business-process automation as an Auto Foundry candidate.
+Use this template only for a later, evidence-grounded Optimization Agent
+report. The deterministic collector records facts separately. Do not classify
+a client business-process automation as an Auto Foundry candidate.
 
 - Candidate ID:
 - Operation or substrate behavior:

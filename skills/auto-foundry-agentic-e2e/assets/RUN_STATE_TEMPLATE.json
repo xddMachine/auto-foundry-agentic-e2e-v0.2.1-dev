@@ -43,9 +43,11 @@
     "traceability_check": null
   },
   "optimizer": {
-    "status": "not_ready|ready|written",
-    "report": "optimizer/experimental_optimizer_report.md",
-    "experimental_optimizer_evidence_appendix": "optimizer/experimental_optimizer_evidence_appendix.md",
+    "status": "not_ready|ready|written|technical_failure",
+    "evidence_bundle": "optimizer/optimizer_evidence_bundle.md",
+    "evidence_appendix": "optimizer/optimizer_evidence_appendix.md",
+    "reasoning_agent": "one_fresh_optimization_agent_after_collection|not_invoked",
+    "analytical_complete": true,
     "read_only": true
   }
 }

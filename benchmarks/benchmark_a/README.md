@@ -22,5 +22,6 @@ the later-launch prompt, config, and checklist.
 
 The later launch must use a new empty run root, the immutable source ZIP and
 hash recorded in the baseline, the exact question order, and zero prior-run
-reuse. Obtain an explicit confirmation immediately before analysis begins.
-There is no time deadline in this package.
+reuse. The user's instruction to run Benchmark A is sufficient; print the
+resolved run root and version/source/question markers for the record, then
+begin immediately. There is no time deadline in this package.

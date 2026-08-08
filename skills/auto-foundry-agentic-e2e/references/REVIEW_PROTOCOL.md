@@ -15,10 +15,13 @@ names. Release sessions when the host supports it.
 If no route is available, continue and disclose exactly:
 
 ```json
-{"review_status":"unavailable","review_strength":"none"}
+{"review_status":"unavailable","review_strength":"none","verdict":"not_reviewed"}
 ```
 
-Do not add a second review of the review.
+The item may still finish as `answered_with_limits` from the Lead Analyst
+result, with the unavailable-review limitation disclosed. A route that was not
+invoked cannot return `accept_with_limits` or any other reviewer verdict. Do
+not add a second review of the review.
 
 ## Reviewer inputs
 

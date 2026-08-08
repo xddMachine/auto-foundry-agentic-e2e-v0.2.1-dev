@@ -109,8 +109,9 @@ and keeps the queue moving.
 - **Independent Reviewer** checks the complete answer at the business-result
   boundary.
 - **Product Builder** assembles final products only from reviewed outputs.
-- **Optimizer** is a post-run read-only observer of Auto Foundry workflow and
-  substrate evidence.
+- **Evidence Collector** is a post-run deterministic observer of Auto Foundry
+  workflow and substrate evidence. A separate fresh Optimization Agent may
+  later reason from its bounded bundle.
 
 For each Requirement Mode item, use this exact, progressive sequence:
 
@@ -210,11 +211,13 @@ the host supports it, release reviewer sessions after the verdict.
 If no reviewer can be obtained, continue with:
 
 ```json
-{"review_status":"unavailable","review_strength":"none"}
+{"review_status":"unavailable","review_strength":"none","verdict":"not_reviewed"}
 ```
 
-Disclose this limitation in the item result and final report. A reviewer may
-return `accept`, `accept_with_limits`, `repair_once`, or
+Disclose this limitation in the item result and final report. The item may
+still finish as `answered_with_limits` from the Lead Analyst result; do not
+claim a reviewer verdict when no reviewer was invoked. An available reviewer
+may return `accept`, `accept_with_limits`, `repair_once`, or
 `block_specific_claims`; only the single permitted repair may follow.
 
 ## 7. Final products and dashboard prototype
@@ -239,32 +242,32 @@ and [offline dashboard asset](assets/dashboard.css) as a small deterministic
 starting point. This is a product-building aid, not a request to build a
 production dashboard.
 
-For an executable local presentation helper, pass a reviewed widget fixture to
-`scripts/dashboard_renderer.py`. The fixture owns display values, trace refs,
-non-empty `reviewed_item_ref` and `reviewed_output_ref` values, and at least one
-evidence/trace provenance reference per widget, plus limitations and (when
-non-empty ordered domain/decision-flow metadata assigning every widget exactly
-once. Missing, unknown, duplicate, or invalid-order assignments fail
-validation before the business-domain/decision-flow organization claim;
-the helper never reads raw sources or calculates a new metric. It supports
-KPI cards, generic bar/line/stacked/heatmap/scatter forms, a supplied
-small-category donut, and drill-down tables, all with local HTML/CSS and
-validated internal trace anchors.
+For an executable local presentation helper, pass one `RunContext`, one
+run-relative reviewed widget fixture, and products-relative output and
+manifest paths to `scripts/dashboard_renderer.py`. The fixture owns display
+values, trace refs, non-empty `reviewed_item_ref` and `reviewed_output_ref`
+values, and at least one evidence/trace provenance reference per widget, plus
+limitations and non-empty ordered domain/decision-flow metadata assigning every
+widget exactly once. Every path is validated before a probe/read/mkdir/write;
+the helper never reads raw sources or calculates a new metric. Its CLI accepts
+`--run-root` and `--run-id`, with the fixture path relative to the run and both
+outputs relative to `run_root/products`.
 
-The development-only `scripts/experimental_optimizer.py` is a read-only
-observer of Auto Foundry workflow/substrate evidence. It requires an explicit
-structured freeze mapping with all five markers true:
+The development-only `scripts/optimizer_evidence_collector.py` is a
+deterministic, read-only evidence collector. It requires one current
+`RunContext` and a frozen products manifest with all five markers true:
 `answers_frozen`, `living_enterprise_model_frozen` (or `lem_frozen`),
 `prepared_assets_frozen` (or `prepared_data_registry_frozen`),
 `dashboard_frozen`, and `telemetry_frozen`. A generic `frozen: true` or
-products-only marker fails. It hashes analytical inputs before and after
-reading, writes only `experimental_optimizer_report.md` and
-`experimental_optimizer_evidence_appendix.md` in the caller's optimizer
-directory, and reports repeated code, repeated
-reads/context, cache misses, reviewer bottlenecks, and capability gaps when
-evidenced. Every recommendation separates observed evidence, hypothesis,
-recommendation, expected benefit, risk, and generality. It rejects a
-client-business-automation classification and makes no model calls.
+products-only marker fails. It hashes run-local analytical inputs before and
+after reading, records exact duplicate files, and summarizes cache/read,
+reviewer, and capability facts. It writes only
+`optimizer/optimizer_evidence_bundle.md` and
+`optimizer/optimizer_evidence_appendix.md`; it never modifies products. The
+collector makes no model call and is not the free-thinking Optimization Agent.
+Use its non-blocking result in run state: a collector or later Optimization
+Agent failure is `optimizer_status: technical_failure` and leaves
+`analytical_complete` unchanged.
 
 ## 8. Passive telemetry and the optimizer
 
@@ -276,17 +279,22 @@ routes, create gates, or change answers.
 
 Only after reviewed answers and outcomes are frozen, the LEM and prepared
 registry are frozen, the dashboard prototype is complete, and telemetry is
-closed may the Optimizer inspect workflow/substrate evidence. It writes only:
+closed may the collector inspect workflow/substrate evidence:
 
-- `optimizer/experimental_optimizer_report.md`;
-- `optimizer/experimental_optimizer_evidence_appendix.md`.
+```text
+frozen run
+  → deterministic optimizer evidence bundle
+  → one fresh Optimization Agent
+  → grounded free-form optimization report
+```
 
-Each recommendation records observed evidence, hypothesis, recommendation,
-expected benefit, risk, and generality. The optimizer is strictly read-only:
-it cannot edit source, run state, LEM, prepared data, products, code, or
-configuration; it cannot auto-promote code. Keep Auto Foundry substrate/workflow
-optimization separate from client business automation. If evidence is weak,
-say so and recommend another observation rather than inventing a benchmark.
+No Optimization Agent/model call is executed by this skill helper. The
+collector is strictly read-only: it cannot edit source, run state, LEM,
+prepared data, products, code, or configuration. If either the collector or
+the later agent fails, record `optimizer_status: technical_failure` and retain
+the analytical completion state. Keep Auto Foundry substrate/workflow
+optimization separate from client business automation; weak evidence remains
+an observation gap rather than an invented benchmark.
 
 ## 9. Run workspace
 
@@ -328,7 +336,7 @@ central/cross-run caches.
   lifecycle control.
 - Do not add compatibility wrappers or deprecated v0.2.0 instructions.
 - Do not auto-promote custom code or confuse client business automation with
-  the experimental Auto Foundry optimizer.
+  the development-only evidence collector and later Optimization Agent.
 
 See the focused references for implementation detail:
 

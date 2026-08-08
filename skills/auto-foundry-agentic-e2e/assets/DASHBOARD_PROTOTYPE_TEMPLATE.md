@@ -59,6 +59,7 @@ domain or flow.
   a new metric while rendering.
 - Keep HTML, CSS, images, and scripts local and usable offline.
 - Use stable internal anchors such as `#trace-Q-001` and check every link.
-- Show `review_status` and `review_strength` when review was unavailable.
+- Show `review_status: unavailable`, `review_strength: none`, and
+  `verdict: not_reviewed` when no reviewer was invoked; disclose the limit.
 - Keep blocked/unsupported claims visible as limitations, not as zeros.
 - Record the manifest and link-check result in structured run state.

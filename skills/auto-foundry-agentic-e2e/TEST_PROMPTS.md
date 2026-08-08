@@ -68,8 +68,10 @@ optional core/custom code, self-check, one reviewer, at most one repair, final
 answer, and atomically applied reviewed Knowledge Delta. Build the static
 reviewed-output-only dashboard only after all items have terminal outcomes.
 After answers, LEM, prepared registry, dashboard, and telemetry are frozen,
-produce a read-only optimizer report and evidence appendix. Do not mutate the
-run or propose client business automation as Auto Foundry optimization.
+collect a deterministic optimizer evidence bundle and appendix. A separate
+fresh Optimization Agent may later write a grounded free-form report; that
+agent is not invoked by this offline helper. Do not mutate the run or propose
+client business automation as Auto Foundry optimization.
 ```
 
 ## Minimal fake acceptance matrix
@@ -92,6 +94,6 @@ The offline tests should demonstrate:
 - clean-room roots, path enforcement, and discarded-lane incidents;
 - dashboard reviewed-output traceability, limitations, offline assets, and no
   new analytics;
-- passive telemetry plus frozen/read-only optimizer evidence fields;
+- passive telemetry plus frozen/read-only optimizer evidence-bundle fields;
 - prohibitions on dictionaries, cross-run caches, approval trees, lifecycle
   prose authority, a second repair, client automation, and production apps.

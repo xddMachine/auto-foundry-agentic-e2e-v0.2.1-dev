@@ -17,15 +17,17 @@
   requires non-empty ordered domain/decision-flow assignments for every widget,
   emits standalone HTML/CSS, and validates internal trace links. It calculates
   no analytical metric and reads no source.
-- `skills/auto-foundry-agentic-e2e/scripts/experimental_optimizer.py` is
-  development-only and read-only. It
+- `skills/auto-foundry-agentic-e2e/scripts/optimizer_evidence_collector.py` is
+  development-only, deterministic, and read-only. It
   requires an explicit mapping with `answers_frozen`,
   `living_enterprise_model_frozen`/`lem_frozen`,
   `prepared_assets_frozen`/`prepared_data_registry_frozen`,
   `dashboard_frozen`, and `telemetry_frozen` all true. It hashes analytical
   inputs before and after observation, reports five workflow/substrate
-  evidence categories, and writes exactly two report files. Client-business
-  automation is rejected.
+  evidence categories and exact duplicate groups, and writes exactly two
+  evidence-bundle files. Client-business automation is rejected. A separate
+  fresh Optimization Agent is described but is not invoked by this helper;
+  collection failure is non-blocking.
 
 ## Deliverable and boundaries
 

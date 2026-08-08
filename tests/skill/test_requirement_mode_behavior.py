@@ -50,6 +50,7 @@ def test_requirement_roles_plan_navigate_analyze_and_disclose_reviewer_fallback(
     assert all(result.route == "fresh" for result in results)
     assert all(result.review.review_status == "unavailable" for result in results)
     assert all(result.review.review_strength == "none" for result in results)
+    assert all(result.review.verdict == "not_reviewed" for result in results)
     assert run.planner.portfolios_seen == [("R-001", "R-002")]
     assert run.navigator.selections == [("R-002", ("P-001",)), ("R-001", ("O-001",))]
     assert run.analyst.calls == ["R-002", "R-001"]

@@ -50,16 +50,19 @@ offline rendering, internal links, and traceability. A presentation defect is
 fixed in the product. A genuine analytical defect returns to the originating
 item for its single permitted repair; do not create a second review pipeline.
 
-## Post-run optimizer
+## Post-run evidence and optimization
 
-The optimizer runs only after answers, LEM, prepared registry, dashboard, and
-telemetry are frozen. It studies Auto Foundry workflow/substrate evidence, not
-client business-process automation. It writes exactly two report artifacts:
+The deterministic collector runs only after answers, LEM, prepared registry,
+dashboard, and telemetry are frozen. It studies Auto Foundry
+workflow/substrate evidence, not client business-process automation, and writes
+exactly two run-local artifacts:
 
-- `optimizer/experimental_optimizer_report.md`;
-- `optimizer/experimental_optimizer_evidence_appendix.md`.
+- `optimizer/optimizer_evidence_bundle.md`;
+- `optimizer/optimizer_evidence_appendix.md`.
 
-Each candidate or recommendation records:
+The bundle contains observed facts, exact duplicate groups, and before/after
+hashes. It does not make hypotheses or recommendations. One fresh Optimization
+Agent may later consume the bundle and write a grounded free-form report using:
 
 ```text
 Observed evidence
@@ -71,7 +74,7 @@ Generality
 Evidence references
 ```
 
-Separate observed repetition from speculation. A recommendation may be
-classified `mechanical_now`, `deterministic_after_more_runs`, `keep_agentic`,
-or `do_not_automate`. No benchmark is invented, and no code, configuration,
-source, state, LEM, prepared asset, or product is mutated or auto-promoted.
+No benchmark is invented, and no code, configuration, source, state, LEM,
+prepared asset, or product is mutated or auto-promoted. Collector or agent
+failure is recorded as `optimizer_status: technical_failure` without changing
+the analytical completion state.

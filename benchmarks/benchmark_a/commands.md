@@ -24,8 +24,9 @@ PREPARE ONLY: do not call a model, execute a question, or create products.
 
 ## LAUNCH LATER (not executed)
 
-At the later launch boundary, use the exact prompt below. Stop after showing
-the prompt and obtain explicit confirmation before analysis begins.
+At the later launch boundary, use the exact prompt below. The user's request
+to run Benchmark A is sufficient; after printing the required markers, begin
+the run immediately.
 
 ```text
 LAUNCH LATER — Benchmark A only.
@@ -49,10 +50,9 @@ Keep the source read-only and do
 not make external/model calls beyond the approved product runtime boundary.
 
 Before analysis begins, print the resolved empty run root, source path/hash,
-question-order hash, zero-prior-run-reuse confirmation, and the four markers.
-Then ask for explicit confirmation. Do not start analysis until confirmation
-is received.
+question-order hash, zero-prior-run-reuse marker, and the four markers. Then
+begin analysis immediately; no additional user step is required.
 ```
 
-There is no time deadline. Benchmark A remains unexecuted until that explicit
-later launch and acceptance decision.
+There is no time deadline. Benchmark A remains unexecuted until that later
+launch instruction and acceptance decision.

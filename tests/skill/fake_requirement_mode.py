@@ -180,7 +180,10 @@ class FakeReviewer:
         self.calls.append(requirement_id)
         if self.available:
             return ReviewResult("available", "independent", "accept_with_limits")
-        return ReviewResult("unavailable", "none", "accept_with_limits")
+        # An uninvoked reviewer cannot issue an acceptance verdict.  The Lead
+        # Analyst may still complete the item with an explicit limits outcome,
+        # but the review record itself is not_reviewed.
+        return ReviewResult("unavailable", "none", "not_reviewed")
 
 
 class FakeLivingEnterpriseModel:

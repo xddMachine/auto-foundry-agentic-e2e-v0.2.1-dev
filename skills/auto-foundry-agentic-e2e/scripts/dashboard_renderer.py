@@ -26,6 +26,17 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+try:
+    from auto_foundry_core.workspace import AllowedRootError, RunContext
+except ModuleNotFoundError:  # pragma: no cover - direct script execution
+    # The skill is installable independently of the source checkout.  When a
+    # developer invokes this script directly from the repository, make the
+    # committed local core importable without changing the caller's paths.
+    _SRC = Path(__file__).resolve().parents[3] / "src"
+    if str(_SRC) not in sys.path:
+        sys.path.insert(0, str(_SRC))
+    from auto_foundry_core.workspace import AllowedRootError, RunContext
+
 
 SUPPORTED_WIDGETS = {
     "kpi",
@@ -560,31 +571,60 @@ def render_dashboard(fixture: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
     return document, manifest
 
 
-def render_fixture(input_path: Path, output_path: Path, manifest_path: Path | None = None) -> dict[str, Any]:
-    fixture = json.loads(input_path.read_text(encoding="utf-8"))
+def render_fixture(
+    context: RunContext,
+    fixture_path: str | Path,
+    output_path: str | Path,
+    manifest_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Render one reviewed fixture through one bounded :class:`RunContext`.
+
+    ``fixture_path`` is run-relative (the reviewed fixture is already a
+    system-owned run artifact); output and manifest paths are products-relative.
+    Every path is resolved before the fixture is probed/read or any directory
+    is created.  The pure :func:`render_dashboard` function remains available
+    for callers that already hold a validated in-memory fixture.
+    """
+
+    if not isinstance(context, RunContext):
+        raise TypeError("render_fixture requires one RunContext")
+    # Resolve all paths up front.  In particular, do not read the fixture
+    # before a malicious output/manifest path has been rejected.
+    resolved_fixture = context.resolve_run_path(fixture_path)
+    resolved_product_root = context.resolve_product_path("")
+    if resolved_product_root != context.run_root / "products":
+        raise AllowedRootError("products root must be the current run's products directory")
+    resolved_output = context.resolve_product_path(output_path)
+    resolved_manifest = context.resolve_product_path(manifest_path) if manifest_path is not None else None
+    if not resolved_fixture.is_file():
+        raise FileNotFoundError(resolved_fixture)
+    fixture = json.loads(resolved_fixture.read_text(encoding="utf-8"))
     if not isinstance(fixture, Mapping):
         raise ValueError("dashboard fixture root must be a JSON object")
     document, manifest = render_dashboard(fixture)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(document.rstrip() + "\n", encoding="utf-8")
-    if manifest_path is not None:
-        manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+    resolved_output.parent.mkdir(parents=True, exist_ok=True)
+    resolved_output.write_text(document.rstrip() + "\n", encoding="utf-8")
+    if resolved_manifest is not None:
+        resolved_manifest.parent.mkdir(parents=True, exist_ok=True)
+        resolved_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
     return manifest
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, required=True, help="reviewed widget fixture JSON")
-    parser.add_argument("--output", type=Path, required=True, help="offline HTML output")
-    parser.add_argument("--manifest-output", type=Path, help="optional dashboard manifest JSON")
+    parser.add_argument("--run-root", type=Path, required=True, help="current run root")
+    parser.add_argument("--run-id", required=True, help="simple current run identifier")
+    parser.add_argument("--input", "--fixture", dest="fixture_path", required=True, help="run-relative reviewed widget fixture JSON")
+    parser.add_argument("--output", required=True, help="products-relative offline HTML output")
+    parser.add_argument("--manifest-output", help="optional products-relative dashboard manifest JSON")
     args = parser.parse_args(argv)
     try:
-        manifest = render_fixture(args.input, args.output, args.manifest_output)
+        context = RunContext(run_id=args.run_id, run_root=args.run_root)
+        manifest = render_fixture(context, args.fixture_path, args.output, args.manifest_output)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"dashboard renderer: {exc}", file=sys.stderr)
         return 2
-    print(json.dumps({"output": str(args.output), "internal_links_checked": manifest["internal_links_checked"], "widget_count": len(manifest["items"])}, sort_keys=True))
+    print(json.dumps({"output": str(context.resolve_product_path(args.output)), "internal_links_checked": manifest["internal_links_checked"], "widget_count": len(manifest["items"])}, sort_keys=True))
     return 0
 
 

@@ -44,8 +44,9 @@ Unresolved issues and limits
 Approximate effort (optional)
 ```
 
-The trace is observational evidence for the post-run optimizer. It does not
-control lifecycle state.
+The trace is observational input for the deterministic post-run evidence
+collector. It does not control lifecycle state or stand in for a free-form
+Optimization Agent report.
 
 ## Do not create
 
@@ -81,7 +82,8 @@ use telemetry to invent timing benchmarks or to alter an answer.
 
 ## Optimizer boundary
 
-The optimizer may read frozen traces, telemetry, and product manifests only
-after the run products are complete. Its report and evidence appendix are
+The evidence collector may read frozen traces, telemetry, and product manifests
+only after the run products are complete. Its evidence bundle and appendix are
 new read-only artifacts; it cannot mutate code, state, LEM, prepared data,
-products, source files, or configuration.
+products, source files, or configuration. A later Optimization Agent may write
+a separate report from that bundle, but collector/agent failure is non-blocking.

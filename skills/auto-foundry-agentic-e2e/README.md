@@ -45,8 +45,9 @@ and status. Scope is classified semantically as
 - reviewed-output-only local static dashboard prototype guidance and a reusable
   offline asset;
 - passive workflow telemetry;
-- a strictly read-only post-run optimizer report that studies Auto Foundry
-  substrate/workflow evidence, not client business automation.
+- a strictly read-only post-run evidence bundle for one later Optimization
+  Agent; it studies Auto Foundry substrate/workflow evidence, not client
+  business automation.
 
 ## Install and verify
 
@@ -73,9 +74,11 @@ structured widget fixture without reading raw data or calculating metrics:
 
 ```bash
 python3 skills/auto-foundry-agentic-e2e/scripts/dashboard_renderer.py \
-  --input reviewed_widgets.json \
-  --output products/dashboard.html \
-  --manifest-output products/dashboard_manifest.json
+  --run-root /absolute/path/to/run \
+  --run-id RUN-20260808-example \
+  --input products/reviewed_widgets.json \
+  --output dashboard.html \
+  --manifest-output dashboard_manifest.json
 ```
 
 The fixture supplies `widgets` (types `kpi`, `bar`, `line`,
@@ -88,29 +91,31 @@ validation. The renderer is stdlib-only, emits local
 HTML/CSS, and fails on broken internal links or external assets. It is a
 presentation helper, not an analytical engine.
 
-The development-only optimizer observes synthetic or run-local telemetry,
-traces, and scripts only after an explicit structured freeze mapping proves all
-five markers are true: `answers_frozen`,
-`living_enterprise_model_frozen` (or `lem_frozen`), `prepared_assets_frozen`
-(or `prepared_data_registry_frozen`), `dashboard_frozen`, and
-`telemetry_frozen`. A generic `frozen: true` or products-only marker is not
-enough:
+The development-only evidence collector observes run-local telemetry, traces,
+and scripts only after a structured freeze mapping proves all five markers are
+true: `answers_frozen`, `living_enterprise_model_frozen` (or `lem_frozen`),
+`prepared_assets_frozen` (or `prepared_data_registry_frozen`),
+`dashboard_frozen`, and `telemetry_frozen`. A generic `frozen: true` or
+products-only marker is not enough:
 
 ```bash
-python3 skills/auto-foundry-agentic-e2e/scripts/experimental_optimizer.py \
+python3 skills/auto-foundry-agentic-e2e/scripts/optimizer_evidence_collector.py \
+  --run-root /absolute/path/to/run \
+  --run-id RUN-20260808-example \
   --products-manifest products/product_manifest.json \
   --telemetry telemetry/events.jsonl \
   --traces questions \
-  --scripts questions \
-  --optimizer-dir optimizer
+  --scripts questions
 ```
 
-It writes exactly `experimental_optimizer_report.md` and
-`experimental_optimizer_evidence_appendix.md`, proves analytical-input hashes
-are unchanged, and
-separates observed evidence, hypotheses, recommendations, expected benefit,
-risk, and generality. Client-business-automation classifications are rejected;
-no model or network call is possible.
+It writes exactly `optimizer/optimizer_evidence_bundle.md` and
+`optimizer/optimizer_evidence_appendix.md`, proves analytical-input hashes are
+unchanged, and records exact duplicates plus observed cache/read/reviewer/
+capability facts. It does not write hypotheses or recommendations and is not
+the free-thinking Optimization Agent. Client-business-automation
+classifications are rejected; no model or network call is possible. Collector
+failure is non-blocking and returns `optimizer_status: technical_failure`
+without changing `analytical_complete`.
 
 The supplied [test prompts](TEST_PROMPTS.md) exercise both modes without real
 model calls or benchmark execution. The [run-state template](assets/RUN_STATE_TEMPLATE.json)
@@ -125,9 +130,9 @@ starting points; do not create unused empty directories.
 - [Review protocol](references/REVIEW_PROTOCOL.md)
 - [Artifact and efficiency policy](references/ARTIFACT_AND_EFFICIENCY_POLICY.md)
 - [Final product and optimizer](references/FINAL_PRODUCT_AND_AUTOMATION.md)
-- [Automation candidate template](assets/AUTOMATION_CANDIDATE_TEMPLATE.md)
+- [Optimization follow-up template](assets/AUTOMATION_CANDIDATE_TEMPLATE.md)
 - [Question result template](assets/QUESTION_RESULT_TEMPLATE.md)
 - [Dashboard prototype contract](assets/DASHBOARD_PROTOTYPE_TEMPLATE.md)
 - [Telemetry event template](assets/TELEMETRY_EVENT_TEMPLATE.json)
-- [Optimizer report template](assets/EXPERIMENTAL_OPTIMIZER_REPORT_TEMPLATE.md)
+- [Optimizer evidence bundle template](assets/OPTIMIZER_EVIDENCE_BUNDLE_TEMPLATE.md)
 - [Requirement record template](assets/REQUIREMENT_RECORD_TEMPLATE.json)

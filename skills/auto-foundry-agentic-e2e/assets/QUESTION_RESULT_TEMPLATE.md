@@ -44,6 +44,9 @@
 - `review_status`:
 - `review_strength`:
 - Reviewer verdict:
+- If no reviewer was invoked, use `review_status: unavailable`,
+  `review_strength: none`, `verdict: not_reviewed`; the item may still be
+  `answered_with_limits` when the Lead Analyst result is useful.
 - Repair used: `none` | `one_targeted_repair`
 - Final outcome:
 

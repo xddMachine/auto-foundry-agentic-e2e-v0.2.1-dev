@@ -28,4 +28,5 @@ preparing this package.
 - [ ] Reproduce or explicitly classify the Q-004 full-horizon/34-unit issue;
       do not publish the blocked claims as accepted results.
 - [ ] Confirm no model, external, benchmark, V3, xddMachine, autofoundary, or
-      publication operation occurred before acceptance.
+      publication operation occurred during preparation; the later launch
+      starts directly from the user's instruction after markers are printed.

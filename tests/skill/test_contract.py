@@ -44,7 +44,7 @@ def test_frontmatter_and_run_markers_are_v021() -> None:
         assert marker in skill
 
 
-def test_run_state_template_is_structured_authority() -> None:
+def test_run_state_template_is_structured_run_state() -> None:
     state = json.loads(_read("assets/RUN_STATE_TEMPLATE.json"))
     assert state["skill_name"] == "auto-foundry-agentic-e2e"
     assert state["skill_version"] == "0.2.1"
@@ -56,11 +56,9 @@ def test_run_state_template_is_structured_authority() -> None:
     assert state["clean_room"]["empty_cache_at_start"] is True
     assert state["telemetry"]["passive"] is True
     assert state["optimizer"]["read_only"] is True
-    assert state["optimizer"]["report"] == "optimizer/experimental_optimizer_report.md"
-    assert state["optimizer"]["experimental_optimizer_evidence_appendix"] == (
-        "optimizer/experimental_optimizer_evidence_appendix.md"
-    )
-    assert "evidence_appendix" not in state["optimizer"]
+    assert state["optimizer"]["evidence_bundle"] == "optimizer/optimizer_evidence_bundle.md"
+    assert state["optimizer"]["evidence_appendix"] == "optimizer/optimizer_evidence_appendix.md"
+    assert state["optimizer"]["analytical_complete"] is True
 
 
 def test_requirement_record_template_keeps_user_fields_structured() -> None:
@@ -199,6 +197,8 @@ def test_reviewer_routing_fallback_and_disclosure() -> None:
     assert "fresh same-family context" in text
     assert '"review_status":"unavailable"' in text
     assert '"review_strength":"none"' in text
+    assert '"verdict":"not_reviewed"' in text
+    assert "accept_with_limits" in text
     assert "Release sessions" in text or "release reviewer sessions" in text
     assert not re.search(r"\b(?:gpt|claude|gemini|llama|sonnet|opus)[-_\d]", text, re.I)
 
@@ -220,8 +220,9 @@ def test_clean_room_dashboard_telemetry_and_optimizer_contract() -> None:
         "internal links",
         "traceability",
         "passive telemetry",
-        "experimental_optimizer_report.md",
-        "experimental_optimizer_evidence_appendix.md",
+        "optimizer_evidence_bundle.md",
+        "optimizer_evidence_appendix.md",
+        "evidence bundle",
         "strictly read-only",
         "observed evidence",
         "hypothesis",
@@ -234,6 +235,7 @@ def test_clean_room_dashboard_telemetry_and_optimizer_contract() -> None:
     assert (SKILL / "assets" / "DASHBOARD_PROTOTYPE_TEMPLATE.md").is_file()
     assert (SKILL / "assets" / "dashboard.css").is_file()
     assert (SKILL / "assets" / "TELEMETRY_EVENT_TEMPLATE.json").is_file()
+    assert (SKILL / "assets" / "OPTIMIZER_EVIDENCE_BUNDLE_TEMPLATE.md").is_file()
 
 
 def test_regression_prohibitions_have_no_legacy_or_domain_recipe() -> None:
