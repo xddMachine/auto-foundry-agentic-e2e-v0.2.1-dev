@@ -17,39 +17,98 @@ class ParseResult:
     ok: bool = True
     error: str | None = None
     kind: str = "value"
+    attempts: tuple[str, ...] = ()
+    failures: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        return {"raw": self.raw, "value": self.value, "ok": self.ok, "error": self.error, "kind": self.kind}
+        return {
+            "raw": self.raw,
+            "value": self.value,
+            "ok": self.ok,
+            "error": self.error,
+            "kind": self.kind,
+            "attempts": list(self.attempts),
+            "failures": list(self.failures),
+        }
 
 
 _CURRENCY_MARKS = re.compile(r"^[\s\$€£¥₹]+|[\s\$€£¥₹]+$")
 
 
-def _failed(raw: Any, kind: str, message: str) -> ParseResult:
-    return ParseResult(raw=raw, value=None, ok=False, error=message, kind=kind)
+def _failed(
+    raw: Any,
+    kind: str,
+    message: str,
+    *,
+    attempts: Sequence[str] = (),
+    failures: Sequence[str] | None = None,
+) -> ParseResult:
+    return ParseResult(
+        raw=raw,
+        value=None,
+        ok=False,
+        error=message,
+        kind=kind,
+        attempts=tuple(str(item) for item in attempts),
+        failures=tuple(str(item) for item in (failures if failures is not None else (message,))),
+    )
 
 
-def parse_date(value: Any, *, dayfirst: bool = False) -> ParseResult:
-    """Parse common date representations and return an explicit failure."""
+def _format_sequence(formats: Sequence[str] | str | None) -> tuple[str, ...]:
+    if formats is None:
+        return ()
+    if isinstance(formats, str):
+        return (formats,)
+    return tuple(str(fmt) for fmt in formats)
+
+
+def parse_date(
+    value: Any,
+    *,
+    formats: Sequence[str] | str | None = (),
+    dayfirst: bool = False,
+) -> ParseResult:
+    """Parse ISO dates first, then caller-supplied formats.
+
+    No ambient date parser is consulted.  ``attempts`` records the ISO/native
+    and explicit ``strptime`` formats tried; ``failures`` records each failed
+    attempt so an agent can choose an unambiguous format on a subsequent pass.
+    ``dayfirst`` is retained only as an explicit convenience that adds the two
+    corresponding numeric formats; it never enables fuzzy parsing.
+    """
 
     if value is None or (isinstance(value, str) and not value.strip()):
         return _failed(value, "date", "blank value")
     if isinstance(value, datetime):
-        return ParseResult(value, value.date().isoformat(), True, None, "date")
+        return ParseResult(value, value.date().isoformat(), True, None, "date", ("native datetime",), ())
     if isinstance(value, date):
-        return ParseResult(value, value.isoformat(), True, None, "date")
+        return ParseResult(value, value.isoformat(), True, None, "date", ("native date",), ())
+
     text = str(value).strip()
+    attempts: list[str] = ["ISO-8601"]
+    failures: list[str] = []
     try:
-        parsed: datetime | date
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return ParseResult(value, parsed.date().isoformat(), True, None, "date", tuple(attempts), tuple(failures))
+    except ValueError as exc:
+        failures.append(f"ISO-8601: {exc}")
+
+    requested_formats = list(_format_sequence(formats))
+    if dayfirst:
+        # This is still an explicit caller choice, not locale-dependent
+        # guessing.  Caller-provided formats remain first in their declared
+        # order and the convenience formats are tried afterwards.
+        requested_formats.extend(fmt for fmt in ("%d/%m/%Y", "%d-%m-%Y") if fmt not in requested_formats)
+    for fmt in requested_formats:
+        attempts.append(fmt)
         try:
-            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        except ValueError:
-            from dateutil import parser as date_parser
-            parsed = date_parser.parse(text, dayfirst=dayfirst, fuzzy=False)
-        output = parsed.date().isoformat() if isinstance(parsed, datetime) else parsed.isoformat()
-        return ParseResult(value, output, True, None, "date")
-    except Exception as exc:
-        return _failed(value, "date", f"unparseable date: {exc}")
+            parsed = datetime.strptime(text, fmt)
+            return ParseResult(value, parsed.date().isoformat(), True, None, "date", tuple(attempts), tuple(failures))
+        except (TypeError, ValueError) as exc:
+            failures.append(f"{fmt}: {exc}")
+
+    message = f"unparseable date: {text}"
+    return _failed(value, "date", message, attempts=attempts, failures=failures)
 
 
 def parse_number(value: Any) -> ParseResult:
@@ -112,11 +171,12 @@ def normalize_identifier(value: Any, *, case: str | None = "lower") -> Any:
 
 def normalize_value(value: Any, *, kind: str = "string", case: str | None = "lower", **options: Any) -> Any:
     if kind in {"string", "text"}:
-        return normalize_string(value, case=case, **{k: v for k, v in options.items() if k in {"unicode_form", "collapse_whitespace"}})
+        return normalize_string(value, case=case, **{key: option for key, option in options.items() if key in {"unicode_form", "collapse_whitespace"}})
     if kind in {"identifier", "id"}:
         return normalize_identifier(value, case=case)
     if kind in {"date", "datetime"}:
-        return parse_date(value, dayfirst=bool(options.get("dayfirst", False))).value
+        date_formats = options.get("formats", options.get("date_formats", ()))
+        return parse_date(value, formats=date_formats, dayfirst=bool(options.get("dayfirst", False))).value
     if kind in {"number", "numeric", "decimal"}:
         return parse_number(value).value
     if kind == "currency":
@@ -126,35 +186,64 @@ def normalize_value(value: Any, *, kind: str = "string", case: str | None = "low
     raise ValueError(f"unsupported normalization kind: {kind}")
 
 
+def _field_kind_and_formats(
+    name: str,
+    specification: Any,
+    date_formats: Mapping[str, Sequence[str]] | Sequence[str] | str | None,
+    formats: Mapping[str, Sequence[str]] | Sequence[str] | str | None,
+) -> tuple[str, Sequence[str] | str | None]:
+    if isinstance(specification, Mapping):
+        kind = str(specification.get("kind", specification.get("type", "string")))
+        local_formats = specification.get("formats", specification.get("date_formats"))
+    else:
+        kind = str(specification)
+        local_formats = None
+    selected = local_formats
+    global_formats = formats if formats is not None else date_formats
+    if selected is None and isinstance(global_formats, Mapping):
+        selected = global_formats.get(name)
+    elif selected is None:
+        selected = global_formats
+    return kind, selected
+
+
 def normalize_rows(
     rows: Iterable[Mapping[str, Any]],
     *,
-    fields: Mapping[str, str] | Sequence[str] | None = None,
+    fields: Mapping[str, Any] | Sequence[str] | None = None,
     case: str | None = "lower",
     suffix: str = "_normalized",
     error_suffix: str = "_parse_error",
+    date_formats: Mapping[str, Sequence[str]] | Sequence[str] | str | None = None,
+    formats: Mapping[str, Sequence[str]] | Sequence[str] | str | None = None,
     return_metadata: bool = False,
 ) -> list[dict[str, Any]] | dict[str, Any]:
-    """Add normalized columns while retaining every raw column unchanged."""
+    """Add normalized columns while retaining every raw column unchanged.
+
+    ``date_formats``/``formats`` can be a sequence applied to all date fields,
+    a field-to-sequence mapping, or a field specification can carry its own
+    ``{"kind": "date", "formats": (...)}`` mapping.
+    """
 
     materialized = [dict(row) for row in rows]
     if fields is None:
-        kinds: dict[str, str] = {key: "string" for row in materialized for key in row}
+        specifications: dict[str, Any] = {key: "string" for row in materialized for key in row}
     elif isinstance(fields, Mapping):
-        kinds = {str(k): str(v) for k, v in fields.items()}
+        specifications = {str(key): value for key, value in fields.items()}
     else:
-        kinds = {str(k): "string" for k in fields}
+        specifications = {str(key): "string" for key in fields}
     lineage: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     output: list[dict[str, Any]] = []
     for row_number, row in enumerate(materialized):
         result = dict(row)
-        for name, kind in kinds.items():
+        for name, specification in specifications.items():
             if name not in row:
                 continue
+            kind, field_formats = _field_kind_and_formats(name, specification, date_formats, formats)
             raw = row[name]
             if kind in {"date", "datetime"}:
-                parsed = parse_date(raw)
+                parsed = parse_date(raw, formats=field_formats)
             elif kind in {"number", "numeric", "decimal"}:
                 parsed = parse_number(raw)
             else:
@@ -162,8 +251,28 @@ def normalize_rows(
             result[f"{name}{suffix}"] = parsed.value
             if not parsed.ok:
                 result[f"{name}{error_suffix}"] = parsed.error
-                failures.append({"row": row_number, "field": name, "raw": raw, "error": parsed.error})
-            lineage.append({"row": row_number, "field": name, "raw": raw, "normalized": parsed.value, "kind": kind, "ok": parsed.ok})
+                failures.append(
+                    {
+                        "row": row_number,
+                        "field": name,
+                        "raw": raw,
+                        "error": parsed.error,
+                        "attempts": list(parsed.attempts),
+                        "failures": list(parsed.failures),
+                    }
+                )
+            lineage.append(
+                {
+                    "row": row_number,
+                    "field": name,
+                    "raw": raw,
+                    "normalized": parsed.value,
+                    "kind": kind,
+                    "ok": parsed.ok,
+                    "attempts": list(parsed.attempts),
+                    "failures": list(parsed.failures),
+                }
+            )
         output.append(result)
     if not return_metadata:
         return output

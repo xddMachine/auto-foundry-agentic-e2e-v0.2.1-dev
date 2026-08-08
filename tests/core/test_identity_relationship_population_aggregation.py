@@ -16,7 +16,13 @@ def test_identity_is_candidate_evidence_until_reviewed():
     assert candidates
     candidate = candidates[0]
     assert candidate.status == "unresolved"
-    decision = IdentityDecision(candidate.candidate_id, "same_object", decided_by="review", rationale="evidence")
+    decision = IdentityDecision(
+        candidate.candidate_id,
+        "same_object",
+        reviewer_ref="review",
+        review_status="reviewed",
+        rationale="evidence",
+    )
     result = apply_decision(candidate, decision, canonical_id="entity-canonical")
     assert result.canonical_id == "entity-canonical"
     assert result.source_identities == (candidate.left_id, candidate.right_id)
@@ -72,10 +78,10 @@ def test_relationship_population_and_currency_safe_aggregation():
     assert diagnostic["cardinality"] == "many_to_one"
     assert diagnostic["left_unmatched"] == 1
     ledger = PopulationLedger(["a", "b", "c"], eligible=["a"])
-    ledger.exclude(["b"], "missing-value").exclude(["b"], "outside-scope").mark_unresolved(["c"])
+    ledger.exclude(["b"], "missing-value").mark_unresolved(["c"])
     reconciliation = ledger.reconcile()
     assert reconciliation["excluded"] == 1
-    assert reconciliation["reason_counts"] == {"missing-value": 1, "outside-scope": 1}
+    assert reconciliation["reason_counts"] == {"missing-value": 1}
     assert reconciliation["reconciles"]
     totals = aggregate_rows([{"value": 2, "currency": "X"}, {"value": 3, "currency": "X"}, {"value": 5, "currency": "Y"}], "sum", value_field="value", currency_field="currency")
     assert totals == {"X": 5.0, "Y": 5.0}

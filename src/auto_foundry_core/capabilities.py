@@ -25,19 +25,36 @@ def _required_roots(spec: OperationSpec, *, context: str = "catalog filesystem o
     return require_allowed_roots(_allowed_roots(spec), context=context)
 
 
-def _read_rows(value: Any, *, limit: int | None = None, allowed_roots=None) -> list[dict[str, Any]]:
+def _read_rows(
+    value: Any,
+    *,
+    limit: int | None = None,
+    offset: int = 0,
+    table: str | None = None,
+    max_json_bytes: int | None = None,
+    parquet_batch_size: int | None = None,
+    allowed_roots=None,
+) -> list[dict[str, Any]]:
+    read_options: dict[str, Any] = {"limit": limit, "offset": offset}
+    if table is not None:
+        read_options["table"] = table
+    if max_json_bytes is not None:
+        read_options["max_json_bytes"] = max_json_bytes
+    if parquet_batch_size is not None:
+        read_options["parquet_batch_size"] = parquet_batch_size
     if isinstance(value, list):
         return [dict(v) for v in value]
     if isinstance(value, tuple):
         return [dict(v) for v in value]
     if isinstance(value, Mapping) and "rows" in value:
         return [dict(v) for v in value["rows"]]
+    read_options["allowed_roots"] = require_allowed_roots(allowed_roots)
     if isinstance(value, Mapping) and "uri" in value:
         from .sources import read_rows
-        return read_rows(DataAssetRef.from_dict(value), limit=limit, allowed_roots=require_allowed_roots(allowed_roots))
+        return read_rows(DataAssetRef.from_dict(value), **read_options)
     if isinstance(value, (str, Path, DataAssetRef)):
         from .sources import read_rows
-        return read_rows(value, limit=limit, allowed_roots=require_allowed_roots(allowed_roots))
+        return read_rows(value, **read_options)
     raise TypeError("rows or a local source path is required")
 
 
@@ -60,7 +77,14 @@ def _register(spec: OperationSpec, output_dir: str | None, context: RunContext |
 
 def _preview(spec: OperationSpec, output_dir: str | None, context: RunContext | None = None) -> Any:
     from .sources import preview
-    return preview(_source(spec), limit=int(dict(spec.parameters).get("limit", 20)), allowed_roots=_required_roots(spec, context="sources.preview"))
+    parameters = dict(spec.parameters)
+    return preview(
+        _source(spec),
+        limit=int(parameters.get("limit", 20)),
+        max_json_bytes=int(parameters.get("max_json_bytes", 16 * 1024 * 1024)),
+        parquet_batch_size=int(parameters.get("parquet_batch_size", 1024)),
+        allowed_roots=_required_roots(spec, context="sources.preview"),
+    )
 
 
 def _profile(spec: OperationSpec, output_dir: str | None, context: RunContext | None = None) -> Any:
@@ -75,7 +99,14 @@ def _normalize(spec: OperationSpec, output_dir: str | None, context: RunContext 
     rows = p.get("rows")
     if rows is None:
         rows = _read_rows(_source(spec), limit=p.get("limit"), allowed_roots=_required_roots(spec, context="normalization.normalize"))
-    return normalize_rows(rows, fields=p.get("fields"), case=p.get("case", "lower"), return_metadata=bool(p.get("return_metadata", True)))
+    return normalize_rows(
+        rows,
+        fields=p.get("fields"),
+        case=p.get("case", "lower"),
+        date_formats=p.get("date_formats"),
+        formats=p.get("formats"),
+        return_metadata=bool(p.get("return_metadata", True)),
+    )
 
 
 def _identity_candidates(spec: OperationSpec, output_dir: str | None, context: RunContext | None = None) -> Any:
@@ -106,7 +137,30 @@ def _relationship(spec: OperationSpec, output_dir: str | None, context: RunConte
     left = p.get("left_rows", spec.inputs[0] if spec.inputs else None)
     right = p.get("right_rows", spec.inputs[1] if len(spec.inputs) > 1 else None)
     roots = _required_roots(spec, context="relationships.measure") if _is_path_reference(left, strings_are_paths=True) or _is_path_reference(right, strings_are_paths=True) else None
-    return measure_relationship(_read_rows(left, allowed_roots=roots), _read_rows(right, allowed_roots=roots), left_key=p["left_key"], right_key=p.get("right_key"), left_time_field=p.get("left_time_field"), right_time_field=p.get("right_time_field"))
+    return measure_relationship(
+        _read_rows(
+            left,
+            limit=p.get("left_limit"),
+            max_json_bytes=p.get("max_json_bytes"),
+            parquet_batch_size=p.get("parquet_batch_size"),
+            allowed_roots=roots,
+        ),
+        _read_rows(
+            right,
+            limit=p.get("right_limit"),
+            max_json_bytes=p.get("max_json_bytes"),
+            parquet_batch_size=p.get("parquet_batch_size"),
+            allowed_roots=roots,
+        ),
+        left_key=p["left_key"],
+        right_key=p.get("right_key"),
+        left_time_field=p.get("left_time_field"),
+        right_time_field=p.get("right_time_field"),
+        date_formats=p.get("date_formats"),
+        left_date_formats=p.get("left_date_formats"),
+        right_date_formats=p.get("right_date_formats"),
+        sample_limit=int(p.get("sample_limit", 20)),
+    )
 
 
 def _population(spec: OperationSpec, output_dir: str | None, context: RunContext | None = None) -> Any:
@@ -120,6 +174,9 @@ def _population(spec: OperationSpec, output_dir: str | None, context: RunContext
 def _aggregation(spec: OperationSpec, output_dir: str | None, context: RunContext | None = None) -> Any:
     from .aggregation import aggregate_rows
     p = dict(spec.parameters)
+    # Execution context roots are consumed by the reader, not by the
+    # aggregation contract itself.
+    p.pop("allowed_roots", None)
     rows = p.pop("rows", None)
     if rows is None:
         rows = _read_rows(_source(spec), allowed_roots=_required_roots(spec, context="aggregation.compute"))
@@ -187,13 +244,34 @@ def _descriptor(
 
 _PAIRS = [
     _descriptor("sources.register", "Register a local source and content hash.", "You need an immutable source reference.", "Do not use for remote access or source mutation.", {"path": "local path"}, {"type": "DataAssetRef"}, _register, examples=("register_source(path)",)),
-    _descriptor("sources.preview", "Read a bounded source preview and discovered columns.", "You need quick source orientation.", "Do not use as a complete unbounded read.", {"source": "DataAssetRef or local path", "limit": "integer"}, {"type": "preview mapping"}, _preview, examples=("preview(source, limit=20)",)),
+    _descriptor(
+        "sources.preview",
+        "Read a bounded source preview and discovered columns.",
+        "You need quick source orientation.",
+        "Do not use as a complete unbounded read.",
+        {"source": "DataAssetRef or local path", "limit": "integer"},
+        {"type": "preview mapping"},
+        _preview,
+        examples=("preview(source, limit=20)",),
+        metadata={
+            "bounded_formats": {
+                "csv": "streamed rows; only returned slice is materialized",
+                "tsv": "streamed rows; only returned slice is materialized",
+                "jsonl": "streamed lines; only returned slice is materialized",
+                "xlsx": "openpyxl read-only row iterator; only returned slice is materialized",
+                "parquet": "pyarrow ParquetFile.iter_batches; bounded batches and returned slice",
+                "json": "whole document materialized only after max_json_bytes boundary",
+            },
+            "unsupported_formats": ("xls",),
+            "json_materialization_default_max_bytes": 16 * 1024 * 1024,
+        },
+    ),
     _descriptor("profiling.profile", "Produce bounded schema and value diagnostics.", "You need question-supporting source facts.", "Do not treat this as a semantic quality or business decision.", {"source": "DataAssetRef or local path"}, {"type": "profile mapping"}, _profile, examples=("profile_source(source, sample_limit=1000)",)),
-    _descriptor("normalization.normalize", "Add provenance-preserving normalized representations.", "Formatting and parse preparation is needed.", "Do not overwrite raw values or infer identity.", {"rows": "sequence of mappings", "fields": "field to kind"}, {"type": "rows plus lineage"}, _normalize, examples=("normalize_rows(rows, fields={'code': 'identifier'})",)),
+    _descriptor("normalization.normalize", "Add provenance-preserving normalized representations.", "Formatting and parse preparation is needed.", "Do not overwrite raw values or infer identity.", {"rows": "sequence of mappings", "fields": "field to kind", "date_formats": "explicit field formats"}, {"type": "rows plus lineage"}, _normalize, examples=("normalize_rows(rows, fields={'code': 'identifier'})",)),
     _descriptor("identity.candidates", "Generate object-generic identity evidence and contradictions.", "Reviewed identity work needs deterministic candidate facts.", "Do not use a similarity score as an automatic merge.", {"left_rows": "mappings", "right_rows": "mappings"}, {"type": "IdentityCandidate list"}, _identity_candidates, limitations=("Semantic identity decisions remain outside this capability.",), examples=("generate_candidates(left_rows, right_rows, compare_fields=['label'])",)),
     _descriptor("identity.apply-decision", "Apply an explicit identity decision to a derived mapping.", "A reviewed decision is available.", "Do not call without a reviewed semantic decision.", {"candidate": "IdentityCandidate", "decision": "IdentityDecision"}, {"type": "CanonicalMapping and optional derived rows"}, _identity_apply, examples=("apply_decision(candidate, reviewed_decision)",)),
-    _descriptor("relationships.measure", "Measure generic key overlap, coverage, cardinality and temporal diagnostics.", "You need relationship evidence.", "Do not infer business meaning from diagnostics alone.", {"left_rows": "mappings", "right_rows": "mappings", "left_key": "field"}, {"type": "relationship diagnostic mapping"}, _relationship, examples=("measure_relationship(left, right, left_key='key')",), metadata={"search_terms": ("join", "coverage", "overlap")}),
-    _descriptor("populations.reconcile", "Reconcile base, eligible, excluded and unresolved accounting.", "A requirement-scoped population ledger is needed.", "Do not promote a scoped denominator as universal preparation.", {"base": "IDs or count", "excluded": "reason to IDs"}, {"type": "reconciliation mapping"}, _population, examples=("PopulationLedger(base_ids).reconcile()",)),
+    _descriptor("relationships.measure", "Measure generic key overlap, coverage, cardinality and full matched-set temporal diagnostics with a bounded pair sample.", "You need relationship evidence.", "Do not infer business meaning from diagnostics alone.", {"left_rows": "mappings", "right_rows": "mappings", "left_key": "field", "date_formats": "explicit formats"}, {"type": "relationship diagnostic mapping"}, _relationship, examples=("measure_relationship(left, right, left_key='key')",), metadata={"search_terms": ("join", "coverage", "overlap"), "temporal_scope": "full matched set; sample_pairs is bounded"}),
+    _descriptor("populations.reconcile", "Reconcile base IDs, eligible, excluded and unresolved accounting exactly once.", "A requirement-scoped population ledger is needed.", "Do not pass an integer count as base; ID reconciliation is required.", {"base": "iterable of IDs", "excluded": "reason to IDs"}, {"type": "reconciliation mapping"}, _population, examples=("PopulationLedger(base_ids).reconcile()",)),
     _descriptor("aggregation.compute", "Compute generic count, distinct, numeric, grouping, ranking and period operations.", "Typed generic aggregation fits the task.", "Do not use for domain recipes or cross-currency conversion.", {"rows": "mappings", "operation": "AggregationSpec operation"}, {"type": "scalar/list/mapping"}, _aggregation, examples=("aggregate_rows(rows, 'sum', value_field='amount')",)),
     _descriptor("artifacts.write", "Write a deterministic derived artifact and result hash.", "A generic local output is required.", "Do not mutate raw sources.", {"data": "JSON-compatible data", "filename": "relative output name"}, {"type": "OperationResultRef"}, _artifact, cache_behavior="Result can be cached when source/spec hashes are stable.", examples=("write_artifact(rows, output_path)",)),
     _descriptor("artifacts.reproduce", "Compare expected and actual deterministic result fingerprints.", "A prior manifest/result needs reproduction evidence.", "Do not use for lifecycle state or semantic review.", {"expected": "result", "actual": "result"}, {"type": "comparison mapping"}, _reproduce, examples=("compare_results(expected, actual)",)),

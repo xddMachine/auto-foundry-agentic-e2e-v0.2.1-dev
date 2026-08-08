@@ -13,8 +13,9 @@ from .contracts import DataAssetRef, DocumentRef, TableRef
 from .workspace import validate_allowed_path
 
 
-TABULAR_FORMATS = frozenset({"csv", "tsv", "json", "jsonl", "ndjson", "xlsx", "xls", "parquet"})
+TABULAR_FORMATS = frozenset({"csv", "tsv", "json", "jsonl", "ndjson", "xlsx", "parquet"})
 TEXT_FORMATS = frozenset({"txt", "md", "markdown", "rst", "html", "htm", "xml", "log"})
+DEFAULT_JSON_MAX_BYTES = 16 * 1024 * 1024
 
 
 def hash_file(
@@ -118,7 +119,9 @@ def discover(
     asset = _asset(source, allowed_roots)
     path = Path(asset.uri)
     fmt = asset.format or _format(path)
-    if fmt in {"xlsx", "xls"}:
+    if fmt == "xls":
+        raise ValueError("unsupported source format: xls; use xlsx or convert the workbook explicitly")
+    if fmt == "xlsx":
         workbook = _openpyxl().load_workbook(path, read_only=True, data_only=True)
         try:
             return [TableRef(asset=asset, name=str(name), kind="sheet") for name in workbook.sheetnames]
@@ -135,7 +138,7 @@ def _rows_csv(path: Path, *, delimiter: str = ",") -> Iterator[dict[str, Any]]:
             yield dict(row)
 
 
-def _rows_json(path: Path, fmt: str) -> Iterator[dict[str, Any]]:
+def _rows_json(path: Path, fmt: str, *, max_bytes: int = DEFAULT_JSON_MAX_BYTES) -> Iterator[dict[str, Any]]:
     if fmt == "jsonl":
         with path.open("r", encoding="utf-8-sig") as stream:
             for line_number, line in enumerate(stream, 1):
@@ -144,6 +147,13 @@ def _rows_json(path: Path, fmt: str) -> Iterator[dict[str, Any]]:
                 value = json.loads(line)
                 yield value if isinstance(value, dict) else {"value": value, "_line": line_number}
         return
+    if max_bytes < 0:
+        raise ValueError("max_json_bytes cannot be negative")
+    size_bytes = path.stat().st_size
+    if size_bytes > max_bytes:
+        raise ValueError(
+            f"ordinary JSON materialization boundary exceeded: {size_bytes} bytes > {max_bytes} max_json_bytes"
+        )
     with path.open("r", encoding="utf-8-sig") as stream:
         value = json.load(stream)
     if isinstance(value, dict):
@@ -177,9 +187,21 @@ def _rows_excel(path: Path, sheet: str | None = None) -> Iterator[dict[str, Any]
         workbook.close()
 
 
-def _rows_parquet(path: Path) -> Iterator[dict[str, Any]]:
-    table = _pyarrow().read_table(path)
-    yield from table.to_pylist()
+def _rows_parquet(path: Path, *, batch_size: int = 1024) -> Iterator[dict[str, Any]]:
+    if batch_size <= 0:
+        raise ValueError("parquet_batch_size must be positive")
+    parquet = _pyarrow().ParquetFile(path)
+    # iter_batches reads one bounded batch at a time.  In particular, this
+    # avoids pyarrow.read_table(), which materializes every row group before
+    # read_rows can apply offset/limit.
+    for batch in parquet.iter_batches(batch_size=batch_size):
+        yield from batch.to_pylist()
+
+
+def _rows_text(path: Path) -> Iterator[dict[str, Any]]:
+    with path.open("r", encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            yield {"text": line.rstrip("\n")}
 
 
 def read_rows(
@@ -188,6 +210,8 @@ def read_rows(
     table: str | None = None,
     limit: int | None = None,
     offset: int = 0,
+    max_json_bytes: int = DEFAULT_JSON_MAX_BYTES,
+    parquet_batch_size: int = 1024,
     allowed_roots: Iterable[str | Path] | None = None,
 ) -> list[dict[str, Any]]:
     """Read at most ``limit`` records, materializing only the bounded slice."""
@@ -208,13 +232,15 @@ def read_rows(
     elif fmt == "tsv":
         rows = _rows_csv(path, delimiter="\t")
     elif fmt in {"json", "jsonl"}:
-        rows = _rows_json(path, fmt)
-    elif fmt in {"xlsx", "xls"}:
+        rows = _rows_json(path, fmt, max_bytes=max_json_bytes)
+    elif fmt == "xlsx":
         rows = _rows_excel(path, table)
+    elif fmt == "xls":
+        raise ValueError("unsupported source format: xls; use xlsx or convert the workbook explicitly")
     elif fmt == "parquet":
-        rows = _rows_parquet(path)
+        rows = _rows_parquet(path, batch_size=parquet_batch_size)
     elif fmt in TEXT_FORMATS:
-        rows = ({"text": line.rstrip("\n")} for line in path.open("r", encoding="utf-8", errors="replace"))
+        rows = _rows_text(path)
     else:
         raise ValueError(f"unsupported source format: {fmt}")
     output: list[dict[str, Any]] = []
@@ -231,6 +257,8 @@ def preview(
     source: DataAssetRef | TableRef | str | Path,
     *,
     limit: int = 20,
+    max_json_bytes: int = DEFAULT_JSON_MAX_BYTES,
+    parquet_batch_size: int = 1024,
     allowed_roots: Iterable[str | Path] | None = None,
 ) -> dict[str, Any]:
     """Return a bounded, JSON-serializable source preview."""
@@ -242,7 +270,13 @@ def preview(
         ref = _asset(asset, allowed_roots)
     else:
         ref = _asset(asset, allowed_roots)
-    rows = read_rows(source, limit=limit, allowed_roots=allowed_roots)
+    rows = read_rows(
+        source,
+        limit=limit,
+        max_json_bytes=max_json_bytes,
+        parquet_batch_size=parquet_batch_size,
+        allowed_roots=allowed_roots,
+    )
     columns: list[str] = []
     for row in rows:
         for key in row:
@@ -261,4 +295,16 @@ register = register_source
 read = read_rows
 source_hash = hash_file
 
-__all__ = ["TABULAR_FORMATS", "discover", "hash_file", "preview", "read", "read_rows", "register", "register_document", "register_source", "source_hash"]
+__all__ = [
+    "DEFAULT_JSON_MAX_BYTES",
+    "TABULAR_FORMATS",
+    "discover",
+    "hash_file",
+    "preview",
+    "read",
+    "read_rows",
+    "register",
+    "register_document",
+    "register_source",
+    "source_hash",
+]
