@@ -13,7 +13,7 @@ import hashlib
 import json
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, ClassVar, Iterable, Mapping, Sequence
+from typing import Any, ClassVar, Iterable, Literal, Mapping, Sequence
 
 
 def _freeze(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
@@ -46,6 +46,41 @@ class ContractMixin:
     @classmethod
     def from_json(cls, text: str):
         return cls.from_dict(json.loads(text))
+
+
+LEMNamespace = Literal["ontology", "prepared_asset", "canonical_mapping", "knowledge_delta"]
+
+
+@dataclass(frozen=True)
+class LEMRef(ContractMixin):
+    """A namespace-qualified reference into one run-local LEM registry.
+
+    The object id is deliberately not resolved here.  Resolution belongs to
+    :class:`LivingEnterpriseModel`, where the declared namespace is enforced
+    and identical text ids in different registries remain unambiguous.
+    """
+
+    namespace: LEMNamespace
+    object_id: str
+
+    NAMESPACES: ClassVar[frozenset[str]] = frozenset({
+        "ontology", "prepared_asset", "canonical_mapping", "knowledge_delta",
+    })
+
+    def __post_init__(self) -> None:
+        namespace = str(self.namespace).strip()
+        if namespace not in self.NAMESPACES:
+            raise ValueError(f"unsupported LEM namespace: {namespace!r}")
+        object.__setattr__(self, "namespace", namespace)
+        object.__setattr__(self, "object_id", _require(self.object_id, "LEM object_id"))
+
+    @property
+    def id(self) -> str:
+        return self.object_id
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "LEMRef":
+        return cls(namespace=data["namespace"], object_id=data["object_id"])
 
 
 def _require(value: str, label: str) -> str:
@@ -471,6 +506,17 @@ class PreparedAssetDescriptor(ContractMixin):
     creation_requirement: str | None = None
     status: str = "active"
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    # Integrity and provenance fields are part of the descriptor rather than
+    # an external cache key.  This keeps prepared-asset reuse run-local and
+    # makes a descriptor sufficient to verify a materialized output.
+    prepared_content_hash: str | None = None
+    operation_manifest_hash: str | None = None
+    core_version: str | None = None
+    row_count: int | None = None
+    byte_count: int | None = None
+    created_at: str | None = None
+    as_of: str | None = None
+    effective_period: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "prepared_asset_id", _require(self.prepared_asset_id, "prepared_asset_id"))
@@ -482,6 +528,23 @@ class PreparedAssetDescriptor(ContractMixin):
             object.__setattr__(self, name, tuple(str(v) for v in getattr(self, name)))
         object.__setattr__(self, "lineage", _freeze(self.lineage))
         object.__setattr__(self, "metadata", _freeze(self.metadata))
+        for name in ("prepared_content_hash", "operation_manifest_hash"):
+            value = getattr(self, name)
+            if value is not None:
+                value = _require(value, name).lower()
+                if len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+                    raise ValueError(f"{name} must be a SHA-256 hex digest")
+                object.__setattr__(self, name, value)
+        for name in ("row_count", "byte_count"):
+            value = getattr(self, name)
+            if value is not None:
+                if isinstance(value, bool) or int(value) != value or value < 0:
+                    raise ValueError(f"{name} must be a non-negative integer")
+                object.__setattr__(self, name, int(value))
+        for name in ("core_version", "created_at", "as_of", "effective_period"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _require(value, name))
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "PreparedAssetDescriptor":
@@ -495,14 +558,14 @@ class KnowledgeDelta(ContractMixin):
     payload: Mapping[str, Any] = field(default_factory=dict)
     evidence_refs: tuple[str, ...] = ()
     conflicts_with: tuple[str, ...] = ()
-    supersedes: tuple[str, ...] = ()
+    supersedes: tuple[LEMRef, ...] = ()
     reviewer_note: str | None = None
     accepted: bool = False
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     ALLOWED_OPERATIONS: ClassVar[frozenset[str]] = frozenset({
         "add_ontology_item", "extend_ontology_item", "add_alias", "add_canonical_mapping",
-        "add_relationship", "add_metric", "add_definition", "add_rule", "add_process",
+        "add_relationship", "add_metric", "add_definition", "add_rule", "add_process", "add_event", "add_dimension",
         "add_prepared_asset", "extend_prepared_asset", "record_limitation", "record_conflict",
         "supersede", "no_change",
     })
@@ -512,10 +575,23 @@ class KnowledgeDelta(ContractMixin):
         object.__setattr__(self, "operation", _require(self.operation, "operation"))
         if self.operation not in self.ALLOWED_OPERATIONS:
             raise ValueError(f"unsupported knowledge delta operation: {self.operation}")
-        object.__setattr__(self, "payload", _freeze(self.payload))
+        payload = dict(self.payload or {})
+        legacy_targets = {"item_ids", "ontology_item_ids", "prepared_asset_ids"}
+        present_legacy = sorted(legacy_targets.intersection(payload))
+        if present_legacy:
+            raise ValueError("knowledge delta target IDs must be typed LEMRef.supersedes; legacy payload keys: " + ", ".join(present_legacy))
+        object.__setattr__(self, "payload", _freeze(payload))
         object.__setattr__(self, "evidence_refs", _tuple_values(self.evidence_refs))
         object.__setattr__(self, "conflicts_with", _tuple_values(self.conflicts_with))
-        object.__setattr__(self, "supersedes", _tuple_values(self.supersedes))
+        typed_refs: list[LEMRef] = []
+        for target in (self.supersedes or ()):
+            if isinstance(target, LEMRef):
+                typed_refs.append(target)
+            elif isinstance(target, Mapping):
+                typed_refs.append(LEMRef.from_dict(target))
+            else:
+                raise TypeError("KnowledgeDelta.supersedes accepts LEMRef values only")
+        object.__setattr__(self, "supersedes", tuple(typed_refs))
         object.__setattr__(self, "metadata", _freeze(self.metadata))
 
     @classmethod
@@ -572,17 +648,33 @@ class IdentityCandidate(ContractMixin):
 
 @dataclass(frozen=True)
 class IdentityDecision(ContractMixin):
+    """One reviewed, content-addressed identity decision.
+
+    ``candidate_id`` and ``decision`` remain the first two positional fields;
+    all review-trace fields are explicit and there is exactly one reviewer
+    reference.  A caller may provide a stable ``decision_id``; otherwise it
+    is derived deterministically from the decision subject and semantics.
+    """
+
     candidate_id: str
     decision: str
-    decided_by: str | None = None
-    rationale: str = ""
+    decision_id: str | None = None
+    review_status: str = "pending"
+    reviewer_ref: str | None = None
     evidence_refs: tuple[str, ...] = ()
+    rationale: str = ""
+    scope: str | None = None
+    limitations: tuple[str, ...] = ()
     canonical_id: str | None = None
+    decision_hash: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     VOCABULARY: ClassVar[frozenset[str]] = frozenset({
         "same_object", "different_objects", "possible_match", "insufficient_evidence",
         "version_of", "parent_child", "alternate_representation",
+    })
+    REVIEW_STATUSES: ClassVar[frozenset[str]] = frozenset({
+        "pending", "reviewed", "accepted", "rejected",
     })
 
     def __post_init__(self) -> None:
@@ -590,7 +682,43 @@ class IdentityDecision(ContractMixin):
         object.__setattr__(self, "decision", _require(self.decision, "decision"))
         if self.decision not in self.VOCABULARY:
             raise ValueError(f"unsupported identity decision: {self.decision}")
-        object.__setattr__(self, "evidence_refs", _tuple_values(self.evidence_refs))
+        status = _require(self.review_status, "review_status").lower()
+        if status not in self.REVIEW_STATUSES:
+            raise ValueError(f"unsupported identity review_status: {status}")
+        object.__setattr__(self, "review_status", status)
+        if self.reviewer_ref is not None:
+            object.__setattr__(self, "reviewer_ref", _require(self.reviewer_ref, "reviewer_ref"))
+        if self.decision_id is None:
+            seed = json.dumps({
+                "candidate_id": self.candidate_id,
+                "decision": self.decision,
+                "scope": self.scope,
+                "reviewer_ref": self.reviewer_ref,
+            }, sort_keys=True, separators=(",", ":"))
+            object.__setattr__(self, "decision_id", "decision-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:20])
+        else:
+            object.__setattr__(self, "decision_id", _require(self.decision_id, "decision_id"))
+        evidence_refs = (self.evidence_refs,) if isinstance(self.evidence_refs, str) else _tuple_values(self.evidence_refs)
+        object.__setattr__(self, "evidence_refs", tuple(str(value) for value in evidence_refs))
+        object.__setattr__(self, "rationale", str(self.rationale or ""))
+        if self.scope is not None:
+            object.__setattr__(self, "scope", _require(self.scope, "scope"))
+        limitations = (self.limitations,) if isinstance(self.limitations, str) else self.limitations
+        object.__setattr__(self, "limitations", tuple(str(v) for v in limitations))
+        trace = {
+            "decision_id": self.decision_id,
+            "candidate_id": self.candidate_id,
+            "decision": self.decision,
+            "review_status": self.review_status,
+            "reviewer_ref": self.reviewer_ref,
+            "evidence_refs": list(self.evidence_refs),
+            "rationale": self.rationale,
+            "scope": self.scope,
+            "limitations": list(self.limitations),
+            "canonical_id": self.canonical_id,
+        }
+        digest = hashlib.sha256(json.dumps(trace, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
+        object.__setattr__(self, "decision_hash", digest)
         object.__setattr__(self, "metadata", _freeze(self.metadata))
 
     @classmethod
@@ -607,14 +735,22 @@ class CanonicalMapping(ContractMixin):
     status: str = "accepted"
     aliases: tuple[str, ...] = ()
     limitations: tuple[str, ...] = ()
+    scope: str | None = None
+    effective_period: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for name in ("canonical_id", "object_type", "decision_id"):
             object.__setattr__(self, name, _require(getattr(self, name), name))
-        object.__setattr__(self, "source_identities", _tuple_values(self.source_identities))
-        object.__setattr__(self, "aliases", _tuple_values(self.aliases))
+        source_identities = (self.source_identities,) if isinstance(self.source_identities, str) else _tuple_values(self.source_identities)
+        aliases = (self.aliases,) if isinstance(self.aliases, str) else _tuple_values(self.aliases)
+        object.__setattr__(self, "source_identities", tuple(str(value) for value in source_identities))
+        object.__setattr__(self, "aliases", tuple(str(value) for value in aliases))
         object.__setattr__(self, "limitations", _tuple_values(self.limitations))
+        if self.scope is not None:
+            object.__setattr__(self, "scope", _require(self.scope, "scope"))
+        if self.effective_period is not None:
+            object.__setattr__(self, "effective_period", _require(self.effective_period, "effective_period"))
         object.__setattr__(self, "metadata", _freeze(self.metadata))
 
     @classmethod
@@ -719,8 +855,11 @@ class AggregationSpec(ContractMixin):
     operation: str
     value_field: str | None = None
     group_by: tuple[str, ...] = ()
-    distinct: bool = False
     period_field: str | None = None
+    period_order: tuple[str, ...] = ()
+    # Share/rate semantics are explicit values, matching aggregate_rows.
+    numerator: Any = None
+    denominator: Any = None
     currency_field: str | None = None
     ranking_order: str = "desc"
     limit: int | None = None
@@ -736,4 +875,15 @@ class AggregationSpec(ContractMixin):
         if self.operation not in self.ALLOWED:
             raise ValueError(f"unsupported aggregation operation: {self.operation}")
         object.__setattr__(self, "group_by", _tuple_values(self.group_by))
+        object.__setattr__(self, "period_order", tuple(str(v) for v in self.period_order))
+        if self.operation == "period_comparison" and (not self.period_field or not self.period_order):
+            raise ValueError("period_comparison requires period_field and explicit period_order")
+        parameters = self.parameters or {}
+        if self.operation in {"share", "rate"}:
+            has_numerator = self.numerator is not None or parameters.get("numerator") is not None
+            has_denominator = self.denominator is not None or parameters.get("denominator") is not None
+            if not (has_numerator and has_denominator):
+                raise ValueError(f"{self.operation} requires explicit numerator and denominator semantics")
+        if self.limit is not None and (isinstance(self.limit, bool) or self.limit < 0):
+            raise ValueError("aggregation limit cannot be negative")
         object.__setattr__(self, "parameters", _freeze(self.parameters))

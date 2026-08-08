@@ -129,28 +129,46 @@ def apply_decision(
 
     if decision.candidate_id != candidate.candidate_id:
         raise ValueError("identity decision does not refer to candidate")
-    if decision.decision in {"same_object", "alternate_representation"} and not str(decision.decided_by or "").strip():
-        raise ValueError("a reviewed actor (decided_by) is required for a merge-producing identity decision")
+    merge_decision = decision.decision in {"same_object", "alternate_representation"}
+    reviewed = decision.review_status in {"reviewed", "accepted"} and bool(str(decision.reviewer_ref or "").strip())
+    if merge_decision and not reviewed:
+        raise ValueError("a reviewed reviewer_ref and review_status are required for a merge-producing identity decision")
     selected = canonical_id or decision.canonical_id
-    if decision.decision in {"same_object", "alternate_representation"}:
+    reviewed_trace = {
+        "decision_id": decision.decision_id,
+        "decision_hash": decision.decision_hash,
+        "candidate_id": decision.candidate_id,
+        "decision": decision.decision,
+        "review_status": decision.review_status,
+        "reviewer_ref": decision.reviewer_ref,
+        "evidence_refs": list(decision.evidence_refs),
+        "rationale": decision.rationale,
+        "scope": decision.scope,
+        "limitations": list(decision.limitations),
+    }
+    if merge_decision:
         selected = selected or "obj-" + hashlib.sha256(f"{candidate.object_type}\0{candidate.left_id}\0{candidate.right_id}".encode()).hexdigest()[:16]
         mapping = CanonicalMapping(
             canonical_id=selected,
             object_type=candidate.object_type,
             source_identities=(candidate.left_id, candidate.right_id),
-            decision_id=decision.candidate_id,
+            decision_id=decision.decision_id,
             aliases=(candidate.left_id, candidate.right_id),
-            limitations=("Derived from reviewed decision; raw identities remain preserved.",),
+            limitations=("Derived from reviewed decision; raw identities remain preserved.", *decision.limitations),
+            scope=decision.scope,
+            metadata={"reviewed_trace": reviewed_trace},
         )
     else:
         mapping = CanonicalMapping(
             canonical_id=selected or f"unresolved:{candidate.candidate_id}",
             object_type=candidate.object_type,
             source_identities=(candidate.left_id, candidate.right_id),
-            decision_id=decision.candidate_id,
+            decision_id=decision.decision_id,
             status=decision.decision,
             aliases=(candidate.left_id, candidate.right_id),
-            limitations=("No canonical merge was applied.",),
+            limitations=("No canonical merge was applied.", *decision.limitations),
+            scope=decision.scope,
+            metadata={"reviewed_trace": reviewed_trace},
         )
     if rows is None:
         return mapping
