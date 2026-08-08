@@ -17,7 +17,15 @@ from typing import Any, ClassVar, Iterable, Literal, Mapping, Sequence
 
 
 def _freeze(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
-    return MappingProxyType(dict(value or {}))
+    raw = dict(value or {})
+    # Explicit references nested in metadata/properties must regain their
+    # typed objects on contract construction.  Ordinary mappings are copied
+    # unchanged by the recursive helper; field names never trigger inference.
+    from .references import decode_reference_value
+    decoded = decode_reference_value(raw)
+    if not isinstance(decoded, Mapping):
+        raise TypeError("contract mapping field must remain a mapping")
+    return MappingProxyType(dict(decoded))
 
 
 def _jsonable(value: Any) -> Any:

@@ -51,7 +51,9 @@ from .references import (
     OPERATION_RESULT_REFERENCE,
     REFERENCE_DISCRIMINATOR,
     decode_explicit_reference,
+    decode_reference_value,
     encode_explicit_reference,
+    encode_reference_value,
     is_explicit_reference_mapping,
 )
 
@@ -73,5 +75,6 @@ __all__ = [
     "profile_source", "read_rows", "register_source", "reproduce",
     "write_artifact", "write_manifest", "require_allowed_roots",
     "DATA_ASSET_REFERENCE", "OPERATION_RESULT_REFERENCE", "REFERENCE_DISCRIMINATOR",
-    "decode_explicit_reference", "encode_explicit_reference", "is_explicit_reference_mapping",
+    "decode_explicit_reference", "decode_reference_value", "encode_explicit_reference",
+    "encode_reference_value", "is_explicit_reference_mapping",
 ]

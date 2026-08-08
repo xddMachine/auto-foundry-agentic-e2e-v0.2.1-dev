@@ -52,6 +52,16 @@ def _manifest_hash(item: Any, *, allowed_roots, context: str, run_context: RunCo
         return _manifest_path_hash(item.location, allowed_roots=roots, context=context)
     if isinstance(item, Path):
         return _manifest_path_hash(item, allowed_roots=allowed_roots, context=context)
+    if isinstance(item, (list, tuple)):
+        if _contains_manifest_file_ref(item):
+            # Normalize every collection member when any member is a file
+            # reference.  Reproduction uses the same traversal so mixed
+            # business-data/reference collections reproduce deterministically.
+            return hash_value([
+                _manifest_hash(value, allowed_roots=allowed_roots, context=context, run_context=run_context)
+                for value in item
+            ])
+        return hash_value(item)
     if isinstance(item, Mapping):
         if is_explicit_reference_mapping(item):
             return _manifest_hash(decode_explicit_reference(item), allowed_roots=allowed_roots, context=context, run_context=run_context)

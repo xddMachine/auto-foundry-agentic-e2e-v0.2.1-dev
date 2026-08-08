@@ -58,6 +58,17 @@ def _contains_file_ref(value: Any) -> bool:
     return False
 
 
+def _is_file_reference_value(value: Any) -> bool:
+    """Identify one top-level output reference for multi-output manifests."""
+
+    if isinstance(value, (Path, DataAssetRef, OperationResultRef)):
+        return True
+    if isinstance(value, Mapping) and is_explicit_reference_mapping(value):
+        decode_explicit_reference(value)  # validate malformed/unknown tags
+        return True
+    return False
+
+
 def compare_results(expected: Any, actual: Any, *, allowed_roots=None, context: RunContext | None = None) -> dict[str, Any]:
     expected_hash = _fingerprint(expected, allowed_roots=allowed_roots, context=context)
     actual_hash = _fingerprint(actual, allowed_roots=allowed_roots, context=context)
@@ -87,10 +98,7 @@ def reproduce(
     expected = manifest.get("output_hashes", [])
     if isinstance(actual, (Path, DataAssetRef, OperationResultRef)):
         actual_hashes = [_fingerprint(actual, allowed_roots=allowed_roots, context=context)]
-    elif isinstance(actual, (list, tuple)) and actual and all(
-        isinstance(v, (Path, DataAssetRef, OperationResultRef))
-        for v in actual
-    ):
+    elif isinstance(actual, (list, tuple)) and actual and all(_is_file_reference_value(v) for v in actual):
         actual_hashes = [_fingerprint(v, allowed_roots=allowed_roots, context=context) for v in actual]
     else:
         actual_hashes = [_fingerprint(actual, allowed_roots=allowed_roots, context=context)]

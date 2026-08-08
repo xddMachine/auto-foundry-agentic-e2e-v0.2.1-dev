@@ -10,6 +10,8 @@ create a contracts import cycle.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 
 
@@ -67,9 +69,15 @@ def decode_explicit_reference(value: Mapping[str, Any]) -> Any:
     from .contracts import DataAssetRef, OperationResultRef
 
     if tag == DATA_ASSET_REFERENCE:
-        return DataAssetRef(**_payload(value, expected=DATA_ASSET_REFERENCE, fields=_DATA_ASSET_FIELDS))
+        payload = _payload(value, expected=DATA_ASSET_REFERENCE, fields=_DATA_ASSET_FIELDS)
+        if "metadata" in payload:
+            payload["metadata"] = decode_reference_value(payload["metadata"])
+        return DataAssetRef(**payload)
     if tag == OPERATION_RESULT_REFERENCE:
-        return OperationResultRef(**_payload(value, expected=OPERATION_RESULT_REFERENCE, fields=_OPERATION_RESULT_FIELDS))
+        payload = _payload(value, expected=OPERATION_RESULT_REFERENCE, fields=_OPERATION_RESULT_FIELDS)
+        if "metadata" in payload:
+            payload["metadata"] = decode_reference_value(payload["metadata"])
+        return OperationResultRef(**payload)
     raise ValueError(f"unknown {REFERENCE_DISCRIMINATOR} value: {tag!r}")
 
 
@@ -84,7 +92,7 @@ def encode_explicit_reference(ref: Any) -> dict[str, Any]:
             "format": ref.format,
             "content_hash": ref.content_hash,
             "size_bytes": ref.size_bytes,
-            "metadata": dict(ref.metadata),
+            "metadata": encode_reference_value(ref.metadata),
         }
         return {REFERENCE_DISCRIMINATOR: DATA_ASSET_REFERENCE, **payload}
     if isinstance(ref, OperationResultRef):
@@ -93,10 +101,49 @@ def encode_explicit_reference(ref: Any) -> dict[str, Any]:
             "content_hash": ref.content_hash,
             "format": ref.format,
             "rows": ref.rows,
-            "metadata": dict(ref.metadata),
+            "metadata": encode_reference_value(ref.metadata),
         }
         return {REFERENCE_DISCRIMINATOR: OPERATION_RESULT_REFERENCE, **payload}
     raise TypeError(f"cannot encode unsupported reference type: {type(ref).__name__}")
+
+
+def encode_reference_value(value: Any) -> Any:
+    """Recursively encode typed or explicitly tagged references.
+
+    Ordinary mappings are traversed without interpreting field names.  A
+    reserved discriminator is validated and canonicalized; malformed tags
+    therefore fail rather than silently becoming analytical data.
+    """
+
+    from .contracts import DataAssetRef, OperationResultRef
+
+    if isinstance(value, (DataAssetRef, OperationResultRef)):
+        return encode_explicit_reference(value)
+    if isinstance(value, Mapping):
+        if is_explicit_reference_mapping(value):
+            return encode_explicit_reference(decode_explicit_reference(value))
+        return {str(key): encode_reference_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list, set, frozenset)):
+        return [encode_reference_value(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return value
+
+
+def decode_reference_value(value: Any) -> Any:
+    """Recursively restore typed references from explicit serialized values."""
+
+    if isinstance(value, Mapping):
+        if is_explicit_reference_mapping(value):
+            return decode_explicit_reference(value)
+        return {key: decode_reference_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [decode_reference_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(decode_reference_value(item) for item in value)
+    return value
 
 
 def is_data_asset_mapping(value: Any) -> bool:
@@ -121,7 +168,9 @@ __all__ = [
     "OPERATION_RESULT_REFERENCE",
     "REFERENCE_DISCRIMINATOR",
     "decode_explicit_reference",
+    "decode_reference_value",
     "encode_explicit_reference",
+    "encode_reference_value",
     "is_data_asset_mapping",
     "is_explicit_reference_mapping",
 ]

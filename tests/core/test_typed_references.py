@@ -34,17 +34,32 @@ def _digest(path: Path) -> str:
 
 
 def test_reference_contracts_are_explicit_and_round_trip_nested() -> None:
-    asset = DataAssetRef(uri="inputs/orders.csv", format="csv")
+    child_asset = DataAssetRef(uri="inputs/child.csv", format="csv")
+    asset = DataAssetRef(
+        uri="inputs/orders.csv",
+        format="csv",
+        metadata={"child": child_asset, "ordinary": {"uri": "segment-a", "location": "Berlin"}},
+    )
     result = OperationResultRef(location="products/result.json", format="json")
 
     encoded_asset = asset.to_dict()
     encoded_result = result.to_dict()
     assert encoded_asset["__auto_foundry_ref__"] == "data_asset"
+    assert encoded_asset["metadata"]["child"]["__auto_foundry_ref__"] == "data_asset"
+    assert encoded_asset["metadata"]["ordinary"] == {"uri": "segment-a", "location": "Berlin"}
     assert encoded_result["__auto_foundry_ref__"] == "operation_result"
     assert DataAssetRef.from_json(asset.to_json()) == asset
     assert OperationResultRef.from_json(result.to_json()) == result
     assert decode_explicit_reference(encoded_asset) == asset
     assert decode_explicit_reference(encoded_result) == result
+    restored = DataAssetRef.from_json(asset.to_json())
+    assert isinstance(restored.metadata["child"], DataAssetRef)
+    assert restored.metadata["child"] == child_asset
+    enclosing = OperationResultRef(location="outer.json", metadata={"asset": asset})
+    restored_enclosing = OperationResultRef.from_json(enclosing.to_json())
+    assert isinstance(restored_enclosing.metadata["asset"], DataAssetRef)
+    assert isinstance(restored_enclosing.metadata["asset"].metadata["child"], DataAssetRef)
+    json.dumps(enclosing.to_dict())
 
     nested = OperationSpec(
         "artifacts.reproduce",
@@ -143,6 +158,67 @@ def test_explicit_refs_resolve_hash_and_respect_input_and_run_roots(tmp_path: Pa
             capability_id="artifacts.write",
             operation_spec=OperationSpec("artifacts.write"),
             outputs=[escaped_result.to_dict()],
+        )
+
+
+def test_nested_manifest_references_and_multiple_tagged_outputs_reproduce(tmp_path: Path) -> None:
+    context, source, outside = _context(tmp_path)
+    runtime = CoreRuntime(context)
+    asset = DataAssetRef(uri="orders.csv", content_hash=_digest(source))
+    output_one = runtime.write_artifact({"part": 1}, "part-one.json")
+    output_two = runtime.write_artifact({"part": 2}, "part-two.json")
+    business = {"record": {"location": "Berlin", "uri": "segment-a"}}
+    tagged_asset = asset.to_dict()
+    tagged_output_one = output_one.to_dict()
+    tagged_output_two = output_two.to_dict()
+    mixed = [business, tagged_output_one]
+
+    manifest = runtime.build_manifest(
+        capability_id="artifacts.write",
+        operation_spec=OperationSpec("artifacts.write"),
+        inputs=[{"business": business, "asset": tagged_asset}],
+        outputs=[mixed],
+    )
+    expected_nested_input = hash_value({"business": business, "asset": _digest(source)})
+    expected_mixed_output = hash_value([hash_value(business), output_one.content_hash])
+    assert manifest["input_hashes"] == [expected_nested_input]
+    assert manifest["output_hashes"] == [expected_mixed_output]
+    assert runtime.reproduce(manifest, lambda: mixed)["reproduced"]
+
+    direct_input = {"business": business, "asset": DataAssetRef(uri=str(source)).to_dict()}
+    direct_output = [business, OperationResultRef(location=output_one.location).to_dict()]
+    direct = build_manifest(
+        capability_id="artifacts.write",
+        operation_spec=OperationSpec("artifacts.write"),
+        inputs=[direct_input],
+        outputs=[direct_output],
+        allowed_roots=(source.parent, context.run_root),
+    )
+    assert direct["input_hashes"] == [expected_nested_input]
+    assert direct["output_hashes"] == [expected_mixed_output]
+
+    multiple = runtime.build_manifest(
+        capability_id="artifacts.write",
+        operation_spec=OperationSpec("artifacts.write"),
+        outputs=[tagged_output_one, tagged_output_two],
+    )
+    assert runtime.reproduce(
+        multiple,
+        lambda: [tagged_output_one, tagged_output_two],
+    )["reproduced"]
+
+    outside.write_text("outside\n", encoding="utf-8")
+    with pytest.raises(AllowedRootError):
+        runtime.build_manifest(
+            capability_id="artifacts.write",
+            operation_spec=OperationSpec("artifacts.write"),
+            inputs=[{"nested": [DataAssetRef(uri="../outside.json").to_dict()]}],
+        )
+    with pytest.raises(AllowedRootError):
+        runtime.build_manifest(
+            capability_id="artifacts.write",
+            operation_spec=OperationSpec("artifacts.write"),
+            outputs=[{"nested": [OperationResultRef(location="../outside.json").to_dict()]}],
         )
 
 
