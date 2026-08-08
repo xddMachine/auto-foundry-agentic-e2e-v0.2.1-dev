@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -25,6 +26,12 @@ _FORBIDDEN_ONTOLOGY_KEYS = frozenset({
     "reviewer", "reviewer_id", "reviewer_note", "reviewed_by", "lifecycle",
     "lifecycle_state", "run_state", "parser", "parser_metadata", "queue_state",
 })
+
+# Relevant bundles are bounded even when callers omit optional limits.  These
+# are deliberately conservative run-local defaults, not tunable policy.
+_DEFAULT_BUNDLE_LAYER_LIMIT = 256
+_DEFAULT_BUNDLE_TOTAL_LIMIT = 512
+_DEFAULT_BUNDLE_BYTES_LIMIT = 1_000_000
 
 
 def _clean(value: Any) -> Any:
@@ -98,6 +105,11 @@ class LivingEnterpriseModel:
 
     def add_mapping(self, mapping: CanonicalMapping | Mapping[str, Any]) -> CanonicalMapping:
         mapping = mapping if isinstance(mapping, CanonicalMapping) else CanonicalMapping.from_dict(mapping)
+        decision = self.identity_decisions.get(mapping.decision_id)
+        if decision is None:
+            raise ValueError(f"canonical mapping requires a registered identity decision: {mapping.decision_id}")
+        if decision.review_status not in {"reviewed", "accepted"}:
+            raise ValueError(f"canonical mapping requires a reviewed or accepted identity decision: {mapping.decision_id}")
         existing = self.canonical_mappings.get(mapping.canonical_id)
         if existing is not None:
             if existing != mapping:
@@ -365,27 +377,49 @@ class LivingEnterpriseModel:
         if any(periods.values()):
             raise ValueError(f"requested IDs are outside effective period {effective_period!r}: {periods}")
 
-        limits = dict(per_layer_limits or layer_limits or {})
-        limits.update({key: value for key, value in {
+        limits = {
+            "ontology": _DEFAULT_BUNDLE_LAYER_LIMIT,
+            "prepared_assets": _DEFAULT_BUNDLE_LAYER_LIMIT,
+            "mappings": _DEFAULT_BUNDLE_LAYER_LIMIT,
+            "relationships": _DEFAULT_BUNDLE_LAYER_LIMIT,
+        }
+        supplied_layer_limits: dict[str, Any] = {}
+        for source in (per_layer_limits, layer_limits):
+            if source:
+                supplied_layer_limits.update(dict(source))
+        supplied_layer_limits.update({key: value for key, value in {
             "ontology": ontology_limit,
             "prepared_assets": prepared_asset_limit,
             "mappings": mapping_limit,
             "relationships": relationship_limit,
         }.items() if value is not None})
+        unknown_layers = sorted(set(supplied_layer_limits) - set(limits))
+        if unknown_layers:
+            raise ValueError(f"unknown relevant bundle layer limits: {unknown_layers}")
+
+        def validate_limit(value: Any, label: str) -> int:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{label} must be a finite integer")
+            if value < 0:
+                raise ValueError(f"{label} cannot be negative")
+            if not math.isfinite(value):
+                raise ValueError(f"{label} must be finite")
+            return value
+
+        for layer, limit in supplied_layer_limits.items():
+            limits[layer] = validate_limit(limit, f"{layer} limit")
         for layer, limit in limits.items():
-            if limit is None:
-                continue
-            if isinstance(limit, bool) or limit < 0:
-                raise ValueError(f"{layer} limit cannot be negative")
-            if layer in ids and len(ids[layer]) > limit:
+            if len(ids[layer]) > limit:
                 raise ValueError(f"{layer} layer exceeds limit {limit}: {len(ids[layer])}")
+
         total_limit = max_total_items if max_total_items is not None else max_items
+        if total_limit is None:
+            total_limit = _DEFAULT_BUNDLE_TOTAL_LIMIT
+        else:
+            total_limit = validate_limit(total_limit, "total bundle item limit")
         total_count = sum(len(values) for values in ids.values())
-        if total_limit is not None:
-            if isinstance(total_limit, bool) or total_limit < 0:
-                raise ValueError("max total bundle item limit cannot be negative")
-            if total_count > total_limit:
-                raise ValueError(f"bundle exceeds total item limit {total_limit}: {total_count}")
+        if total_count > total_limit:
+            raise ValueError(f"bundle exceeds total item limit {total_limit}: {total_count}")
 
         bundle = {
             "ontology": [self.ontology[key].to_dict() for key in ids["ontology"]],
@@ -396,6 +430,10 @@ class LivingEnterpriseModel:
             "exact_refs": {layer: [ref.to_dict() for ref in typed[layer]] for layer in ("ontology", "prepared_assets", "mappings")},
         }
         byte_limit = max_json_bytes if max_json_bytes is not None else max_bytes
+        if byte_limit is None:
+            byte_limit = _DEFAULT_BUNDLE_BYTES_LIMIT
+        else:
+            byte_limit = validate_limit(byte_limit, "bundle JSON byte limit")
         metadata = {
             "counts": {layer: len(values) for layer, values in ids.items()},
             "total_count": total_count,
@@ -411,11 +449,8 @@ class LivingEnterpriseModel:
         for _ in range(3):
             metadata["approximate_json_bytes"] = approximate_bytes
             approximate_bytes = len(json.dumps(bundle, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8"))
-        if byte_limit is not None:
-            if isinstance(byte_limit, bool) or byte_limit < 0:
-                raise ValueError("max bundle JSON byte limit cannot be negative")
-            if approximate_bytes > byte_limit:
-                raise ValueError(f"bundle exceeds approximate JSON byte limit {byte_limit}: {approximate_bytes}")
+        if approximate_bytes > byte_limit:
+            raise ValueError(f"bundle exceeds approximate JSON byte limit {byte_limit}: {approximate_bytes}")
         metadata["approximate_json_bytes"] = approximate_bytes
         return bundle
 

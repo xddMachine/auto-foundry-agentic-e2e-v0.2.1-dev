@@ -43,16 +43,8 @@ _SOURCE_CAPABILITIES = frozenset(
         "aggregation.compute",
     }
 )
-_PATH_KEYS = frozenset(
-    {
-        "path",
-        "source",
-        "left_path",
-        "right_path",
-        "expected_path",
-        "actual_path",
-    }
-)
+_DATA_ASSET_FIELDS = frozenset({"uri", "format", "content_hash", "size_bytes", "metadata"})
+_RESULT_FIELDS = frozenset({"location", "content_hash", "format", "rows", "metadata"})
 
 
 def _copy_asset(value: DataAssetRef, context: RunContext) -> DataAssetRef:
@@ -66,41 +58,58 @@ def _copy_asset(value: DataAssetRef, context: RunContext) -> DataAssetRef:
     )
 
 
-def _resolve_tagged(value: Mapping[str, Any], context: RunContext) -> dict[str, Any]:
-    result = dict(value)
-    if "uri" in result:
-        result["uri"] = str(context.resolve_input(result["uri"]))
-    if "location" in result:
-        # Result/reproduction locations are system-owned outputs.
-        result["location"] = str(context.resolve_run_path(result["location"]))
-    return result
+def _is_data_asset_mapping(value: Mapping[str, Any]) -> bool:
+    return "uri" in value and set(value).issubset(_DATA_ASSET_FIELDS)
 
 
-def _resolve_value(value: Any, context: RunContext, *, path_strings: bool = False) -> Any:
-    """Resolve explicitly path-shaped values without guessing at plain text."""
+def _is_result_mapping(value: Mapping[str, Any]) -> bool:
+    return "location" in value and set(value).issubset(_RESULT_FIELDS)
+
+
+def _resolve_declared_reference(value: Any, context: RunContext) -> Any:
+    """Resolve a declared path slot, never an arbitrary nested mapping.
+
+    Mapping values are accepted only when their keys match one of the public
+    typed reference contracts.  Plain mappings are returned unchanged; this
+    is important for business rows that happen to contain fields named
+    ``uri`` or ``location``.
+    """
 
     if isinstance(value, DataAssetRef):
         return _copy_asset(value, context)
+    if isinstance(value, OperationResultRef):
+        return OperationResultRef(
+            location=str(context.resolve_run_path(value.location)),
+            content_hash=value.content_hash,
+            format=value.format,
+            rows=value.rows,
+            metadata=value.metadata,
+        )
     if isinstance(value, Path):
         return context.resolve_input(value)
-    if isinstance(value, Mapping):
-        if "uri" in value or "location" in value:
-            return _resolve_tagged(value, context)
-        return {key: _resolve_value(item, context, path_strings=False) for key, item in value.items()}
-    if isinstance(value, (tuple, list)):
-        converted = [_resolve_value(item, context, path_strings=path_strings) for item in value]
-        return tuple(converted) if isinstance(value, tuple) else converted
-    if path_strings and isinstance(value, str):
+    if isinstance(value, str):
         return context.resolve_input(value)
+    if isinstance(value, Mapping):
+        if _is_data_asset_mapping(value):
+            return _copy_asset(DataAssetRef.from_dict(value), context)
+        if _is_result_mapping(value):
+            result = OperationResultRef.from_dict(value)
+            return OperationResultRef(
+                location=str(context.resolve_run_path(result.location)),
+                content_hash=result.content_hash,
+                format=result.format,
+                rows=result.rows,
+                metadata=result.metadata,
+            )
+        return value
+    if isinstance(value, (tuple, list)):
+        converted = [_resolve_declared_reference(item, context) for item in value]
+        return tuple(converted) if isinstance(value, tuple) else converted
     return value
 
 
 def _resolve_source(value: Any, context: RunContext) -> Any:
-    if isinstance(value, str):
-        return context.resolve_input(value)
-    if isinstance(value, (Path, DataAssetRef, Mapping)):
-        return _resolve_value(value, context, path_strings=True)
-    return value
+    return _resolve_declared_reference(value, context)
 
 
 def _prepare_spec(spec: OperationSpec, context: RunContext) -> OperationSpec:
@@ -136,16 +145,7 @@ def _prepare_spec(spec: OperationSpec, context: RunContext) -> OperationSpec:
     elif capability_id == "artifacts.reproduce":
         for key in ("expected", "actual"):
             if key in parameters:
-                parameters[key] = _resolve_value(parameters[key], context)
-
-    # A few callers use tagged path values in otherwise generic parameters.
-    # Resolve those tags and explicitly named path fields, while leaving
-    # ordinary business strings and row values untouched.
-    for key, value in list(parameters.items()):
-        if key in _PATH_KEYS and key != "path" and isinstance(value, (str, Path, DataAssetRef, Mapping)):
-            parameters[key] = _resolve_source(value, context)
-        elif isinstance(value, Mapping) and ("uri" in value or "location" in value):
-            parameters[key] = _resolve_tagged(value, context)
+                parameters[key] = _resolve_declared_reference(parameters[key], context)
 
     read_roots = tuple(str(root) for root in context.read_roots)
     parameters["allowed_roots"] = read_roots
@@ -173,16 +173,6 @@ def _collect_hashes(value: Any, context: RunContext, found: list[str]) -> None:
         found.append(hash_file(path, allowed_roots=context.read_roots))
         return
     if isinstance(value, Mapping):
-        if "uri" in value or "location" in value:
-            location = value.get("uri", value.get("location"))
-            if "location" in value and "uri" not in value:
-                path = context.resolve_run_path(location)
-                roots = (context.run_root,)
-            else:
-                path = context.resolve_input(location)
-                roots = context.read_roots
-            found.append(hash_file(path, allowed_roots=roots))
-            return
         for item in value.values():
             _collect_hashes(item, context, found)
         return
@@ -229,6 +219,14 @@ def _result_ref(value: Any) -> OperationResultRef | None:
         except (TypeError, ValueError):
             return None
     return None
+
+
+def _rehydrate_cached(capability_id: str, value: Any) -> Any:
+    """Restore typed public results that JSON cache serialization flattens."""
+
+    if capability_id == "sources.register" and isinstance(value, Mapping):
+        return DataAssetRef.from_dict(value)
+    return value
 
 
 class CoreRuntime:
@@ -339,16 +337,17 @@ class CoreRuntime:
                 cached = self.cache.get(prepared, input_hashes)
                 if cached is not None:
                     cache_status = "hit"
+                    cached_value = _rehydrate_cached(prepared.capability_id, cached.value)
                     receipt = self._receipt(
                         prepared,
                         input_hashes,
-                        cached.value,
+                        cached_value,
                         cache_status=cache_status,
                         duration_ms=(time.perf_counter() - started) * 1000,
                         spec_hash=original_spec_hash,
                     )
                     self._record_receipt(receipt)
-                    return CoreExecutionResult(cached.value, receipt, cache_status)
+                    return CoreExecutionResult(cached_value, receipt, cache_status)
 
             output_dir = str(self.context.resolve_product_path(""))
             value = execute(prepared, output_dir=output_dir, context=self.context)

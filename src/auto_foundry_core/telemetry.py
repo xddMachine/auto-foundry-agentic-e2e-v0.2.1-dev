@@ -129,7 +129,12 @@ class TelemetryRecorder:
 
     def write_summary(self, path: str | Path | None = None, *, extra: Mapping[str, Any] | None = None) -> RunTelemetrySummary:
         summary = self.summary(extra=extra)
-        destination = Path(path) if path is not None else (self.root / "summary.json" if self.root else None)
+        if path is not None and self.context is not None:
+            # Context-bound summaries are system-owned run artifacts.  Resolve
+            # before mkdir/write so an escape remains a technical path error.
+            destination = self.context.resolve_run_path(path)
+        else:
+            destination = Path(path) if path is not None else (self.root / "summary.json" if self.root else None)
         if destination is not None:
             try:
                 destination.parent.mkdir(parents=True, exist_ok=True)

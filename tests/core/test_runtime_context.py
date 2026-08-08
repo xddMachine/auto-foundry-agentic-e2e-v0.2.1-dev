@@ -7,8 +7,9 @@ import sys
 
 import pytest
 
-from auto_foundry_core.contracts import OperationSpec
+from auto_foundry_core.contracts import DataAssetRef, OperationSpec
 from auto_foundry_core.runtime import CoreRuntime
+from auto_foundry_core.telemetry import TelemetryRecorder
 from auto_foundry_core.workspace import AllowedRootError, RunContext
 
 
@@ -73,6 +74,48 @@ def test_runtime_cache_miss_then_hit_and_passive_receipt_telemetry(tmp_path: Pat
     assert operation_events[-1].cache_status == "hit"
     assert runtime.telemetry.summary().cache_hits == 1
     assert runtime.telemetry.summary().cache_misses == 1
+
+
+def test_runtime_preserves_typed_register_result_across_cache_hit(tmp_path: Path):
+    context, source, _ = _context(tmp_path)
+    runtime = CoreRuntime(context)
+    spec = OperationSpec("sources.register", parameters={"path": str(source)})
+    first = runtime.execute(spec)
+    second = runtime.execute(spec)
+    assert first.cache_status == "miss"
+    assert second.cache_status == "hit"
+    assert isinstance(first.value, DataAssetRef)
+    assert isinstance(second.value, DataAssetRef)
+    assert second.value == first.value
+    assert second.value.content_hash == first.value.content_hash
+
+
+def test_inline_business_uri_and_location_fields_are_not_paths(tmp_path: Path):
+    context, _, _ = _context(tmp_path)
+    runtime = CoreRuntime(context)
+    rows = [{"location": "Berlin", "uri": "segment-a", "value": 1}]
+    result = runtime.execute(OperationSpec("aggregation.compute", parameters={"rows": rows, "operation": "count"}))
+    assert result.value == 1
+
+
+def test_declared_source_path_slot_remains_context_validated(tmp_path: Path):
+    context, source, _ = _context(tmp_path)
+    runtime = CoreRuntime(context)
+    valid = runtime.execute(OperationSpec("sources.preview", parameters={"path": source.name, "limit": 1}))
+    assert valid.value["sample"]
+    outside = tmp_path / "outside" / "rows.json"
+    with pytest.raises(AllowedRootError):
+        runtime.execute(OperationSpec("sources.preview", parameters={"path": str(outside)}))
+
+
+def test_context_telemetry_summary_stays_inside_run(tmp_path: Path):
+    context, _, _ = _context(tmp_path)
+    recorder = TelemetryRecorder(context=context)
+    with pytest.raises(AllowedRootError):
+        recorder.write_summary(tmp_path / "outside" / "summary.json")
+    assert not (tmp_path / "outside" / "summary.json").exists()
+    recorder.write_summary("summaries/summary.json")
+    assert (context.run_root / "summaries/summary.json").is_file()
 
 
 def test_runtime_technical_path_error_is_not_masked(tmp_path: Path):

@@ -63,7 +63,11 @@ def test_semantic_operations_are_ontology_index_items_and_relationships_bounded(
 
 def test_mapping_idempotence_alias_normalization_and_collision():
     model = LivingEnterpriseModel(run_id="r")
-    mapping = CanonicalMapping("c1", "entity", ("a",), "decision-1")
+    reviewed = IdentityDecision("candidate-1", "different_objects", decision_id="decision-1", reviewer_ref="reviewer", review_status="reviewed")
+    reviewed_2 = IdentityDecision("candidate-2", "different_objects", decision_id="decision-2", reviewer_ref="reviewer", review_status="reviewed")
+    model.register_identity_decision(reviewed)
+    model.register_identity_decision(reviewed_2)
+    mapping = CanonicalMapping("c1", "entity", ("a",), reviewed.decision_id)
     assert model.add_mapping(mapping) == mapping
     assert model.add_mapping(mapping) == mapping
     with pytest.raises(ValueError):
@@ -71,6 +75,22 @@ def test_mapping_idempotence_alias_normalization_and_collision():
     model.apply_delta(KnowledgeDelta("alias", "add_alias", {"canonical_id": "c1", "alias": "Alpha", "source_identity": "a2"}, accepted=True))
     assert model.canonical_mappings["c1"].aliases == ("Alpha",)
     assert model.canonical_mappings["c1"].source_identities == ("a", "a2")
+
+
+def test_mapping_requires_registered_reviewed_decision():
+    model = LivingEnterpriseModel(run_id="r")
+    missing = CanonicalMapping("missing", "entity", ("a",), "decision-missing")
+    with pytest.raises(ValueError, match="registered identity decision"):
+        model.add_mapping(missing)
+    pending = IdentityDecision("candidate-pending", "different_objects", decision_id="decision-pending", reviewer_ref="reviewer", review_status="pending")
+    model.register_identity_decision(pending)
+    with pytest.raises(ValueError, match="reviewed or accepted"):
+        model.add_mapping(CanonicalMapping("pending", "entity", ("a",), pending.decision_id))
+    accepted = IdentityDecision("candidate-accepted", "different_objects", decision_id="decision-accepted", reviewer_ref="reviewer", review_status="accepted")
+    model.register_identity_decision(accepted)
+    mapping = CanonicalMapping("accepted", "entity", ("a",), accepted.decision_id)
+    assert model.add_mapping(mapping) == mapping
+    assert model.add_mapping(mapping) == mapping
 
 
 def test_reviewed_identity_trace_hash_and_exact_mapping_linkage():
@@ -110,6 +130,16 @@ def test_relevant_bundle_rejects_duplicate_limits_bytes_scope_and_period():
         model.relevant_bundle(["o"], scope="other")
     with pytest.raises(ValueError):
         model.relevant_bundle(["o"], effective_period="2025")
+    defaults = model.relevant_bundle(["o"])["metadata"]
+    assert defaults["limits"]["total"] > 0
+    assert defaults["limits"]["bytes"] > 0
+    assert set(defaults["limits"]["per_layer"]) == {"ontology", "prepared_assets", "mappings", "relationships"}
+    for index in range(257):
+        model.add_ontology_item({"item_id": f"o-{index}", "item_type": "object", "label": "O"})
+    with pytest.raises(ValueError, match="ontology layer exceeds limit"):
+        model.relevant_bundle([f"o-{index}" for index in range(257)])
+    with pytest.raises((TypeError, ValueError)):
+        model.relevant_bundle(["o"], max_bytes=float("inf"))
 
 
 def test_aggregation_spec_is_explicit_without_distinct_flag():
