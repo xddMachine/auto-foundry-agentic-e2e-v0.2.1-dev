@@ -26,6 +26,12 @@ The public entry points are `RunContext`, `CoreRuntime`,
 package API. A normal run starts from the user's explicit task; it has no
 manual authorization ceremony or second confirmation step.
 
+Filesystem references are explicit. `DataAssetRef` and `OperationResultRef`
+serialize with the reserved `__auto_foundry_ref__` discriminator (`data_asset`
+or `operation_result`); typed source slots also accept a string path, `Path`,
+or `DataAssetRef`. Other mappings are analytical data by default, including
+records with `location`, `uri`, `path`, `filename`, or `content_hash` fields.
+
 This is an experimental release candidate, not a production-hardened
 sandbox. A Coding Agent with unrestricted host shell/filesystem access cannot
 be fully sandboxed by this Python package. True isolation requires a separate

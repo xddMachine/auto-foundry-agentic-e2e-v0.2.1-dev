@@ -74,8 +74,11 @@ root declarations cannot broaden the CLI roots and are ignored. When a
 filesystem path is used, the effective roots are propagated through every
 source read, hash, reproduction comparison, and derived write. Execution-facing
 catalog operations and public manifest or reproduction path hashing require
-explicit `Path`/reference values (or tagged `{"uri": ...}`/`{"location": ...}`
-mappings); ordinary strings remain values.
+explicit `Path`/reference values or an explicit serialized reference mapping.
+The reserved `__auto_foundry_ref__` discriminator has values `data_asset` and
+`operation_result`; a `DataAssetRef` is accepted directly in a typed source
+slot. Arbitrary analytical mappings remain data even when they contain fields
+named `location`, `uri`, `path`, `filename`, or `content_hash`.
 Direct low-level source readers and hashing helpers remain usable without roots
 for callers that explicitly operate outside clean-room mode.  The CLI writes
 only explicitly requested derived output.  Cache roots are supplied by callers
