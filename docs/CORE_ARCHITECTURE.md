@@ -49,6 +49,14 @@ python -m auto_foundry_core catalog describe relationships.measure
 python -m auto_foundry_core run sources.preview --spec operation.json --output out/
 ```
 
-An operation spec is JSON with `capability_id`, optional `inputs`, and
-`parameters`.  The CLI writes only explicitly requested derived output.  Cache
-roots are supplied by callers and are never shared implicitly between runs.
+An operation spec is JSON with `capability_id`, optional `inputs`,
+`allowed_roots`, and `parameters`.  When a filesystem path is used, the declared
+roots are propagated through every source read, hash, reproduction comparison,
+and derived write; CLI output is validated against the same roots before its
+directory is created.  Execution-facing catalog operations and public manifest
+or reproduction path hashing require a nonempty declaration and validate it
+before probing or reading a path.  Direct low-level source readers and hashing
+helpers remain usable without roots for callers that explicitly operate outside
+clean-room mode.  The CLI writes only explicitly requested derived output.
+Cache roots are supplied by callers and are never shared implicitly between
+runs.

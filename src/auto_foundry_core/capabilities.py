@@ -7,21 +7,37 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .contracts import CapabilityDescriptor, DataAssetRef, IdentityCandidate, IdentityDecision, OperationSpec
+from .workspace import require_allowed_roots
 
 
 CapabilityHandler = Callable[[OperationSpec, str | None], Any]
 
 
-def _read_rows(value: Any, *, limit: int | None = None) -> list[dict[str, Any]]:
+def _allowed_roots(spec: OperationSpec):
+    parameters = dict(spec.parameters)
+    roots = spec.allowed_roots or parameters.get("allowed_roots")
+    if roots is None and isinstance(spec.metadata, Mapping):
+        roots = spec.metadata.get("allowed_roots")
+    return roots
+
+
+def _required_roots(spec: OperationSpec, *, context: str = "catalog filesystem operation"):
+    return require_allowed_roots(_allowed_roots(spec), context=context)
+
+
+def _read_rows(value: Any, *, limit: int | None = None, allowed_roots=None) -> list[dict[str, Any]]:
     if isinstance(value, list):
         return [dict(v) for v in value]
     if isinstance(value, tuple):
         return [dict(v) for v in value]
     if isinstance(value, Mapping) and "rows" in value:
         return [dict(v) for v in value["rows"]]
-    if isinstance(value, str):
+    if isinstance(value, Mapping) and "uri" in value:
         from .sources import read_rows
-        return read_rows(value, limit=limit)
+        return read_rows(DataAssetRef.from_dict(value), limit=limit, allowed_roots=require_allowed_roots(allowed_roots))
+    if isinstance(value, (str, Path, DataAssetRef)):
+        from .sources import read_rows
+        return read_rows(value, limit=limit, allowed_roots=require_allowed_roots(allowed_roots))
     raise TypeError("rows or a local source path is required")
 
 
@@ -39,18 +55,18 @@ def _source(spec: OperationSpec) -> Any:
 
 def _register(spec: OperationSpec, output_dir: str | None) -> Any:
     from .sources import register_source
-    return register_source(_source(spec), allowed_roots=dict(spec.parameters).get("allowed_roots"))
+    return register_source(_source(spec), allowed_roots=_required_roots(spec, context="sources.register"))
 
 
 def _preview(spec: OperationSpec, output_dir: str | None) -> Any:
     from .sources import preview
-    return preview(_source(spec), limit=int(dict(spec.parameters).get("limit", 20)), allowed_roots=dict(spec.parameters).get("allowed_roots"))
+    return preview(_source(spec), limit=int(dict(spec.parameters).get("limit", 20)), allowed_roots=_required_roots(spec, context="sources.preview"))
 
 
 def _profile(spec: OperationSpec, output_dir: str | None) -> Any:
     from .profiling import profile_source
     parameters = dict(spec.parameters)
-    return profile_source(_source(spec), sample_limit=int(parameters.get("sample_limit", 1000)), frequency_limit=int(parameters.get("frequency_limit", 20)), allowed_roots=parameters.get("allowed_roots"))
+    return profile_source(_source(spec), sample_limit=int(parameters.get("sample_limit", 1000)), frequency_limit=int(parameters.get("frequency_limit", 20)), allowed_roots=_required_roots(spec, context="profiling.profile"))
 
 
 def _normalize(spec: OperationSpec, output_dir: str | None) -> Any:
@@ -58,7 +74,7 @@ def _normalize(spec: OperationSpec, output_dir: str | None) -> Any:
     p = dict(spec.parameters)
     rows = p.get("rows")
     if rows is None:
-        rows = _read_rows(_source(spec), limit=p.get("limit"))
+        rows = _read_rows(_source(spec), limit=p.get("limit"), allowed_roots=_required_roots(spec, context="normalization.normalize"))
     return normalize_rows(rows, fields=p.get("fields"), case=p.get("case", "lower"), return_metadata=bool(p.get("return_metadata", True)))
 
 
@@ -71,7 +87,8 @@ def _identity_candidates(spec: OperationSpec, output_dir: str | None) -> Any:
         left = spec.inputs[0]
     if right is None and len(spec.inputs) > 1:
         right = spec.inputs[1]
-    return [candidate.to_dict() for candidate in generate_candidates(_read_rows(left), _read_rows(right), object_type=p.get("object_type", "object"), compare_fields=p.get("compare_fields"), threshold=float(p.get("threshold", 0.55)), max_candidates=p.get("max_candidates"))]
+    roots = _required_roots(spec, context="identity.candidates") if _is_path_reference(left, strings_are_paths=True) or _is_path_reference(right, strings_are_paths=True) else None
+    return [candidate.to_dict() for candidate in generate_candidates(_read_rows(left, allowed_roots=roots), _read_rows(right, allowed_roots=roots), object_type=p.get("object_type", "object"), compare_fields=p.get("compare_fields"), threshold=float(p.get("threshold", 0.55)), max_candidates=p.get("max_candidates"))]
 
 
 def _identity_apply(spec: OperationSpec, output_dir: str | None) -> Any:
@@ -88,7 +105,8 @@ def _relationship(spec: OperationSpec, output_dir: str | None) -> Any:
     p = dict(spec.parameters)
     left = p.get("left_rows", spec.inputs[0] if spec.inputs else None)
     right = p.get("right_rows", spec.inputs[1] if len(spec.inputs) > 1 else None)
-    return measure_relationship(_read_rows(left), _read_rows(right), left_key=p["left_key"], right_key=p.get("right_key"), left_time_field=p.get("left_time_field"), right_time_field=p.get("right_time_field"))
+    roots = _required_roots(spec, context="relationships.measure") if _is_path_reference(left, strings_are_paths=True) or _is_path_reference(right, strings_are_paths=True) else None
+    return measure_relationship(_read_rows(left, allowed_roots=roots), _read_rows(right, allowed_roots=roots), left_key=p["left_key"], right_key=p.get("right_key"), left_time_field=p.get("left_time_field"), right_time_field=p.get("right_time_field"))
 
 
 def _population(spec: OperationSpec, output_dir: str | None) -> Any:
@@ -104,7 +122,7 @@ def _aggregation(spec: OperationSpec, output_dir: str | None) -> Any:
     p = dict(spec.parameters)
     rows = p.pop("rows", None)
     if rows is None:
-        rows = _read_rows(_source(spec))
+        rows = _read_rows(_source(spec), allowed_roots=_required_roots(spec, context="aggregation.compute"))
     operation = p.pop("operation", p.pop("aggregation", "count"))
     return aggregate_rows(rows, operation, **p)
 
@@ -118,6 +136,7 @@ def _artifact(spec: OperationSpec, output_dir: str | None) -> Any:
     if data is None:
         raise ValueError("artifacts.write requires data")
     path = Path(output_dir or ".") / str(p.pop("filename", "result.json"))
+    p.setdefault("allowed_roots", _required_roots(spec, context="artifacts.write"))
     result = write_artifact(data, path, operation_spec=spec, **p)
     return result.to_dict()
 
@@ -125,7 +144,9 @@ def _artifact(spec: OperationSpec, output_dir: str | None) -> Any:
 def _reproduce(spec: OperationSpec, output_dir: str | None) -> Any:
     from .reproduction import compare_results
     p = dict(spec.parameters)
-    return compare_results(p.get("expected"), p.get("actual"))
+    expected, actual = p.get("expected"), p.get("actual")
+    roots = _required_roots(spec, context="artifacts.reproduce") if _is_path_reference(expected) or _is_path_reference(actual) else None
+    return compare_results(expected, actual, allowed_roots=roots)
 
 
 def _descriptor(
@@ -185,8 +206,45 @@ def descriptors() -> tuple[CapabilityDescriptor, ...]:
     return tuple(DESCRIPTORS[key] for key in sorted(DESCRIPTORS))
 
 
-def execute(spec: OperationSpec | Mapping[str, Any], *, output_dir: str | None = None) -> Any:
+def _looks_like_path(value: str) -> bool:
+    """Classify a string as a possible path without touching the filesystem.
+
+    ``Path.is_file`` is deliberately not used here: execution-boundary root
+    enforcement must happen before *any* filesystem probe.  Source arguments
+    are handled with ``strings_are_paths=True`` below because their contract is
+    explicitly a local source path; result/value arguments use lexical hints so
+    ordinary inline strings remain root-free.
+    """
+
+    text = value.strip()
+    if not text:
+        return False
+    candidate = Path(text).expanduser()
+    return (
+        candidate.is_absolute()
+        or text.startswith((".", "~"))
+        or "/" in text
+        or "\\" in text
+        or bool(candidate.suffix)
+    )
+
+
+def _is_path_reference(value: Any, *, strings_are_paths: bool = False) -> bool:
+    if isinstance(value, str):
+        return strings_are_paths or _looks_like_path(value)
+    if isinstance(value, (Path, DataAssetRef)):
+        return True
+    if isinstance(value, Mapping):
+        return "uri" in value or "location" in value
+    return False
+
+
+def execute(spec: OperationSpec | Mapping[str, Any], *, output_dir: str | None = None, allowed_roots=None) -> Any:
     operation = spec if isinstance(spec, OperationSpec) else OperationSpec.from_dict(spec)
+    if allowed_roots is not None:
+        parameters = dict(operation.parameters)
+        parameters["allowed_roots"] = tuple(allowed_roots)
+        operation = OperationSpec(operation.capability_id, inputs=operation.inputs, parameters=parameters, version=operation.version, metadata=operation.metadata, allowed_roots=tuple(str(value) for value in allowed_roots))
     try:
         handler = HANDLERS[operation.capability_id]
     except KeyError as exc:

@@ -11,7 +11,7 @@ from typing import Any, Iterable, Mapping
 
 from .contracts import DataAssetRef, OperationReceipt, OperationResultRef, OperationSpec
 from .sources import hash_file
-from .workspace import validate_allowed_path
+from .workspace import require_allowed_roots, validate_allowed_path
 
 
 def _jsonable(value: Any) -> Any:
@@ -27,6 +27,37 @@ def _jsonable(value: Any) -> Any:
 def hash_value(value: Any) -> str:
     encoded = json.dumps(_jsonable(value), sort_keys=True, separators=(",", ":"), default=str).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _looks_like_path(value: str) -> bool:
+    """Recognize path-shaped strings without probing the filesystem.
+
+    Manifest construction is an execution/public boundary.  It must validate
+    a declared root before calling ``Path.is_file`` or hashing a path, while
+    still allowing simple inline marker strings to be hashed as values.
+    """
+
+    text = value.strip()
+    if not text:
+        return False
+    candidate = Path(text).expanduser()
+    return (
+        candidate.is_absolute()
+        or text.startswith((".", "~"))
+        or "/" in text
+        or "\\" in text
+        or bool(candidate.suffix)
+    )
+
+
+def _manifest_string_hash(value: str, *, allowed_roots, context: str) -> str:
+    if not _looks_like_path(value):
+        return hash_value(value)
+    roots = require_allowed_roots(allowed_roots, context=context)
+    candidate = validate_allowed_path(value, roots)
+    if candidate.is_file():
+        return hash_file(candidate, allowed_roots=roots)
+    return hash_value(value)
 
 
 def _rows(data: Any) -> list[dict[str, Any]] | None:
@@ -51,6 +82,19 @@ def write_artifact(
     destination = Path(path).expanduser().resolve(strict=False)
     if allowed_roots is not None:
         destination = validate_allowed_path(destination, allowed_roots)
+    source_hashes = []
+    for source in source_refs:
+        if isinstance(source, Mapping) and "uri" in source:
+            source = DataAssetRef.from_dict(source)
+        if isinstance(source, DataAssetRef):
+            # Validate and re-hash descriptors before creating any output so a
+            # rejected input cannot leave a misleading derived artifact.
+            current_hash = hash_file(source.uri, allowed_roots=allowed_roots)
+            if source.content_hash and current_hash != source.content_hash:
+                raise ValueError(f"source changed after registration: {source.uri}")
+            source_hashes.append(current_hash)
+        else:
+            source_hashes.append(hash_file(source, allowed_roots=allowed_roots))
     destination.parent.mkdir(parents=True, exist_ok=True)
     fmt = (format or destination.suffix.lstrip(".") or "json").lower()
     if fmt in {"ndjson", "jsonl"}:
@@ -87,13 +131,7 @@ def write_artifact(
         pq.write_table(pa.Table.from_pylist(records), destination)
     else:
         raise ValueError(f"unsupported artifact format: {fmt}")
-    output_hash = hash_file(destination)
-    source_hashes = []
-    for source in source_refs:
-        if isinstance(source, DataAssetRef):
-            source_hashes.append(source.content_hash or hash_file(source.uri))
-        else:
-            source_hashes.append(hash_file(source))
+    output_hash = hash_file(destination, allowed_roots=allowed_roots)
     metadata = {
         "source_hashes": source_hashes,
         "operation_spec_hash": operation_spec.spec_hash if isinstance(operation_spec, OperationSpec) else (OperationSpec.from_dict(operation_spec).spec_hash if operation_spec else None),
@@ -110,6 +148,7 @@ def build_manifest(
     outputs: Iterable[OperationResultRef | str] = (),
     core_version: str = "0.1.0",
     metadata: Mapping[str, Any] | None = None,
+    allowed_roots: Iterable[str | Path] | None = None,
 ) -> dict[str, Any]:
     spec = operation_spec if isinstance(operation_spec, OperationSpec) else OperationSpec.from_dict(operation_spec)
     input_hashes: list[str] = []
@@ -117,22 +156,22 @@ def build_manifest(
     for item in inputs:
         if isinstance(item, (DataAssetRef, OperationResultRef)):
             input_refs.append(item.to_dict())
-            value = item.content_hash
-            if value is None and hasattr(item, "uri"):
-                value = hash_file(item.uri)
-            input_hashes.append(value or hash_value(item.to_dict()))
+            location = item.uri if isinstance(item, DataAssetRef) else item.location
+            roots = require_allowed_roots(allowed_roots, context="manifest input hashing")
+            input_hashes.append(hash_file(location, allowed_roots=roots))
         else:
             input_refs.append(str(item))
-            input_hashes.append(hash_file(item) if Path(item).is_file() else hash_value(str(item)))
+            input_hashes.append(_manifest_string_hash(str(item), allowed_roots=allowed_roots, context="manifest input hashing"))
     output_refs: list[Any] = []
     output_hashes: list[str] = []
     for item in outputs:
         if isinstance(item, OperationResultRef):
             output_refs.append(item.to_dict())
-            output_hashes.append(item.content_hash or hash_value(item.to_dict()))
+            roots = require_allowed_roots(allowed_roots, context="manifest output hashing")
+            output_hashes.append(hash_file(item.location, allowed_roots=roots))
         else:
             output_refs.append(str(item))
-            output_hashes.append(hash_file(item) if Path(item).is_file() else hash_value(str(item)))
+            output_hashes.append(_manifest_string_hash(str(item), allowed_roots=allowed_roots, context="manifest output hashing"))
     return {
         "manifest_version": "1",
         "core_version": core_version,
@@ -149,10 +188,10 @@ def build_manifest(
 
 def write_manifest(path: str | Path, manifest: Mapping[str, Any] | None = None, *, allowed_roots: Iterable[str | Path] | None = None, **kwargs: Any) -> dict[str, Any]:
     if manifest is None:
-        manifest = build_manifest(**kwargs)
+        manifest = build_manifest(allowed_roots=allowed_roots, **kwargs)
+    roots = require_allowed_roots(allowed_roots, context="manifest write")
     destination = Path(path).expanduser().resolve(strict=False)
-    if allowed_roots is not None:
-        destination = validate_allowed_path(destination, allowed_roots)
+    destination = validate_allowed_path(destination, roots)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("w", encoding="utf-8", newline="\n") as stream:
         json.dump(_jsonable(dict(manifest)), stream, sort_keys=True, indent=2, ensure_ascii=False, default=str)

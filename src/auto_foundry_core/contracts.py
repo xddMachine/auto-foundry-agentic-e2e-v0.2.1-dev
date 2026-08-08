@@ -204,12 +204,14 @@ class OperationSpec(ContractMixin):
     parameters: Mapping[str, Any] = field(default_factory=dict)
     version: str = "0.1.0"
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    allowed_roots: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "capability_id", _require(self.capability_id, "capability_id"))
         object.__setattr__(self, "inputs", _tuple_values(self.inputs))
         object.__setattr__(self, "parameters", _freeze(self.parameters))
         object.__setattr__(self, "metadata", _freeze(self.metadata))
+        object.__setattr__(self, "allowed_roots", tuple(str(value) for value in self.allowed_roots))
 
     @property
     def normalized(self) -> str:

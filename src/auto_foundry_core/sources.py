@@ -17,9 +17,15 @@ TABULAR_FORMATS = frozenset({"csv", "tsv", "json", "jsonl", "ndjson", "xlsx", "x
 TEXT_FORMATS = frozenset({"txt", "md", "markdown", "rst", "html", "htm", "xml", "log"})
 
 
-def hash_file(path: str | Path, *, chunk_size: int = 1024 * 1024) -> str:
+def hash_file(
+    path: str | Path,
+    *,
+    chunk_size: int = 1024 * 1024,
+    allowed_roots: Iterable[str | Path] | None = None,
+) -> str:
     """Return a stable SHA-256 hash without loading the whole file."""
 
+    path = _bounded(path, allowed_roots)
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
         while chunk := stream.read(chunk_size):
@@ -57,7 +63,7 @@ def register_source(
     return DataAssetRef(
         uri=str(candidate),
         format=_format(candidate, format),
-        content_hash=hash_file(candidate),
+        content_hash=hash_file(candidate, allowed_roots=allowed_roots),
         size_bytes=candidate.stat().st_size,
         metadata={"read_only": True, **dict(metadata or {})},
     )
@@ -77,7 +83,7 @@ def register_document(
 def _asset(source: DataAssetRef | str | Path, allowed_roots: Iterable[str | Path] | None = None) -> DataAssetRef:
     if isinstance(source, DataAssetRef):
         path = _bounded(source.uri, allowed_roots)
-        if source.content_hash and path.is_file() and hash_file(path) != source.content_hash:
+        if source.content_hash and path.is_file() and hash_file(path, allowed_roots=allowed_roots) != source.content_hash:
             raise ValueError(f"source changed after registration: {path}")
         # Re-hash only when caller passed a descriptor that does not carry one.
         if source.content_hash:

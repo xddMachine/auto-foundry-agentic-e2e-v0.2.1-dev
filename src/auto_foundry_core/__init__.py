@@ -30,7 +30,7 @@ from .contracts import (
     TableRef,
     TelemetryEvent,
 )
-from .workspace import AllowedRootError, Workspace
+from .workspace import AllowedRootError, Workspace, require_allowed_roots
 from .sources import discover, preview, register_source, read_rows
 from .profiling import profile_rows, profile_source
 from .normalization import normalize_rows, normalize_value, parse_date, parse_number
@@ -61,5 +61,5 @@ __all__ = [
     "mapping_coverage", "measure_relationship", "normalize_rows",
     "normalize_value", "parse_date", "parse_number", "preview", "profile_rows",
     "profile_source", "read_rows", "register_source", "reproduce",
-    "write_artifact", "write_manifest",
+    "write_artifact", "write_manifest", "require_allowed_roots",
 ]

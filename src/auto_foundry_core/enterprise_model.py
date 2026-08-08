@@ -45,6 +45,9 @@ class LivingEnterpriseModel:
         self.relationships: dict[str, dict[str, Any]] = {}
         self.knowledge: dict[str, dict[str, Any]] = {}
         self.conflicts: list[dict[str, Any]] = []
+        self.conflict_links: dict[str, set[str]] = {}
+        self.supersession_links: dict[str, set[str]] = {}
+        self.conflict_state: dict[str, dict[str, Any]] = {}
         self.revisions: list[dict[str, Any]] = []
 
     @property
@@ -94,6 +97,7 @@ class LivingEnterpriseModel:
         mapping_ids: Iterable[str] = (),
         relationship_ids: Iterable[str] = (),
         max_items: int | None = None,
+        scope: str | None = None,
     ) -> dict[str, Any]:
         """Resolve exact IDs into a bounded bundle; no keyword routing occurs."""
 
@@ -109,6 +113,13 @@ class LivingEnterpriseModel:
         }
         if any(missing.values()):
             raise KeyError(f"unknown exact IDs: {missing}")
+        if scope is not None:
+            mismatches = {
+                "ontology": [key for key in ontology_ids if self.ontology[key].scope not in {None, scope}],
+                "prepared_assets": [key for key in prepared_asset_ids if self.prepared_assets[key].scope not in {"reusable", scope}],
+            }
+            if any(mismatches.values()):
+                raise ValueError(f"requested IDs are outside scope {scope!r}: {mismatches}")
         if max_items is not None and max_items < 0:
             raise ValueError("max_items cannot be negative")
         selected_ontology = list(ontology_ids)
@@ -133,10 +144,15 @@ class LivingEnterpriseModel:
             accepted = delta.accepted
         if not accepted:
             return {"applied": False, "delta_id": delta.delta_id, "operation": delta.operation}
-        snapshot = (deepcopy(self.ontology), deepcopy(self.prepared_assets), deepcopy(self.canonical_mappings), deepcopy(self.relationships), deepcopy(self.knowledge), deepcopy(self.conflicts), deepcopy(self.revisions))
+        # Contract values are frozen and contain mapping proxies, which are
+        # intentionally not deepcopy/pickleable.  Copy the registries by
+        # identity and deep-copy only the mutable evidence containers.
+        snapshot = (dict(self.ontology), dict(self.prepared_assets), dict(self.canonical_mappings), deepcopy(self.relationships), deepcopy(self.knowledge), deepcopy(self.conflicts), {key: set(value) for key, value in self.conflict_links.items()}, {key: set(value) for key, value in self.supersession_links.items()}, deepcopy(self.conflict_state), deepcopy(self.revisions))
         try:
             payload = _clean(dict(delta.payload))
             operation = delta.operation
+            conflict_targets = tuple(str(value) for value in (delta.conflicts_with or payload.get("conflicts_with", ())))
+            supersession_targets = tuple(str(value) for value in (delta.supersedes or payload.get("item_ids", ()) or payload.get("supersedes", ())))
             if operation == "add_ontology_item":
                 self.add_ontology_item(payload)
             elif operation == "extend_ontology_item":
@@ -165,20 +181,38 @@ class LivingEnterpriseModel:
                 aliases = tuple(dict.fromkeys((*mapping.aliases, *payload.get("aliases", ()), str(payload.get("alias")) if payload.get("alias") is not None else "")))
                 self.canonical_mappings[key] = replace(mapping, aliases=tuple(alias for alias in aliases if alias))
             elif operation in {"record_limitation", "record_conflict"}:
-                self.conflicts.append({"delta_id": delta.delta_id, "operation": operation, "payload": payload, "evidence_refs": list(delta.evidence_refs)})
+                self.conflicts.append({"delta_id": delta.delta_id, "operation": operation, "payload": payload, "conflicts_with": list(conflict_targets), "supersedes": list(supersession_targets), "evidence_refs": list(delta.evidence_refs), "unresolved": bool(payload.get("unresolved", operation == "record_conflict")), "working_definition": payload.get("working_definition")})
             elif operation == "supersede":
-                for item_id in delta.supersedes or tuple(payload.get("item_ids", ())):
+                for item_id in supersession_targets:
                     if item_id in self.ontology:
                         self.ontology[item_id] = replace(self.ontology[item_id], status="superseded")
                     if item_id in self.prepared_assets:
                         self.prepared_assets[item_id] = replace(self.prepared_assets[item_id], status="superseded")
             elif operation == "no_change":
                 pass
-            self.knowledge[delta.delta_id] = {"operation": operation, "payload": payload, "evidence_refs": list(delta.evidence_refs)}
+            if conflict_targets:
+                links = self.conflict_links.setdefault(delta.delta_id, set())
+                for target in conflict_targets:
+                    links.add(str(target))
+                    self.conflict_links.setdefault(str(target), set()).add(delta.delta_id)
+                    self.conflict_state.setdefault(delta.delta_id, {"unresolved": True, "working_definition": payload.get("working_definition"), "scope": payload.get("scope")})
+                    self.conflict_state.setdefault(str(target), {"unresolved": True, "working_definition": None, "scope": None})
+                    target_record = self.knowledge.get(str(target))
+                    if target_record is not None:
+                        target_record["conflicts_with"] = sorted(set(target_record.get("conflicts_with", ())) | {delta.delta_id})
+                        target_record["unresolved"] = True
+            if supersession_targets:
+                targets = self.supersession_links.setdefault(delta.delta_id, set())
+                for target in supersession_targets:
+                    targets.add(str(target))
+                    target_record = self.knowledge.get(str(target))
+                    if target_record is not None:
+                        target_record["superseded_by"] = sorted(set(target_record.get("superseded_by", ())) | {delta.delta_id})
+            self.knowledge[delta.delta_id] = {"operation": operation, "payload": payload, "evidence_refs": list(delta.evidence_refs), "conflicts_with": list(conflict_targets), "supersedes": list(supersession_targets), "unresolved": self.conflict_state.get(delta.delta_id, {}).get("unresolved", bool(operation == "record_conflict")), "working_definition": payload.get("working_definition")}
             self.revisions.append({"delta_id": delta.delta_id, "operation": operation, "applied_at": datetime.now(timezone.utc).isoformat()})
             return {"applied": True, "delta_id": delta.delta_id, "operation": operation}
         except Exception:
-            self.ontology, self.prepared_assets, self.canonical_mappings, self.relationships, self.knowledge, self.conflicts, self.revisions = snapshot
+            self.ontology, self.prepared_assets, self.canonical_mappings, self.relationships, self.knowledge, self.conflicts, self.conflict_links, self.supersession_links, self.conflict_state, self.revisions = snapshot
             raise
 
     def export(self) -> dict[str, Any]:
@@ -189,7 +223,11 @@ class LivingEnterpriseModel:
             "prepared_assets": [asset.to_dict() for asset in sorted(self.prepared_assets.values(), key=lambda asset: asset.prepared_asset_id)],
             "canonical_mappings": [mapping.to_dict() for mapping in sorted(self.canonical_mappings.values(), key=lambda mapping: mapping.canonical_id)],
             "relationships": {key: self.relationships[key] for key in sorted(self.relationships)},
+            "knowledge": deepcopy(self.knowledge),
             "conflicts": deepcopy(self.conflicts),
+            "conflict_links": {key: sorted(value) for key, value in sorted(self.conflict_links.items())},
+            "supersession_links": {key: sorted(value) for key, value in sorted(self.supersession_links.items())},
+            "conflict_state": deepcopy(self.conflict_state),
             "revisions": deepcopy(self.revisions),
         }
 

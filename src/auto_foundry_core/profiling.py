@@ -56,12 +56,12 @@ def profile_rows(
     if sample_limit < 0 or frequency_limit < 0:
         raise ValueError("sample_limit and frequency_limit cannot be negative")
     materialized: list[dict[str, Any]] = []
+    observed_rows = 0
     for row in rows:
+        observed_rows += 1
         if len(materialized) < sample_limit:
             materialized.append(dict(row))
-    # ``rows`` may be a list, in which case use its complete count.  For an
-    # iterator we have intentionally only observed the bounded sample.
-    total_rows = len(rows) if isinstance(rows, (list, tuple)) else len(materialized)
+    total_rows = observed_rows
     columns: list[str] = []
     for row in materialized:
         for name in row:
@@ -105,7 +105,11 @@ def profile_rows(
     return {
         "row_count": total_rows,
         "sampled_rows": len(materialized),
-        "bounded": total_rows > len(materialized),
+        "bounded": False,
+        "row_count_exact": True,
+        "row_count_lower_bound": total_rows,
+        "sample_complete": total_rows <= len(materialized),
+        "row_count_kind": "exact",
         "columns": column_profiles,
         "duplicate_row_candidates": duplicate_keys,
     }
@@ -131,8 +135,19 @@ def profile_source(
     frequency_limit: int = 20,
     allowed_roots=None,
 ) -> dict[str, Any]:
-    rows = read_rows(source, limit=sample_limit, allowed_roots=allowed_roots)
-    return profile_rows(rows, sample_limit=sample_limit, frequency_limit=frequency_limit)
+    # Read one sentinel row beyond the retained sample.  This keeps the value
+    # profile bounded while proving when the source is larger than the sample.
+    observed = read_rows(source, limit=sample_limit + 1, allowed_roots=allowed_roots)
+    has_more = len(observed) > sample_limit
+    profile = profile_rows(observed[:sample_limit], sample_limit=sample_limit, frequency_limit=frequency_limit)
+    if has_more:
+        profile["row_count"] = len(observed)
+        profile["row_count_exact"] = False
+        profile["row_count_lower_bound"] = len(observed)
+        profile["row_count_kind"] = "lower_bound"
+        profile["bounded"] = True
+        profile["sample_complete"] = False
+    return profile
 
 
 profile = profile_source

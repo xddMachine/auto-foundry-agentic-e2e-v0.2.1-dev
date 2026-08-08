@@ -33,6 +33,26 @@ def validate_allowed_path(path: str | os.PathLike[str], allowed_roots: Iterable[
     return candidate
 
 
+def require_allowed_roots(
+    allowed_roots: Iterable[str | os.PathLike[str]] | None,
+    *,
+    context: str = "filesystem operation",
+) -> tuple[str, ...]:
+    """Require one declared execution root at an execution boundary.
+
+    Low-level readers may intentionally remain general; catalog execution,
+    manifests, reproduction, and CLI output call this helper before touching a
+    filesystem path.
+    """
+
+    if allowed_roots is None:
+        raise AllowedRootError(f"{context} requires nonempty allowed_roots")
+    roots = tuple(str(root) for root in allowed_roots)
+    if not roots:
+        raise AllowedRootError(f"{context} requires nonempty allowed_roots")
+    return roots
+
+
 @dataclass
 class Workspace:
     """A bounded, local run workspace.
@@ -85,4 +105,4 @@ class Workspace:
         return self.ensure("manifests")
 
 
-__all__ = ["AllowedRootError", "Workspace", "validate_allowed_path"]
+__all__ = ["AllowedRootError", "Workspace", "require_allowed_roots", "validate_allowed_path"]

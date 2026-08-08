@@ -22,8 +22,15 @@ class TelemetryRecorder:
 
     def __init__(self, root: str | Path | None = None, *, run_id: str = "run") -> None:
         self.root = Path(root).expanduser().resolve() if root is not None else None
+        self.storage_available = False
+        self.dropped_events = 0
+        self.write_errors: list[str] = []
         if self.root is not None:
-            self.root.mkdir(parents=True, exist_ok=True)
+            try:
+                self.root.mkdir(parents=True, exist_ok=True)
+                self.storage_available = True
+            except Exception as exc:  # telemetry must never block the caller
+                self._note_write_error(exc)
         self.run_id = run_id
         self.started_at = _now()
         self._started_clock = time.perf_counter()
@@ -46,9 +53,17 @@ class TelemetryRecorder:
         self.events.append(event)
         path = self.event_path
         if path is not None:
-            with path.open("a", encoding="utf-8", newline="\n") as stream:
-                stream.write(event.to_json() + "\n")
+            try:
+                with path.open("a", encoding="utf-8", newline="\n") as stream:
+                    stream.write(event.to_json() + "\n")
+            except Exception as exc:  # passive telemetry: keep the in-memory fact
+                self.dropped_events += 1
+                self._note_write_error(exc)
         return event
+
+    def _note_write_error(self, error: Exception) -> None:
+        self.storage_available = False
+        self.write_errors.append(f"{type(error).__name__}: {error}")
 
     def record_operation(self, receipt: OperationReceipt) -> TelemetryEvent:
         return self.record(
@@ -82,6 +97,10 @@ class TelemetryRecorder:
         cache_misses = sum(event.event_type == "cache_miss" for event in self.events)
         bytes_read = sum(event.bytes_processed or 0 for event in self.events if event.event_type in {"source_read", "operation"})
         files_read = sum(event.event_type == "source_read" for event in self.events)
+        facts = dict(extra or {})
+        facts.setdefault("telemetry_storage", "available" if self.storage_available else ("disabled" if self.root is None else "unavailable"))
+        facts.setdefault("telemetry_write_errors", len(self.write_errors))
+        facts.setdefault("telemetry_dropped_events", self.dropped_events)
         return RunTelemetrySummary(
             run_id=self.run_id,
             started_at=self.started_at,
@@ -97,15 +116,19 @@ class TelemetryRecorder:
             capability_usage=dict(capability_usage),
             custom_script_count="unavailable",
             custom_script_loc="unavailable",
-            facts=dict(extra or {}),
+            facts=facts,
         )
 
     def write_summary(self, path: str | Path | None = None, *, extra: Mapping[str, Any] | None = None) -> RunTelemetrySummary:
         summary = self.summary(extra=extra)
         destination = Path(path) if path is not None else (self.root / "summary.json" if self.root else None)
         if destination is not None:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text(summary.to_json() + "\n", encoding="utf-8")
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(summary.to_json() + "\n", encoding="utf-8")
+            except Exception as exc:  # summary persistence is observational only
+                self.dropped_events += 1
+                self._note_write_error(exc)
         return summary
 
 

@@ -11,7 +11,7 @@ from typing import Any
 from .capabilities import execute
 from .catalog import capability_catalog, get_capability, search_capabilities
 from .contracts import OperationSpec
-from .workspace import validate_allowed_path
+from .workspace import require_allowed_roots, validate_allowed_path
 
 
 def _print(value: Any) -> None:
@@ -56,8 +56,12 @@ def main(argv: list[str] | None = None) -> int:
         parameters = dict(payload.get("parameters") or {})
         parameters.setdefault("allowed_roots", payload.pop("allowed_roots"))
         payload["parameters"] = parameters
+        payload["allowed_roots"] = parameters["allowed_roots"]
     spec = OperationSpec.from_dict(payload)
-    declared_roots = payload.get("allowed_roots") or payload.get("parameters", {}).get("allowed_roots")
+    declared_roots = require_allowed_roots(
+        payload.get("allowed_roots") or payload.get("parameters", {}).get("allowed_roots"),
+        context="CLI run",
+    )
     raw_output = Path(args.output).expanduser().resolve()
     output_dir = validate_allowed_path(raw_output, declared_roots) if declared_roots else raw_output
     result_path = validate_allowed_path(output_dir / "result.json", declared_roots) if declared_roots else output_dir / "result.json"

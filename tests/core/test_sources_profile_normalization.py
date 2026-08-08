@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from auto_foundry_core.normalization import normalize_rows, parse_date, parse_number
-from auto_foundry_core.profiling import profile_rows
+from auto_foundry_core.profiling import profile_rows, profile_source
 from auto_foundry_core.artifacts import write_artifact, write_manifest
 from auto_foundry_core.sources import discover, preview, read_rows, register_document, register_source
 from auto_foundry_core.workspace import AllowedRootError
@@ -76,6 +76,18 @@ def test_profile_and_provenance_preserving_normalization():
     assert len(result["failures"]) == 2
     assert parse_date("not-a-date").ok is False
     assert parse_number("(1,200)").value == -1200.0
+
+
+def test_profile_source_reports_sentinel_beyond_sample(tmp_path: Path):
+    source = tmp_path / "large.csv"
+    source.write_text("id\n" + "".join(f"{index}\n" for index in range(1001)), encoding="utf-8")
+    profile = profile_source(source, sample_limit=1000, allowed_roots=(tmp_path,))
+    assert profile["sampled_rows"] == 1000
+    assert profile["row_count"] == 1001
+    assert profile["row_count_lower_bound"] == 1001
+    assert profile["row_count_exact"] is False
+    assert profile["sample_complete"] is False
+    assert profile["row_count_kind"] == "lower_bound"
 
 
 def test_source_hash_is_immutable_and_artifact_roots_are_enforced(tmp_path: Path):
