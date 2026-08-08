@@ -17,6 +17,7 @@ from .artifacts import build_manifest, write_artifact, write_manifest, hash_valu
 from .cache import RunCache
 from .capabilities import DESCRIPTORS, execute
 from .contracts import DataAssetRef, OperationReceipt, OperationResultRef, OperationSpec
+from .references import decode_explicit_reference, is_data_asset_mapping, is_explicit_reference_mapping
 from .reproduction import compare_results, reproduce
 from .sources import hash_file
 from .telemetry import TelemetryRecorder
@@ -43,10 +44,6 @@ _SOURCE_CAPABILITIES = frozenset(
         "aggregation.compute",
     }
 )
-_DATA_ASSET_FIELDS = frozenset({"uri", "format", "content_hash", "size_bytes", "metadata"})
-_RESULT_FIELDS = frozenset({"location", "content_hash", "format", "rows", "metadata"})
-
-
 def _copy_asset(value: DataAssetRef, context: RunContext) -> DataAssetRef:
     path = context.resolve_input(value.uri)
     return DataAssetRef(
@@ -58,21 +55,13 @@ def _copy_asset(value: DataAssetRef, context: RunContext) -> DataAssetRef:
     )
 
 
-def _is_data_asset_mapping(value: Mapping[str, Any]) -> bool:
-    return "uri" in value and set(value).issubset(_DATA_ASSET_FIELDS)
-
-
-def _is_result_mapping(value: Mapping[str, Any]) -> bool:
-    return "location" in value and set(value).issubset(_RESULT_FIELDS)
-
-
 def _resolve_declared_reference(value: Any, context: RunContext) -> Any:
-    """Resolve a declared path slot, never an arbitrary nested mapping.
+    """Resolve typed/explicit refs in an otherwise arbitrary value.
 
-    Mapping values are accepted only when their keys match one of the public
-    typed reference contracts.  Plain mappings are returned unchanged; this
-    is important for business rows that happen to contain fields named
-    ``uri`` or ``location``.
+    Ordinary strings and mappings are analytical values here.  Source path
+    slots use :func:`_resolve_source` below, which is the only place where a
+    plain string or a complete direct ``DataAssetRef`` mapping is interpreted
+    as a source.
     """
 
     if isinstance(value, DataAssetRef):
@@ -87,29 +76,53 @@ def _resolve_declared_reference(value: Any, context: RunContext) -> Any:
         )
     if isinstance(value, Path):
         return context.resolve_input(value)
-    if isinstance(value, str):
-        return context.resolve_input(value)
     if isinstance(value, Mapping):
-        if _is_data_asset_mapping(value):
-            return _copy_asset(DataAssetRef.from_dict(value), context)
-        if _is_result_mapping(value):
-            result = OperationResultRef.from_dict(value)
-            return OperationResultRef(
-                location=str(context.resolve_run_path(result.location)),
-                content_hash=result.content_hash,
-                format=result.format,
-                rows=result.rows,
-                metadata=result.metadata,
-            )
-        return value
+        if is_explicit_reference_mapping(value):
+            return _resolve_declared_reference(decode_explicit_reference(value), context)
+        # Preserve ordinary mappings while still allowing an explicitly
+        # tagged reference nested inside a list/dict value.
+        return {key: _resolve_explicit_nested(item, context) for key, item in value.items()}
     if isinstance(value, (tuple, list)):
         converted = [_resolve_declared_reference(item, context) for item in value]
         return tuple(converted) if isinstance(value, tuple) else converted
     return value
 
 
+def _resolve_explicit_nested(value: Any, context: RunContext) -> Any:
+    """Resolve only explicit tags nested in an arbitrary mapping."""
+
+    if isinstance(value, Mapping):
+        if is_explicit_reference_mapping(value):
+            return _resolve_declared_reference(value, context)
+        return {key: _resolve_explicit_nested(item, context) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_resolve_explicit_nested(item, context) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_resolve_explicit_nested(item, context) for item in value)
+    return value
+
+
 def _resolve_source(value: Any, context: RunContext) -> Any:
-    return _resolve_declared_reference(value, context)
+    """Resolve a value in a capability-declared source path slot."""
+
+    if isinstance(value, str):
+        return context.resolve_input(value)
+    if isinstance(value, Path):
+        return context.resolve_input(value)
+    if isinstance(value, DataAssetRef):
+        return _copy_asset(value, context)
+    if isinstance(value, OperationResultRef):
+        raise TypeError("source slots accept DataAssetRef values, not OperationResultRef")
+    if isinstance(value, Mapping):
+        if is_explicit_reference_mapping(value):
+            decoded = decode_explicit_reference(value)
+            if not isinstance(decoded, DataAssetRef):
+                raise TypeError("source slots accept data_asset references")
+            return _copy_asset(decoded, context)
+        if is_data_asset_mapping(value):
+            return _copy_asset(DataAssetRef.from_dict(value), context)
+        return _resolve_explicit_nested(value, context)
+    return _resolve_explicit_nested(value, context)
 
 
 def _prepare_spec(spec: OperationSpec, context: RunContext) -> OperationSpec:
@@ -124,12 +137,18 @@ def _prepare_spec(spec: OperationSpec, context: RunContext) -> OperationSpec:
             parameters["path"] = _resolve_source(parameters["path"], context)
         if capability_id in {"identity.candidates", "relationships.measure"}:
             for key in ("left_rows", "right_rows"):
-                if key in parameters and isinstance(parameters[key], (str, Path, DataAssetRef, Mapping)):
+                if key in parameters and (
+                    isinstance(parameters[key], (str, Path, DataAssetRef, OperationResultRef))
+                    or is_explicit_reference_mapping(parameters[key])
+                ):
                     parameters[key] = _resolve_source(parameters[key], context)
             for index, value in enumerate(inputs):
-                if isinstance(value, (str, Path, DataAssetRef, Mapping)):
+                if isinstance(value, (str, Path, DataAssetRef, OperationResultRef)) or is_explicit_reference_mapping(value):
                     inputs[index] = _resolve_source(value, context)
-        elif inputs and isinstance(inputs[0], (str, Path, DataAssetRef, Mapping)):
+        elif inputs and (
+            isinstance(inputs[0], (str, Path, DataAssetRef, OperationResultRef))
+            or is_explicit_reference_mapping(inputs[0])
+        ):
             inputs[0] = _resolve_source(inputs[0], context)
     elif capability_id == "artifacts.write":
         if "source_refs" in parameters:
@@ -173,6 +192,9 @@ def _collect_hashes(value: Any, context: RunContext, found: list[str]) -> None:
         found.append(hash_file(path, allowed_roots=context.read_roots))
         return
     if isinstance(value, Mapping):
+        if is_explicit_reference_mapping(value):
+            _collect_hashes(decode_explicit_reference(value), context, found)
+            return
         for item in value.values():
             _collect_hashes(item, context, found)
         return
@@ -202,30 +224,60 @@ def _input_hashes(spec: OperationSpec, context: RunContext) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
-def _output_hash(value: Any) -> str:
-    if isinstance(value, OperationResultRef):
+def _output_hash(value: Any, context: RunContext | None = None) -> str:
+    if isinstance(value, DataAssetRef):
+        if context is not None:
+            return hash_file(context.resolve_input(value.uri), allowed_roots=context.read_roots)
         return value.content_hash or hash_value(value)
-    if isinstance(value, Mapping) and "content_hash" in value:
-        return str(value["content_hash"])
+    if isinstance(value, OperationResultRef):
+        if context is not None:
+            return hash_file(context.resolve_run_path(value.location), allowed_roots=(context.run_root,))
+        return value.content_hash or hash_value(value)
+    if isinstance(value, Mapping) and is_explicit_reference_mapping(value):
+        return _output_hash(decode_explicit_reference(value), context)
+    if isinstance(value, Mapping) and any(_contains_typed_reference(item) for item in value.values()):
+        return hash_value({
+            key: _output_hash(item, context) if _contains_typed_reference(item) else item
+            for key, item in value.items()
+        })
+    if isinstance(value, (list, tuple)) and any(_contains_typed_reference(item) for item in value):
+        return hash_value([_output_hash(item, context) if _contains_typed_reference(item) else item for item in value])
     return hash_value(value)
+
+
+def _contains_typed_reference(value: Any) -> bool:
+    if isinstance(value, (Path, DataAssetRef, OperationResultRef)):
+        return True
+    if isinstance(value, Mapping):
+        if is_explicit_reference_mapping(value):
+            decode_explicit_reference(value)  # validate malformed/unknown tags
+            return True
+        return any(_contains_typed_reference(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_typed_reference(item) for item in value)
+    return False
 
 
 def _result_ref(value: Any) -> OperationResultRef | None:
     if isinstance(value, OperationResultRef):
         return value
-    if isinstance(value, Mapping) and "location" in value:
-        try:
-            return OperationResultRef.from_dict(value)
-        except (TypeError, ValueError):
-            return None
+    if isinstance(value, Mapping) and is_explicit_reference_mapping(value):
+        result = decode_explicit_reference(value)
+        if not isinstance(result, OperationResultRef):
+            raise TypeError(f"operation output reference must be operation_result, got {type(result).__name__}")
+        return result
     return None
 
 
 def _rehydrate_cached(capability_id: str, value: Any) -> Any:
     """Restore typed public results that JSON cache serialization flattens."""
 
-    if capability_id == "sources.register" and isinstance(value, Mapping):
-        return DataAssetRef.from_dict(value)
+    if isinstance(value, Mapping) and is_explicit_reference_mapping(value):
+        decoded = decode_explicit_reference(value)
+        if capability_id == "sources.register" and isinstance(decoded, DataAssetRef):
+            return decoded
+        if capability_id == "artifacts.write" and isinstance(decoded, OperationResultRef):
+            return decoded
     return value
 
 
@@ -297,7 +349,7 @@ class CoreRuntime:
         spec_hash: str | None = None,
     ) -> OperationReceipt:
         descriptor = DESCRIPTORS.get(spec.capability_id)
-        output_hashes = () if errors else (_output_hash(value),)
+        output_hashes = () if errors else (_output_hash(value, self.context),)
         return OperationReceipt(
             capability_id=spec.capability_id,
             spec_hash=spec_hash or spec.spec_hash,

@@ -46,6 +46,14 @@ from .telemetry import TelemetryRecorder
 from .enterprise_model import LivingEnterpriseModel
 from .catalog import capability_catalog, get_capability
 from .runtime import CoreExecutionResult, CoreRuntime
+from .references import (
+    DATA_ASSET_REFERENCE,
+    OPERATION_RESULT_REFERENCE,
+    REFERENCE_DISCRIMINATOR,
+    decode_explicit_reference,
+    encode_explicit_reference,
+    is_explicit_reference_mapping,
+)
 
 __version__ = "0.1.0"
 
@@ -64,4 +72,6 @@ __all__ = [
     "normalize_value", "parse_date", "parse_number", "preview", "profile_rows",
     "profile_source", "read_rows", "register_source", "reproduce",
     "write_artifact", "write_manifest", "require_allowed_roots",
+    "DATA_ASSET_REFERENCE", "OPERATION_RESULT_REFERENCE", "REFERENCE_DISCRIMINATOR",
+    "decode_explicit_reference", "encode_explicit_reference", "is_explicit_reference_mapping",
 ]

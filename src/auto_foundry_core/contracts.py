@@ -21,6 +21,13 @@ def _freeze(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
 
 
 def _jsonable(value: Any) -> Any:
+    # Filesystem references are the one intentionally tagged union in the
+    # package.  Handle them before the generic dataclass branch so every
+    # nested contract (receipts, operation specs, cache values, manifests)
+    # preserves the explicit discriminator on the wire.
+    if "DataAssetRef" in globals() and "OperationResultRef" in globals() and isinstance(value, (DataAssetRef, OperationResultRef)):
+        from .references import encode_explicit_reference
+        return encode_explicit_reference(value)
     if is_dataclass(value):
         return {f.name: _jsonable(getattr(value, f.name)) for f in fields(value)}
     if isinstance(value, Mapping):
@@ -126,6 +133,14 @@ class DataAssetRef(ContractMixin):
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "DataAssetRef":
+        if not isinstance(data, Mapping):
+            raise TypeError("DataAssetRef.from_dict expects a mapping")
+        from .references import decode_explicit_reference, is_explicit_reference_mapping
+        if is_explicit_reference_mapping(data):
+            value = decode_explicit_reference(data)
+            if not isinstance(value, cls):
+                raise TypeError(f"expected data_asset reference, got {type(value).__name__}")
+            return value
         return cls(**dict(data))
 
     @classmethod
@@ -274,11 +289,24 @@ class OperationResultRef(ContractMixin):
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "location", _require(self.location, "result location"))
+        if self.content_hash is not None:
+            digest = _require(self.content_hash, "content_hash").lower()
+            if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                raise ValueError("content_hash must be a SHA-256 hex digest")
+            object.__setattr__(self, "content_hash", digest)
         object.__setattr__(self, "format", self.format.lower().lstrip(".") if self.format else None)
         object.__setattr__(self, "metadata", _freeze(self.metadata))
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "OperationResultRef":
+        if not isinstance(data, Mapping):
+            raise TypeError("OperationResultRef.from_dict expects a mapping")
+        from .references import decode_explicit_reference, is_explicit_reference_mapping
+        if is_explicit_reference_mapping(data):
+            value = decode_explicit_reference(data)
+            if not isinstance(value, cls):
+                raise TypeError(f"expected operation_result reference, got {type(value).__name__}")
+            return value
         return cls(**dict(data))
 
 

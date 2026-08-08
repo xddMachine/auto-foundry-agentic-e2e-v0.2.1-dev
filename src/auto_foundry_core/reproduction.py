@@ -8,6 +8,7 @@ from typing import Any, Callable, Mapping
 
 from .artifacts import hash_value
 from .contracts import DataAssetRef, OperationResultRef
+from .references import decode_explicit_reference, is_explicit_reference_mapping
 from .sources import hash_file
 from .workspace import RunContext, require_allowed_roots, validate_allowed_path
 
@@ -29,16 +30,14 @@ def _fingerprint(value: Any, *, allowed_roots=None, context: RunContext | None =
         roots = require_allowed_roots((str(context.run_root),) if context is not None else allowed_roots, context="reproduction result hashing")
         path = context.resolve_run_path(value.location) if context is not None else value.location
         return hash_file(path, allowed_roots=roots)
-    if isinstance(value, Mapping) and ("location" in value or "uri" in value):
-        location = value.get("location", value.get("uri"))
-        roots = require_allowed_roots((str(context.run_root),) if context is not None and "location" in value and "uri" not in value else (tuple(str(root) for root in context.read_roots) if context is not None else allowed_roots), context="reproduction path hashing")
-        if context is not None:
-            path = context.resolve_run_path(location) if "location" in value and "uri" not in value else context.resolve_input(location)
-        else:
-            path = validate_allowed_path(location, roots)
-        return hash_file(path, allowed_roots=roots)
-    if isinstance(value, Mapping) and "content_hash" in value:
-        return str(value["content_hash"])
+    if isinstance(value, Mapping):
+        if is_explicit_reference_mapping(value):
+            return _fingerprint(decode_explicit_reference(value), allowed_roots=allowed_roots, context=context)
+        # An ordinary mapping is value data.  Recurse only when a nested value
+        # is itself an actual/explicit reference; keys such as ``location``,
+        # ``uri``, and ``content_hash`` never trigger filesystem access.
+        if any(_contains_file_ref(item) for item in value.values()):
+            return hash_value({key: _fingerprint(item, allowed_roots=allowed_roots, context=context) if _contains_file_ref(item) else item for key, item in value.items()})
     return hash_value(value)
 
 
@@ -50,7 +49,8 @@ def _contains_file_ref(value: Any) -> bool:
     if isinstance(value, (DataAssetRef, OperationResultRef)):
         return True
     if isinstance(value, Mapping):
-        if "location" in value or "uri" in value:
+        if is_explicit_reference_mapping(value):
+            decode_explicit_reference(value)  # validate malformed/unknown tags
             return True
         return any(_contains_file_ref(item) for item in value.values())
     if isinstance(value, (list, tuple)):

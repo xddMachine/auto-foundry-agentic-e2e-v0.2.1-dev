@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .contracts import DataAssetRef, OperationReceipt, OperationResultRef, OperationSpec
+from .references import decode_explicit_reference, is_data_asset_mapping, is_explicit_reference_mapping
 from .sources import hash_file
 from .workspace import RunContext, require_allowed_roots, validate_allowed_path
 
@@ -26,6 +27,8 @@ def _jsonable(value: Any) -> Any:
         return {str(k): _jsonable(v) for k, v in value.items()}
     if isinstance(value, (tuple, list, set, frozenset)):
         return [_jsonable(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
     return value
 
 
@@ -40,27 +43,27 @@ def _manifest_path_hash(path: str | Path, *, allowed_roots, context: str) -> str
     return hash_file(candidate, allowed_roots=roots)
 
 
-def _tagged_location(value: Mapping[str, Any]) -> str | Path | None:
-    """Return a tagged filesystem location, if one was explicitly supplied."""
-
-    if "uri" in value:
-        return value["uri"]
-    if "location" in value:
-        return value["location"]
-    return None
-
-
-def _manifest_hash(item: Any, *, allowed_roots, context: str) -> str:
+def _manifest_hash(item: Any, *, allowed_roots, context: str, run_context: RunContext | None = None) -> str:
     if isinstance(item, DataAssetRef):
-        return _manifest_path_hash(item.uri, allowed_roots=allowed_roots, context=context)
+        roots = _context_read_roots(run_context) if run_context is not None else allowed_roots
+        return _manifest_path_hash(item.uri, allowed_roots=roots, context=context)
     if isinstance(item, OperationResultRef):
-        return _manifest_path_hash(item.location, allowed_roots=allowed_roots, context=context)
+        roots = (str(run_context.run_root),) if run_context is not None else allowed_roots
+        return _manifest_path_hash(item.location, allowed_roots=roots, context=context)
     if isinstance(item, Path):
         return _manifest_path_hash(item, allowed_roots=allowed_roots, context=context)
     if isinstance(item, Mapping):
-        location = _tagged_location(item)
-        if location is not None:
-            return _manifest_path_hash(location, allowed_roots=allowed_roots, context=context)
+        if is_explicit_reference_mapping(item):
+            return _manifest_hash(decode_explicit_reference(item), allowed_roots=allowed_roots, context=context, run_context=run_context)
+        # Preserve ordinary mappings as value data.  A nested typed or
+        # explicitly tagged reference remains a file reference, but a field
+        # named ``location``, ``uri``, or ``content_hash`` alone does nothing.
+        if any(_contains_manifest_file_ref(value) for value in item.values()):
+            return hash_value({
+                key: _manifest_hash(value, allowed_roots=allowed_roots, context=context, run_context=run_context)
+                if _contains_manifest_file_ref(value) else value
+                for key, value in item.items()
+            })
     # Plain strings are values, even when they happen to resemble filenames.
     return hash_value(item)
 
@@ -87,20 +90,38 @@ def _context_manifest_item(item: Any, context: RunContext, *, output: bool) -> A
     """Resolve typed manifest locations before hashing them."""
 
     if isinstance(item, DataAssetRef):
-        path = context.resolve_run_path(item.uri) if output else context.resolve_input(item.uri)
+        # Data assets always live under input roots; an output flag does not
+        # change the semantic namespace of a typed reference.
+        path = context.resolve_input(item.uri)
         return DataAssetRef(uri=str(path), format=item.format, content_hash=item.content_hash, size_bytes=item.size_bytes, metadata=item.metadata)
     if isinstance(item, OperationResultRef):
         return OperationResultRef(location=str(context.resolve_run_path(item.location)), content_hash=item.content_hash, format=item.format, rows=item.rows, metadata=item.metadata)
     if isinstance(item, Path):
         return context.resolve_run_path(item) if output else context.resolve_input(item)
     if isinstance(item, Mapping):
-        value = dict(item)
-        if "uri" in value:
-            value["uri"] = str(context.resolve_input(value["uri"]))
-        if "location" in value:
-            value["location"] = str(context.resolve_run_path(value["location"]))
-        return value
+        if is_explicit_reference_mapping(item):
+            return _context_manifest_item(decode_explicit_reference(item), context, output=output)
+        # Ordinary mappings are analytical data.  Recurse only to preserve
+        # explicit/typed references nested inside a collection.
+        return {key: _context_manifest_item(value, context, output=output) for key, value in item.items()}
+    if isinstance(item, list):
+        return [_context_manifest_item(value, context, output=output) for value in item]
+    if isinstance(item, tuple):
+        return tuple(_context_manifest_item(value, context, output=output) for value in item)
     return item
+
+
+def _contains_manifest_file_ref(value: Any) -> bool:
+    if isinstance(value, (Path, DataAssetRef, OperationResultRef)):
+        return True
+    if isinstance(value, Mapping):
+        if is_explicit_reference_mapping(value):
+            decode_explicit_reference(value)  # validate malformed/unknown tags
+            return True
+        return any(_contains_manifest_file_ref(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_manifest_file_ref(item) for item in value)
+    return False
 
 
 def write_artifact(
@@ -127,8 +148,13 @@ def write_artifact(
         output_roots = allowed_roots
     source_hashes = []
     for source in source_refs:
-        if isinstance(source, Mapping) and "uri" in source:
-            source = DataAssetRef.from_dict(source)
+        if isinstance(source, Mapping):
+            if is_explicit_reference_mapping(source):
+                source = decode_explicit_reference(source)
+            elif is_data_asset_mapping(source):
+                source = DataAssetRef.from_dict(source)
+            else:
+                raise TypeError("artifacts.write source_refs accepts DataAssetRef or local path values")
         if isinstance(source, DataAssetRef):
             # Validate and re-hash descriptors before creating any output so a
             # rejected input cannot leave a misleading derived artifact.
@@ -205,24 +231,35 @@ def build_manifest(
             item = _context_manifest_item(item, context, output=False)
         if isinstance(item, (DataAssetRef, OperationResultRef)):
             input_refs.append(item.to_dict())
-            roots = require_allowed_roots(_context_read_roots(context) if context is not None else allowed_roots, context="manifest input hashing")
-            input_hashes.append(_manifest_hash(item, allowed_roots=roots, context="manifest input hashing"))
+            roots = require_allowed_roots(
+                _context_read_roots(context) if context is not None else allowed_roots,
+                context="manifest input hashing",
+            )
+            input_hashes.append(_manifest_hash(item, allowed_roots=roots, context="manifest input hashing", run_context=context))
         else:
-            input_refs.append(dict(item) if isinstance(item, Mapping) else str(original_item))
-            input_hashes.append(_manifest_hash(item, allowed_roots=_context_read_roots(context) if context is not None else allowed_roots, context="manifest input hashing"))
+            input_refs.append(_jsonable(dict(item)) if isinstance(item, Mapping) else str(original_item))
+            input_hashes.append(_manifest_hash(item, allowed_roots=_context_read_roots(context) if context is not None else allowed_roots, context="manifest input hashing", run_context=context))
     output_refs: list[Any] = []
     output_hashes: list[str] = []
     for item in outputs:
         original_item = item
         if context is not None:
             item = _context_manifest_item(item, context, output=True)
-        if isinstance(item, OperationResultRef):
+        if isinstance(item, (DataAssetRef, OperationResultRef)):
             output_refs.append(item.to_dict())
-            roots = require_allowed_roots((str(context.run_root),) if context is not None else allowed_roots, context="manifest output hashing")
-            output_hashes.append(_manifest_hash(item, allowed_roots=roots, context="manifest output hashing"))
+            # A DataAssetRef remains an input-root object even when a caller
+            # places it in the output collection; OperationResultRef belongs
+            # to the run-output namespace.
+            roots = require_allowed_roots(
+                _context_read_roots(context)
+                if isinstance(item, DataAssetRef) and context is not None
+                else ((str(context.run_root),) if context is not None else allowed_roots),
+                context="manifest output hashing",
+            )
+            output_hashes.append(_manifest_hash(item, allowed_roots=roots, context="manifest output hashing", run_context=context))
         else:
-            output_refs.append(dict(item) if isinstance(item, Mapping) else str(original_item))
-            output_hashes.append(_manifest_hash(item, allowed_roots=(str(context.run_root),) if context is not None else allowed_roots, context="manifest output hashing"))
+            output_refs.append(_jsonable(dict(item)) if isinstance(item, Mapping) else str(original_item))
+            output_hashes.append(_manifest_hash(item, allowed_roots=(str(context.run_root),) if context is not None else allowed_roots, context="manifest output hashing", run_context=context))
     return {
         "manifest_version": "1",
         "core_version": core_version,
@@ -233,7 +270,7 @@ def build_manifest(
         "input_hashes": input_hashes,
         "output_refs": output_refs,
         "output_hashes": output_hashes,
-        "metadata": dict(metadata or {}),
+        "metadata": _jsonable(dict(metadata or {})),
     }
 
 

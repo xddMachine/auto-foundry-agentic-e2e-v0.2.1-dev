@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .contracts import CapabilityDescriptor, DataAssetRef, IdentityCandidate, IdentityDecision, OperationResultRef, OperationSpec
+from .references import decode_explicit_reference, is_data_asset_mapping, is_explicit_reference_mapping
 from .workspace import RunContext, require_allowed_roots
 
 
@@ -46,10 +47,16 @@ def _read_rows(
         return [dict(v) for v in value]
     if isinstance(value, tuple):
         return [dict(v) for v in value]
-    if isinstance(value, Mapping) and "rows" in value:
-        return [dict(v) for v in value["rows"]]
+    if isinstance(value, Mapping):
+        if is_explicit_reference_mapping(value):
+            decoded = decode_explicit_reference(value)
+            if not isinstance(decoded, DataAssetRef):
+                raise TypeError("source rows require a data_asset reference")
+            value = decoded
+        elif "rows" in value:
+            return [dict(v) for v in value["rows"]]
     read_options["allowed_roots"] = require_allowed_roots(allowed_roots)
-    if isinstance(value, Mapping) and "uri" in value:
+    if isinstance(value, Mapping) and is_data_asset_mapping(value):
         from .sources import read_rows
         return read_rows(DataAssetRef.from_dict(value), **read_options)
     if isinstance(value, (str, Path, DataAssetRef)):
@@ -62,12 +69,20 @@ def _source(spec: OperationSpec) -> Any:
     params = dict(spec.parameters)
     if "path" in params:
         value = params["path"]
-        if isinstance(value, Mapping) and "uri" in value:
+        if isinstance(value, Mapping) and is_explicit_reference_mapping(value):
+            value = decode_explicit_reference(value)
+            if not isinstance(value, DataAssetRef):
+                raise TypeError("source path requires a data_asset reference")
+        elif isinstance(value, Mapping) and is_data_asset_mapping(value):
             return DataAssetRef.from_dict(value)
         return value
     if spec.inputs:
         value = spec.inputs[0]
-        if isinstance(value, Mapping) and "uri" in value:
+        if isinstance(value, Mapping) and is_explicit_reference_mapping(value):
+            value = decode_explicit_reference(value)
+            if not isinstance(value, DataAssetRef):
+                raise TypeError("source path requires a data_asset reference")
+        elif isinstance(value, Mapping) and is_data_asset_mapping(value):
             return DataAssetRef.from_dict(value)
         return value
     raise ValueError("operation requires a source path/input")
@@ -199,7 +214,9 @@ def _artifact(spec: OperationSpec, output_dir: str | None, context: RunContext |
     path = (context.resolve_product_path(filename) if context is not None else Path(output_dir or ".") / filename)
     p.setdefault("allowed_roots", _required_roots(spec, context="artifacts.write"))
     result = write_artifact(data, path, operation_spec=spec, context=context, **p)
-    return result.to_dict()
+    # Keep the public result typed.  CoreRuntime/cache/receipt serialization
+    # tags the object explicitly, while the CLI can still render ``to_dict``.
+    return result
 
 
 def _reproduce(spec: OperationSpec, output_dir: str | None, context: RunContext | None = None) -> Any:
@@ -301,7 +318,14 @@ def _is_path_reference(value: Any, *, strings_are_paths: bool = False) -> bool:
     if isinstance(value, (Path, DataAssetRef, OperationResultRef)):
         return True
     if isinstance(value, Mapping):
-        return "uri" in value or "location" in value
+        if is_explicit_reference_mapping(value):
+            decode_explicit_reference(value)  # validate malformed/unknown tags before dispatch
+            return True
+        # Do not apply ``strings_are_paths`` to arbitrary row fields.  Only a
+        # nested actual/explicit reference should make a collection path-like.
+        return any(_is_path_reference(item, strings_are_paths=False) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_is_path_reference(item, strings_are_paths=False) for item in value)
     return False
 
 

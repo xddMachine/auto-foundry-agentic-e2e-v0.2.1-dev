@@ -11,6 +11,7 @@ import tempfile
 from typing import Any, Callable, Iterable, Mapping
 
 from .contracts import OperationSpec
+from .references import decode_explicit_reference, is_explicit_reference_mapping
 from .workspace import RunContext
 
 
@@ -30,6 +31,11 @@ def _restore(value: Any) -> Any:
     if isinstance(value, Mapping) and set(value) == {"__bytes__"}:
         return base64.b64decode(value["__bytes__"])
     if isinstance(value, Mapping):
+        if is_explicit_reference_mapping(value):
+            # Validate the wire contract but retain the mapping shape for
+            # capability results whose nested source descriptors are data
+            # fields rather than the public result itself.
+            decode_explicit_reference(value)
         return {k: _restore(v) for k, v in value.items()}
     if isinstance(value, list):
         return [_restore(v) for v in value]
