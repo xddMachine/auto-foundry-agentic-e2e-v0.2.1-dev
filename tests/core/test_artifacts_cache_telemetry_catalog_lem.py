@@ -102,7 +102,8 @@ def test_lem_delta_links_conflicts_supersession_and_scope(tmp_path: Path):
         accepted=True,
     )
     assert model.apply_delta(conflict)["applied"]
-    supersede = KnowledgeDelta("d-new", "supersede", {"item_ids": ("item-a",)}, supersedes=("d-add",), accepted=True)
+    model.register_prepared_asset(PreparedAssetDescriptor("prepared-a", location="prepared.json"))
+    supersede = KnowledgeDelta("d-new", "supersede", {"item_ids": ("item-a", "prepared-a")}, supersedes=("d-add",), accepted=True)
     assert model.apply_delta(supersede)["applied"]
     exported = model.export()
     assert exported["knowledge"]["d-conflict"]["conflicts_with"] == ["d-add"]
@@ -111,6 +112,13 @@ def test_lem_delta_links_conflicts_supersession_and_scope(tmp_path: Path):
     assert exported["conflict_state"]["d-conflict"]["unresolved"] is True
     assert exported["knowledge"]["d-conflict"]["working_definition"] == "definition-a"
     assert exported["supersession_links"]["d-new"] == ["d-add"]
+    assert exported["knowledge"]["d-add"]["superseded_by"] == ["d-new"]
+    assert exported["ontology"][0]["status"] == "superseded"
+    assert exported["prepared_assets"][0]["status"] == "superseded"
+    before_rejected = model.export()
+    with __import__("pytest").raises(KeyError):
+        model.apply_delta(KnowledgeDelta("d-bad", "supersede", {"item_ids": ("missing-item",)}, supersedes=("d-add",), accepted=True))
+    assert model.export() == before_rejected
     with __import__("pytest").raises(ValueError):
         model.relevant_bundle(["item-a"], scope="other")
     with __import__("pytest").raises(KeyError):
@@ -123,11 +131,11 @@ def test_cli_declared_allowed_root_is_enforced(tmp_path: Path):
     spec = tmp_path / "spec.json"
     spec.write_text(json.dumps({"parameters": {"path": str(source), "allowed_roots": [str(tmp_path)]}}), encoding="utf-8")
     env = {"PYTHONPATH": "src", "PYTHONDONTWRITEBYTECODE": "1"}
-    result = subprocess.run([sys.executable, "-m", "auto_foundry_core", "run", "sources.preview", "--spec", str(spec), "--output", str(tmp_path / "out")], env={**__import__("os").environ, **env}, capture_output=True, text=True)
+    result = subprocess.run([sys.executable, "-m", "auto_foundry_core", "run", "sources.preview", "--spec", str(spec), "--output", str(tmp_path / "out"), "--allowed-root", str(tmp_path)], env={**__import__("os").environ, **env}, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert (tmp_path / "out" / "result.json").is_file()
     outside = tmp_path.parent / (tmp_path.name + "-outside")
-    blocked = subprocess.run([sys.executable, "-m", "auto_foundry_core", "run", "sources.preview", "--spec", str(spec), "--output", str(outside)], env={**__import__("os").environ, **env}, capture_output=True, text=True)
+    blocked = subprocess.run([sys.executable, "-m", "auto_foundry_core", "run", "sources.preview", "--spec", str(spec), "--output", str(outside), "--allowed-root", str(tmp_path)], env={**__import__("os").environ, **env}, capture_output=True, text=True)
     assert blocked.returncode != 0
     assert not outside.exists()
 
@@ -147,7 +155,7 @@ def test_every_path_reading_catalog_capability_rejects_escape(tmp_path: Path):
         OperationSpec("relationships.measure", inputs=(str(outside), str(outside)), parameters={"left_key": "key", "allowed_roots": roots}),
         OperationSpec("aggregation.compute", inputs=(str(outside),), parameters={"operation": "count", "allowed_roots": roots}),
         OperationSpec("artifacts.write", parameters={"data": [{"ok": True}], "source_refs": [str(outside)], "allowed_roots": roots}),
-        OperationSpec("artifacts.reproduce", parameters={"expected": str(outside), "actual": str(outside), "allowed_roots": roots}),
+        OperationSpec("artifacts.reproduce", parameters={"expected": {"location": str(outside)}, "actual": {"location": str(outside)}, "allowed_roots": roots}),
     ]
     for spec in specs:
         with __import__("pytest").raises(AllowedRootError):
@@ -170,6 +178,20 @@ def test_execution_and_public_path_boundaries_require_roots(tmp_path: Path):
         compare_results(source, source)
     assert compare_results(source, source, allowed_roots=(tmp_path,))["equal"]
     assert compare_results([source], [source], allowed_roots=(tmp_path,))["equal"]
+    assert compare_results("v1.0", "v1.0")["equal"]
+    assert compare_results("example.com", "example.com")["equal"]
+    assert compare_results("report.csv", "report.csv")["equal"]
+    with pytest.raises(AllowedRootError):
+        compare_results({"location": str(source)}, {"location": str(source)})
+    manifest = build_manifest(
+        capability_id="artifacts.write",
+        operation_spec=OperationSpec("artifacts.write"),
+        inputs=["report.csv"],
+        outputs=[{"location": source}],
+        allowed_roots=(tmp_path,),
+    )
+    assert manifest["input_hashes"] == [hash_value("report.csv")]
+    assert manifest["output_hashes"]
 
 
 def test_cli_requires_roots_because_it_always_writes_result(tmp_path: Path):
@@ -180,3 +202,22 @@ def test_cli_requires_roots_because_it_always_writes_result(tmp_path: Path):
     result = subprocess.run([sys.executable, "-m", "auto_foundry_core", "run", "aggregation.compute", "--spec", str(spec), "--output", str(output)], env=env, capture_output=True, text=True)
     assert result.returncode != 0
     assert not output.exists()
+
+
+def test_cli_spec_and_embedded_roots_cannot_escape_out_of_band_root(tmp_path: Path):
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_spec = outside / "spec.json"
+    outside_spec.write_text(json.dumps({"parameters": {"rows": [{"value": 1}], "operation": "count"}}), encoding="utf-8")
+    env = {"PYTHONPATH": "src", "PYTHONDONTWRITEBYTECODE": "1", **__import__("os").environ}
+    blocked_spec = subprocess.run([sys.executable, "-m", "auto_foundry_core", "run", "aggregation.compute", "--spec", str(outside_spec), "--output", str(allowed / "out"), "--allowed-root", str(allowed)], env=env, capture_output=True, text=True)
+    assert blocked_spec.returncode != 0
+    assert not (allowed / "out").exists()
+
+    spec = allowed / "spec.json"
+    spec.write_text(json.dumps({"allowed_roots": [str(outside)], "parameters": {"rows": [{"value": 1}], "operation": "count"}}), encoding="utf-8")
+    blocked_embedded = subprocess.run([sys.executable, "-m", "auto_foundry_core", "run", "aggregation.compute", "--spec", str(spec), "--output", str(allowed / "out"), "--allowed-root", str(allowed)], env=env, capture_output=True, text=True)
+    assert blocked_embedded.returncode != 0
+    assert not (allowed / "out").exists()

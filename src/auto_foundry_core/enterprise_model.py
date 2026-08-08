@@ -152,7 +152,29 @@ class LivingEnterpriseModel:
             payload = _clean(dict(delta.payload))
             operation = delta.operation
             conflict_targets = tuple(str(value) for value in (delta.conflicts_with or payload.get("conflicts_with", ())))
-            supersession_targets = tuple(str(value) for value in (delta.supersedes or payload.get("item_ids", ()) or payload.get("supersedes", ())))
+            # ``delta.supersedes`` addresses prior knowledge records.  Payload
+            # item IDs address current ontology/prepared registries; keeping
+            # these domains separate prevents an ontology ID from being
+            # mistaken for a delta ID (or vice versa).
+            record_supersession_targets = tuple(str(value) for value in (delta.supersedes or ()))
+            item_values: list[str] = []
+            for key in ("item_ids", "ontology_item_ids", "prepared_asset_ids"):
+                value = payload.get(key, ())
+                if isinstance(value, (str, bytes)):
+                    value = (value,)
+                item_values.extend(str(item_id) for item_id in (value or ()))
+            item_supersession_targets = tuple(dict.fromkeys(item_values)) if operation == "supersede" else ()
+            missing_records = [item_id for item_id in record_supersession_targets if item_id not in self.knowledge]
+            if missing_records:
+                raise KeyError(f"unknown knowledge supersession targets: {missing_records}")
+            if operation == "supersede":
+                missing_items = [
+                    item_id
+                    for item_id in item_supersession_targets
+                    if item_id not in self.ontology and item_id not in self.prepared_assets
+                ]
+                if missing_items:
+                    raise KeyError(f"unknown ontology/prepared supersession targets: {missing_items}")
             if operation == "add_ontology_item":
                 self.add_ontology_item(payload)
             elif operation == "extend_ontology_item":
@@ -181,9 +203,9 @@ class LivingEnterpriseModel:
                 aliases = tuple(dict.fromkeys((*mapping.aliases, *payload.get("aliases", ()), str(payload.get("alias")) if payload.get("alias") is not None else "")))
                 self.canonical_mappings[key] = replace(mapping, aliases=tuple(alias for alias in aliases if alias))
             elif operation in {"record_limitation", "record_conflict"}:
-                self.conflicts.append({"delta_id": delta.delta_id, "operation": operation, "payload": payload, "conflicts_with": list(conflict_targets), "supersedes": list(supersession_targets), "evidence_refs": list(delta.evidence_refs), "unresolved": bool(payload.get("unresolved", operation == "record_conflict")), "working_definition": payload.get("working_definition")})
+                self.conflicts.append({"delta_id": delta.delta_id, "operation": operation, "payload": payload, "conflicts_with": list(conflict_targets), "supersedes": list(record_supersession_targets), "evidence_refs": list(delta.evidence_refs), "unresolved": bool(payload.get("unresolved", operation == "record_conflict")), "working_definition": payload.get("working_definition")})
             elif operation == "supersede":
-                for item_id in supersession_targets:
+                for item_id in item_supersession_targets:
                     if item_id in self.ontology:
                         self.ontology[item_id] = replace(self.ontology[item_id], status="superseded")
                     if item_id in self.prepared_assets:
@@ -201,14 +223,14 @@ class LivingEnterpriseModel:
                     if target_record is not None:
                         target_record["conflicts_with"] = sorted(set(target_record.get("conflicts_with", ())) | {delta.delta_id})
                         target_record["unresolved"] = True
-            if supersession_targets:
+            if record_supersession_targets:
                 targets = self.supersession_links.setdefault(delta.delta_id, set())
-                for target in supersession_targets:
+                for target in record_supersession_targets:
                     targets.add(str(target))
                     target_record = self.knowledge.get(str(target))
                     if target_record is not None:
                         target_record["superseded_by"] = sorted(set(target_record.get("superseded_by", ())) | {delta.delta_id})
-            self.knowledge[delta.delta_id] = {"operation": operation, "payload": payload, "evidence_refs": list(delta.evidence_refs), "conflicts_with": list(conflict_targets), "supersedes": list(supersession_targets), "unresolved": self.conflict_state.get(delta.delta_id, {}).get("unresolved", bool(operation == "record_conflict")), "working_definition": payload.get("working_definition")}
+            self.knowledge[delta.delta_id] = {"operation": operation, "payload": payload, "evidence_refs": list(delta.evidence_refs), "conflicts_with": list(conflict_targets), "supersedes": list(record_supersession_targets), "superseded_items": list(item_supersession_targets), "unresolved": self.conflict_state.get(delta.delta_id, {}).get("unresolved", bool(operation == "record_conflict")), "working_definition": payload.get("working_definition")}
             self.revisions.append({"delta_id": delta.delta_id, "operation": operation, "applied_at": datetime.now(timezone.utc).isoformat()})
             return {"applied": True, "delta_id": delta.delta_id, "operation": operation}
         except Exception:

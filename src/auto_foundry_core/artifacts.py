@@ -29,35 +29,35 @@ def hash_value(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _looks_like_path(value: str) -> bool:
-    """Recognize path-shaped strings without probing the filesystem.
-
-    Manifest construction is an execution/public boundary.  It must validate
-    a declared root before calling ``Path.is_file`` or hashing a path, while
-    still allowing simple inline marker strings to be hashed as values.
-    """
-
-    text = value.strip()
-    if not text:
-        return False
-    candidate = Path(text).expanduser()
-    return (
-        candidate.is_absolute()
-        or text.startswith((".", "~"))
-        or "/" in text
-        or "\\" in text
-        or bool(candidate.suffix)
-    )
-
-
-def _manifest_string_hash(value: str, *, allowed_roots, context: str) -> str:
-    if not _looks_like_path(value):
-        return hash_value(value)
+def _manifest_path_hash(path: str | Path, *, allowed_roots, context: str) -> str:
     roots = require_allowed_roots(allowed_roots, context=context)
-    candidate = validate_allowed_path(value, roots)
-    if candidate.is_file():
-        return hash_file(candidate, allowed_roots=roots)
-    return hash_value(value)
+    candidate = validate_allowed_path(path, roots)
+    return hash_file(candidate, allowed_roots=roots)
+
+
+def _tagged_location(value: Mapping[str, Any]) -> str | Path | None:
+    """Return a tagged filesystem location, if one was explicitly supplied."""
+
+    if "uri" in value:
+        return value["uri"]
+    if "location" in value:
+        return value["location"]
+    return None
+
+
+def _manifest_hash(item: Any, *, allowed_roots, context: str) -> str:
+    if isinstance(item, DataAssetRef):
+        return _manifest_path_hash(item.uri, allowed_roots=allowed_roots, context=context)
+    if isinstance(item, OperationResultRef):
+        return _manifest_path_hash(item.location, allowed_roots=allowed_roots, context=context)
+    if isinstance(item, Path):
+        return _manifest_path_hash(item, allowed_roots=allowed_roots, context=context)
+    if isinstance(item, Mapping):
+        location = _tagged_location(item)
+        if location is not None:
+            return _manifest_path_hash(location, allowed_roots=allowed_roots, context=context)
+    # Plain strings are values, even when they happen to resemble filenames.
+    return hash_value(item)
 
 
 def _rows(data: Any) -> list[dict[str, Any]] | None:
@@ -144,8 +144,8 @@ def build_manifest(
     *,
     capability_id: str,
     operation_spec: OperationSpec | Mapping[str, Any],
-    inputs: Iterable[DataAssetRef | OperationResultRef | str] = (),
-    outputs: Iterable[OperationResultRef | str] = (),
+    inputs: Iterable[DataAssetRef | OperationResultRef | Path | Mapping[str, Any] | str] = (),
+    outputs: Iterable[OperationResultRef | Path | Mapping[str, Any] | str] = (),
     core_version: str = "0.1.0",
     metadata: Mapping[str, Any] | None = None,
     allowed_roots: Iterable[str | Path] | None = None,
@@ -156,22 +156,21 @@ def build_manifest(
     for item in inputs:
         if isinstance(item, (DataAssetRef, OperationResultRef)):
             input_refs.append(item.to_dict())
-            location = item.uri if isinstance(item, DataAssetRef) else item.location
             roots = require_allowed_roots(allowed_roots, context="manifest input hashing")
-            input_hashes.append(hash_file(location, allowed_roots=roots))
+            input_hashes.append(_manifest_hash(item, allowed_roots=roots, context="manifest input hashing"))
         else:
-            input_refs.append(str(item))
-            input_hashes.append(_manifest_string_hash(str(item), allowed_roots=allowed_roots, context="manifest input hashing"))
+            input_refs.append(dict(item) if isinstance(item, Mapping) else str(item))
+            input_hashes.append(_manifest_hash(item, allowed_roots=allowed_roots, context="manifest input hashing"))
     output_refs: list[Any] = []
     output_hashes: list[str] = []
     for item in outputs:
         if isinstance(item, OperationResultRef):
             output_refs.append(item.to_dict())
             roots = require_allowed_roots(allowed_roots, context="manifest output hashing")
-            output_hashes.append(hash_file(item.location, allowed_roots=roots))
+            output_hashes.append(_manifest_hash(item, allowed_roots=roots, context="manifest output hashing"))
         else:
-            output_refs.append(str(item))
-            output_hashes.append(_manifest_string_hash(str(item), allowed_roots=allowed_roots, context="manifest output hashing"))
+            output_refs.append(dict(item) if isinstance(item, Mapping) else str(item))
+            output_hashes.append(_manifest_hash(item, allowed_roots=allowed_roots, context="manifest output hashing"))
     return {
         "manifest_version": "1",
         "core_version": core_version,

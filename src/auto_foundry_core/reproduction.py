@@ -12,28 +12,12 @@ from .sources import hash_file
 from .workspace import require_allowed_roots, validate_allowed_path
 
 
-def _looks_like_path(value: str) -> bool:
-    """Recognize path-shaped strings without an unbounded filesystem probe."""
-
-    text = value.strip()
-    if not text:
-        return False
-    candidate = Path(text).expanduser()
-    return (
-        candidate.is_absolute()
-        or text.startswith((".", "~"))
-        or "/" in text
-        or "\\" in text
-        or bool(candidate.suffix)
-    )
-
-
 def _fingerprint(value: Any, *, allowed_roots=None) -> str:
     if isinstance(value, (list, tuple)):
         if any(_contains_file_ref(item) for item in value):
             return hash_value([_fingerprint(item, allowed_roots=allowed_roots) for item in value])
         return hash_value(value)
-    if isinstance(value, Path) or (isinstance(value, str) and _looks_like_path(value)):
+    if isinstance(value, Path):
         roots = require_allowed_roots(allowed_roots, context="reproduction path hashing")
         path = validate_allowed_path(value, roots)
         return hash_file(path, allowed_roots=roots)
@@ -47,8 +31,7 @@ def _fingerprint(value: Any, *, allowed_roots=None) -> str:
         location = value.get("location", value.get("uri"))
         roots = require_allowed_roots(allowed_roots, context="reproduction path hashing")
         path = validate_allowed_path(location, roots)
-        if path.is_file():
-            return hash_file(path, allowed_roots=roots)
+        return hash_file(path, allowed_roots=roots)
     if isinstance(value, Mapping) and "content_hash" in value:
         return str(value["content_hash"])
     return hash_value(value)
@@ -58,7 +41,7 @@ def _contains_file_ref(value: Any) -> bool:
     if isinstance(value, Path):
         return True
     if isinstance(value, str):
-        return _looks_like_path(value)
+        return False
     if isinstance(value, (DataAssetRef, OperationResultRef)):
         return True
     if isinstance(value, Mapping):
@@ -96,10 +79,10 @@ def reproduce(
 
     actual = operation(*args, **kwargs)
     expected = manifest.get("output_hashes", [])
-    if isinstance(actual, (Path, DataAssetRef, OperationResultRef)) or (isinstance(actual, str) and _looks_like_path(actual)):
+    if isinstance(actual, (Path, DataAssetRef, OperationResultRef)):
         actual_hashes = [_fingerprint(actual, allowed_roots=allowed_roots)]
     elif isinstance(actual, (list, tuple)) and actual and all(
-        isinstance(v, (Path, DataAssetRef, OperationResultRef)) or (isinstance(v, str) and _looks_like_path(v))
+        isinstance(v, (Path, DataAssetRef, OperationResultRef))
         for v in actual
     ):
         actual_hashes = [_fingerprint(v, allowed_roots=allowed_roots) for v in actual]

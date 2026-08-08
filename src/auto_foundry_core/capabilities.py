@@ -6,7 +6,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Mapping
 
-from .contracts import CapabilityDescriptor, DataAssetRef, IdentityCandidate, IdentityDecision, OperationSpec
+from .contracts import CapabilityDescriptor, DataAssetRef, IdentityCandidate, IdentityDecision, OperationResultRef, OperationSpec
 from .workspace import require_allowed_roots
 
 
@@ -206,33 +206,17 @@ def descriptors() -> tuple[CapabilityDescriptor, ...]:
     return tuple(DESCRIPTORS[key] for key in sorted(DESCRIPTORS))
 
 
-def _looks_like_path(value: str) -> bool:
-    """Classify a string as a possible path without touching the filesystem.
+def _is_path_reference(value: Any, *, strings_are_paths: bool = False) -> bool:
+    """Identify explicit path references without guessing from string syntax.
 
-    ``Path.is_file`` is deliberately not used here: execution-boundary root
-    enforcement must happen before *any* filesystem probe.  Source arguments
-    are handled with ``strings_are_paths=True`` below because their contract is
-    explicitly a local source path; result/value arguments use lexical hints so
-    ordinary inline strings remain root-free.
+    Source arguments are strings by contract, hence ``strings_are_paths`` is
+    used only by source-backed identity/relationship operations.  Reproduction
+    values require an explicit ``Path``, ref contract, or tagged mapping.
     """
 
-    text = value.strip()
-    if not text:
-        return False
-    candidate = Path(text).expanduser()
-    return (
-        candidate.is_absolute()
-        or text.startswith((".", "~"))
-        or "/" in text
-        or "\\" in text
-        or bool(candidate.suffix)
-    )
-
-
-def _is_path_reference(value: Any, *, strings_are_paths: bool = False) -> bool:
     if isinstance(value, str):
-        return strings_are_paths or _looks_like_path(value)
-    if isinstance(value, (Path, DataAssetRef)):
+        return strings_are_paths
+    if isinstance(value, (Path, DataAssetRef, OperationResultRef)):
         return True
     if isinstance(value, Mapping):
         return "uri" in value or "location" in value
