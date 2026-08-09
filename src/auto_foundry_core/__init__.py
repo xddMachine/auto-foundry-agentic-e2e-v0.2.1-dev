@@ -46,6 +46,22 @@ from .telemetry import TelemetryRecorder
 from .enterprise_model import LivingEnterpriseModel
 from .catalog import capability_catalog, get_capability
 from .runtime import CoreExecutionResult, CoreRuntime
+from .workbench import (
+    DataRoom,
+    DataRoomCatalogEntry,
+    DataRoomMember,
+    DataRoomWorkbench,
+    PreparedAsset,
+)
+from .durable import (
+    AcceptedSnapshot,
+    ArtifactProgress,
+    ExecutionAttempt,
+    ITEM_STATE_FIELDS,
+    ITEM_STATE_SCHEMA,
+    ItemWorkspace,
+    ProgressDecision,
+)
 from .references import (
     DATA_ASSET_REFERENCE,
     OPERATION_RESULT_REFERENCE,
@@ -57,11 +73,14 @@ from .references import (
     is_explicit_reference_mapping,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "AggregationSpec", "AllowedRootError", "CanonicalMapping",
-    "CapabilityDescriptor", "CoreExecutionResult", "CoreRuntime", "DataAssetRef", "DocumentRef", "FieldRef",
+    "CapabilityDescriptor", "CoreExecutionResult", "CoreRuntime", "DataAssetRef", "DataRoom",
+    "DataRoomCatalogEntry", "DataRoomMember", "DataRoomWorkbench", "DocumentRef", "FieldRef",
+    "PreparedAsset", "AcceptedSnapshot", "ArtifactProgress", "ExecutionAttempt", "ITEM_STATE_FIELDS",
+    "ITEM_STATE_SCHEMA", "ItemWorkspace", "ProgressDecision",
     "FoundationTask", "IdentityCandidate", "IdentityDecision",
     "IdentityEvidence", "KnowledgeDelta", "LEMRef", "LivingEnterpriseModel",
     "OntologyItem", "OperationReceipt", "OperationResultRef", "OperationSpec",
