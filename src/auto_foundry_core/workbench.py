@@ -61,9 +61,10 @@ DOCUMENT_FORMATS = frozenset(
         "sql",
         "py",
         "sh",
+        "pdf",
     }
 )
-UNSUPPORTED_FORMATS = frozenset({"xls", "parquet", "feather", "avro", "pdf", "doc", "docx", "ppt", "pptx"})
+UNSUPPORTED_FORMATS = frozenset({"xls", "parquet", "feather", "avro", "doc", "docx", "ppt", "pptx"})
 _RESERVED_LINEAGE_KEYS = frozenset({"archive", "members", "transformations"})
 
 
@@ -127,6 +128,19 @@ def _validate_member_name(name: str) -> None:
         raise ValueError(f"unsafe ZIP member name: {name!r}")
     if ":" in parts[0] or PurePosixPath(name).is_absolute():
         raise ValueError(f"unsafe ZIP member name: {name!r}")
+
+
+def _is_ignored_archive_metadata(name: str) -> bool:
+    """Return whether *name* is inert macOS archive metadata.
+
+    ``__MACOSX`` metadata is recognized only below that directory component;
+    an ordinary member named ``__MACOSX`` remains part of the data room.  A
+    ``.DS_Store`` file is ignored at any depth.  Callers must perform the
+    normal member safety checks before using this predicate.
+    """
+
+    path = PurePosixPath(name)
+    return path.name == ".DS_Store" or "__MACOSX" in path.parts[:-1]
 
 
 def _is_symlink(info: zipfile.ZipInfo) -> bool:
@@ -490,6 +504,8 @@ def _inspect_archive_member(
         max_member_bytes=limits.max_member_bytes,
         max_compression_ratio=limits.max_compression_ratio,
     )
+    if _is_ignored_archive_metadata(info.filename):
+        return None
     fmt = _format_for_name(info.filename)
     if _member_kind(fmt) == "unsupported":
         raise ValueError(f"unsupported ZIP member format: {info.filename} ({fmt})")
@@ -527,6 +543,13 @@ def _inventory_archive(archive_path: Path, *, limits: _ArchiveLimits) -> tuple[D
             for info in source.infolist():
                 member = _inspect_archive_member(source, info, limits=limits, seen_names=seen_names)
                 if member is None:
+                    # Ignored metadata is still part of the archive's bounded
+                    # physical footprint, while directory accounting remains
+                    # unchanged from the pre-filter inventory.
+                    if not info.is_dir() and _is_ignored_archive_metadata(info.filename):
+                        total_size += info.file_size
+                        if total_size > limits.max_total_bytes:
+                            raise ValueError(f"ZIP exceeds max_total_bytes: {total_size} > {limits.max_total_bytes}")
                     continue
                 total_size += member.size_bytes
                 if total_size > limits.max_total_bytes:
@@ -869,6 +892,8 @@ class DataRoom:
             raise ValueError(f"unsupported data-room member format: {resolved.format}")
         if resolved.kind != "document":
             raise ValueError(f"member is tabular, not a document: {resolved.path}")
+        if resolved.format == "pdf":
+            raise ValueError(f"PDF document excerpts require custom code: {resolved.path}")
         data = self._read_member_bytes(resolved, max_bytes=max_bytes, allow_truncate=True)
         return data.decode("utf-8-sig", errors="replace")
 
@@ -890,6 +915,16 @@ class DataRoom:
         sample_rows: int,
         categorical_limit: int,
     ) -> list[DataRoomCatalogEntry]:
+        if member.format == "pdf":
+            return [
+                DataRoomCatalogEntry(
+                    member=member,
+                    row_count=None,
+                    row_count_exact=False,
+                    row_count_lower_bound=None,
+                    metadata={"extraction": "opaque", "requires_custom_code": True},
+                )
+            ]
         excerpt = self.document_excerpt(member, max_bytes=min(65536, self.limits.max_member_bytes))
         lines = tuple(excerpt.splitlines()[:sample_rows])
         return [

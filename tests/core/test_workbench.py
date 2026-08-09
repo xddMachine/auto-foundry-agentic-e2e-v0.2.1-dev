@@ -90,6 +90,153 @@ def test_inventory_hash_search_and_read_formats(room_fixture: tuple[RunContext, 
     }
 
 
+def test_macos_metadata_is_ignored_without_mutating_archive(tmp_path: Path) -> None:
+    input_root = tmp_path / "inputs"
+    run_root = tmp_path / "run"
+    input_root.mkdir()
+    run_root.mkdir()
+    archive = input_root / "room.zip"
+    csv_payload = b"order_id,amount\nA-1,10\n"
+    metadata = {
+        "__MACOSX/._room.csv": b"apple-double metadata",
+        "__MACOSX/nested/._.DS_Store": b"finder metadata",
+        "nested/.DS_Store": b"finder metadata",
+    }
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+        output.writestr("room.csv", csv_payload)
+        for name, payload in metadata.items():
+            output.writestr(name, payload)
+
+    original_bytes = archive.read_bytes()
+    original_hash = hashlib.sha256(original_bytes).hexdigest()
+    context = RunContext("RUN-MACOS-METADATA", run_root, (input_root,))
+    room = DataRoom.open(context, archive)
+
+    assert [member.path for member in room.members()] == ["room.csv"]
+    assert room.read_rows("room.csv") == [{"order_id": "A-1", "amount": "10"}]
+    assert room.build_catalog()[0].path == "room.csv"
+    assert archive.read_bytes() == original_bytes
+    assert hashlib.sha256(archive.read_bytes()).hexdigest() == original_hash
+
+
+@pytest.mark.parametrize(
+    ("name", "payload", "kwargs", "message"),
+    [
+        ("__MACOSX/../.DS_Store", b"unsafe", {}, "unsafe ZIP member name"),
+        ("__MACOSX/large", b"x" * 32, {"max_member_bytes": 8}, "max_member_bytes"),
+        ("__MACOSX/large", b"x" * 1024, {"max_compression_ratio": 1.0}, "max_compression_ratio"),
+        ("nested/.DS_Store", b"x" * 32, {"max_total_bytes": 8}, "max_total_bytes"),
+    ],
+)
+def test_ignored_metadata_still_obeys_archive_safety_checks(
+    tmp_path: Path,
+    name: str,
+    payload: bytes,
+    kwargs: dict[str, object],
+    message: str,
+) -> None:
+    input_root = tmp_path / "inputs"
+    run_root = tmp_path / "run"
+    input_root.mkdir()
+    run_root.mkdir()
+    archive = input_root / "unsafe.zip"
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+        output.writestr(name, payload)
+    context = RunContext("RUN-MACOS-METADATA-SAFETY", run_root, (input_root,))
+
+    with pytest.raises(ValueError, match=message):
+        DataRoom.open(context, archive, **kwargs)
+
+
+def test_duplicate_ignored_metadata_names_are_rejected(tmp_path: Path) -> None:
+    input_root = tmp_path / "inputs"
+    run_root = tmp_path / "run"
+    input_root.mkdir()
+    run_root.mkdir()
+    archive = input_root / "duplicate.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("__MACOSX/.DS_Store", b"first")
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            output.writestr("__MACOSX/.DS_Store", b"second")
+    context = RunContext("RUN-MACOS-METADATA-DUPLICATE", run_root, (input_root,))
+
+    with pytest.raises(ValueError, match="duplicate ZIP member name"):
+        DataRoom.open(context, archive)
+
+
+def test_symlink_ignored_metadata_is_rejected(tmp_path: Path) -> None:
+    input_root = tmp_path / "inputs"
+    run_root = tmp_path / "run"
+    input_root.mkdir()
+    run_root.mkdir()
+    archive = input_root / "symlink.zip"
+    symlink = zipfile.ZipInfo("__MACOSX/link")
+    symlink.create_system = 3
+    symlink.external_attr = (stat.S_IFLNK | 0o777) << 16
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr(symlink, b"target")
+    context = RunContext("RUN-MACOS-METADATA-SYMLINK", run_root, (input_root,))
+
+    with pytest.raises(ValueError, match="symlink"):
+        DataRoom.open(context, archive)
+
+
+def test_pdf_members_are_opaque_catalog_documents_without_excerpt_decoding(tmp_path: Path) -> None:
+    input_root = tmp_path / "inputs"
+    run_root = tmp_path / "run"
+    input_root.mkdir()
+    run_root.mkdir()
+    archive = input_root / "documents.zip"
+    pdf_payload = b"%PDF-1.4\nopaque test bytes\n%%EOF\n"
+    csv_payload = b"id,status\nA-1,open\n"
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+        output.writestr("policy.pdf", pdf_payload)
+        output.writestr("records.csv", csv_payload)
+
+    original_bytes = archive.read_bytes()
+    original_hash = hashlib.sha256(original_bytes).hexdigest()
+    context = RunContext("RUN-PDF-OPAQUE", run_root, (input_root,))
+    room = DataRoom.open(context, archive)
+
+    pdf_member = next(member for member in room.members() if member.path == "policy.pdf")
+    assert pdf_member.format == "pdf"
+    assert pdf_member.kind == "document"
+    assert pdf_member.size_bytes == len(pdf_payload)
+    assert pdf_member.content_hash == hashlib.sha256(pdf_payload).hexdigest()
+
+    catalog = room.build_catalog()
+    pdf_entry = next(entry for entry in catalog if entry.path == "policy.pdf")
+    assert pdf_entry.member == pdf_member
+    assert pdf_entry.columns == ()
+    assert pdf_entry.sample_values == {}
+    assert pdf_entry.sample_rows == ()
+    assert pdf_entry.row_count is None
+    assert pdf_entry.row_count_exact is False
+    assert pdf_entry.metadata == {"extraction": "opaque", "requires_custom_code": True}
+    assert room.search("policy.pdf", catalog=catalog) == (pdf_entry,)
+    with pytest.raises(ValueError, match="PDF document excerpts require custom code"):
+        room.document_excerpt(pdf_member)
+
+    assert archive.read_bytes() == original_bytes
+    assert hashlib.sha256(archive.read_bytes()).hexdigest() == original_hash
+
+
+def test_pdf_members_still_obey_archive_bounds(tmp_path: Path) -> None:
+    input_root = tmp_path / "inputs"
+    run_root = tmp_path / "run"
+    input_root.mkdir()
+    run_root.mkdir()
+    archive = input_root / "bounded-documents.zip"
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+        output.writestr("policy.pdf", b"x" * 1024)
+    context = RunContext("RUN-PDF-BOUNDS", run_root, (input_root,))
+
+    with pytest.raises(ValueError, match="max_member_bytes"):
+        DataRoom.open(context, archive, max_member_bytes=8)
+    with pytest.raises(ValueError, match="max_compression_ratio"):
+        DataRoom.open(context, archive, max_compression_ratio=1.0)
+
+
 def test_xlsx_sheet_reads_and_catalog(room_fixture: tuple[RunContext, Path, dict[str, bytes]]) -> None:
     context, archive, payloads = room_fixture
     if "workbook.xlsx" not in payloads:
