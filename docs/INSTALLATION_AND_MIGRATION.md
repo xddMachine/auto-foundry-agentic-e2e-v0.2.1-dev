@@ -52,29 +52,33 @@ unzip -q dist/auto-foundry-agentic-e2e-v0.2.2.zip -d "$SKILLS_DIR"
    start a **fresh Codex task**. Skill discovery is refreshed at task start;
    do not assume the current task sees a changed skill.
 
-Rollback is a replacement, not a merge. Resolve and validate both exact
-same-name paths first, send only the replacement directory to the macOS Trash,
-then restore the backup:
+Rollback is a replacement, not a merge. The active v0.2.2 tree must leave the
+skills discovery root before the previous entrypoint is restored; otherwise a
+recursive discovery scan can see two same-name skills. Keep the replacement
+tree in a timestamped retained directory outside `$CODEX_HOME/skills`:
 
 ```bash
 SKILLS_DIR="$(cd "${CODEX_HOME:-$HOME/.codex}/skills" && pwd -P)"
-REPLACEMENT="${SKILLS_DIR}/auto-foundry-agentic-e2e"
-BACKUP_DIR="${SKILLS_DIR}/auto-foundry-agentic-e2e.backup"
+ACTIVE="${SKILLS_DIR}/auto-foundry-agentic-e2e"
+BACKUP_DIR="${SKILLS_DIR}/auto-foundry-agentic-e2e-v0.2.1-backup-20260809T134600Z"
+ROLLBACK_ROOT="${CODEX_HOME:-$HOME/.codex}/skill-rollback-replacements"
+REPLACEMENT="${ROLLBACK_ROOT}/auto-foundry-agentic-e2e-v0.2.2-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$ROLLBACK_ROOT"
 test -d "$SKILLS_DIR"
-test -d "$REPLACEMENT"
+test -d "$ACTIVE"
 test -d "$BACKUP_DIR"
-case "$REPLACEMENT" in
-  "$SKILLS_DIR/auto-foundry-agentic-e2e") ;;
-  *) printf '%s\n' "unexpected replacement path: $REPLACEMENT" >&2; exit 1 ;;
-esac
-test "$REPLACEMENT" != "$SKILLS_DIR"
-/usr/bin/trash "$REPLACEMENT"
-mv "$BACKUP_DIR" "$REPLACEMENT"
+test ! -e "$REPLACEMENT"
+test ! -e "$BACKUP_DIR/SKILL.md"
+test -f "$BACKUP_DIR/SKILL.md.rollback-v0.2.1"
+mv "$ACTIVE" "$REPLACEMENT"
+mv "$BACKUP_DIR/SKILL.md.rollback-v0.2.1" "$BACKUP_DIR/SKILL.md"
+mv "$BACKUP_DIR" "$ACTIVE"
 ```
 
-Keep the backup until the fresh-task discovery check succeeds. If
-`/usr/bin/trash` is unavailable, stop and use a scoped, recoverable macOS
-Trash operation; do not use broad recursive deletion.
+After the final move, the only discoverable `auto-foundry-agentic-e2e` entrypoint
+under `SKILLS_DIR` is the restored active path; the retained replacement is
+outside that root. Keep the replacement until the fresh-task discovery check
+succeeds, then remove only that explicitly named retained directory if desired.
 
 ## Core wheel replacement (same package name)
 
