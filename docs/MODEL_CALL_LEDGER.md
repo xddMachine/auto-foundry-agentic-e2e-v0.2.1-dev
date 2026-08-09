@@ -4,7 +4,7 @@ This ledger covers the product-under-test and Benchmark A preparation only.
 
 | Scope | Analytical/model calls | Network/external calls | Status |
 |---|---:|---:|---|
-| v0.2.1/core v0.1 implementation helpers | 0 | 0 | complete offline |
+| v0.2.2/core v0.2.0 workbench and durable helpers | 0 | 0 | complete offline |
 | Benchmark A preparation | 0 | 0 | prepared, not executed |
 | Generic offline vertical acceptance | 0 | 0 | complete fixture proof |
 | Baseline run reference | not re-executed here | not re-executed here | read-only evidence |
@@ -18,7 +18,7 @@ installed-skill modification, V3/xddMachine/autofoundary touch, push, PR, or
 remote publication occurred in this task. Benchmark A remains unexecuted and
 V3 remains untouched.
 
-The candidate status after passing the vertical and full offline suites is
-**v0.2.1-rc1 — ready for Benchmark A**. This is not a production-hardened
+The candidate status after passing the vertical proofs and full offline suites
+is **v0.2.2 — offline acceptance ready for later Benchmark A**. This is not a production-hardened
 host sandbox; true isolation requires a separate workspace/container or host
 allowlist.

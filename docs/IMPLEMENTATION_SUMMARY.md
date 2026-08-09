@@ -2,17 +2,22 @@
 
 ## Architecture
 
-- `auto_foundry_core` v0.1.0 is a small, source-agnostic deterministic
+- `auto_foundry_core` v0.2.0 is a small, source-agnostic deterministic
   substrate with typed contracts, local source/profile/normalization,
   identity/relationship/population/aggregation operations, artifact and cache
-  boundaries, telemetry, a Living Enterprise Model, and a capability catalog.
+  boundaries, telemetry, a Living Enterprise Model, a capability catalog, a
+  program-owned data room, and durable item workspaces.
 - The normal entry point is one immutable `RunContext` passed to one
-  `CoreRuntime`. `CoreRuntime.execute()` validates the run/input boundary,
-  hashes deterministic inputs, performs run-local cache lookup, dispatches the
-  catalog capability, records an `OperationReceipt`, and emits passive
-  telemetry. Its `CoreExecutionResult` carries the value, receipt, and cache
-  status. The deprecated mutable `Workspace` facade is removed.
-- `auto-foundry-agentic-e2e` v0.2.1 is a natural reviewed workflow with
+  `DataRoomWorkbench` and one `ItemWorkspace` per active item. The workbench
+  owns read-only archive/member cataloging, hashes, bounded reads, prepared
+  assets, item state, artifact progress, execution recovery, review, and
+  immutable terminal snapshots. `CoreRuntime.execute()` remains available for
+  deterministic operations: it validates the run/input boundary, hashes
+  deterministic inputs, performs run-local cache lookup, dispatches the catalog
+  capability, records an `OperationReceipt`, and emits passive telemetry. Its
+  `CoreExecutionResult` carries the value, receipt, and cache status. The
+  deprecated mutable `Workspace` facade is removed.
+- `auto-foundry-agentic-e2e` v0.2.2 is a natural reviewed workflow with
   Question and analytics-only Requirement modes, progressive run-local LEM
   layers, exact-ID evidence selection, review routing, clean-room controls,
   passive telemetry, and reviewed-output-only products.
@@ -37,15 +42,14 @@
 
 ## Complete offline vertical proof
 
-`tests/integration/test_vertical_acceptance.py` is the closure proof for the
-normal path. It uses three generic local files, two analytics requirements, one
-shared `FoundationTask`, and fake semantic role records only. The test reaches
-terminal completion while proving source registration/profile/normalization,
-cache miss then hit, real receipts/telemetry, identity and relationship
-diagnostics, prepared output integrity and exact LEM namespace reuse, reviewer
-unavailability disclosure, a reviewed-output-only traceable dashboard,
-non-blocking optimizer evidence collection, source immutability, sibling-path
-rejection, and lifecycle-independent calculations after terminal export.
+`tests/integration/test_vertical_acceptance.py` remains the broader closure
+proof for source/runtime/LEM/product behavior. The companion
+`tests/integration/test_workbench_durable_vertical.py` proves the normal v0.2.2
+program path with a safe generic ZIP: catalog/search/read/save-prepared,
+workspace creation before an attempt, materialization then execution recovery,
+a separate one-time business repair, review/accept/reload, telemetry, source
+hash immutability, sibling-path rejection, and no model/network calls. Both
+tests use real local filesystem wiring and generic fixtures only.
 
 Two concrete integration defects found by this proof are fixed: contract
 hashing now uses `to_dict()` before `dataclasses.asdict()` (mapping proxies are
@@ -68,10 +72,11 @@ are recorded in Benchmark A's baseline JSON.
 
 ## Release candidate boundary
 
-When the vertical proof and full offline suite pass, the status is
-**v0.2.1-rc1 — ready for Benchmark A**. Benchmark A remains prepared and
-unexecuted. This is an experimental release candidate, not a production-hardened
-sandbox. A Coding Agent with unrestricted host shell/filesystem access cannot
+When the vertical proofs and full offline suite pass, the status is
+**v0.2.2 — offline acceptance ready for later Benchmark A**. Benchmark A
+remains prepared and unexecuted. This is an experimental release candidate, not
+a production-hardened sandbox. A Coding Agent with unrestricted host
+shell/filesystem access cannot
 be fully sandboxed by this Python package. True isolation requires a separate
 workspace/container or host allowlist.
 Any stronger host/container isolation remains future, nonblocking hardening;

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-ZIP_NAME = "auto-foundry-agentic-e2e-v0.2.1.zip"
+ZIP_NAME = "auto-foundry-agentic-e2e-v0.2.2.zip"
 
 # The release deliberately replaces the old deterministic optimizer report
 # helper with the evidence collector.  Keep this check explicit so a stale
@@ -24,6 +24,9 @@ ZIP_NAME = "auto-foundry-agentic-e2e-v0.2.1.zip"
 REQUIRED_SKILL_MEMBERS = {
     "scripts/dashboard_renderer.py",
     "scripts/optimizer_evidence_collector.py",
+    "references/FINAL_PRODUCT_AND_AUTOMATION.md",
+    "assets/REQUIREMENT_RECORD_TEMPLATE.json",
+    "assets/ITEM_STATE_TEMPLATE.json",
 }
 DELETED_OPTIMIZER_MEMBERS = {
     "scripts/experimental_optimizer.py",
@@ -39,6 +42,7 @@ REQUIRED_CORE_MODULES = {
     "auto_foundry_core/catalog.py",
     "auto_foundry_core/cli.py",
     "auto_foundry_core/contracts.py",
+    "auto_foundry_core/durable.py",
     "auto_foundry_core/enterprise_model.py",
     "auto_foundry_core/identity.py",
     "auto_foundry_core/normalization.py",
@@ -49,6 +53,7 @@ REQUIRED_CORE_MODULES = {
     "auto_foundry_core/runtime.py",
     "auto_foundry_core/sources.py",
     "auto_foundry_core/telemetry.py",
+    "auto_foundry_core/workbench.py",
     "auto_foundry_core/workspace.py",
 }
 
@@ -111,10 +116,10 @@ def _validate_zip(zip_path: Path, skill_root: Path) -> dict[str, object]:
         if not skill_text.startswith("---\n"):
             raise ValueError("SKILL.md frontmatter missing")
         frontmatter = skill_text.split("---\n", 2)[1]
-        required = ('name: auto-foundry-agentic-e2e', 'version: "0.2.1"', 'core_name: auto_foundry_core', 'core_version: "0.1.0"')
+        required = ('name: auto-foundry-agentic-e2e', 'version: "0.2.2"', 'core_name: auto_foundry_core', 'core_version: "0.2.0"')
         if any(marker not in frontmatter for marker in required):
             raise ValueError("SKILL.md frontmatter/version markers invalid")
-        for marker in ("skill_version: 0.2.1", "core_version: 0.1.0"):
+        for marker in ("skill_version: 0.2.2", "core_version: 0.2.0"):
             if marker not in skill_text:
                 raise ValueError(f"SKILL.md run marker missing: {marker}")
         return {
@@ -147,7 +152,7 @@ def _validate_wheel(wheel_path: Path) -> dict[str, object]:
         if metadata_name is None:
             raise ValueError("wheel METADATA missing")
         metadata = _metadata(archive.read(metadata_name).decode("utf-8"))
-        if metadata.get("Name") != "auto_foundry_core" or metadata.get("Version") != "0.1.0":
+        if metadata.get("Name") != "auto_foundry_core" or metadata.get("Version") != "0.2.0":
             raise ValueError(f"wheel metadata mismatch: {metadata.get('Name')} {metadata.get('Version')}")
         missing = sorted(REQUIRED_CORE_MODULES - set(names))
         if missing:
@@ -173,14 +178,21 @@ def _offline_install_smoke(wheel_path: Path) -> dict[str, object]:
         subprocess.run(command, check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         import_script = (
             "import auto_foundry_core as core; "
-            "from auto_foundry_core import CoreExecutionResult, CoreRuntime, LEMRef, RunContext; "
+            "from auto_foundry_core import (AcceptedSnapshot, ArtifactProgress, CoreExecutionResult, CoreRuntime, "
+            "DataRoom, DataRoomCatalogEntry, DataRoomMember, DataRoomWorkbench, ExecutionAttempt, "
+            "ITEM_STATE_FIELDS, ITEM_STATE_SCHEMA, ItemWorkspace, LEMRef, PreparedAsset, ProgressDecision, RunContext); "
             "assert not hasattr(core, 'Workspace'); "
+            "assert all(item is not None for item in (AcceptedSnapshot, ArtifactProgress, CoreExecutionResult, "
+            "CoreRuntime, DataRoom, DataRoomCatalogEntry, DataRoomMember, DataRoomWorkbench, ExecutionAttempt, "
+            "ITEM_STATE_FIELDS, ITEM_STATE_SCHEMA, ItemWorkspace, LEMRef, PreparedAsset, ProgressDecision, RunContext)); "
+            "assert set(ITEM_STATE_FIELDS[:8]) == {'item_id', 'mode', 'original_text', 'lifecycle_state', "
+            "'execution_recovery_count', 'business_repair_count', 'created_at', 'updated_at'}; "
             "assert core.capability_catalog(); "
             "print(core.__version__)"
         )
         import_result = subprocess.run([sys.executable, "-c", import_script], check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         cli_result = subprocess.run([sys.executable, "-m", "auto_foundry_core", "catalog", "list"], check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if import_result.stdout.strip() != "0.1.0":
+        if import_result.stdout.strip() != "0.2.0":
             raise ValueError(f"installed import version mismatch: {import_result.stdout!r}")
         if not cli_result.stdout.strip().startswith("["):
             raise ValueError("installed catalog CLI did not return JSON list")
@@ -190,7 +202,7 @@ def _offline_install_smoke(wheel_path: Path) -> dict[str, object]:
 def validate_release(root: Path, dist: Path, zip_path: Path | None = None, wheel_path: Path | None = None) -> dict[str, object]:
     zip_path = zip_path or dist / ZIP_NAME
     if wheel_path is None:
-        wheels = sorted(dist.glob("auto_foundry_core-0.1.0-*.whl"))
+        wheels = sorted(dist.glob("auto_foundry_core-0.2.0-*.whl"))
         if len(wheels) != 1:
             raise ValueError(f"expected one core wheel in {dist}, found {wheels}")
         wheel_path = wheels[0]

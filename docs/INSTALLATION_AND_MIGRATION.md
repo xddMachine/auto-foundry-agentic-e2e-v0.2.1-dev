@@ -9,24 +9,30 @@ repository's Python environment or the Codex runtime automatically.
 The supported integration path is deliberately small:
 
 ```python
-from auto_foundry_core import CoreRuntime, OperationSpec, RunContext
+from auto_foundry_core import DataRoomWorkbench, ItemWorkspace, CoreRuntime, OperationSpec, RunContext
 
 context = RunContext("RUN-example", run_root, (input_root,))
+workbench = DataRoomWorkbench(context, archive_path)
+item = ItemWorkspace.create(context, "Q-001", original_text="Count supplied rows")
 execution = CoreRuntime(context).execute(
     OperationSpec("sources.preview", parameters={"path": "rows.json", "limit": 20})
 )
 ```
 
 The same context bounds source reads, products, cache, telemetry, and
-optimizer evidence. Public exports include `RunContext`, `CoreRuntime`,
-`CoreExecutionResult`, `LEMRef`, and the immutable contracts. The old mutable
-`Workspace` export is removed; callers should not keep a second root-plumbing
-layer. A normal run begins from the explicit task and does not require manual
-authorization or an extra confirmation step.
+optimizer evidence. Public exports include `RunContext`, `DataRoom`,
+`DataRoomWorkbench`, `DataRoomMember`, `DataRoomCatalogEntry`, `PreparedAsset`,
+`ItemWorkspace`, `ArtifactProgress`, `ProgressDecision`, `ExecutionAttempt`,
+`AcceptedSnapshot`, `CoreRuntime`, `CoreExecutionResult`, `LEMRef`, and the
+immutable contracts. The old mutable `Workspace` export is removed; callers
+should not keep a second root-plumbing layer. The workbench owns physical
+source access and durable execution, while the Lead Analyst owns semantic
+judgment. A normal run begins from the explicit task and does not require
+manual authorization or an extra confirmation step.
 
 ## Skill replacement (same name)
 
-1. Build/validate `dist/auto-foundry-agentic-e2e-v0.2.1.zip` locally.
+1. Build/validate `dist/auto-foundry-agentic-e2e-v0.2.2.zip` locally.
 2. Inspect that the ZIP has exactly one top-level directory named
    `auto-foundry-agentic-e2e/`.
 3. Back up the existing same-name directory, then replace it atomically in the
@@ -39,10 +45,10 @@ test -d "$SKILLS_DIR"
 test -d "${SKILLS_DIR}/auto-foundry-agentic-e2e"
 test ! -e "$BACKUP_DIR"
 mv "${SKILLS_DIR}/auto-foundry-agentic-e2e" "$BACKUP_DIR"
-unzip -q dist/auto-foundry-agentic-e2e-v0.2.1.zip -d "$SKILLS_DIR"
+unzip -q dist/auto-foundry-agentic-e2e-v0.2.2.zip -d "$SKILLS_DIR"
 ```
 
-4. Verify the installed `SKILL.md` frontmatter and markers are `0.2.1`, then
+4. Verify the installed `SKILL.md` frontmatter and markers are `0.2.2`, then
    start a **fresh Codex task**. Skill discovery is refreshed at task start;
    do not assume the current task sees a changed skill.
 
@@ -72,13 +78,13 @@ Trash operation; do not use broad recursive deletion.
 
 ## Core wheel replacement (same package name)
 
-The validated wheel is `dist/auto_foundry_core-0.1.0-*.whl`. Install into an
+The validated wheel is `dist/auto_foundry_core-0.2.0-*.whl`. Install into an
 explicit target or environment selected by the operator; do not install into
 the repository or a user runtime as part of this deliverable:
 
 ```bash
 TARGET="$(mktemp -d)"
-python3 -m pip install --no-index --no-deps --target "$TARGET" dist/auto_foundry_core-0.1.0-*.whl
+python3 -m pip install --no-index --no-deps --target "$TARGET" dist/auto_foundry_core-0.2.0-*.whl
 PYTHONPATH="$TARGET" python3 -c 'import auto_foundry_core; print(auto_foundry_core.__version__)'
 PYTHONPATH="$TARGET" python3 -m auto_foundry_core catalog list
 ```
@@ -95,10 +101,10 @@ do not fetch packages or use a remote index.
 
 ## Release candidate status
 
-After the complete offline vertical proof and full suite pass, use the status
-label **v0.2.1-rc1 — ready for Benchmark A**. Benchmark A is prepared but not
-run by this repository task. This remains an experimental release candidate,
-not a production-hardened sandbox.
+After the complete offline vertical proofs and full suite pass, use the status
+label **v0.2.2 — offline acceptance ready for later Benchmark A**. Benchmark A
+is prepared but not run by this repository task. This remains an experimental
+release candidate, not a production-hardened sandbox.
 
 > A Coding Agent with unrestricted host shell/filesystem access cannot be fully sandboxed by this Python package. True isolation requires a separate workspace/container or host allowlist.
 

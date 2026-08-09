@@ -1,30 +1,39 @@
-# Auto Foundry Agentic E2E v0.2.1 / core v0.1.0
+# Auto Foundry Agentic E2E v0.2.2 / core v0.2.0
 
-This repository contains the v0.2.1 reviewed-analysis skill and the
-source-agnostic, deterministic `auto_foundry_core` v0.1.0 substrate. The
-deliverable is offline-friendly: the skill keeps a run-local Living Enterprise
-Model and reviewed outputs, while the core provides typed local operations and
-catalog discovery. No production dashboard, client automation, remote
-publication, or benchmark execution is included.
+This repository contains the v0.2.2 reviewed-analysis skill and the
+source-agnostic, deterministic `auto_foundry_core` v0.2.0 substrate. The
+deliverable is offline-friendly: the skill keeps a run-local data room, durable
+item workspaces, Living Enterprise Model, and reviewed outputs, while the core
+provides typed local operations, bounded catalog access, and durable artifact
+progress. No production dashboard, client automation, remote publication, or
+benchmark execution is included.
 
-The normal path is one immutable `RunContext` passed to one `CoreRuntime`:
+The normal path is one immutable `RunContext` passed to one
+`DataRoomWorkbench` and one `ItemWorkspace` per active item. `CoreRuntime`
+remains available for deterministic operations:
 
 ```text
 RunContext
-  -> CoreRuntime.execute(OperationSpec)
-  -> catalog capability and bounded source read
-  -> deterministic input hashes and run-local cache
-  -> OperationReceipt plus passive telemetry
-  -> typed LEM/prepared-asset reuse
+  -> DataRoomWorkbench(context, archive_path) -> catalog/search/read/save_prepared
+  -> ItemWorkspace.create before the Lead Analyst attempt
+  -> artifact progress -> execution recovery when needed
+  -> draft -> one review -> optional one business repair
+  -> immutable accepted snapshot and reloadable state
+  -> CoreRuntime.execute(OperationSpec) for deterministic mechanics
   -> reviewed fixture -> products dashboard
   -> frozen evidence collector -> terminal run export
 ```
 
-The public entry points are `RunContext`, `CoreRuntime`,
-`CoreExecutionResult`, `LEMRef`, and the immutable contracts exported from
-`auto_foundry_core`. The old mutable `Workspace` facade is not part of the
-package API. A normal run starts from the user's explicit task; it has no
-manual authorization ceremony or second confirmation step.
+The public entry points include `RunContext`, `DataRoom`,
+`DataRoomWorkbench`, `DataRoomMember`, `DataRoomCatalogEntry`,
+`PreparedAsset`, `ItemWorkspace`, `ArtifactProgress`, `ProgressDecision`,
+`ExecutionAttempt`, `AcceptedSnapshot`, `CoreRuntime`, `CoreExecutionResult`,
+`LEMRef`, and the immutable contracts exported from `auto_foundry_core`. The
+old mutable `Workspace` facade is not part of the package API. The workbench
+owns physical source access and durable state; the Lead Analyst owns semantic
+interpretation and route selection. A normal run starts from the user's
+explicit task and has no manual authorization ceremony or second confirmation
+step.
 
 Filesystem references are explicit. `DataAssetRef` and `OperationResultRef`
 serialize with the reserved `__auto_foundry_ref__` discriminator (`data_asset`
@@ -58,12 +67,14 @@ python3 scripts/package_release.py
 python3 scripts/validate_release.py
 ```
 
-The complete offline vertical proof is
-`tests/integration/test_vertical_acceptance.py`; it uses three generic local
-fixtures, fake semantic role records, real cache/telemetry/filesystem wiring,
-and no model or network call. When that proof and the full offline suite pass,
-the candidate status is **v0.2.1-rc1 — ready for Benchmark A**. Benchmark A
-remains prepared but unexecuted in this repository.
+The complete offline vertical proofs are
+`tests/integration/test_vertical_acceptance.py` and
+`tests/integration/test_workbench_durable_vertical.py`; together they use
+generic local fixtures, real workbench/durable/cache/telemetry/filesystem
+wiring, and no model or network call. When those proofs and the full offline
+suite pass, the candidate status is **v0.2.2 — offline acceptance ready for
+later Benchmark A**. Benchmark A remains prepared but unexecuted in this
+repository.
 
 The package script creates ignored local artifacts under `dist/`; no command
 in this repository pushes or publishes them. Start a fresh Codex task after
