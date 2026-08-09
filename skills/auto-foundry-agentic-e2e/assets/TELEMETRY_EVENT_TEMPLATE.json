@@ -2,10 +2,48 @@
   "event_id": "TEL-...",
   "run_id": "RUN-...",
   "item_id": "Q-...|R-...|foundation-...|product|optimizer",
-  "event_type": "item_started|operation|review_routed|review_completed|item_completed|product_built|optimizer_observed",
+  "event_type": "invocation|artifact_progress|source_read|recovery|review_routed|review_completed|item_completed|product_built|optimizer_observed",
+  "invocation": {
+    "lane": "lead|reviewer|specialist|program|collector|host",
+    "role": "Lead Analyst|Independent Reviewer|Run Director|Specialist|Product Builder|Evidence Collector|host",
+    "route": "...",
+    "started_at": "2026-01-01T00:00:00Z",
+    "ended_at": "2026-01-01T00:00:00Z"
+  },
   "occurred_at": "2026-01-01T00:00:00Z",
-  "status": "started|completed|failed|unavailable",
+  "status": "started|completed|failed|unavailable|recovered",
+  "error": {
+    "class": null,
+    "message": null
+  },
+  "artifact_progress": {
+    "before": {
+      "material_artifact_count": 0,
+      "materialized": false
+    },
+    "after": {
+      "material_artifact_count": 0,
+      "materialized": false
+    },
+    "count_delta": 0,
+    "consecutive_no_progress": 0
+  },
+  "counts": {
+    "execution_recovery_count": 0,
+    "business_repair_count": 0,
+    "source_reads": 0,
+    "member_reads": 0
+  },
+  "source_reads": [],
+  "member_reads": [],
+  "core_cache": {
+    "core_operation": null,
+    "cache_checked": false,
+    "cache_hit": null,
+    "receipt_ref": null
+  },
   "artifact_refs": [],
-  "error_class": null,
-  "passive": true
+  "passive": true,
+  "records_raw_rows": false,
+  "controls_route": false
 }

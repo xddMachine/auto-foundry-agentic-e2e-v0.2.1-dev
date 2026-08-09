@@ -1,10 +1,10 @@
 # Offline test prompts
 
 These prompts are contract fixtures. They use fake rows or metadata only; do
-not call a real model, benchmark, external system, or current dataset. The
-offline dashboard and optimizer helper smoke fixtures follow the same rule:
-dashboard rendering is presentation of reviewed values, while optimization is
-explicitly frozen, passive, and run-local.
+not call a real model, benchmark, external system, network, or current
+dataset. The offline dashboard and optimizer helpers follow the same rule:
+dashboard rendering presents accepted values, while optimization is frozen,
+passive, and run-local.
 
 ## Question Mode: clean-room queue
 
@@ -19,24 +19,42 @@ allowed roots and record any discarded-lane incident.
 At run start, write these exact markers to structured state and the final
 report:
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.2.1
+skill_version: 0.2.2
 core_name: auto_foundry_core
-core_version: 0.1.0
+core_version: 0.2.0
 
-Process the questions in exactly this order, preserving each original string:
+Build one program-owned data room/source catalog from the supplied archive and
+member metadata. Keep the archive read-only. Process the questions in exactly
+this order, preserving each original string:
 1. Count fulfilled order lines by month from one supplied table.
 2. Compare invoice totals with a second source, but retain source-local
    results when the identity link is incomplete.
 3. Normalize a small supplier-status field and report exclusions.
 
-For each item use one Lead Analyst self-check, one routed independent review,
-and at most one targeted repair. Continue after partial, blocked, unsupported,
-or technical outcomes. Build the final reviewed-output-only dashboard after
-the complete queue. Show periods, denominators, limitations, traceability, and
-review availability. Keep telemetry passive.
+Before each Lead Analyst invocation, create the item's durable `work`
+workspace and authoritative `item_state.json`. The Lead Analyst must write a
+plan/source map first, then append material findings. After each response, use
+structured `artifact_progress`: continue on progress; request materialization
+after the first no-progress response; stop that lane and recover from the
+handoff after the second consecutive no-progress response. Do not use a
+wall-time deadline or a terminalizer agent. Preserve scratch during execution
+recovery; it does not consume the one business repair allowed only after a
+reviewer `repair_once` verdict. Materialize `draft` and then one atomic
+immutable `accepted` snapshot only when their contents exist.
+
+Use one Lead Analyst and one reviewer per item. The reviewer should perform a
+targeted source-catalog completeness search for material absence claims and
+check any identity-escalation route without repeating the full analysis. Keep
+telemetry passive: record invocation lane/role/route, status/errors,
+artifact-before/after/counts, recovery and repair counts, source/member reads,
+and core/cache facts, never raw rows or route control.
+
+Continue after partial, blocked, unsupported, or technical outcomes. Build the
+final accepted-snapshot-only dashboard after the complete queue and whole-run
+freeze. Do not run Benchmark A, call a model, access a network, or publish.
 ```
 
-## Requirement Mode: portfolio and reuse
+## Requirement Mode: priority and reuse
 
 ```text
 Use `$auto-foundry-agentic-e2e` in analytics-only Requirement Mode.
@@ -54,46 +72,49 @@ R-003 (priority=unset): Create a local evidence-readiness dashboard for the
 first two answers; this is a visual analytics deliverable, not a new metric.
 R-004 (priority=unset): Change the customer payment process automatically.
 
-One semantic Portfolio Planner must see the full portfolio, honor R-001's
-explicit priority, classify each record as analytics_in_scope,
-analytics_requires_missing_data, or out_of_analytics_scope without a keyword
-dictionary, and record the rationale. It may order the unprioritized records
-for dependency/reuse reasons and must replan briefly between items. Execute
-one item at a time; shared foundation work is traceable but is not a user
-requirement.
+Preserve R-001 as first priority. Classify every record semantically as
+analytics_in_scope, analytics_requires_missing_data, or out_of_analytics_scope
+without a keyword dictionary, and record the rationale. Unprioritized records
+may be ordered one at a time for observed dependency or safe reuse; do not add
+a planner framework or parallel requirement wave. Shared foundation work is
+traceable but is not a user requirement.
 
-For each in-scope item, use Navigator-selected exact ontology/prepared IDs,
-deterministic validation, a catalog inspection, concise plan, natural analysis,
-optional core/custom code, self-check, one reviewer, at most one repair, final
-answer, and atomically applied reviewed Knowledge Delta. Build the static
-reviewed-output-only dashboard only after all items have terminal outcomes.
-After answers, LEM, prepared registry, dashboard, and telemetry are frozen,
-collect a deterministic optimizer evidence bundle and appendix. A separate
-fresh Optimization Agent may later write a grounded free-form report; that
-agent is not invoked by this offline helper. Do not mutate the run or propose
-client business automation as Auto Foundry optimization.
+Build one data room/source catalog. Before each Lead Analyst call, create the
+item workspace and authoritative state. The Lead Analyst selects relevant IDs
+directly from compact source/LEM/prepared indexes, writes a plan/source map
+first, and appends material findings and loadable run-local prepared assets.
+There is no mandatory Navigator role or per-item Capability Catalog
+compliance artifact; catalog operations may be used internally when they fit,
+and custom reproducible code is allowed.
+
+Use artifact_progress after each response. Recover execution separately from
+the one business repair, preserve scratch, and write technical_failure only
+after recovery routes are exhausted. Have one reviewer check source-catalog
+completeness and identity escalation where material. Materialize draft and
+then an atomic accepted snapshot. Apply reviewed Knowledge Delta in program
+code; a no_change delta has a concrete reason. Build products only after the
+whole-run freeze, then collect the deterministic read-only optimizer evidence
+bundle. Do not run a model, network, benchmark, or client-business automation.
 ```
 
 ## Minimal fake acceptance matrix
 
 The offline tests should demonstrate:
 
-- version and core markers in instructions and run-state template;
-- exact Question Mode wording/order, continuation, one self-check, one review,
-  and one-repair maximum;
-- Requirement Mode records, semantic scope classification, explicit priority,
-  whole-portfolio planning, foundation-task traceability, short replans, and
-  sequential execution;
-- fake-role behavior for planner, exact-ID Navigator, bounded Lead Analyst,
-  unavailable-reviewer fallback, and LEM found/reuse, extend, fresh,
-  conflict/supersession, and scoped-rejection cases;
-- LEM layer separation, scoped preparation, conflicts/effective periods,
-  `no_change`, compact indexes, and exact-ID bundles;
-- catalog-first-but-optional core use and reproducible custom code;
-- reviewer routing fallbacks, unavailable disclosure, and session release;
-- clean-room roots, path enforcement, and discarded-lane incidents;
-- dashboard reviewed-output traceability, limitations, offline assets, and no
-  new analytics;
-- passive telemetry plus frozen/read-only optimizer evidence-bundle fields;
-- prohibitions on dictionaries, cross-run caches, approval trees, lifecycle
-  prose authority, a second repair, client automation, and production apps.
+- v0.2.2 skill and v0.2.0 core markers in instructions and run-state;
+- one data room/source catalog, read-only raw archive, and bounded metadata;
+- item workspace/state creation before agent invocation;
+- plan/source-map-first work, materialized draft, atomic accepted snapshot,
+  and mutable scratch;
+- artifact-based progress, two-strike execution recovery, no wall-time
+  deadline, and recovery/repair separation;
+- exact Question Mode wording/order and Requirement Mode priority semantics;
+- one Lead Analyst, one reviewer, one business repair maximum, no terminalizer;
+- no mandatory Navigator role or per-item catalog-compliance artifact;
+- source-completeness search, identity escalation, scoped knowledge, concrete
+  `no_change`, loadable prepared assets, and program-owned delta application;
+- passive attempt/artifact telemetry without rows or route control;
+- reviewed-output dashboard, whole-run freeze, and read-only optimizer boundary;
+- prohibitions on planner frameworks, dictionaries, domain recipes, central or
+  cross-run caches, parallel question waves, production apps, external calls,
+  compatibility wrappers, and stale v0.2.1 current instructions.

@@ -1,9 +1,9 @@
 {
   "run_id": "RUN-...",
   "skill_name": "auto-foundry-agentic-e2e",
-  "skill_version": "0.2.1",
+  "skill_version": "0.2.2",
   "core_name": "auto_foundry_core",
-  "core_version": "0.1.0",
+  "core_version": "0.2.0",
   "mode": "question|requirement",
   "status": "initialized|running|products_frozen|completed|global_failure",
   "allowed_roots": ["/current/run", "/supplied/input", "/approved/tool"],
@@ -13,34 +13,59 @@
     "empty_cache_at_start": true,
     "incidents": []
   },
+  "workbench": {
+    "data_room": "data_room",
+    "source_catalog": "data_room/source_catalog.json",
+    "catalog_kind": "zip_member_metadata",
+    "raw_archive_read_only": true,
+    "bounded_metadata": [
+      "columns",
+      "samples_or_values",
+      "hashes",
+      "sheet_info"
+    ],
+    "item_workspace_pattern": "questions|requirements/<id>/work",
+    "item_state_pattern": "questions|requirements/<id>/item_state.json"
+  },
   "active_item_id": null,
   "questions": [],
   "requirements": [],
   "foundation_tasks": [],
-  "portfolio_plan": {
-    "planner": "semantic_portfolio_planner",
+  "queue": {
     "ordered_item_ids": [],
-    "rationale_refs": [],
-    "replans": []
+    "priority_rule": "explicit_user_priority_first",
+    "parallel_question_wave": false
   },
   "lem": {
     "enterprise_ontology": "lem/enterprise_ontology.jsonl",
     "prepared_data_registry": "lem/prepared_data_registry.jsonl",
-    "knowledge_delta_status": "pending|promoted|promoted_with_limits|no_change"
+    "knowledge_delta_status": "pending|promoted|promoted_with_limits|no_change",
+    "no_change_reason": null
   },
   "indexes": {
+    "source": "indexes/source_index.json",
     "ontology": "indexes/ontology_index.json",
     "prepared": "indexes/prepared_index.json"
   },
   "telemetry": {
     "path": "telemetry/events.jsonl",
     "status": "open|closed",
-    "passive": true
+    "passive": true,
+    "records_raw_rows": false,
+    "controls_route": false
+  },
+  "execution": {
+    "recovery_count": 0,
+    "business_repair_count": 0,
+    "terminalizer_agent": false,
+    "wall_time_deadline": false
   },
   "products": {
     "status": "pending|built|reviewed",
     "dashboard_manifest": null,
-    "traceability_check": null
+    "traceability_check": null,
+    "whole_run_freeze": false,
+    "accepted_snapshots_frozen": false
   },
   "optimizer": {
     "status": "not_ready|ready|written|technical_failure",

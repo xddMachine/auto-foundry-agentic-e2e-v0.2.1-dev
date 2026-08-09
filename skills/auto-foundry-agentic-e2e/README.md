@@ -1,8 +1,11 @@
-# Auto Foundry Agentic E2E Skill v0.2.1
+# Auto Foundry Agentic E2E Skill v0.2.2
 
 `auto-foundry-agentic-e2e` is a natural, reviewed, offline-friendly workflow
-for turning supplied enterprise evidence into useful answers and a traceable
-management dashboard prototype.
+for turning supplied enterprise evidence into bounded answers and a traceable
+management dashboard prototype. The v0.2.2 contract is **Agent Workbench +
+Durable Execution**: the program owns one data room/source catalog and one
+durable item workspace before analysis, while the Lead Analyst remains free to
+choose the useful analytical route.
 
 ## Run markers
 
@@ -10,53 +13,77 @@ Every run records:
 
 ```text
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.2.1
+skill_version: 0.2.2
 core_name: auto_foundry_core
-core_version: 0.1.0
+core_version: 0.2.0
 ```
+
+The normal program path is `RunContext` + `DataRoomWorkbench` +
+`ItemWorkspace`; `CoreRuntime` remains available for deterministic operations.
+The core records state but cannot create or restart model threads. The Run
+Director/host makes and executes recovery decisions.
 
 ## Choose one mode
 
-- **Question Mode** keeps supplied wording and order, processes one question at
-  a time, continues after limited or failed outcomes, gives each item one Lead
-  Analyst self-check and one routed review, allows at most one repair, and
-  builds the dashboard after the queue.
-- **Requirement Mode** is analytics-only. A semantic Portfolio Planner sees
-  the full set of manager requirements, honors explicit priority, records
-  dependencies and missing evidence, can reorder only unprioritized work for
-  safe reuse, replans briefly between items, and executes sequentially.
+- **Question Mode** preserves supplied wording and order, processes one
+  question at a time, and never runs a parallel question wave. The program
+  creates the item workspace and state before one Lead Analyst, checks
+  artifact progress after every response, performs execution recovery before
+  review when needed, routes one reviewer, allows at most one targeted business
+  repair, and writes an atomic accepted snapshot before continuing. It builds
+  the dashboard after the complete queue and whole-run freeze.
+- **Requirement Mode** is analytics-only and keeps user-owned records and
+  explicit priority semantics. It records original text, objective, expected
+  analytical/visual outputs, internal and foundation dependencies, data/
+  ontology/prepared needs, definitions, limits, and status. Unprioritized
+  records may be ordered one at a time for observed dependencies or safe reuse;
+  there is no separate planner framework or keyword dictionary.
 
-Requirement records remain user-owned. They retain original text, priority,
-objective, expected analytical/visual outputs, internal tasks, dependencies,
-foundation dependencies, data/ontology/prepared needs, definitions, limits,
-and status. Scope is classified semantically as
-`analytics_in_scope`, `analytics_requires_missing_data`, or
-`out_of_analytics_scope`; no fixed keyword dictionary is used.
+## Agent Workbench + Durable Execution
 
-## What is new in 0.2.1
+The program builds one physical source catalog from ZIP/archive and member
+metadata. Entries include bounded columns, samples/values, hashes, and
+workbook sheet information when available; the raw archive remains read-only.
+For each item it creates:
 
-- progressive run-local Living Enterprise Model with separate Enterprise
-  Ontology and Prepared Data Registry layers;
-- semantic Navigator bundles with exact-ID validation;
-- catalog-first, fit-driven use of `auto_foundry_core`, with reproducible custom
-  code and capability-gap records;
-- independent-review routing with explicit unavailable disclosure;
-- clean-room path allowlists and discarded-lane incident records;
-- reviewed-output-only local static dashboard prototype guidance and a reusable
-  offline asset;
-- passive workflow telemetry;
-- a strictly read-only post-run evidence bundle for one later Optimization
-  Agent; it studies Auto Foundry substrate/workflow evidence, not client
-  business automation.
+```text
+questions/<id>/item_state.json
+questions/<id>/work/
+requirements/<id>/item_state.json
+requirements/<id>/work/
+```
 
-The normal core path is one immutable `RunContext` passed to one
-`CoreRuntime.execute(OperationSpec)`. It resolves the run/input boundary,
-checks deterministic cache entries, records receipts and passive telemetry,
-and is the path used by the skill's integrated operations. The public core API
-exports `RunContext`, `CoreRuntime`, `CoreExecutionResult`, `LEMRef`, and the
-immutable contracts; the old mutable `Workspace` facade is not exported. A
-normal run follows the user's explicit task without a manual authorization
-ceremony or an extra confirmation step.
+The Lead Analyst writes a plan and source map first, then appends material
+findings and evidence. `draft` appears only when materialized. `accepted` is
+an atomic immutable snapshot; `work` remains mutable. The program checks
+structured `artifact_progress`, not prose activity: progress continues the
+lane, the first no-progress response requests materialization, and the second
+consecutive no-progress response stops the lane and recovers from its handoff.
+There is no wall-time deadline, terminalizer agent, or per-question freeze
+incident. Execution recovery preserves scratch and does not consume the one
+business repair allowed after reviewer `repair_once`.
+
+Compact source/LEM/prepared indexes remain searchable and the Lead Analyst
+selects relevant IDs directly. Catalog capabilities may be recommended or
+used internally; custom reproducible code is allowed. There is no mandatory
+Navigator role or per-item catalog-compliance artifact.
+
+When exact identity overlap is absent but same-object representations are
+materially plausible, the run records candidates, evidence/coverage, a
+semantic identity decision, and the reviewer check before declaring a combined
+relationship unavailable (or explains why the route is inapplicable). Review
+also performs a targeted source-catalog completeness search for material
+absence claims without repeating the full analysis.
+
+Run-local Prepared Data Registry entries point to loadable assets and record
+hash, location, schema, grain, lineage/source IDs, scope, period, and limits.
+Structured `no_change` Knowledge Deltas include a concrete reason, and the
+program—not custom question code—validates/applies reviewed deltas.
+
+Passive attempt/artifact telemetry records invocation lane/role/route,
+start/end/status/error when available, artifact before/after/counts, recovery
+and business-repair counts, source/member reads, and core/cache facts. It
+contains no raw rows and never controls routing.
 
 ## Install and verify
 
@@ -66,77 +93,34 @@ skill so discovery is refreshed. Run the offline contract suite from the
 repository root:
 
 ```bash
-python3 -m pytest -q tests/skill
-git diff --check
+PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q tests/skill/test_contract.py
+git diff --check -- skills/auto-foundry-agentic-e2e tests/skill/test_contract.py
 ```
 
-The offline contract suite includes a deterministic fake-role Requirement Mode
-harness covering whole-portfolio planning, exact-ID navigation, bounded
-analyst routing, unavailable-reviewer disclosure, and LEM reuse/extension/
-fresh/conflict acceptance. It uses metadata fixtures only and never calls the
-core, a model, or a source.
+The contract suite inspects text, local Markdown links, and JSON templates
+only. It never imports the analytics core, calls a model, reads a dataset, or
+performs a run. Do not run Benchmark A, network calls, package builds, commits,
+or pushes as part of this offline check.
 
-### Offline helper scripts
+## Offline helper scripts
 
-After reviewed outputs are frozen, the local dashboard helper can render a
-structured widget fixture without reading raw data or calculating metrics:
-
-```bash
-python3 skills/auto-foundry-agentic-e2e/scripts/dashboard_renderer.py \
-  --run-root /absolute/path/to/run \
-  --run-id RUN-20260808-example \
-  --input products/reviewed_widgets.json \
-  --output dashboard.html \
-  --manifest-output dashboard_manifest.json
-```
-
-The fixture supplies `widgets` (types `kpi`, `bar`, `line`,
-`stacked_composition`, `heatmap`, `scatter`, supplied `donut`, or `table`),
-already-reviewed values, non-empty `reviewed_item_ref`,
-`reviewed_output_ref`, and evidence/trace provenance references, plus limitations
-and non-empty ordered `domains`/`decision_flow` records assigning every widget
-exactly once. Missing, unknown, duplicate, or invalid-order assignments fail
-validation. The renderer is stdlib-only, emits local
-HTML/CSS, and fails on broken internal links or external assets. It is a
-presentation helper, not an analytical engine.
-
-The development-only evidence collector observes run-local telemetry, traces,
-and scripts only after a structured freeze mapping proves all five markers are
-true: `answers_frozen`, `living_enterprise_model_frozen` (or `lem_frozen`),
-`prepared_assets_frozen` (or `prepared_data_registry_frozen`),
-`dashboard_frozen`, and `telemetry_frozen`. A generic `frozen: true` or
-products-only marker is not enough:
-
-```bash
-python3 skills/auto-foundry-agentic-e2e/scripts/optimizer_evidence_collector.py \
-  --run-root /absolute/path/to/run \
-  --run-id RUN-20260808-example \
-  --products-manifest products/product_manifest.json \
-  --telemetry telemetry/events.jsonl \
-  --traces questions \
-  --scripts questions
-```
-
-It writes exactly `optimizer/optimizer_evidence_bundle.md` and
-`optimizer/optimizer_evidence_appendix.md`, proves analytical-input hashes are
-unchanged, and records exact duplicates plus observed cache/read/reviewer/
-capability facts. It does not write hypotheses or recommendations and is not
-the free-thinking Optimization Agent. Client-business-automation
-classifications are rejected; no model or network call is possible. Collector
-failure is non-blocking and returns `optimizer_status: technical_failure`
-without changing `analytical_complete`.
+The existing local dashboard helper renders reviewed values only, and the
+development-only optimizer collector remains a deterministic, strictly
+read-only observer after the whole-run freeze. Neither helper calculates new
+analytics or makes a model/network call. Their detailed contracts remain in
+[Final product and optimizer](references/FINAL_PRODUCT_AND_AUTOMATION.md).
 
 The supplied [test prompts](TEST_PROMPTS.md) exercise both modes without real
-model calls or benchmark execution. The [run-state template](assets/RUN_STATE_TEMPLATE.json)
-and [dashboard contract](assets/DASHBOARD_PROTOTYPE_TEMPLATE.md) are optional
-starting points; do not create unused empty directories.
+model calls or benchmark execution. The [run-state template](assets/RUN_STATE_TEMPLATE.json),
+[item-state template](assets/ITEM_STATE_TEMPLATE.json), and [dashboard contract](assets/DASHBOARD_PROTOTYPE_TEMPLATE.md)
+are optional starting points; do not create unused empty directories.
 
-When `tests/integration/test_vertical_acceptance.py` and the full offline suite
-pass, the package status is **v0.2.1-rc1 — ready for Benchmark A**. Benchmark A
-is prepared but unexecuted. This is an experimental release candidate, not a
-production-hardened host sandbox.
+This is an offline-friendly contract, not a claim of host-level sandboxing,
+Benchmark A.1 completion, or production hardening:
 
-> A Coding Agent with unrestricted host shell/filesystem access cannot be fully sandboxed by this Python package. True isolation requires a separate workspace/container or host allowlist.
+> A Coding Agent with unrestricted host shell/filesystem access cannot be fully
+> sandboxed by this Python package. True isolation requires a separate
+> workspace/container or host allowlist.
 
 ## Reference map
 
@@ -148,6 +132,7 @@ production-hardened host sandbox.
 - [Final product and optimizer](references/FINAL_PRODUCT_AND_AUTOMATION.md)
 - [Optimization follow-up template](assets/AUTOMATION_CANDIDATE_TEMPLATE.md)
 - [Question result template](assets/QUESTION_RESULT_TEMPLATE.md)
+- [Item state template](assets/ITEM_STATE_TEMPLATE.json)
 - [Dashboard prototype contract](assets/DASHBOARD_PROTOTYPE_TEMPLATE.md)
 - [Telemetry event template](assets/TELEMETRY_EVENT_TEMPLATE.json)
 - [Optimizer evidence bundle template](assets/OPTIMIZER_EVIDENCE_BUNDLE_TEMPLATE.md)

@@ -2,21 +2,26 @@
 
 ## Principle
 
-Preserve work that materially supports a reviewed answer. Do not manufacture
+Preserve work that materially supports a reviewed answer. The program owns
+one data room/source catalog and one durable item workspace; do not manufacture
 paperwork, empty folders, or per-capability artifacts.
 
 ## Always preserve
 
 - original question or Requirement Mode record;
 - structured run identity, mode, scope classification, and outcome;
-- Navigator bundle IDs and deterministic validation result;
-- concise plan and analysis trace;
+- source-catalog and compact-index references used by the item;
+- authoritative `item_state.json` and mutable `work/` handoff;
+- plan and source map written before Lead Analyst analysis;
+- artifact-progress before/after counts and no-progress/recovery decisions;
 - evidence references, definitions, assumptions, limits, population, and
   denominator;
-- draft answer, Lead Analyst self-check, reviewer verdict, and any one repair;
-- final answer and reviewed Knowledge Delta result (`promoted`,
-  `promoted_with_limits`, or `no_change`);
-- passive telemetry event references;
+- material findings and any run-local prepared assets;
+- materialized draft, Lead Analyst self-check, reviewer verdict, and any one
+  business repair;
+- atomic accepted snapshot and reviewed Knowledge Delta result (`promoted`,
+  `promoted_with_limits`, or `no_change` with a concrete reason);
+- passive attempt/artifact telemetry event references;
 - dashboard/product traceability and internal-link checks.
 
 ## Preserve when created or used
@@ -24,22 +29,26 @@ paperwork, empty folders, or per-capability artifacts.
 Keep Python, SQL, shell, notebook, spreadsheet formula, mapping, transformed
 asset, chart specification, dashboard source, command, and material output
 when it affects a result or improves reproducibility. Record purpose, material
-inputs and outputs, assumptions, limits, and a reproduction command. Never
-overwrite raw evidence.
+inputs and outputs, assumptions, limits, and a reproduction command. Prepared
+Registry entries must point to loadable run-local assets with hash, location,
+schema, grain, lineage/source IDs, scope, and effective period. Never overwrite
+raw evidence.
 
 ## Natural analysis trace
 
 Use one concise trace per active item:
 
 ```text
-Evidence and exact IDs inspected
-Catalog capabilities inspected and selected (or gap)
-Tools and specialists used
-Scripts or transformations created
+Data-room source/member IDs and exact LEM/prepared IDs inspected
+Plan and source map written before analysis
+Catalog capabilities recommended/used (or gap), if any
+Tools, specialists, scripts, and transformations used
 Key decisions and working definitions
 Population, denominator, and relationship measurements
-Outputs and evidence references
-Self-check and review result
+Material findings, draft, and accepted-snapshot references
+Artifact progress before/after each response
+Execution-recovery and business-repair counts
+Self-check and review result, including source-completeness/identity checks
 Unresolved issues and limits
 Approximate effort (optional)
 ```
@@ -52,38 +61,49 @@ Optimization Agent report.
 
 - empty directories or files;
 - a folder for every capability that was not needed;
-- capability-by-capability approval trees or finalizer artifacts;
+- a mandatory Navigator, per-item catalog-compliance artifact, terminalizer,
+  capability approval tree, or finalizer artifact;
 - verifier scripts that inspect prose wording to decide state;
 - repeated copies of unchanged artifacts;
 - scripts created only to satisfy this policy;
 - broad scans unrelated to the active item;
-- central ontologies or cross-run caches.
+- central ontologies, cross-run caches, planner frameworks, domain recipes, or
+  business-term dictionaries;
+- parallel question waves, wall-time deadline artifacts, or a second repair.
 
 ## Efficiency and reuse
 
-Inventory sources once, then profile deeply only for the active item. Use
-compact ontology/prepared indexes and exact IDs to bound reads. Reuse prepared
-assets when source scope, effective period, evidence, and limits still apply;
-create requirement-scoped views when they do not. Replan the Requirement Mode
-portfolio briefly between items, not as a second workflow.
+Build the source catalog once, inventory sources once, then profile deeply only
+for the active item. Use compact source/LEM/prepared indexes and exact IDs to
+bound reads. Reuse a prepared asset only when source scope, effective period,
+hash/location, schema, grain, lineage, evidence, transformations, and limits
+still apply; create a requirement-scoped view when they do not. Requirement
+Mode preserves explicit user priority and executes one item at a time; no
+second planning workflow is needed.
 
 ## Reproducibility
 
 For a material or repeated calculation, prefer preserved code. For a simple
 calculation, record input references, formula, output, exclusions, and units.
-The Capability Catalog is inspected first, but custom code is valid when it is
-the clearest fit and remains reproducible.
+Catalog capabilities may be recommended/used internally, but custom code is
+valid when it is the clearest fit and remains reproducible. The program—not
+custom question code—validates and applies reviewed Knowledge Delta records.
 
 ## Telemetry and privacy
 
-Telemetry is append-only and passive. Store event metadata and artifact IDs,
-not raw business rows, secrets, tokens, or unnecessary personal data. Do not
-use telemetry to invent timing benchmarks or to alter an answer.
+Telemetry is append-only and passive. For each material attempt/artifact event,
+store invocation lane/role/route, start/end/status/error when available,
+artifact before/after/counts, execution-recovery and business-repair counts,
+source/member reads, core/cache facts, and artifact IDs—not raw business rows,
+secrets, tokens, or unnecessary personal data. Do not use telemetry to invent
+timing benchmarks, select a route, or alter an answer.
 
 ## Optimizer boundary
 
 The evidence collector may read frozen traces, telemetry, and product manifests
-only after the run products are complete. Its evidence bundle and appendix are
-new read-only artifacts; it cannot mutate code, state, LEM, prepared data,
-products, source files, or configuration. A later Optimization Agent may write
-a separate report from that bundle, but collector/agent failure is non-blocking.
+only after accepted snapshots and the whole-run freeze are complete. Its
+evidence bundle and appendix are new read-only artifacts; it cannot mutate
+code, state, LEM, prepared data, products, source files, or configuration. A
+later Optimization Agent may write a separate report from that bundle, but
+collector/agent failure is non-blocking. Client-business automation is out of
+scope.

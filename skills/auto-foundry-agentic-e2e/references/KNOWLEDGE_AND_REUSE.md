@@ -1,5 +1,18 @@
 # Progressive Living Enterprise Model and reuse
 
+The program owns one run-local data room, one source catalog, and two linked
+LEM layers. This reference defines the knowledge boundary; it does not create
+a separate planner, navigation role, or lifecycle gate.
+
+## Data room and source catalog
+
+The data room builds one physical, searchable source catalog from ZIP/archive
+and member metadata before item analysis. Catalog entries are bounded and may
+include source/member IDs, archive/member locations, formats, byte counts,
+hashes, bounded columns/types, bounded samples or values, and workbook sheet
+metadata. The raw archive remains read-only; the catalog is not a transaction
+copy. Source/member reads are observed in passive telemetry.
+
 ## Two linked layers
 
 Keep these run-local layers separate but link them with evidence references:
@@ -9,18 +22,38 @@ Keep these run-local layers separate but link them with evidence references:
 An extensible, non-transaction representation of business objects, fields,
 grains, relationships, metric meanings, applicable rules, process definitions,
 conflicts, effective periods, and known limits. It captures reusable
-understanding; it does not copy rows from a source.
+understanding; it does not copy rows from a source and is never a central
+ontology.
 
 ### Prepared Data Registry
 
 A registry of reusable derived assets: profiles, normalized values, mappings,
 relationship measurements, prepared tables, and other bounded views. Each
-entry records source references, exact asset IDs, scope, effective period,
-transformations, evidence, limits, and whether it is reusable preparation or a
-requirement-scoped view.
+entry records source references, an exact asset ID, a run-local loadable
+location, content hash, schema, grain, lineage/source IDs, scope, effective
+period, transformations, evidence, limits, and whether it is reusable
+preparation or a requirement-scoped view.
 
-Both layers are empty at the start of a clean-room run. Neither is a central or
+Entries may be source-scoped when their evidence, scope, and period support
+reuse. Keep reusable preparation distinct from a requirement-scoped view and
+never reuse an asset outside its recorded boundaries. Neither layer is a
 cross-run cache.
+
+Both layers start empty at the start of a clean-room run. Compact source,
+ontology, and prepared indexes may be searched, but the Lead Analyst selects
+relevant IDs directly. There is no mandatory Navigator role and no per-item
+Capability Catalog compliance artifact.
+
+## Durable item workspace and bounded selection
+
+The program creates `questions/<id>/work` or `requirements/<id>/work` and
+authoritative `item_state.json` before invoking the Lead Analyst. The Lead
+Analyst writes a plan and source map first, then appends findings and prepared
+asset references. The program validates every selected ID deterministically:
+existence, current-run ownership, expected layer/type, allowed scope,
+effective period, hash/location, schema, grain, lineage, and evidence
+references. Missing, duplicated, or out-of-scope IDs are a bundle failure; do
+not guess or broaden the selection.
 
 ## Knowledge item shape
 
@@ -44,28 +77,22 @@ Use structured JSON/JSONL records such as:
 ```
 
 Prepared Registry entries use the same provenance discipline and additionally
-record `asset_kind`, `source_asset_ids`, `transformation_refs`,
-`reusable_preparation` (boolean), and `requirement_scope` (nullable).
-
-## Bounded selection and validation
-
-The Navigator reads compact indexes, selects a bounded list of exact IDs, and
-records the semantic rationale. The caller then validates every ID
-deterministically: existence, current-run ownership, expected layer/type,
-allowed scope, effective period, and evidence references. Missing, duplicated,
-or out-of-scope IDs are a bundle failure; do not guess or broaden the selection.
+record `asset_kind`, `asset_hash`, `asset_location`, `schema`, `grain`,
+`lineage`, `source_asset_ids`, `transformation_refs`, `reusable_preparation`
+(boolean), and `requirement_scope` (nullable).
 
 ## Progressive promotion
 
-After the item review, apply one reviewed Knowledge Delta atomically by code.
-The result is one of:
+After the item review, the program—not custom question code—validates and
+applies one reviewed Knowledge Delta atomically. The result is one of:
 
 - `promoted`;
 - `promoted_with_limits`;
 - `no_change`.
 
-`no_change` is valid and does not block the next item. There is no separate
-ontology closing pass or extra review layer. Preserve conflicts and
+`no_change` is valid, does not block the next item, and always includes a
+concrete reason such as “source scope is too narrow for reusable preparation”
+or “review found no new supported relationship.” Preserve conflicts and
 supersession links rather than replacing a prior meaning silently.
 
 ## Reuse decision
@@ -74,18 +101,22 @@ Before reusing an ontology item or prepared asset:
 
 1. match source scope and exact asset IDs;
 2. check effective period and freshness;
-3. confirm evidence and transformations;
+3. confirm hash, location, schema, grain, lineage, evidence, and
+   transformations;
 4. carry forward limits and conflicts;
-5. decide whether the asset is broadly reusable preparation or must be a new
-   requirement-scoped view;
+5. decide whether the asset is source-scoped reusable preparation or must be a
+   new requirement-scoped view;
 6. record the decision in the active item's trace.
 
-The model has no fixed business-term dictionary. Meanings come from supplied
-context, observed evidence, and explicit reasoning for the active item.
+When exact identity overlap is absent but same-object representations are
+materially plausible, record candidate representations, independent evidence
+and coverage, a semantic identity decision, and reviewer confirmation before
+declaring a combined relationship unavailable. If the route is inapplicable,
+record the reason explicitly.
 
 ## What does not belong in the LEM
 
 Keep active item state, queue/portfolio status, reviewer identity,
-repair/recheck control, parser status, telemetry events, clean-room incidents,
-candidate reports, freeze markers, and optimizer recommendations in their
-structured run/audit records, not as business knowledge.
+execution-recovery and business-repair control, parser status, telemetry
+events, clean-room incidents, candidate reports, freeze markers, and optimizer
+recommendations in structured run/audit records, not as business knowledge.

@@ -7,6 +7,17 @@ terminal outcome, including limited, blocked, unsupported, or technical
 outcomes. Freeze the reviewed answer references, LEM snapshot, prepared-data
 registry, and closed telemetry before building products.
 
+## Normal workflow boundary
+
+The program-owned workbench controls physical evidence access and durable
+execution: it opens the supplied archive read-only, builds one bounded source
+catalog, creates each item workspace before an attempt, records artifact
+progress, and preserves recovery handoffs. The Lead Analyst owns semantic
+judgment: selecting useful source/member IDs, defining the analytical route,
+interpreting evidence, and writing a bounded draft. The workbench does not
+infer business meaning, and the analyst does not bypass its path, hash, or
+workspace controls.
+
 ## Cross-item synthesis
 
 Synthesize reviewed results only. Show common findings, compatible trends,
@@ -36,8 +47,8 @@ validate internal links and anchors without network access. Use the reusable
 
 ## Audit/trace view
 
-Include source manifest and allowed roots; exact Navigator IDs; population and
-denominator; joins and coverage; document/rule scope; scripts and commands;
+Include source catalog/member IDs and allowed roots; population and denominator;
+joins and coverage; document/rule scope; scripts and commands;
 self-check and reviewer verdict; review availability; Knowledge Delta; passive
 telemetry references; dashboard element lineage; and all limitations. Structured
 JSON remains authoritative for status.

@@ -558,7 +558,7 @@ def render_dashboard(fixture: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
         "assets_local": True,
         "internal_links_checked": True,
         "run_id": _text(fixture.get("run_id")),
-        "skill_version": _text(fixture.get("skill_version"), "0.2.1"),
+        "skill_version": _text(fixture.get("skill_version"), "0.2.2"),
         "domain_order": [domain["id"] for domain in domains],
         "decision_flow_order": [
             {"domain_id": domain["id"], "flow_id": flow["id"]}

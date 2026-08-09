@@ -3,11 +3,13 @@
 ## Objective
 
 Catch material analytical errors and overclaiming at the business-result
-boundary without turning natural analysis into a chain of gates.
+boundary without turning natural analysis into a chain of gates. The reviewer
+receives a materialized draft from the durable item workspace; scratch remains
+mutable until the program writes the accepted snapshot.
 
 ## Reviewer routing
 
-Use one reviewer per active item. Prefer an independent reviewer in fresh
+Use one reviewer per active item. Prefer an independent reviewer in a fresh
 context. If that route is unavailable, try an alternate independent route;
 then try a fresh context from the same family. Do not hardcode model/provider
 names. Release sessions when the host supports it.
@@ -25,11 +27,12 @@ not add a second review of the review.
 
 ## Reviewer inputs
 
-The reviewer receives the user-owned question/requirement record, Navigator
-exact IDs and validation evidence, concise plan, selected catalog capabilities,
+The reviewer receives the user-owned question/requirement record, data-room
+source catalog references and bounded completeness-search target, Lead Analyst
+exact source/LEM/prepared IDs and validation evidence, plan/source map,
 material scripts and outputs, draft answer, self-check, assumptions/proxies,
 relationship measurements, population/denominator, limitations, telemetry
-references, and intended Knowledge Delta.
+references, intended Knowledge Delta, and any identity-escalation candidates.
 
 ## Required checks
 
@@ -42,8 +45,17 @@ references, and intended Knowledge Delta.
 7. Are associations distinguished from causality?
 8. Are supported and unsupported components separated?
 9. Could a useful partial answer be retained?
-10. Are methods, scripts, and catalog/core operations reproducible?
+10. Are methods, scripts, and core operations reproducible?
 11. Does every intended Knowledge Delta item have evidence and limits?
+12. For each material absence claim, did a targeted search of the physical
+    source catalog check relevant archive/member metadata and bounded fields?
+13. If exact overlap is absent but same-object representations are plausible,
+    were candidates, evidence/coverage, semantic identity decision, and this
+    review check recorded—or was route inapplicability justified?
+
+The completeness and identity checks are targeted. Do not repeat the full
+analysis (without repeating the full analysis in another form), introduce a mandatory catalog-compliance artifact, or add another
+review layer.
 
 ## Verdicts
 
@@ -54,23 +66,28 @@ references, and intended Knowledge Delta.
   preserving supported findings.
 
 After `repair_once`, perform one short fresh recheck of the repaired points.
-Do not restart the item or create another repair. If the issue remains, record
-the supported outcome and disclose the unresolved component.
+Do not restart the item or create another business repair. Execution recovery
+before review is a separate program decision and does not consume this repair.
+If the issue remains, record the supported outcome and disclose the unresolved
+component. The program then validates and atomically applies the reviewed
+Knowledge Delta; custom question code does not apply it.
 
 ## What a reviewer must not do
 
 Do not reject a valid source-local answer merely because there is no unique
 enterprise definition, a labelled proxy was used, a partial answer is
 possible, or the Knowledge Delta is `no_change`. Do not demand extra artifacts,
-formatting, helper use, or hidden lifecycle proof.
+formatting, helper use, wall-time targets, or hidden lifecycle proof.
 
-Do not parse free-form prose, headings, bullets, or wording to determine
-state. Mechanical checks may verify structured fields, file existence, script
-results, exact IDs, raw-source immutability, and internal-link integrity;
-business judgment remains with the Lead Analyst and reviewer.
+Do not parse free-form prose, headings, bullets, or wording to determine state.
+Mechanical checks may verify structured fields, file existence, script
+results, exact IDs, raw-source immutability, artifact progress, and internal-
+link integrity; business judgment remains with the Lead Analyst and reviewer.
 
 ## Technical defects
 
-Record workflow/tool/parser defects as `technical_failure`, preserve valid
-supported analysis, disclose review availability, and continue the queue when
-possible. A technical defect is not a conclusion about the data.
+Record workflow/tool/parser defects as `technical_failure` only after the
+program's allowed execution-recovery routes are exhausted. Preserve valid
+supported analysis, disclose review availability, preserve scratch, and
+continue the queue when possible. A technical defect is not a conclusion
+about the data, and no terminalizer agent is involved.

@@ -1,0 +1,10 @@
+{
+  "item_id": "Q-001",
+  "mode": "question",
+  "original_text": "Summarize the supplied generic fixture.",
+  "lifecycle_state": "work",
+  "execution_recovery_count": 0,
+  "business_repair_count": 0,
+  "created_at": "2026-08-09T00:00:00+00:00",
+  "updated_at": "2026-08-09T00:00:00+00:00"
+}
