@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -13,6 +15,7 @@ from auto_foundry_core.contracts import (
     IdentityDecision,
     KnowledgeDelta,
     LEMRef,
+    OntologyItem,
     PreparedAssetDescriptor,
 )
 from auto_foundry_core.enterprise_model import LivingEnterpriseModel
@@ -49,6 +52,192 @@ def test_typed_supersession_resolves_collision_and_rolls_back():
         {"namespace": "ontology", "object_id": "same-id"},
         {"namespace": "prepared_asset", "object_id": "same-id"},
     ]
+
+
+def test_later_delta_snapshots_nested_frozen_contracts_and_rejects_invalid_delta_atomically():
+    model = LivingEnterpriseModel(run_id="r")
+    embedded = OntologyItem(
+        "embedded",
+        "object",
+        "Embedded",
+        properties={"attributes": {"region": "north"}},
+        metadata={"source": "contract"},
+    )
+    first = KnowledgeDelta(
+        "d-relationship",
+        "add_relationship",
+        {
+            "relationship_id": "rel-1",
+            "label": "Relationship",
+            "source_id": "supplier",
+            "target_id": "purchase-order",
+            "metadata": {
+                "embedded": embedded,
+                "evidence": [{"contract": embedded}, (embedded,)],
+                "links": {LEMRef("ontology", "embedded")},
+            },
+        },
+        accepted=True,
+    )
+    second = KnowledgeDelta(
+        "d-metric",
+        "add_metric",
+        {"item_id": "metric-1", "label": "Metric", "metadata": {"embedded": embedded}},
+        accepted=True,
+    )
+
+    assert model.apply_delta(first)["applied"]
+    assert model.apply_delta(second)["applied"]
+    assert model.knowledge["d-relationship"]["payload"]["metadata"]["embedded"] is embedded
+    exported = model.export()
+    exported_bytes = json.dumps(exported, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    assert exported["relationships"]["rel-1"]["metadata"]["embedded"]["item_id"] == "embedded"
+    exported["relationships"]["rel-1"]["metadata"]["embedded"]["properties"]["attributes"]["region"] = "south"
+    exported["relationships"]["rel-1"]["metadata"]["evidence"][0]["contract"]["label"] = "Changed"
+    exported["relationships"]["rel-1"]["metadata"]["links"].append({"namespace": "ontology", "object_id": "mutated"})
+    exported["knowledge"]["d-relationship"]["payload"]["metadata"]["embedded"]["metadata"]["source"] = "changed"
+    exported["ontology"][0]["metadata"]["embedded"]["properties"]["attributes"]["region"] = "west"
+    assert json.dumps(exported, sort_keys=True, separators=(",", ":")).encode("utf-8") != exported_bytes
+    assert embedded.properties["attributes"]["region"] == "north"
+    assert embedded.metadata["source"] == "contract"
+    assert model.relationships["rel-1"]["metadata"]["embedded"] is embedded
+    assert model.knowledge["d-relationship"]["payload"]["metadata"]["embedded"] is embedded
+    assert model.ontology["metric-1"].metadata["embedded"] is embedded
+
+    before = model.export()
+    before_bytes = json.dumps(before, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+    invalid = KnowledgeDelta(
+        "d-invalid",
+        "supersede",
+        supersedes=(LEMRef("ontology", "missing"),),
+        accepted=True,
+    )
+    with pytest.raises(KeyError):
+        model.apply_delta(invalid)
+
+    after = model.export()
+    assert after == before
+    assert json.dumps(after, sort_keys=True, separators=(",", ":")).encode("utf-8") == before_bytes
+    assert "d-invalid" not in model.knowledge
+    assert all(revision["delta_id"] != "d-invalid" for revision in model.revisions)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_lem_export_rejects_nonfinite_float_evidence(value: float):
+    model = LivingEnterpriseModel(run_id="r")
+    model.relationships["rel"] = {"relationship_id": "rel", "evidence": value}
+    with pytest.raises(TypeError, match="finite floats"):
+        model.export()
+
+
+def test_lem_export_rejects_non_string_mapping_keys():
+    model = LivingEnterpriseModel(run_id="r")
+    model.relationships["rel"] = {"relationship_id": "rel", "evidence": {1: "not-json-contract"}}
+    with pytest.raises(TypeError, match="mapping keys must be strings"):
+        model.export()
+
+
+def test_lem_export_rejects_foreign_frozen_dataclass_even_with_to_dict():
+    @dataclass(frozen=True)
+    class ForeignEvidence:
+        value: str
+
+        def to_dict(self) -> dict[str, str]:
+            return {"value": self.value}
+
+    model = LivingEnterpriseModel(run_id="r")
+    model.relationships["rel"] = {"relationship_id": "rel", "evidence": ForeignEvidence("foreign")}
+    with pytest.raises(TypeError, match="does not support frozen dataclass"):
+        model.export()
+
+
+def test_lem_export_validates_original_top_level_contract_graph():
+    @dataclass(frozen=True)
+    class ForeignEvidence:
+        value: str
+
+        def to_dict(self) -> dict[str, str]:
+            return {"value": self.value}
+
+    key_model = LivingEnterpriseModel(run_id="r-key")
+    key_model.ontology["bad-key"] = OntologyItem(
+        "bad-key",
+        "object",
+        "Bad key",
+        properties={"nested": {1: "must reject"}},
+    )
+    with pytest.raises(TypeError, match="mapping keys must be strings"):
+        key_model.export()
+
+    dataclass_model = LivingEnterpriseModel(run_id="r-dataclass")
+    dataclass_model.ontology["bad-dataclass"] = OntologyItem(
+        "bad-dataclass",
+        "object",
+        "Bad dataclass",
+        metadata={"foreign": ForeignEvidence("must reject")},
+    )
+    with pytest.raises(TypeError, match="does not support frozen dataclass"):
+        dataclass_model.export()
+
+
+def test_late_delta_failure_restores_every_lem_registry_after_mutation():
+    class LateFailingModel(LivingEnterpriseModel):
+        def add_metric(self, item=None, **values):
+            super().add_metric(item, **values)
+            raise RuntimeError("late metric failure")
+
+    model = LateFailingModel(run_id="r")
+    model.apply_delta(
+        KnowledgeDelta(
+            "seed-relationship",
+            "add_relationship",
+            {"relationship_id": "seed-rel", "label": "Seed", "scope": "shared"},
+            accepted=True,
+        )
+    )
+    model.register_prepared_asset(PreparedAssetDescriptor("seed-asset", location="seed.json"))
+    model.apply_delta(
+        KnowledgeDelta(
+            "seed-conflict",
+            "record_conflict",
+            {"working_definition": "seed", "scope": "shared", "unresolved": True},
+            conflicts_with=("seed-relationship",),
+            accepted=True,
+        )
+    )
+    model.apply_delta(
+        KnowledgeDelta(
+            "seed-supersede",
+            "supersede",
+            supersedes=(LEMRef("ontology", "seed-rel"), LEMRef("prepared_asset", "seed-asset")),
+            accepted=True,
+        )
+    )
+    before_state = {
+        "ontology": dict(model.ontology),
+        "prepared_assets": dict(model.prepared_assets),
+        "canonical_mappings": dict(model.canonical_mappings),
+        "identity_decisions": dict(model.identity_decisions),
+        "relationships": dict(model.relationships),
+        "knowledge": dict(model.knowledge),
+        "conflicts": list(model.conflicts),
+        "conflict_links": {key: set(value) for key, value in model.conflict_links.items()},
+        "supersession_links": {key: set(value) for key, value in model.supersession_links.items()},
+        "conflict_state": dict(model.conflict_state),
+        "revisions": list(model.revisions),
+    }
+    before_bytes = json.dumps(model.export(), sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+    with pytest.raises(RuntimeError, match="late metric failure"):
+        model.apply_delta(KnowledgeDelta("late-failure", "add_metric", {"item_id": "late", "label": "Late"}, accepted=True))
+
+    for name, expected in before_state.items():
+        assert getattr(model, name) == expected
+    assert json.dumps(model.export(), sort_keys=True, separators=(",", ":")).encode("utf-8") == before_bytes
+    assert "late" not in model.ontology
+    assert "late-failure" not in model.knowledge
+    assert all(revision["delta_id"] != "late-failure" for revision in model.revisions)
 
 
 def test_semantic_operations_are_ontology_index_items_and_relationships_bounded():

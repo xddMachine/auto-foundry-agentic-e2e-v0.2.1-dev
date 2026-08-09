@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
-from dataclasses import replace
+from dataclasses import fields, is_dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -33,6 +32,16 @@ _DEFAULT_BUNDLE_LAYER_LIMIT = 256
 _DEFAULT_BUNDLE_TOTAL_LIMIT = 512
 _DEFAULT_BUNDLE_BYTES_LIMIT = 1_000_000
 
+_EXPORT_CONTRACT_TYPES = (
+    CanonicalMapping,
+    DataAssetRef,
+    IdentityDecision,
+    LEMRef,
+    KnowledgeDelta,
+    OntologyItem,
+    PreparedAssetDescriptor,
+)
+
 
 def _clean(value: Any) -> Any:
     if isinstance(value, Mapping):
@@ -42,6 +51,145 @@ def _clean(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(_clean(v) for v in value)
     return value
+
+
+def _snapshot_value(value: Any, memo: dict[int, Any] | None = None) -> Any:
+    """Copy mutable evidence containers without copying frozen contracts.
+
+    Contract instances are frozen dataclasses whose mapping fields are
+    ``MappingProxyType`` values.  They are safe to retain by identity, while
+    the surrounding evidence records still need independent mutable
+    containers for rollback.  ``deepcopy`` cannot represent that combination
+    because it attempts to pickle the mapping proxies, so only the container
+    types that the LEM stores are traversed here.
+    """
+
+    if memo is None:
+        memo = {}
+    if isinstance(value, Mapping):
+        marker = id(value)
+        if marker in memo:
+            return memo[marker]
+        copied: dict[Any, Any] = {}
+        memo[marker] = copied
+        for key, item in value.items():
+            copied[key] = _snapshot_value(item, memo)
+        return copied
+    if isinstance(value, list):
+        marker = id(value)
+        if marker in memo:
+            return memo[marker]
+        copied_list: list[Any] = []
+        memo[marker] = copied_list
+        copied_list.extend(_snapshot_value(item, memo) for item in value)
+        return copied_list
+    if isinstance(value, tuple):
+        marker = id(value)
+        if marker in memo:
+            return memo[marker]
+        copied_tuple = tuple(_snapshot_value(item, memo) for item in value)
+        memo[marker] = copied_tuple
+        return copied_tuple
+    if isinstance(value, set):
+        marker = id(value)
+        if marker in memo:
+            return memo[marker]
+        copied_set: set[Any] = set()
+        memo[marker] = copied_set
+        copied_set.update(_snapshot_value(item, memo) for item in value)
+        return copied_set
+    if isinstance(value, frozenset):
+        marker = id(value)
+        if marker in memo:
+            return memo[marker]
+        copied_frozenset = frozenset(_snapshot_value(item, memo) for item in value)
+        memo[marker] = copied_frozenset
+        return copied_frozenset
+    if isinstance(value, bytearray):
+        return bytearray(value)
+    if is_dataclass(value) and getattr(getattr(type(value), "__dataclass_params__", None), "frozen", False):
+        return value
+    return value
+
+
+def _validate_export_source(value: Any) -> None:
+    """Validate an original graph before any contract serializer can coerce it."""
+
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise TypeError(f"LEM export requires finite floats, got {value!r}")
+        return
+    if is_dataclass(value):
+        if not getattr(getattr(type(value), "__dataclass_params__", None), "frozen", False):
+            raise TypeError(f"LEM export does not support mutable dataclass: {type(value).__name__}")
+        if not isinstance(value, _EXPORT_CONTRACT_TYPES):
+            raise TypeError(f"LEM export does not support frozen dataclass: {type(value).__name__}")
+        for field in fields(value):
+            _validate_export_source(getattr(value, field.name))
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"LEM export mapping keys must be strings: {type(key).__name__}")
+            _validate_export_source(item)
+        return
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            _validate_export_source(item)
+        return
+    if isinstance(value, (bytearray, bytes)):
+        raise TypeError(f"LEM export does not support {type(value).__name__} evidence")
+    raise TypeError(f"LEM export does not support value type: {type(value).__name__}")
+
+
+def _export_value(value: Any) -> Any:
+    """Materialize LEM values into detached, JSON-native structures.
+
+    Rollback snapshots intentionally retain frozen contract instances by
+    identity.  Exported values have a different boundary: they must not leak
+    those instances or their mapping proxies to callers.  Core contracts
+    expose ``to_dict`` as their serialization contract; any other frozen
+    dataclass is rejected rather than stringified or returned by alias.
+    """
+
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise TypeError(f"LEM export requires finite floats, got {value!r}")
+        return value
+    if is_dataclass(value):
+        if not getattr(getattr(type(value), "__dataclass_params__", None), "frozen", False):
+            raise TypeError(f"LEM export does not support mutable dataclass: {type(value).__name__}")
+        if not isinstance(value, _EXPORT_CONTRACT_TYPES):
+            raise TypeError(f"LEM export does not support frozen dataclass: {type(value).__name__}")
+        _validate_export_source(value)
+        serializer = getattr(value, "to_dict", None)
+        if not callable(serializer):
+            raise TypeError(f"LEM export has no serialization contract for frozen dataclass: {type(value).__name__}")
+        materialized = serializer()
+        if materialized is value:
+            raise TypeError(f"LEM export serializer returned the original frozen dataclass: {type(value).__name__}")
+        return _export_value(materialized)
+    if isinstance(value, Mapping):
+        result: dict[Any, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"LEM export mapping keys must be strings: {type(key).__name__}")
+            result[key] = _export_value(item)
+        return result
+    if isinstance(value, (list, tuple)):
+        return [_export_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        exported = [_export_value(item) for item in value]
+        return sorted(exported, key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")))
+    if isinstance(value, bytearray):
+        raise TypeError("LEM export does not support bytearray evidence")
+    if isinstance(value, bytes):
+        raise TypeError("LEM export does not support bytes evidence")
+    raise TypeError(f"LEM export does not support value type: {type(value).__name__}")
 
 
 class LivingEnterpriseModel:
@@ -466,13 +614,14 @@ class LivingEnterpriseModel:
             raise ValueError(f"knowledge delta already exists: {delta.delta_id}")
         # Contract values are frozen and contain mapping proxies, which are
         # intentionally not deepcopy/pickleable.  Copy registries by identity
-        # and deep-copy only mutable evidence containers.
+        # and recursively copy only mutable evidence containers.
+        snapshot_memo: dict[int, Any] = {}
         snapshot = (
             dict(self.ontology), dict(self.prepared_assets), dict(self.canonical_mappings),
-            dict(self.identity_decisions), deepcopy(self.relationships), deepcopy(self.knowledge),
-            deepcopy(self.conflicts), {key: set(value) for key, value in self.conflict_links.items()},
-            {key: set(value) for key, value in self.supersession_links.items()},
-            deepcopy(self.conflict_state), deepcopy(self.revisions),
+            dict(self.identity_decisions), _snapshot_value(self.relationships, snapshot_memo),
+            _snapshot_value(self.knowledge, snapshot_memo), _snapshot_value(self.conflicts, snapshot_memo),
+            _snapshot_value(self.conflict_links, snapshot_memo), _snapshot_value(self.supersession_links, snapshot_memo),
+            _snapshot_value(self.conflict_state, snapshot_memo), _snapshot_value(self.revisions, snapshot_memo),
         )
         try:
             payload = _clean(dict(delta.payload))
@@ -595,18 +744,18 @@ class LivingEnterpriseModel:
     def export(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
-            "ontology": [item.to_dict() for item in sorted(self.ontology.values(), key=lambda item: item.item_id)],
-            "ontology_index": self.ontology_index,
-            "prepared_assets": [asset.to_dict() for asset in sorted(self.prepared_assets.values(), key=lambda asset: asset.prepared_asset_id)],
-            "canonical_mappings": [mapping.to_dict() for mapping in sorted(self.canonical_mappings.values(), key=lambda mapping: mapping.canonical_id)],
-            "identity_decisions": [decision.to_dict() for decision in sorted(self.identity_decisions.values(), key=lambda decision: decision.decision_id)],
-            "relationships": {key: self.relationships[key] for key in sorted(self.relationships)},
-            "knowledge": deepcopy(self.knowledge),
-            "conflicts": deepcopy(self.conflicts),
-            "conflict_links": {key: sorted(value) for key, value in sorted(self.conflict_links.items())},
-            "supersession_links": {key: [ref.to_dict() for ref in sorted(value, key=lambda ref: (ref.namespace, ref.object_id))] for key, value in sorted(self.supersession_links.items())},
-            "conflict_state": deepcopy(self.conflict_state),
-            "revisions": deepcopy(self.revisions),
+            "ontology": _export_value(list(sorted(self.ontology.values(), key=lambda item: item.item_id))),
+            "ontology_index": _export_value(self.ontology_index),
+            "prepared_assets": _export_value(list(sorted(self.prepared_assets.values(), key=lambda asset: asset.prepared_asset_id))),
+            "canonical_mappings": _export_value(list(sorted(self.canonical_mappings.values(), key=lambda mapping: mapping.canonical_id))),
+            "identity_decisions": _export_value(list(sorted(self.identity_decisions.values(), key=lambda decision: decision.decision_id))),
+            "relationships": _export_value({key: self.relationships[key] for key in sorted(self.relationships)}),
+            "knowledge": _export_value(self.knowledge),
+            "conflicts": _export_value(self.conflicts),
+            "conflict_links": _export_value({key: value for key, value in sorted(self.conflict_links.items())}),
+            "supersession_links": _export_value({key: value for key, value in sorted(self.supersession_links.items())}),
+            "conflict_state": _export_value(self.conflict_state),
+            "revisions": _export_value(self.revisions),
         }
 
 
