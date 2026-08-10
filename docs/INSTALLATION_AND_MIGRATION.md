@@ -9,7 +9,15 @@ repository's Python environment or the Codex runtime automatically.
 The supported integration path is deliberately small:
 
 ```python
-from auto_foundry_core import DataRoomWorkbench, ItemWorkspace, CoreRuntime, OperationSpec, RunContext
+from auto_foundry_core import (
+    BoundAnalysisContext,
+    ControlledScriptRunner,
+    CoreRuntime,
+    DataRoomWorkbench,
+    ItemWorkspace,
+    OperationSpec,
+    RunContext,
+)
 
 context = RunContext("RUN-example", run_root, (input_root,))
 workbench = DataRoomWorkbench(context, archive_path)
@@ -18,6 +26,14 @@ execution = CoreRuntime(context).execute(
     OperationSpec("sources.preview", parameters={"path": "rows.json", "limit": 20})
 )
 ```
+
+For the current item runtime, create one immutable bound context after the
+canonical catalog exists.  The program writes its manifest under the item
+workspace; scripts load it through `AUTO_FOUNDRY_ANALYSIS_CONTEXT` and run via
+`ControlledScriptRunner`.  Coding, timeout, and dependency failures are
+same-attempt feedback.  This is a path/process bound, offline runner rather
+than a hostile-code sandbox; use an OS/container boundary when executing
+untrusted code.
 
 The same context bounds source reads, products, cache, telemetry, and
 optimizer evidence. Public exports include `RunContext`, `DataRoom`,
@@ -32,7 +48,7 @@ manual authorization or an extra confirmation step.
 
 ## Skill replacement (same name)
 
-1. Build/validate `dist/auto-foundry-agentic-e2e-v0.2.2.zip` locally.
+1. Build/validate `dist/auto-foundry-agentic-e2e-v0.2.3.zip` locally.
 2. Inspect that the ZIP has exactly one top-level directory named
    `auto-foundry-agentic-e2e/`.
 3. Back up the existing same-name directory, then replace it atomically in the
@@ -45,14 +61,15 @@ test -d "$SKILLS_DIR"
 test -d "${SKILLS_DIR}/auto-foundry-agentic-e2e"
 test ! -e "$BACKUP_DIR"
 mv "${SKILLS_DIR}/auto-foundry-agentic-e2e" "$BACKUP_DIR"
-unzip -q dist/auto-foundry-agentic-e2e-v0.2.2.zip -d "$SKILLS_DIR"
+unzip -q dist/auto-foundry-agentic-e2e-v0.2.3.zip -d "$SKILLS_DIR"
 ```
 
-4. Verify the installed `SKILL.md` frontmatter and markers are `0.2.2`, then
+4. Verify the installed `SKILL.md` frontmatter and markers are `0.2.3` with
+core version `0.3.0`, then
    start a **fresh Codex task**. Skill discovery is refreshed at task start;
    do not assume the current task sees a changed skill.
 
-Rollback is a replacement, not a merge. The active v0.2.2 tree must leave the
+Rollback is a replacement, not a merge. The active v0.2.3 tree must leave the
 skills discovery root before the previous entrypoint is restored; otherwise a
 recursive discovery scan can see two same-name skills. Keep the replacement
 tree in a timestamped retained directory outside `$CODEX_HOME/skills`:
@@ -62,7 +79,7 @@ SKILLS_DIR="$(cd "${CODEX_HOME:-$HOME/.codex}/skills" && pwd -P)"
 ACTIVE="${SKILLS_DIR}/auto-foundry-agentic-e2e"
 BACKUP_DIR="${SKILLS_DIR}/auto-foundry-agentic-e2e-v0.2.1-backup-20260809T134600Z"
 ROLLBACK_ROOT="${CODEX_HOME:-$HOME/.codex}/skill-rollback-replacements"
-REPLACEMENT="${ROLLBACK_ROOT}/auto-foundry-agentic-e2e-v0.2.2-$(date -u +%Y%m%dT%H%M%SZ)"
+REPLACEMENT="${ROLLBACK_ROOT}/auto-foundry-agentic-e2e-v0.2.3-$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$ROLLBACK_ROOT"
 test -d "$SKILLS_DIR"
 test -d "$ACTIVE"
@@ -82,13 +99,13 @@ succeeds, then remove only that explicitly named retained directory if desired.
 
 ## Core wheel replacement (same package name)
 
-The validated wheel is `dist/auto_foundry_core-0.2.0-*.whl`. Install into an
+The validated wheel is `dist/auto_foundry_core-0.3.0-*.whl`. Install into an
 explicit target or environment selected by the operator; do not install into
 the repository or a user runtime as part of this deliverable:
 
 ```bash
 TARGET="$(mktemp -d)"
-python3 -m pip install --no-index --no-deps --target "$TARGET" dist/auto_foundry_core-0.2.0-*.whl
+python3 -m pip install --no-index --no-deps --target "$TARGET" dist/auto_foundry_core-0.3.0-*.whl
 PYTHONPATH="$TARGET" python3 -c 'import auto_foundry_core; print(auto_foundry_core.__version__)'
 PYTHONPATH="$TARGET" python3 -m auto_foundry_core catalog list
 ```
@@ -106,8 +123,8 @@ do not fetch packages or use a remote index.
 ## Release candidate status
 
 After the complete offline vertical proofs and full suite pass, use the status
-label **v0.2.2 — offline acceptance ready for later Benchmark A**. Benchmark A
-is prepared but not run by this repository task. This remains an experimental
+label **v0.2.3 / core 0.3.0 — offline program validation complete for later
+Benchmark A**. Benchmark A is prepared but not run by this repository task. This remains an experimental
 release candidate, not a production-hardened sandbox.
 
 > A Coding Agent with unrestricted host shell/filesystem access cannot be fully sandboxed by this Python package. True isolation requires a separate workspace/container or host allowlist.

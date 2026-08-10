@@ -6,5 +6,20 @@
   "execution_recovery_count": 0,
   "business_repair_count": 0,
   "created_at": "2026-08-09T00:00:00+00:00",
-  "updated_at": "2026-08-09T00:00:00+00:00"
+  "updated_at": "2026-08-09T00:00:00+00:00",
+  "attempts": [],
+  "active_attempt_id": null,
+  "consecutive_no_progress": 0,
+  "review": {
+    "status": "pending",
+    "strength": null,
+    "verdict": null,
+    "reviewer_ref": null,
+    "draft_hash": null
+  },
+  "terminal_outcome": null,
+  "terminal_intent": null,
+  "integration_state": "pending",
+  "integration_manifest_hash": null,
+  "integration_manifest_ref": null
 }

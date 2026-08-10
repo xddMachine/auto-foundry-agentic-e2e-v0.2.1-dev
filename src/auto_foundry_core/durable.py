@@ -8,7 +8,10 @@ executes models or scripts itself.
 Canonical extended ``item_state.json`` keys are exposed as ``ITEM_STATE_FIELDS``
 and ``ITEM_STATE_SCHEMA`` below.  A freshly-created workspace deliberately
 writes only the eight base fields; the first layer-2 operation migrates it to
-the extended shape in place.
+the extended shape in place.  Analytical acceptance publishes an immutable
+``accepted/`` directory containing the exact reviewed bytes, a separate
+acceptance envelope, and a hash-bound manifest; integration status remains a
+program-owned state field rather than business content.
 """
 
 from __future__ import annotations
@@ -36,7 +39,7 @@ _FINDINGS_FILENAME = "findings.jsonl"
 _OPEN_ISSUES_FILENAME = "open_issues.json"
 _HANDOFF_FILENAME = "handoff.json"
 _DRAFT_FILENAME = "draft.json"
-_ACCEPTED_FILENAME = "accepted.json"
+_ACCEPTED_FILENAME = "accepted"
 _BASE_STATE_FIELDS = frozenset(
     {
         "item_id",
@@ -58,6 +61,9 @@ _EXECUTION_STATE_FIELDS = frozenset(
         "review",
         "terminal_outcome",
         "terminal_intent",
+        "integration_state",
+        "integration_manifest_hash",
+        "integration_manifest_ref",
     }
 )
 ITEM_STATE_FIELDS = (
@@ -75,6 +81,9 @@ ITEM_STATE_FIELDS = (
     "review",
     "terminal_outcome",
     "terminal_intent",
+    "integration_state",
+    "integration_manifest_hash",
+    "integration_manifest_ref",
 )
 _ATTEMPT_FIELDS = (
     "attempt_id",
@@ -95,8 +104,11 @@ ITEM_STATE_SCHEMA = {
     "fields": ITEM_STATE_FIELDS,
     "attempt_fields": _ATTEMPT_FIELDS,
     "review_fields": tuple(sorted(_REVIEW_FIELDS)),
-    "accepted_directory": "accepted.json/",
-    "accepted_manifest": "accepted.json/manifest.json",
+    "accepted_directory": "accepted/",
+    "accepted_content": "accepted/answer_content.json",
+    "acceptance_envelope": "accepted/acceptance_envelope.json",
+    "accepted_manifest": "accepted/manifest.json",
+    "integration_fields": ("integration_state", "integration_manifest_hash", "integration_manifest_ref"),
     "terminal_intent_fields": ("outcome", "manifest_hash"),
 }
 _TERMINAL_FIELDS = frozenset({"status", "item_id", "outcome", "manifest_path", "content_hash"})
@@ -105,14 +117,12 @@ _ACCEPTED_MANIFEST_FIELDS = frozenset(
     {
         "item_id",
         "outcome",
-        "final_answer",
+        "content_path",
         "content_hash",
-        "draft_hash",
+        "envelope_path",
+        "envelope_hash",
         "hashes",
         "artifact_progress",
-        "refs",
-        "accepted_refs",
-        "knowledge_delta",
         "manifest_hash",
     }
 )
@@ -434,7 +444,7 @@ class ProgressDecision:
     changed_files: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.action not in {"continue", "materialize_now", "recover"}:
+        if self.action not in {"continue", "materialize_now", "await_runtime"}:
             raise ValueError("progress decision action is invalid")
         if not isinstance(self.progress, ArtifactProgress):
             raise TypeError("progress must be ArtifactProgress")
@@ -662,9 +672,9 @@ class ItemWorkspace:
         if not isinstance(manifest, dict):
             raise ValueError("accepted snapshot manifest must be an object")
         outcome = manifest.get("outcome")
-        if outcome not in {"accepted", "technical_failure"}:
+        if outcome not in {"accepted", "accepted_with_limits", "technical_failure"}:
             raise ValueError("accepted snapshot outcome is invalid")
-        expected_fields = _ACCEPTED_MANIFEST_FIELDS if outcome == "accepted" else _TECHNICAL_MANIFEST_FIELDS
+        expected_fields = _ACCEPTED_MANIFEST_FIELDS if outcome in {"accepted", "accepted_with_limits"} else _TECHNICAL_MANIFEST_FIELDS
         if set(manifest) != expected_fields:
             raise ValueError("accepted snapshot manifest fields are invalid")
         content_hash = manifest.get("content_hash")
@@ -710,28 +720,37 @@ class ItemWorkspace:
             raise ValueError("accepted snapshot item_id is invalid")
         outcome = manifest["outcome"]
         content_hash = manifest["content_hash"]
-        if outcome == "accepted":
-            final_name = manifest["final_answer"]
-            if final_name != "final_answer.json":
-                raise ValueError("accepted snapshot final_answer is invalid")
-            draft_hash = manifest["draft_hash"]
-            if not _is_sha256(draft_hash):
-                raise ValueError("accepted snapshot draft_hash is invalid")
-            if draft_hash != content_hash:
-                raise ValueError("accepted snapshot draft_hash does not match content_hash")
-            refs = self._validate_manifest_refs(manifest["refs"], label="refs")
-            accepted_refs = self._validate_manifest_refs(manifest["accepted_refs"], label="accepted_refs")
-            if refs != accepted_refs:
-                raise ValueError("accepted snapshot refs are inconsistent")
-            if manifest["knowledge_delta"] not in _KNOWLEDGE_DELTAS:
-                raise ValueError("accepted snapshot knowledge_delta is invalid")
+        if outcome in {"accepted", "accepted_with_limits"}:
+            content_name = manifest["content_path"]
+            if content_name != "answer_content.json":
+                raise ValueError("accepted snapshot content_path is invalid")
+            envelope_name = manifest["envelope_path"]
+            if envelope_name != "acceptance_envelope.json":
+                raise ValueError("accepted snapshot envelope_path is invalid")
+            envelope_hash = manifest["envelope_hash"]
+            if not _is_sha256(envelope_hash):
+                raise ValueError("accepted snapshot envelope_hash is invalid")
             self._validate_manifest_artifacts(manifest)
-            if files != {"manifest.json", final_name}:
+            if files != {"manifest.json", content_name, envelope_name}:
                 raise ValueError("accepted snapshot files are inconsistent")
-            final_path = self._resolve_item_subpath(Path(_ACCEPTED_FILENAME) / final_name)
-            _assert_regular_no_symlink(final_path, label="accepted final answer")
-            if _sha256_file(final_path) != content_hash:
-                raise ValueError("accepted final answer hash does not match manifest")
+            content_path = self._resolve_item_subpath(Path(_ACCEPTED_FILENAME) / content_name)
+            envelope_path = self._resolve_item_subpath(Path(_ACCEPTED_FILENAME) / envelope_name)
+            _assert_regular_no_symlink(content_path, label="accepted answer content")
+            _assert_regular_no_symlink(envelope_path, label="acceptance envelope")
+            if _sha256_file(content_path) != content_hash:
+                raise ValueError("accepted answer content hash does not match manifest")
+            if _sha256_file(envelope_path) != envelope_hash:
+                raise ValueError("acceptance envelope hash does not match manifest")
+            try:
+                envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("acceptance envelope is invalid") from exc
+            self._validate_acceptance_envelope(
+                envelope,
+                item_id=self.item_id,
+                content_hash=content_hash,
+                outcome=outcome,
+            )
             return
         if not isinstance(manifest["reason"], str) or not manifest["reason"]:
             raise ValueError("technical failure reason is invalid")
@@ -746,6 +765,51 @@ class ItemWorkspace:
         unsigned.pop("manifest_hash", None)
         if _sha256_bytes(_json_bytes(unsigned)) != content_hash:
             raise ValueError("technical failure manifest hash does not match content")
+
+    @staticmethod
+    def _validate_acceptance_envelope(
+        envelope: Mapping[str, Any],
+        *,
+        item_id: str,
+        content_hash: str,
+        outcome: str,
+    ) -> None:
+        expected = {
+            "item_id",
+            "outcome",
+            "review_status",
+            "review_strength",
+            "review_verdict",
+            "reviewer_ref",
+            "content_hash",
+            "draft_hash",
+            "accepted_refs",
+            "knowledge_delta",
+            "accepted_at",
+        }
+        if not isinstance(envelope, Mapping) or set(envelope) != expected:
+            raise ValueError("acceptance envelope fields are invalid")
+        if envelope.get("item_id") != item_id or envelope.get("outcome") != outcome:
+            raise ValueError("acceptance envelope outcome is invalid")
+        if envelope.get("content_hash") != content_hash or envelope.get("draft_hash") != content_hash:
+            raise ValueError("acceptance envelope content hash is invalid")
+        if envelope.get("review_status") not in {"reviewed", "unavailable"}:
+            raise ValueError("acceptance envelope review_status is invalid")
+        if envelope.get("review_verdict") not in {"accept", "accept_with_limits", "not_reviewed"}:
+            raise ValueError("acceptance envelope review_verdict is invalid")
+        if envelope.get("review_status") == "unavailable":
+            if envelope.get("review_verdict") != "not_reviewed" or envelope.get("review_strength") != "none":
+                raise ValueError("unavailable acceptance envelope is not explicitly limited")
+            if envelope.get("reviewer_ref") is not None:
+                raise ValueError("unavailable acceptance envelope cannot have reviewer_ref")
+        if not isinstance(envelope.get("accepted_refs"), list) or any(
+            not isinstance(ref, str) or not ref for ref in envelope["accepted_refs"]
+        ):
+            raise ValueError("acceptance envelope accepted_refs are invalid")
+        if envelope.get("knowledge_delta") not in _KNOWLEDGE_DELTAS:
+            raise ValueError("acceptance envelope knowledge_delta is invalid")
+        if not isinstance(envelope.get("accepted_at"), str) or not envelope.get("accepted_at"):
+            raise ValueError("acceptance envelope accepted_at is invalid")
 
     def _read_valid_terminal_snapshot(self) -> tuple[AcceptedSnapshot, dict[str, Any]]:
         """Read and verify the immutable accepted directory.
@@ -777,7 +841,11 @@ class ItemWorkspace:
         if self._state.get("active_attempt_id") is not None:
             raise ValueError("accepted snapshot cannot coexist with an active attempt")
         lifecycle = self._state.get("lifecycle_state")
-        if outcome == "accepted":
+        if outcome in {"accepted", "accepted_with_limits"}:
+            # ``accepted`` is the canonical program lifecycle state for both a
+            # clean acceptance and an acceptance carrying explicit limits.
+            # The business outcome remains distinct in the immutable snapshot
+            # and terminal envelope.
             if lifecycle not in {"review", "accepted"}:
                 raise ValueError("accepted snapshot requires a review preterminal state")
             review = self._state.get("review", {})
@@ -786,7 +854,7 @@ class ItemWorkspace:
             ) or (review.get("status") == "unavailable" and review.get("verdict") == "not_reviewed")
             if not accepted_review:
                 raise ValueError("accepted snapshot requires a valid review")
-            if review.get("draft_hash") != manifest.get("draft_hash") or review.get("draft_hash") != manifest.get("content_hash"):
+            if review.get("draft_hash") != manifest.get("content_hash"):
                 raise ValueError("accepted snapshot review hash does not match content")
             return
         if lifecycle not in {"work", "review", "technical_failure"}:
@@ -809,12 +877,16 @@ class ItemWorkspace:
         lifecycle = self._state["lifecycle_state"]
         if lifecycle in {"accepted", "technical_failure"}:
             terminal = self._state.get("terminal_outcome")
-            expected = {"status": lifecycle, **snapshot.to_dict()}
+            # Compare the terminal payload's business outcome independently
+            # from the canonical lifecycle state.  In particular, limited
+            # acceptance persists lifecycle_state=accepted while terminal
+            # outcome/status remains accepted_with_limits.
+            expected = {"status": snapshot.outcome, **snapshot.to_dict()}
             if terminal != expected:
                 raise ValueError("terminal state does not match accepted snapshot")
             return
         state = copy.deepcopy(self._state)
-        state["lifecycle_state"] = snapshot.outcome
+        state["lifecycle_state"] = "accepted" if snapshot.outcome in {"accepted", "accepted_with_limits"} else snapshot.outcome
         state["terminal_outcome"] = {"status": snapshot.outcome, **snapshot.to_dict()}
         self._persist_state(state)
 
@@ -1064,7 +1136,7 @@ class ItemWorkspace:
             return None
         if not isinstance(intent, Mapping) or set(intent) != _TERMINAL_INTENT_FIELDS:
             raise ValueError("item_state.json terminal_intent is invalid")
-        if intent["outcome"] not in {"accepted", "technical_failure"}:
+        if intent["outcome"] not in {"accepted", "accepted_with_limits", "technical_failure"}:
             raise ValueError("item_state.json terminal_intent outcome is invalid")
         manifest_hash = intent["manifest_hash"]
         if not isinstance(manifest_hash, str) or len(manifest_hash) != 64 or any(char not in "0123456789abcdef" for char in manifest_hash):
@@ -1081,9 +1153,17 @@ class ItemWorkspace:
     ) -> None:
         lifecycle = state["lifecycle_state"]
         if lifecycle in {"accepted", "technical_failure"}:
-            if terminal is None or terminal["outcome"] != lifecycle:
+            accepted_match = lifecycle == "accepted" and terminal is not None and terminal["outcome"] in {
+                "accepted",
+                "accepted_with_limits",
+            }
+            if terminal is None or (not accepted_match and terminal["outcome"] != lifecycle):
                 raise ValueError("terminal lifecycle requires matching terminal_outcome")
-            if intent is None or intent["outcome"] != lifecycle:
+            intent_match = lifecycle == "accepted" and intent is not None and intent["outcome"] in {
+                "accepted",
+                "accepted_with_limits",
+            }
+            if intent is None or (not intent_match and intent["outcome"] != lifecycle):
                 raise ValueError("terminal lifecycle requires matching terminal_intent")
             if active is not None:
                 raise ValueError("terminal lifecycle cannot have an active attempt")
@@ -1092,7 +1172,7 @@ class ItemWorkspace:
         if intent is not None and active is not None:
             raise ValueError("terminal intent cannot have an active attempt")
         if intent is not None and lifecycle not in {"accepted", "technical_failure"}:
-            allowed_preterminal = {"review"} if intent["outcome"] == "accepted" else {"work", "review"}
+            allowed_preterminal = {"review"} if intent["outcome"] in {"accepted", "accepted_with_limits"} else {"work", "review"}
             if lifecycle not in allowed_preterminal:
                 raise ValueError("terminal intent lifecycle is invalid")
         if lifecycle == "review" and (active is not None or review_status not in {"reviewed", "unavailable"}):
@@ -1101,6 +1181,22 @@ class ItemWorkspace:
             raise ValueError("work lifecycle requires pending review")
         if lifecycle in {"recovering", "recovery_ready"} and active is None:
             raise ValueError("recovery lifecycle requires an active attempt")
+
+    @staticmethod
+    def _validate_integration_state(state: Mapping[str, Any]) -> None:
+        integration_state = state.get("integration_state")
+        if integration_state not in {"pending", "integrated", "technical_failure"}:
+            raise ValueError("item_state.json integration_state is invalid")
+        manifest_hash = state.get("integration_manifest_hash")
+        if manifest_hash is not None and not _is_sha256(manifest_hash):
+            raise ValueError("item_state.json integration_manifest_hash is invalid")
+        manifest_ref = state.get("integration_manifest_ref")
+        if manifest_ref is not None and (not isinstance(manifest_ref, str) or not manifest_ref.strip()):
+            raise ValueError("item_state.json integration_manifest_ref is invalid")
+        if integration_state == "pending" and (manifest_hash is not None or manifest_ref is not None):
+            raise ValueError("pending integration cannot have a manifest reference")
+        if integration_state in {"integrated", "technical_failure"} and manifest_hash is None:
+            raise ValueError("terminal integration requires a manifest hash")
 
     @staticmethod
     def _validate_terminal_state(state: Mapping[str, Any], active: str | None, review_status: str) -> None:
@@ -1115,6 +1211,7 @@ class ItemWorkspace:
         active = ItemWorkspace._validate_attempt_state(state)
         review_status = ItemWorkspace._validate_review_state(state["review"])
         ItemWorkspace._validate_terminal_state(state, active, review_status)
+        ItemWorkspace._validate_integration_state(state)
 
     @staticmethod
     def _execution_defaults() -> dict[str, Any]:
@@ -1125,6 +1222,9 @@ class ItemWorkspace:
             "review": ItemWorkspace._pending_review(),
             "terminal_outcome": None,
             "terminal_intent": None,
+            "integration_state": "pending",
+            "integration_manifest_hash": None,
+            "integration_manifest_ref": None,
         }
 
     def _ensure_execution_state(self) -> None:
@@ -1326,6 +1426,23 @@ class ItemWorkspace:
     def state(self) -> dict[str, Any]:
         return copy.deepcopy(self._state)
 
+    @property
+    def integration_state(self) -> str:
+        self._ensure_execution_state()
+        return str(self._state["integration_state"])
+
+    @property
+    def integration_manifest_hash(self) -> str | None:
+        self._ensure_execution_state()
+        value = self._state.get("integration_manifest_hash")
+        return str(value) if value is not None else None
+
+    @property
+    def integration_manifest_ref(self) -> str | None:
+        self._ensure_execution_state()
+        value = self._state.get("integration_manifest_ref")
+        return str(value) if value is not None else None
+
     def write_plan(self, mapping: Mapping[str, Any]) -> None:
         if not isinstance(mapping, Mapping):
             raise TypeError("plan must be a mapping")
@@ -1520,8 +1637,12 @@ class ItemWorkspace:
             if consecutive == 1:
                 action = "materialize_now"
             else:
-                action = "recover"
-                state["lifecycle_state"] = "recovery_ready"
+                # Filesystem progress is only a host observation.  A second
+                # unchanged poll must not authorize recovery: the caller
+                # needs a completed invocation receipt that classifies the
+                # failure as a confirmed execution loss.
+                action = "await_runtime"
+                state["lifecycle_state"] = "work"
         self._persist_state(state)
         decision = ProgressDecision(action, progress, changed_files)
         self._emit(
@@ -1570,19 +1691,68 @@ class ItemWorkspace:
         )
         return attempt
 
-    def begin_recovery(self, lane_id: str, role: str, *, prior_attempt_id: str) -> ExecutionAttempt:
-        """Start a recovery attempt after the second consecutive no-progress observation."""
+    def begin_recovery(
+        self,
+        lane_id: str,
+        role: str,
+        *,
+        prior_attempt_id: str,
+        receipt: Any = None,
+        receipt_ref: str | None = None,
+    ) -> ExecutionAttempt:
+        """Start recovery only for a completed receipt proving execution loss.
+
+        No-progress polling is intentionally insufficient.  ``receipt`` may
+        be an :class:`AgentInvocationReceipt` (or its exact mapping) or a
+        stable ``receipt_ref`` resolved through the run-local invocation
+        ledger.
+        """
 
         self._ensure_execution_state()
         self._ensure_not_terminal()
-        if self._state.get("lifecycle_state") != "recovery_ready":
-            raise ValueError("begin_recovery requires recovery_ready")
+        if self._state.get("lifecycle_state") not in {"work", "recovery_ready"}:
+            raise ValueError("begin_recovery requires an active work attempt")
         prior_attempt_id = str(prior_attempt_id).strip()
         if self._state.get("active_attempt_id") != prior_attempt_id:
             raise ValueError("begin_recovery requires the current active attempt")
         prior_index, prior = self._attempt_record(prior_attempt_id)
         if prior.get("status") != "active":
             raise ValueError("begin_recovery requires the current active attempt")
+        if receipt is None and receipt_ref is not None:
+            try:
+                from .lifecycle import InvocationReceiptLedger
+
+                ledger = InvocationReceiptLedger(context=self.context)
+                stable_ref = str(receipt_ref).strip()
+                # A caller may persist either the invocation ID or a
+                # run-local ledger reference of the form
+                # ``telemetry/invocation_receipts.jsonl#<invocation_id>``.
+                if "#" in stable_ref:
+                    stable_ref = stable_ref.rsplit("#", 1)[1]
+                elif ":" in stable_ref and stable_ref.rsplit(":", 1)[-1].startswith("I-"):
+                    stable_ref = stable_ref.rsplit(":", 1)[-1]
+                receipt = ledger.get(stable_ref)
+            except Exception as exc:
+                raise ValueError("begin_recovery requires a valid invocation receipt") from exc
+        if receipt is None:
+            raise ValueError("begin_recovery requires a completed invocation receipt")
+        try:
+            from .lifecycle import AgentInvocationReceipt, classify_terminal_reason
+
+            if isinstance(receipt, Mapping):
+                receipt = AgentInvocationReceipt.from_dict(receipt)
+            if not isinstance(receipt, AgentInvocationReceipt):
+                raise TypeError("receipt must be AgentInvocationReceipt")
+            if receipt.item_id != self.item_id:
+                raise ValueError("invocation receipt item_id does not match workspace")
+            if receipt.finish is None or not receipt.terminal_reason:
+                raise ValueError("begin_recovery requires a completed invocation receipt")
+            if classify_terminal_reason(receipt.terminal_reason) != "execution_recovery":
+                raise ValueError("invocation receipt does not authorize execution recovery")
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError("begin_recovery requires a valid invocation receipt") from exc
         lane_id = str(lane_id).strip()
         role = str(role).strip()
         if not lane_id or not role:
@@ -1748,32 +1918,103 @@ class ItemWorkspace:
         refs = tuple(str(ref) for ref in accepted_refs)
         if any(not ref for ref in refs):
             raise ValueError("accepted_refs must be non-empty strings")
-        final_name = "final_answer.json"
+        accepted_outcome = "accepted"
+        if review.get("verdict") == "accept_with_limits" or review.get("status") == "unavailable":
+            accepted_outcome = "accepted_with_limits"
+        content_name = "answer_content.json"
+        envelope_name = "acceptance_envelope.json"
+        accepted_at = _now()
+        envelope = {
+            "item_id": self.item_id,
+            "outcome": accepted_outcome,
+            "review_status": review.get("status"),
+            "review_strength": review.get("strength"),
+            "review_verdict": review.get("verdict"),
+            "reviewer_ref": review.get("reviewer_ref"),
+            "content_hash": content_hash,
+            "draft_hash": content_hash,
+            "accepted_refs": list(refs),
+            "knowledge_delta": knowledge_delta,
+            "accepted_at": accepted_at,
+        }
+        envelope_payload = _json_bytes(envelope)
+        envelope_hash = _sha256_bytes(envelope_payload)
         progress = self._artifact_progress(payload)
         manifest = {
             "item_id": self.item_id,
-            "outcome": "accepted",
-            "final_answer": final_name,
+            "outcome": accepted_outcome,
+            "content_path": content_name,
             "content_hash": content_hash,
-            "draft_hash": content_hash,
+            "envelope_path": envelope_name,
+            "envelope_hash": envelope_hash,
             "hashes": dict(progress.hashes),
             "artifact_progress": progress.to_dict(),
-            "refs": list(refs),
-            "accepted_refs": list(refs),
-            "knowledge_delta": knowledge_delta,
         }
         manifest["manifest_hash"] = _manifest_hash(manifest)
         intent_state = dict(self._state)
-        intent_state["terminal_intent"] = {"outcome": "accepted", "manifest_hash": manifest["manifest_hash"]}
+        intent_state["terminal_intent"] = {"outcome": accepted_outcome, "manifest_hash": manifest["manifest_hash"]}
         self._persist_state(intent_state)
-        manifest_path = self._publish_accepted_directory({final_name: payload}, manifest)
-        snapshot = AcceptedSnapshot(self.item_id, "accepted", str(manifest_path), content_hash)
+        manifest_path = self._publish_accepted_directory(
+            {content_name: payload, envelope_name: envelope_payload},
+            manifest,
+        )
+        snapshot = AcceptedSnapshot(self.item_id, accepted_outcome, str(manifest_path), content_hash)
         state = dict(self._state)
         state["lifecycle_state"] = "accepted"
-        state["terminal_outcome"] = {"status": "accepted", **snapshot.to_dict()}
+        state["terminal_outcome"] = {"status": accepted_outcome, **snapshot.to_dict()}
         self._persist_state(state)
-        self._emit("item_accepted", outcome="accepted", manifest_path=str(manifest_path), content_hash=content_hash)
+        self._emit("item_accepted", outcome=accepted_outcome, manifest_path=str(manifest_path), content_hash=content_hash)
         return snapshot
+
+    def mark_integration_committed(self, manifest_hash: str, manifest_ref: str) -> dict[str, Any]:
+        """Record a program-owned integration commit for an accepted item.
+
+        Integration is deliberately separate from analytical acceptance.  The
+        item remains business-terminal while this state is ``pending`` until a
+        trusted IntegrationSession calls this method with the immutable
+        integration manifest identity.
+        """
+
+        self._ensure_execution_state()
+        if self._state.get("lifecycle_state") != "accepted":
+            raise ValueError("integration can be committed only for an accepted item")
+        if self._state.get("integration_state") != "pending":
+            raise ValueError("integration is already terminal")
+        manifest_hash = str(manifest_hash).strip()
+        manifest_ref = str(manifest_ref).strip()
+        if not _is_sha256(manifest_hash):
+            raise ValueError("integration manifest hash must be a SHA-256 digest")
+        if not manifest_ref or Path(manifest_ref).is_absolute() or "\x00" in manifest_ref:
+            raise ValueError("integration manifest ref is invalid")
+        state = copy.deepcopy(self._state)
+        state["integration_state"] = "integrated"
+        state["integration_manifest_hash"] = manifest_hash
+        state["integration_manifest_ref"] = manifest_ref
+        self._persist_state(state)
+        self._emit("item_integration_committed", integration_manifest_ref=manifest_ref, integration_manifest_hash=manifest_hash)
+        return copy.deepcopy(self._state)
+
+    def mark_integration_failed(self, manifest_hash: str, manifest_ref: str) -> dict[str, Any]:
+        """Record an explicit, non-retryable integration technical failure."""
+
+        self._ensure_execution_state()
+        if self._state.get("lifecycle_state") != "accepted":
+            raise ValueError("integration can be failed only for an accepted item")
+        if self._state.get("integration_state") != "pending":
+            raise ValueError("integration is already terminal")
+        manifest_hash = str(manifest_hash).strip()
+        manifest_ref = str(manifest_ref).strip()
+        if not _is_sha256(manifest_hash):
+            raise ValueError("integration manifest hash must be a SHA-256 digest")
+        if not manifest_ref or Path(manifest_ref).is_absolute() or "\x00" in manifest_ref:
+            raise ValueError("integration manifest ref is invalid")
+        state = copy.deepcopy(self._state)
+        state["integration_state"] = "technical_failure"
+        state["integration_manifest_hash"] = manifest_hash
+        state["integration_manifest_ref"] = manifest_ref
+        self._persist_state(state)
+        self._emit("item_integration_failed", integration_manifest_ref=manifest_ref, integration_manifest_hash=manifest_hash)
+        return copy.deepcopy(self._state)
 
     def technical_failure(self, reason: str, *, recovery_exhausted: bool) -> AcceptedSnapshot:
         """Publish a terminal workflow failure only after recovery exhaustion."""

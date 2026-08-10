@@ -13,14 +13,21 @@ paperwork, empty folders, or per-capability artifacts.
 - source-catalog and compact-index references used by the item;
 - authoritative `item_state.json` and mutable `work/` handoff;
 - plan and source map written before Lead Analyst analysis;
+- reproducible Lead Analyst script and `ControlledScriptRunner` preflight
+  checks; successful runtime receipts are `smoke` and `full`, with an optional
+  second `full` receipt for deterministic comparison (a failed preflight emits
+  only its `compile` or `dependency_check` receipt);
 - artifact-progress before/after counts and no-progress/recovery decisions;
 - evidence references, definitions, assumptions, limits, population, and
   denominator;
 - material findings and any run-local prepared assets;
 - materialized draft, Lead Analyst self-check, reviewer verdict, and any one
   business repair;
-- atomic accepted snapshot and reviewed Knowledge Delta result (`promoted`,
+- immutable accepted answer bytes plus a separate program-owned acceptance
+  envelope;
+- atomic reviewed Knowledge Delta result (`promoted`,
   `promoted_with_limits`, or `no_change` with a concrete reason);
+- one post-acceptance Result Integration Agent receipt and incremental API refs;
 - passive attempt/artifact telemetry event references;
 - dashboard/product traceability and internal-link checks.
 
@@ -61,8 +68,10 @@ Optimization Agent report.
 
 - empty directories or files;
 - a folder for every capability that was not needed;
-- a mandatory Navigator, per-item catalog-compliance artifact, terminalizer,
-  capability approval tree, or finalizer artifact;
+- a Portfolio Planner, Navigator, descriptor/typed-validation role,
+  business-repair finalizer, reviewer-of-reviewer, manual terminalizer,
+  Integration Reviewer, per-item catalog-compliance artifact, capability
+  approval tree, or finalizer artifact;
 - verifier scripts that inspect prose wording to decide state;
 - repeated copies of unchanged artifacts;
 - scripts created only to satisfy this policy;
@@ -70,6 +79,8 @@ Optimization Agent report.
 - central ontologies, cross-run caches, planner frameworks, domain recipes, or
   business-term dictionaries;
 - parallel question waves, wall-time deadline artifacts, or a second repair.
+- filesystem no-progress recovery without a completed invocation receipt that
+  proves lane/provider/host/process loss;
 
 ## Efficiency and reuse
 
@@ -94,9 +105,11 @@ custom question code—validates and applies reviewed Knowledge Delta records.
 Telemetry is append-only and passive. For each material attempt/artifact event,
 store invocation lane/role/route, start/end/status/error when available,
 artifact before/after/counts, execution-recovery and business-repair counts,
-source/member reads, core/cache facts, and artifact IDs—not raw business rows,
-secrets, tokens, or unnecessary personal data. Do not use telemetry to invent
-timing benchmarks, select a route, or alter an answer.
+source/member reads, core/cache facts, literal provider/model/host/process
+identity (`unavailable` when unknown), terminal reason class, and artifact
+IDs—not raw business rows, secrets, tokens, or unnecessary personal data. Do
+not use telemetry to invent timing benchmarks, select a route, or alter an
+answer.
 
 ## Optimizer boundary
 

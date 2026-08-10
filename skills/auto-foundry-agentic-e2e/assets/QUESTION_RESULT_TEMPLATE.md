@@ -59,9 +59,16 @@
   `review_strength: none`, `verdict: not_reviewed`; the item may still be
   `answered_with_limits` when the Lead Analyst result is useful.
 - Execution recovery count (not a business repair):
+- Terminal reason classifier output: `same_attempt_feedback` |
+  `business_repair` | `execution_recovery` | `abort_and_new_clean_run` |
+  `null`
+- Raw terminal reason (specific fact, for example `syntax_error` or
+  `core_defect`):
+- Provider/model/host/process identity (literal `unavailable` when unknown):
 - Business repair used: `none` | `one_targeted_repair`
 - Final outcome:
-- Accepted snapshot (atomic):
+- Accepted answer bytes (immutable ref/hash):
+- Acceptance envelope (program-owned ref/hash/lifecycle):
 
 ## Knowledge and telemetry
 
@@ -70,3 +77,12 @@
 - Atomic application receipt (program-owned):
 - Prepared assets (loadable run-local hash/location/schema/grain/lineage):
 - Telemetry event references:
+
+## Result integration
+
+- Result Integration Agent: exactly one post-acceptance owner
+- Incremental API facts: claims, metrics, limitations, evidence, prepared
+  assets, ontology, relationships, dashboard facts
+- Semantic mappings:
+- Deterministic validation: types, paths, refs, hashes, stages, commits
+- Integration state/receipt:

@@ -43,6 +43,7 @@ class TelemetryRecorder:
         self.started_at = _now()
         self._started_clock = time.perf_counter()
         self.events: list[TelemetryEvent] = []
+        self._invocation_ledger = None
 
     @property
     def event_path(self) -> Path | None:
@@ -85,6 +86,39 @@ class TelemetryRecorder:
             error="; ".join(receipt.errors) if receipt.errors else None,
             facts={"backend": receipt.backend, "limitations": list(receipt.limitations)},
         )
+
+    @property
+    def invocation_ledger(self):
+        """Lazily expose the run-local invocation ledger when context-bound."""
+
+        if self.context is None:
+            return None
+        if self._invocation_ledger is None:
+            from .lifecycle import InvocationReceiptLedger
+
+            try:
+                self._invocation_ledger = InvocationReceiptLedger(context=self.context)
+            except Exception as exc:
+                # Receipt persistence is passive telemetry.  A ledger failure
+                # must not change the operation outcome.
+                self._note_write_error(exc)
+                return None
+        return self._invocation_ledger
+
+    def record_invocation(self, receipt: Any) -> Any:
+        """Passively append a completed invocation receipt when storage works."""
+
+        ledger = self.invocation_ledger
+        if ledger is None:
+            return receipt
+        try:
+            return ledger.append(receipt)
+        except Exception as exc:
+            self._note_write_error(exc)
+            return receipt
+
+    # Explicit name for callers that want to make the passive boundary clear.
+    record_invocation_receipt = record_invocation
 
     @contextmanager
     def operation(self, capability_id: str, *, spec_hash: str | None = None, input_hashes=()) -> Iterator[dict[str, Any]]:

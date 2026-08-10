@@ -1,4 +1,4 @@
-"""Offline contract checks for the v0.2.2 Agent Workbench skill tree.
+"""Offline contract checks for the v0.2.3 Agent Workbench skill tree.
 
 These tests intentionally inspect owned text and templates only. Core loading
 of the item-state template is covered by the offline integration vertical;
@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+
+from auto_foundry_core.lifecycle import classify_terminal_reason
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -25,11 +27,13 @@ OWNED_MARKDOWN = (
     SKILL / "references" / "REVIEW_PROTOCOL.md",
     SKILL / "references" / "ARTIFACT_AND_EFFICIENCY_POLICY.md",
     SKILL / "assets" / "QUESTION_RESULT_TEMPLATE.md",
+    SKILL / "assets" / "DASHBOARD_PROTOTYPE_TEMPLATE.md",
 )
 OWNED_JSON = (
     SKILL / "assets" / "RUN_STATE_TEMPLATE.json",
     SKILL / "assets" / "TELEMETRY_EVENT_TEMPLATE.json",
     SKILL / "assets" / "ITEM_STATE_TEMPLATE.json",
+    SKILL / "assets" / "REQUIREMENT_RECORD_TEMPLATE.json",
 )
 
 
@@ -41,48 +45,55 @@ def _owned_text() -> str:
     return "\n".join(_read(path) for path in OWNED_MARKDOWN + OWNED_JSON)
 
 
-def test_frontmatter_and_run_markers_are_v022() -> None:
+def test_frontmatter_and_run_markers_are_v023() -> None:
     skill = _read(SKILL / "SKILL.md")
     assert skill.startswith("---\n")
     frontmatter = skill.split("---\n", 2)[1]
     assert "name: auto-foundry-agentic-e2e" in frontmatter
-    assert 'version: "0.2.2"' in frontmatter
+    assert 'version: "0.2.3"' in frontmatter
     assert "core_name: auto_foundry_core" in frontmatter
-    assert 'core_version: "0.2.0"' in frontmatter
+    assert 'core_version: "0.3.0"' in frontmatter
     for marker in (
         "skill_name: auto-foundry-agentic-e2e",
-        "skill_version: 0.2.2",
+        "skill_version: 0.2.3",
         "core_name: auto_foundry_core",
-        "core_version: 0.2.0",
+        "core_version: 0.3.0",
     ):
         assert marker in skill
     assert "Agent Workbench" in skill
     assert "Durable Execution" in skill
 
 
-def test_run_state_template_is_workbench_authority() -> None:
+def test_run_state_template_is_exact_lifecycle_authority() -> None:
     state = json.loads(_read(OWNED_JSON[0]))
-    assert state["skill_name"] == "auto-foundry-agentic-e2e"
-    assert state["skill_version"] == "0.2.2"
-    assert state["core_name"] == "auto_foundry_core"
-    assert state["core_version"] == "0.2.0"
-    assert state["mode"] == "question|requirement"
-    assert state["allowed_roots"]
-    assert state["workbench"]["source_catalog"] == "data_room/source_catalog.json"
-    assert state["workbench"]["catalog_kind"] == "zip_member_metadata"
-    assert state["workbench"]["raw_archive_read_only"] is True
-    assert state["workbench"]["item_workspace_pattern"] == "questions|requirements/<id>/work"
-    assert state["queue"]["priority_rule"] == "explicit_user_priority_first"
-    assert state["queue"]["parallel_question_wave"] is False
-    assert state["execution"]["terminalizer_agent"] is False
-    assert state["execution"]["wall_time_deadline"] is False
-    assert state["telemetry"]["passive"] is True
-    assert state["telemetry"]["records_raw_rows"] is False
-    assert state["telemetry"]["controls_route"] is False
-    assert state["optimizer"]["read_only"] is True
-    assert state["optimizer"]["evidence_bundle"] == "optimizer/optimizer_evidence_bundle.md"
-    assert state["optimizer"]["evidence_appendix"] == "optimizer/optimizer_evidence_appendix.md"
-    assert state["optimizer"]["analytical_complete"] is True
+    assert set(state) == {
+        "run_id",
+        "run_root",
+        "item_ids",
+        "mode",
+        "status",
+        "generation",
+        "manifest_hash",
+        "created_at",
+        "updated_at",
+    }
+    assert state["run_id"] == "RUN-example"
+    assert state["run_root"] == "/current/run"
+    assert state["item_ids"] == ["Q-001"]
+    assert state["mode"].split("|") == ["question", "requirement"]
+    assert state["status"].split("|") == [
+        "initialized",
+        "running",
+        "analytical_complete",
+        "integration_complete",
+        "products_complete",
+        "complete",
+        "complete_with_limits",
+    ]
+    assert state["generation"] >= 0
+    assert state["manifest_hash"].startswith("<sha256(")
+    assert state["created_at"].endswith("+00:00")
+    assert state["updated_at"].endswith("+00:00")
 
 
 def test_item_state_template_is_authoritative_and_durable() -> None:
@@ -96,6 +107,15 @@ def test_item_state_template_is_authoritative_and_durable() -> None:
         "business_repair_count",
         "created_at",
         "updated_at",
+        "attempts",
+        "active_attempt_id",
+        "consecutive_no_progress",
+        "review",
+        "terminal_outcome",
+        "terminal_intent",
+        "integration_state",
+        "integration_manifest_hash",
+        "integration_manifest_ref",
     }
     assert state["item_id"] == "Q-001"
     assert state["mode"] == "question"
@@ -103,6 +123,11 @@ def test_item_state_template_is_authoritative_and_durable() -> None:
     assert state["lifecycle_state"] == "work"
     assert state["execution_recovery_count"] == 0
     assert state["business_repair_count"] == 0
+    assert state["attempts"] == []
+    assert state["active_attempt_id"] is None
+    assert state["consecutive_no_progress"] == 0
+    assert state["review"]["status"] == "pending"
+    assert state["integration_state"] == "pending"
     assert isinstance(state["created_at"], str) and "T" in state["created_at"]
     assert isinstance(state["updated_at"], str) and "T" in state["updated_at"]
 
@@ -112,6 +137,7 @@ def test_telemetry_template_observes_attempts_and_artifacts_only() -> None:
     assert {"lane", "role", "route", "started_at", "ended_at"} <= set(
         event["invocation"]
     )
+    assert {"provider", "model", "host", "process"} <= set(event["invocation"])
     assert {"before", "after", "count_delta", "consecutive_no_progress"} <= set(
         event["artifact_progress"]
     )
@@ -127,6 +153,54 @@ def test_telemetry_template_observes_attempts_and_artifacts_only() -> None:
     assert event["passive"] is True
     assert event["records_raw_rows"] is False
     assert event["controls_route"] is False
+    assert event["invocation"]["provider"] == "unavailable"
+    assert event["invocation"]["model"] == "unavailable"
+    assert event["terminal_reason_class"] == "same_attempt_feedback|business_repair|execution_recovery|abort_and_new_clean_run|null"
+    assert event["recovery_decision"] == "continue|await_runtime|materialization_guidance|execution_recovery|null"
+
+
+def test_requirement_and_dashboard_templates_use_program_owned_boundaries() -> None:
+    requirement = json.loads(_read(SKILL / "assets" / "REQUIREMENT_RECORD_TEMPLATE.json"))
+    execution = requirement["execution_contract"]
+    assert execution["bound_analysis_context_before_attempt"] is True
+    assert execution["code_error_route"] == "same_attempt_feedback"
+    assert execution["controlled_script_preflight_checks"] == ["compile", "dependency_check"]
+    assert execution["successful_runtime_receipt_phases"] == ["smoke", "full"]
+    assert execution["failed_preflight_receipt_phase"] == "compile|dependency_check"
+    assert execution["execution_recovery_authority"] == "completed_invocation_loss_receipt_only"
+    integration = requirement["result_integration"]
+    assert integration["owner"] == "one_result_integration_agent"
+    assert "integration_reviewer" not in integration
+    assert set(integration["api_surfaces"]) == {
+        "claims",
+        "metrics",
+        "limitations",
+        "evidence",
+        "prepared_assets",
+        "ontology",
+        "relationships",
+        "dashboard_facts",
+    }
+    dashboard = _read(SKILL / "assets" / "DASHBOARD_PROTOTYPE_TEMPLATE.md")
+    assert '"freeze_markers"' in dashboard
+    assert '"prepared_data_registry_frozen": true' in dashboard
+    assert "decision_flow" in dashboard
+    assert "decision_flows" not in dashboard
+
+
+def test_terminal_reason_classifier_matches_current_template_vocabulary() -> None:
+    expected = {
+        "syntax_error": "same_attempt_feedback",
+        "business_review_error": "business_repair",
+        "process_lost": "execution_recovery",
+        "core_defect": "abort_and_new_clean_run",
+        None: None,
+    }
+    for raw_reason, classification in expected.items():
+        assert classify_terminal_reason(raw_reason) == classification
+
+    telemetry = json.loads(_read(SKILL / "assets" / "TELEMETRY_EVENT_TEMPLATE.json"))
+    assert telemetry["terminal_reason_class"] == "same_attempt_feedback|business_repair|execution_recovery|abort_and_new_clean_run|null"
 
 
 def test_question_mode_preserves_queue_and_bounded_review() -> None:
@@ -141,8 +215,11 @@ def test_question_mode_preserves_queue_and_bounded_review() -> None:
         "continue after",
         "build the final dashboard after",
         "artifact_progress",
-        "second consecutive no-progress",
+        "materialization_guidance",
         "execution recovery",
+        "same-attempt",
+        "controlledscriptrunner",
+        "boundanalysiscontext",
         "accepted snapshot",
     ):
         assert phrase.lower() in normalized
@@ -185,6 +262,9 @@ def test_requirement_mode_is_analytics_only_and_priority_owned() -> None:
     assert "no separate planner framework" in normalized
     assert "keyword router" in normalized
     assert "business-term dictionary" in normalized
+    assert "boundanalysiscontext" in normalized
+    assert "same-attempt" in normalized
+    assert "result integration agent" in normalized
 
 
 def test_workbench_sequence_and_recovery_are_progressive_and_separate() -> None:
@@ -193,14 +273,15 @@ def test_workbench_sequence_and_recovery_are_progressive_and_separate() -> None:
     sequence = (
         "program builds data room/source catalog",
         "program creates item_state.json and mutable work/",
-        "Lead Analyst writes plan and source map first",
+        "Lead Analyst writes plan, script, and source map first",
         "Lead Analyst appends findings, evidence, and loadable prepared assets",
         "Run Director checks artifact_progress after each response",
-        "optional execution recovery from the durable handoff",
+        "completed invocation receipt proves lane/provider/host/process loss",
         "materialized draft",
         "one Independent Reviewer",
         "at most one targeted business repair",
-        "atomic accepted snapshot and final outcome",
+        "atomic immutable answer bytes + separate acceptance envelope",
+        "one Result Integration Agent incremental API pass",
         "program validates and applies the reviewed Knowledge Delta",
     )
     positions = [workflow.index(part) for part in sequence]
@@ -264,6 +345,8 @@ def test_reviewer_routing_completeness_identity_and_disclosure() -> None:
     assert "identity-escalation route" in normalized
     assert "without repeating the full analysis" in normalized
     assert "accept_with_limits" in text
+    assert "result integration agent" in normalized
+    assert re.search(r"there is no [^.]*integration reviewer", normalized)
     assert not re.search(r"\b(?:gpt|claude|gemini|llama|sonnet|opus)[-_\d]", text, re.I)
 
 
@@ -292,6 +375,7 @@ def test_dashboard_telemetry_and_optimizer_boundary_remains_intact() -> None:
 
 def test_regression_prohibitions_do_not_reintroduce_legacy_workflow() -> None:
     text = _owned_text().lower()
+    fake_text = _read(ROOT / "tests" / "skill" / "fake_requirement_mode.py")
     # Exact old markers and positive legacy workflow instructions are absent.
     assert "skill_version: 0.2.1" not in text
     assert "core_version: 0.1.0" not in text
@@ -307,6 +391,10 @@ def test_regression_prohibitions_do_not_reintroduce_legacy_workflow() -> None:
     assert "no wall-time deadline" in text
     assert "parallel question wave" in text
     assert "production application" in text  # explicit prohibition/boundary
+    for obsolete in ("Fake" + "PortfolioPlanner", "Fake" + "Navigator"):
+        assert f"class {obsolete}" not in fake_text
+    assert "class ControlledScriptRunner" in fake_text
+    assert "class ResultIntegrationAgent" in fake_text
 
 
 def test_owned_markdown_links_and_json_templates_resolve() -> None:

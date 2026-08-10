@@ -10,6 +10,7 @@ and document excerpts while keeping all derived state inside one
 from __future__ import annotations
 
 import csv
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import hashlib
 import io
@@ -22,8 +23,13 @@ from types import MappingProxyType
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 import zipfile
 
+try:  # pragma: no cover - supported macOS/POSIX hosts provide fcntl
+    import fcntl
+except ImportError:  # pragma: no cover - defensive for non-POSIX packaging
+    fcntl = None  # type: ignore[assignment]
+
 from .contracts import DataAssetRef, PreparedAssetDescriptor
-from .enterprise_model import LivingEnterpriseModel
+from .prepared import PreparedAssetRegistry
 from .telemetry import TelemetryRecorder
 from .workspace import RunContext
 
@@ -40,6 +46,11 @@ DEFAULT_XLSX_TOTAL_MAX_BYTES = 512 * 1024 * 1024
 DEFAULT_XLSX_COMPRESSION_RATIO = 10_000.0
 DEFAULT_XLSX_ENTRY_LIMIT = 4096
 DEFAULT_PREPARED_MAX_BYTES = 64 * 1024 * 1024
+CATALOG_SCHEMA_VERSION = "1"
+# Canonical physical metadata must not depend on a caller's sampling profile.
+# Keep one bounded scan budget for every catalog identity; derived sample and
+# category views use their own explicit limits later.
+CANONICAL_CATALOG_ROWS = DEFAULT_CATALOG_ROWS
 
 TABULAR_FORMATS = frozenset({"csv", "tsv", "json", "jsonl", "ndjson", "xlsx"})
 DOCUMENT_FORMATS = frozenset(
@@ -92,6 +103,13 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _catalog_identity_key(source_hash: str, core_version: str) -> str:
+    """Return the stable key for one immutable physical catalog."""
+
+    identity = "\0".join((str(source_hash), str(core_version), CATALOG_SCHEMA_VERSION))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
 def _safe_id(value: str, label: str = "identifier") -> str:
@@ -408,6 +426,38 @@ class DataRoomCatalogEntry:
 
 
 @dataclass(frozen=True)
+class CatalogCounts:
+    """Typed counts for the physical archive and expanded catalog.
+
+    ``archive_members`` counts physical ZIP members.  ``catalog_entries``
+    counts expanded member/table/sheet entries.  ``table_members`` counts
+    distinct physical tabular members, while ``sheet_entries`` counts the
+    expanded XLSX worksheet entries.  Keeping these values in a named
+    contract prevents callers from accidentally comparing an archive count
+    with an expanded catalog count by position.
+    """
+
+    archive_members: int
+    catalog_entries: int
+    table_members: int
+    sheet_entries: int
+
+    def __post_init__(self) -> None:
+        for field_name in ("archive_members", "catalog_entries", "table_members", "sheet_entries"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise TypeError(f"{field_name} must be a non-negative integer")
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "archive_members": self.archive_members,
+            "catalog_entries": self.catalog_entries,
+            "table_members": self.table_members,
+            "sheet_entries": self.sheet_entries,
+        }
+
+
+@dataclass(frozen=True)
 class PreparedAsset:
     """A loadable prepared asset and its integrity descriptor."""
 
@@ -579,7 +629,11 @@ class DataRoom:
         self._members = members
         self.limits = limits
         self.telemetry = telemetry
-        self.catalog_path = context.resolve_run_path("data_room/source_catalog.json")
+        self.catalog_schema_version = CATALOG_SCHEMA_VERSION
+        self.catalog_key = _catalog_identity_key(archive_ref.content_hash or "", context.core_version)
+        self.catalog_root = context.resolve_run_path(Path("data_room") / "catalogs")
+        self.catalog_path = context.resolve_run_path(self.catalog_root / f"{self.catalog_key}.json")
+        self.catalog_lock_path = context.resolve_run_path(self.catalog_root / ".catalog.lock")
 
     @classmethod
     def open(
@@ -665,11 +719,15 @@ class DataRoom:
             raise ValueError(f"archive changed after registration: {self.archive_path}")
 
     def _resolve_member(self, member: DataRoomMember | DataRoomCatalogEntry | str | Path) -> DataRoomMember:
+        expected_hash: str | None = None
         if isinstance(member, DataRoomCatalogEntry):
+            expected_hash = member.member.content_hash
             member = member.member
         path = member.path if isinstance(member, DataRoomMember) else str(member)
         for candidate in self._members:
             if candidate.path == path:
+                if expected_hash is not None and candidate.content_hash != expected_hash:
+                    raise ValueError(f"catalog member hash changed: {path}")
                 return candidate
         raise KeyError(f"unknown data-room member: {path}")
 
@@ -897,24 +955,18 @@ class DataRoom:
         data = self._read_member_bytes(resolved, max_bytes=max_bytes, allow_truncate=True)
         return data.decode("utf-8-sig", errors="replace")
 
-    def _catalog_for_member(self, member: DataRoomMember, *, sample_rows: int, categorical_limit: int) -> list[DataRoomCatalogEntry]:
+    def _catalog_for_member(self, member: DataRoomMember) -> list[DataRoomCatalogEntry]:
         if member.kind == "unsupported":
             raise ValueError(f"unsupported data-room member format: {member.format}")
         if member.kind == "document":
-            return self._catalog_document(member, sample_rows=sample_rows, categorical_limit=categorical_limit)
+            return self._catalog_document(member)
         if member.format == "xlsx":
-            return self._catalog_xlsx(member, sample_rows=sample_rows, categorical_limit=categorical_limit)
+            return self._catalog_xlsx(member)
         if member.format in {"json", "jsonl"}:
-            return self._catalog_json(member, sample_rows=sample_rows, categorical_limit=categorical_limit)
-        return self._catalog_delimited(member, sample_rows=sample_rows, categorical_limit=categorical_limit)
+            return self._catalog_json(member)
+        return self._catalog_delimited(member)
 
-    def _catalog_document(
-        self,
-        member: DataRoomMember,
-        *,
-        sample_rows: int,
-        categorical_limit: int,
-    ) -> list[DataRoomCatalogEntry]:
+    def _catalog_document(self, member: DataRoomMember) -> list[DataRoomCatalogEntry]:
         if member.format == "pdf":
             return [
                 DataRoomCatalogEntry(
@@ -925,28 +977,16 @@ class DataRoom:
                     metadata={"extraction": "opaque", "requires_custom_code": True},
                 )
             ]
-        excerpt = self.document_excerpt(member, max_bytes=min(65536, self.limits.max_member_bytes))
-        lines = tuple(excerpt.splitlines()[:sample_rows])
         return [
             DataRoomCatalogEntry(
                 member=member,
-                columns=("text",),
-                sample_values={"text": lines[:categorical_limit]},
                 row_count=None,
                 row_count_exact=False,
                 row_count_lower_bound=None,
-                sample_rows=tuple({"text": line} for line in lines),
-                metadata={"excerpt_bytes": len(excerpt.encode("utf-8"))},
             )
         ]
 
-    def _catalog_xlsx(
-        self,
-        member: DataRoomMember,
-        *,
-        sample_rows: int,
-        categorical_limit: int,
-    ) -> list[DataRoomCatalogEntry]:
+    def _catalog_xlsx(self, member: DataRoomMember) -> list[DataRoomCatalogEntry]:
         data = self._read_member_bytes(member)
         _preflight_xlsx_bytes(
             data,
@@ -968,8 +1008,6 @@ class DataRoom:
                         member,
                         workbook[sheet_name],
                         sheet_name=sheet_name,
-                        sample_rows=sample_rows,
-                        categorical_limit=categorical_limit,
                     )
                 )
         finally:
@@ -983,22 +1021,17 @@ class DataRoom:
         worksheet: Any,
         *,
         sheet_name: str,
-        sample_rows: int,
-        categorical_limit: int,
     ) -> DataRoomCatalogEntry:
         values = worksheet.iter_rows(values_only=True)
         try:
             headers = [str(value) if value is not None else f"column_{index + 1}" for index, value in enumerate(next(values))]
         except StopIteration:
             headers = []
-        rows: list[dict[str, Any]] = []
         count = 0
         exhausted = True
         for row in values:
             count += 1
-            if len(rows) < sample_rows:
-                rows.append({headers[column]: row[column] if column < len(row) else None for column in range(len(headers))})
-            if count >= self.limits.max_catalog_rows:
+            if count >= CANONICAL_CATALOG_ROWS:
                 try:
                     next(values)
                 except StopIteration:
@@ -1006,35 +1039,22 @@ class DataRoom:
                 else:
                     exhausted = False
                 break
-        return self._entry_from_rows(member, rows, headers, sheet_name, count, exhausted, categorical_limit)
+        return self._entry_from_rows(member, headers, sheet_name, count, exhausted)
 
-    def _catalog_json(
-        self,
-        member: DataRoomMember,
-        *,
-        sample_rows: int,
-        categorical_limit: int,
-    ) -> list[DataRoomCatalogEntry]:
-        rows = self._iter_json_rows(member, limit=self.limits.max_catalog_rows + 1, offset=0)
+    def _catalog_json(self, member: DataRoomMember) -> list[DataRoomCatalogEntry]:
+        rows = self._iter_json_rows(member, limit=CANONICAL_CATALOG_ROWS + 1, offset=0)
         headers: list[str] = []
-        for row in rows[:sample_rows]:
+        for row in rows:
             for key in row:
                 if str(key) not in headers:
                     headers.append(str(key))
-        exhausted = len(rows) <= self.limits.max_catalog_rows
-        count = min(len(rows), self.limits.max_catalog_rows)
-        return [self._entry_from_rows(member, rows[:sample_rows], headers, None, count, exhausted, categorical_limit)]
+        exhausted = len(rows) <= CANONICAL_CATALOG_ROWS
+        count = min(len(rows), CANONICAL_CATALOG_ROWS)
+        return [self._entry_from_rows(member, headers, None, count, exhausted)]
 
-    def _catalog_delimited(
-        self,
-        member: DataRoomMember,
-        *,
-        sample_rows: int,
-        categorical_limit: int,
-    ) -> list[DataRoomCatalogEntry]:
+    def _catalog_delimited(self, member: DataRoomMember) -> list[DataRoomCatalogEntry]:
         self._check_archive_unchanged()
         info = self._zip_info(member)
-        rows: list[dict[str, Any]] = []
         delimiter = "\t" if member.format == "tsv" else ","
         count = 0
         exhausted = True
@@ -1044,9 +1064,7 @@ class DataRoom:
                 headers = [str(value) for value in (reader.fieldnames or ())]
                 for row in reader:
                     count += 1
-                    if len(rows) < sample_rows:
-                        rows.append(dict(row))
-                    if count >= self.limits.max_catalog_rows:
+                    if count >= CANONICAL_CATALOG_ROWS:
                         try:
                             next(reader)
                         except StopIteration:
@@ -1055,77 +1073,216 @@ class DataRoom:
                             exhausted = False
                         break
         self._emit("data_room_member_read", bytes_processed=member.size_bytes, facts={"member_path": member.path, "format": member.format, "rows": count})
-        return [self._entry_from_rows(member, rows, headers, None, count, exhausted, categorical_limit)]
+        return [self._entry_from_rows(member, headers, None, count, exhausted)]
 
     @staticmethod
     def _entry_from_rows(
         member: DataRoomMember,
-        rows: Sequence[Mapping[str, Any]],
         headers: Sequence[str],
         sheet_name: str | None,
         count: int,
         exact: bool,
-        categorical_limit: int,
     ) -> DataRoomCatalogEntry:
         columns: list[str] = [str(value) for value in headers]
-        for row in rows:
-            for key in row:
-                if str(key) not in columns:
-                    columns.append(str(key))
-        samples: dict[str, tuple[Any, ...]] = {}
-        for column in columns:
-            values: list[Any] = []
-            for row in rows:
-                value = row.get(column)
-                if value is None or value == "":
-                    continue
-                if value not in values and len(values) < categorical_limit:
-                    values.append(_jsonable(value))
-            samples[column] = tuple(values)
         return DataRoomCatalogEntry(
             member=member,
             table_name=sheet_name or PurePosixPath(member.path).stem,
             sheet_name=sheet_name,
             columns=tuple(columns),
-            sample_values=samples,
             row_count=count if exact else None,
             row_count_exact=exact,
             row_count_lower_bound=count,
-            sample_rows=tuple(rows),
         )
 
-    def build_catalog(self, *, sample_rows: int = 20, categorical_limit: int = 20) -> tuple[DataRoomCatalogEntry, ...]:
-        if sample_rows < 0 or categorical_limit < 0:
-            raise ValueError("sample_rows and categorical_limit cannot be negative")
-        self._check_archive_unchanged()
-        catalog_path = self.catalog_path
+    def _load_canonical_catalog(self) -> tuple[DataRoomCatalogEntry, ...]:
+        """Load and validate the one immutable catalog for this source identity."""
+
+        if not self.catalog_path.is_file():
+            raise FileNotFoundError(self.catalog_path)
         try:
-            if catalog_path.is_file():
-                payload = json.loads(catalog_path.read_text(encoding="utf-8"))
-                if (
-                    payload.get("archive_hash") == self.archive_ref.content_hash
-                    and payload.get("sample_rows") == sample_rows
-                    and payload.get("categorical_limit") == categorical_limit
-                ):
-                    entries = tuple(DataRoomCatalogEntry.from_dict(value) for value in payload.get("entries", ()))
-                    self._emit("data_room_catalog_reused", facts={"entry_count": len(entries), "catalog_path": str(catalog_path)})
-                    return entries
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            pass
-        entries: list[DataRoomCatalogEntry] = []
-        for member in self._members:
-            entries.extend(self._catalog_for_member(member, sample_rows=sample_rows, categorical_limit=categorical_limit))
-        result = tuple(sorted(entries, key=lambda item: (item.path, item.sheet_name or "")))
-        payload = {
-            "archive": self.archive_ref.to_dict(),
-            "archive_hash": self.archive_ref.content_hash,
-            "sample_rows": sample_rows,
-            "categorical_limit": categorical_limit,
-            "entries": [entry.to_dict() for entry in result],
+            payload = json.loads(self.catalog_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("canonical source catalog is unreadable") from exc
+        if not isinstance(payload, Mapping):
+            raise ValueError("canonical source catalog must be an object")
+        expected = {
+            "catalog_schema_version": CATALOG_SCHEMA_VERSION,
+            "catalog_key": self.catalog_key,
+            "source_hash": self.archive_ref.content_hash,
+            "core_version": self.context.core_version,
         }
-        _atomic_write_json(catalog_path, payload)
-        self._emit("data_room_catalog_created", facts={"entry_count": len(result), "catalog_path": str(catalog_path)})
-        return result
+        if any(payload.get(key) != value for key, value in expected.items()):
+            raise ValueError("canonical source catalog identity does not match current run")
+        raw_entries = payload.get("entries")
+        if not isinstance(raw_entries, list):
+            raise ValueError("canonical source catalog entries must be a list")
+        entries = tuple(DataRoomCatalogEntry.from_dict(value) for value in raw_entries)
+        for entry in entries:
+            # Validate every persisted physical member against the immutable
+            # archive inventory before exposing catalog metadata to callers.
+            self._resolve_member(entry.member)
+        # Canonical entries are physical metadata only.  A non-empty sample or
+        # category field indicates a caller-specific view was persisted and is
+        # rejected rather than silently reused as canonical state.
+        if any(entry.sample_values or entry.sample_rows for entry in entries):
+            raise ValueError("canonical source catalog contains derived sample data")
+        raw_counts = payload.get("counts")
+        if not isinstance(raw_counts, Mapping):
+            raise ValueError("canonical source catalog counts must be an object")
+        try:
+            persisted_counts = CatalogCounts(
+                archive_members=raw_counts["archive_members"],
+                catalog_entries=raw_counts["catalog_entries"],
+                table_members=raw_counts["table_members"],
+                sheet_entries=raw_counts["sheet_entries"],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("canonical source catalog counts are invalid") from exc
+        if persisted_counts != self.catalog_counts(entries):
+            raise ValueError("canonical source catalog counts do not match entries")
+        return entries
+
+    def build_catalog(self) -> tuple[DataRoomCatalogEntry, ...]:
+        """Build or load one immutable physical catalog for this source hash.
+
+        Sampling and category limits are intentionally absent.  They belong to
+        the derived ``sample``/``categories`` APIs and never alter canonical
+        catalog identity or trigger a full archive rescan.
+        """
+
+        self._check_archive_unchanged()
+        if self.catalog_path.is_file():
+            entries = self._load_canonical_catalog()
+            self._emit(
+                "data_room_catalog_reused",
+                facts={
+                    "entry_count": len(entries),
+                    "catalog_path": str(self.catalog_path),
+                    "catalog_key": self.catalog_key,
+                    "catalog_schema_version": CATALOG_SCHEMA_VERSION,
+                },
+            )
+            return entries
+        with _catalog_lock(self.catalog_lock_path):
+            self._check_archive_unchanged()
+            # A concurrent opener may have won publication while this caller
+            # waited for the lock.  Recheck before touching any member.
+            if self.catalog_path.is_file():
+                entries = self._load_canonical_catalog()
+                self._emit(
+                    "data_room_catalog_reused",
+                    facts={
+                        "entry_count": len(entries),
+                        "catalog_path": str(self.catalog_path),
+                        "catalog_key": self.catalog_key,
+                        "catalog_schema_version": CATALOG_SCHEMA_VERSION,
+                    },
+                )
+                return entries
+            entries: list[DataRoomCatalogEntry] = []
+            for member in self._members:
+                entries.extend(self._catalog_for_member(member))
+            # A source mutation during the bounded scan must fail closed and
+            # must never publish a partial catalog under the old identity.
+            self._check_archive_unchanged()
+            result = tuple(sorted(entries, key=lambda item: (item.path, item.sheet_name or "")))
+            counts = self.catalog_counts(result)
+            payload = {
+                "catalog_schema_version": CATALOG_SCHEMA_VERSION,
+                "catalog_key": self.catalog_key,
+                "source_hash": self.archive_ref.content_hash,
+                "core_version": self.context.core_version,
+                "archive": self.archive_ref.to_dict(),
+                "counts": counts.to_dict(),
+                "entries": [entry.to_dict() for entry in result],
+            }
+            _atomic_write_json(self.catalog_path, payload)
+            self._emit(
+                "data_room_catalog_created",
+                facts={
+                    "entry_count": len(result),
+                    "catalog_path": str(self.catalog_path),
+                    "catalog_key": self.catalog_key,
+                    "catalog_schema_version": CATALOG_SCHEMA_VERSION,
+                    **counts.to_dict(),
+                },
+            )
+            return result
+
+    def catalog_counts(self, catalog: Iterable[DataRoomCatalogEntry] | None = None) -> CatalogCounts:
+        """Return distinct physical-member and expanded-entry counts."""
+
+        entries = tuple(catalog) if catalog is not None else self.build_catalog()
+        table_paths = {entry.member.path for entry in entries if entry.member.kind == "table"}
+        sheet_entries = sum(1 for entry in entries if entry.sheet_name is not None)
+        return CatalogCounts(
+            archive_members=len(self._members),
+            catalog_entries=len(entries),
+            table_members=len(table_paths),
+            sheet_entries=sheet_entries,
+        )
+
+    def sample(
+        self,
+        entry: DataRoomCatalogEntry | DataRoomMember | str | Path,
+        *,
+        limit: int = 20,
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Read a bounded sample from one explicitly selected member/view."""
+
+        if limit < 0:
+            raise ValueError("limit cannot be negative")
+        if limit == 0:
+            return ()
+        if isinstance(entry, DataRoomCatalogEntry):
+            selected = entry
+            member = entry.member
+            sheet = entry.sheet_name
+        else:
+            selected = None
+            member = self._resolve_member(entry)
+            sheet = None
+        if member.kind == "document":
+            excerpt = self.document_excerpt(member, max_bytes=min(self.limits.max_member_bytes, max(limit, 1) * 4096))
+            return tuple({"text": line} for line in excerpt.splitlines()[:limit])
+        rows = self.read_rows(member if selected is None else selected, sheet=sheet, limit=limit)
+        return tuple(_freeze_mapping(row) for row in rows)
+
+    def categories(
+        self,
+        entry: DataRoomCatalogEntry | DataRoomMember | str | Path,
+        column: str,
+        *,
+        limit: int = 20,
+    ) -> tuple[Any, ...]:
+        """Return bounded distinct values from one selected member/table/sheet."""
+
+        if limit < 0:
+            raise ValueError("limit cannot be negative")
+        if limit == 0:
+            return ()
+        if isinstance(entry, DataRoomCatalogEntry):
+            selected = entry
+            member = entry.member
+            sheet = entry.sheet_name
+            if selected.columns and str(column) not in selected.columns:
+                raise KeyError(f"unknown catalog column: {column}")
+        else:
+            selected = None
+            member = self._resolve_member(entry)
+            sheet = None
+        if member.kind != "table":
+            raise ValueError(f"categories require a tabular member: {member.path}")
+        values: list[Any] = []
+        rows = self.read_rows(member if selected is None else selected, sheet=sheet, limit=self.limits.max_catalog_rows)
+        for row in rows:
+            value = row.get(column)
+            if value in (None, "") or value in values:
+                continue
+            values.append(_jsonable(value))
+            if len(values) >= limit:
+                break
+        return tuple(values)
 
     def search(
         self,
@@ -1150,7 +1307,6 @@ class DataRoom:
                 entry.sheet_name or "",
                 *entry.columns,
             ]
-            values.extend(str(value) for sample in entry.sample_values.values() for value in sample)
             haystack = " ".join(values).lower()
             score = sum(1 for token in tokens if token in haystack)
             if score:
@@ -1175,6 +1331,21 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
             temporary.unlink(missing_ok=True)
 
 
+@contextmanager
+def _catalog_lock(path: Path):
+    """Serialize canonical catalog creation across concurrent callers."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as stream:
+        if fcntl is not None:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
 class DataRoomWorkbench:
     """Analyst-facing workbench for one archive and one run context."""
 
@@ -1185,7 +1356,6 @@ class DataRoomWorkbench:
         *,
         runtime: Any = None,
         telemetry: TelemetryRecorder | None = None,
-        lem: LivingEnterpriseModel | None = None,
         **limits: Any,
     ) -> None:
         if runtime is not None and getattr(runtime, "context", context) is not context:
@@ -1193,16 +1363,16 @@ class DataRoomWorkbench:
         self.context = context
         self.runtime = runtime
         self.telemetry = telemetry or getattr(runtime, "telemetry", None) or TelemetryRecorder(context=context)
-        self.lem = lem
         self._room = DataRoom.open(context, archive, telemetry=self.telemetry, **limits)
+        self.prepared_registry = PreparedAssetRegistry(context, telemetry=self.telemetry)
         self._prepared: dict[str, PreparedAssetDescriptor] = {}
 
     @property
     def data_room(self) -> DataRoom:
         return self._room
 
-    def catalog(self, *, sample_rows: int = 20, categorical_limit: int = 20) -> tuple[DataRoomCatalogEntry, ...]:
-        return self._room.build_catalog(sample_rows=sample_rows, categorical_limit=categorical_limit)
+    def catalog(self) -> tuple[DataRoomCatalogEntry, ...]:
+        return self._room.build_catalog()
 
     def _resolve_source_member(self, value: DataRoomMember | DataRoomCatalogEntry | str | Path) -> DataRoomMember:
         return self._room._resolve_member(value)
@@ -1354,6 +1524,7 @@ class DataRoomWorkbench:
         relationship_mappings: tuple[str, ...],
         limitations: tuple[str, ...],
         lineage: Mapping[str, Any] | None,
+        scope: str,
         unique_members: Sequence[DataRoomMember],
         source_refs: tuple[DataAssetRef | str, ...],
         source_hashes: tuple[str, ...],
@@ -1389,7 +1560,7 @@ class DataRoomWorkbench:
             relationship_mappings=relationship_mappings,
             limitations=limitations,
             lineage=lineage_payload,
-            scope="reusable",
+            scope=scope,
             prepared_content_hash=_sha256_bytes(encoded),
             operation_manifest_hash=operation_manifest_hash,
             core_version=self.context.core_version,
@@ -1418,7 +1589,7 @@ class DataRoomWorkbench:
         relationship_mappings: Iterable[str] = (),
         limitations: Iterable[str] = (),
         lineage: Mapping[str, Any] | None = None,
-        register_lem: bool = True,
+        scope: str = "requirement_scoped",
         max_rows: int = DEFAULT_CATALOG_ROWS,
         max_bytes: int = DEFAULT_PREPARED_MAX_BYTES,
         max_output_bytes: int | None = None,
@@ -1429,6 +1600,8 @@ class DataRoomWorkbench:
             normalized_format = "jsonl"
         if normalized_format not in {"jsonl", "csv"}:
             raise ValueError("prepared assets support only JSONL or CSV")
+        if scope not in PreparedAssetRegistry.allowed_scopes:
+            raise ValueError(f"prepared asset scope is invalid: {scope!r}")
         if max_rows < 0:
             raise ValueError("max_rows cannot be negative")
         if max_output_bytes is not None:
@@ -1469,18 +1642,20 @@ class DataRoomWorkbench:
             relationship_mappings=relationship_mappings,
             limitations=limitations,
             lineage=lineage,
+            scope=scope,
             unique_members=unique_members,
             source_refs=source_ref_values,
             source_hashes=source_hashes,
             sheet=sheet,
             max_bytes=max_bytes,
         )
-        _atomic_write_bytes(destination, encoded)
         descriptor_path = self.context.resolve_run_path(Path("prepared") / f"{prepared_asset_id}.descriptor.json")
-        _atomic_write_json(descriptor_path, descriptor.to_dict())
+        descriptor = self.prepared_registry.materialize_accepted(
+            descriptor,
+            encoded,
+            descriptor_path,
+        )
         self._prepared[prepared_asset_id] = descriptor
-        if register_lem and self.lem is not None:
-            self.lem.register_prepared_asset(descriptor)
         self._emit_prepared(descriptor)
         return descriptor
 
@@ -1498,59 +1673,16 @@ class DataRoomWorkbench:
 
     def prepared(self, prepared_asset_id: str) -> PreparedAsset:
         prepared_asset_id = _safe_id(prepared_asset_id, "prepared_asset_id")
-        descriptor = self._prepared.get(prepared_asset_id)
-        descriptor_path = self.context.resolve_run_path(Path("prepared") / f"{prepared_asset_id}.descriptor.json")
-        if descriptor is None:
-            if not descriptor_path.is_file():
-                raise FileNotFoundError(descriptor_path)
-            descriptor = PreparedAssetDescriptor.from_dict(json.loads(descriptor_path.read_text(encoding="utf-8")))
-            self._prepared[prepared_asset_id] = descriptor
-        location = self.context.resolve_run_path(descriptor.location)
-        if not location.is_file():
-            raise FileNotFoundError(location)
-        encoded = location.read_bytes()
-        if descriptor.prepared_content_hash and _sha256_bytes(encoded) != descriptor.prepared_content_hash:
-            raise ValueError(f"prepared asset content changed: {prepared_asset_id}")
-        if descriptor.byte_count is not None and descriptor.byte_count != len(encoded):
-            raise ValueError(f"prepared asset byte count changed: {prepared_asset_id}")
-        fmt = str(descriptor.metadata.get("format", location.suffix.lstrip("."))).lower()
-        rows: list[dict[str, Any]] = []
-        if fmt == "jsonl":
-            for line_number, line in enumerate(encoded.decode("utf-8").splitlines(), 1):
-                if line.strip():
-                    value = json.loads(line)
-                    if not isinstance(value, Mapping):
-                        raise ValueError(f"prepared JSONL row {line_number} is not an object")
-                    rows.append(dict(value))
-        elif fmt == "csv":
-            reader = csv.DictReader(io.StringIO(encoded.decode("utf-8")))
-            rows = [dict(row) for row in reader]
-        else:
-            raise ValueError(f"unsupported prepared asset format: {fmt}")
-        if descriptor.row_count is not None and descriptor.row_count != len(rows):
-            raise ValueError(f"prepared asset row count changed: {prepared_asset_id}")
-        return PreparedAsset(descriptor=descriptor, rows=tuple(rows))
-
-
-def _atomic_write_bytes(path: Path, encoded: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile("wb", dir=path.parent, prefix=f".{path.name}.", delete=False) as stream:
-            temporary = Path(stream.name)
-            stream.write(encoded)
-            stream.flush()
-            os.fsync(stream.fileno())
-        temporary.replace(path)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-
+        loaded = self.prepared_registry.load(prepared_asset_id)
+        self._prepared[prepared_asset_id] = loaded.descriptor
+        return loaded
 
 __all__ = [
+    "CatalogCounts",
     "DataRoom",
     "DataRoomCatalogEntry",
     "DataRoomMember",
     "DataRoomWorkbench",
     "PreparedAsset",
+    "PreparedAssetRegistry",
 ]

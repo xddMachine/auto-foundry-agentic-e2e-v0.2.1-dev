@@ -47,11 +47,43 @@ from .enterprise_model import LivingEnterpriseModel
 from .catalog import capability_catalog, get_capability
 from .runtime import CoreExecutionResult, CoreRuntime
 from .workbench import (
+    CatalogCounts,
     DataRoom,
     DataRoomCatalogEntry,
     DataRoomMember,
     DataRoomWorkbench,
     PreparedAsset,
+)
+from .prepared import PreparedAssetRegistry
+from .analysis import (
+    BoundAnalysisContext,
+    CatalogSnapshot,
+    ControlledScriptRunner,
+    ScriptExecutionReceipt,
+    ScriptRunReport,
+    load_bound_analysis_context,
+)
+from .integration import (
+    AcceptedAnalysisBundle,
+    IntegrationRecord,
+    IntegrationSession,
+    IntegrationValidation,
+)
+from .lifecycle import (
+    AgentInvocationReceipt,
+    InvocationReceiptLedger,
+    RunLifecycle,
+    RunLifecycleSnapshot,
+    classify_invocation_terminal_reason,
+    classify_terminal_reason,
+    recovery_classification,
+)
+from .product_contracts import (
+    FREEZE_MARKER_FIELDS,
+    FreezeMarkers,
+    ProductContractError,
+    decode_freeze_markers,
+    validate_freeze_markers,
 )
 from .durable import (
     AcceptedSnapshot,
@@ -73,13 +105,13 @@ from .references import (
     is_explicit_reference_mapping,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "AggregationSpec", "AllowedRootError", "CanonicalMapping",
-    "CapabilityDescriptor", "CoreExecutionResult", "CoreRuntime", "DataAssetRef", "DataRoom",
+    "CapabilityDescriptor", "CatalogCounts", "CoreExecutionResult", "CoreRuntime", "DataAssetRef", "DataRoom",
     "DataRoomCatalogEntry", "DataRoomMember", "DataRoomWorkbench", "DocumentRef", "FieldRef",
-    "PreparedAsset", "AcceptedSnapshot", "ArtifactProgress", "ExecutionAttempt", "ITEM_STATE_FIELDS",
+    "PreparedAsset", "PreparedAssetRegistry", "AcceptedSnapshot", "ArtifactProgress", "ExecutionAttempt", "ITEM_STATE_FIELDS",
     "ITEM_STATE_SCHEMA", "ItemWorkspace", "ProgressDecision",
     "FoundationTask", "IdentityCandidate", "IdentityDecision",
     "IdentityEvidence", "KnowledgeDelta", "LEMRef", "LivingEnterpriseModel",
@@ -96,4 +128,11 @@ __all__ = [
     "DATA_ASSET_REFERENCE", "OPERATION_RESULT_REFERENCE", "REFERENCE_DISCRIMINATOR",
     "decode_explicit_reference", "decode_reference_value", "encode_explicit_reference",
     "encode_reference_value", "is_explicit_reference_mapping",
+    "BoundAnalysisContext", "CatalogSnapshot", "ControlledScriptRunner",
+    "ScriptExecutionReceipt", "ScriptRunReport", "load_bound_analysis_context",
+    "AcceptedAnalysisBundle", "IntegrationRecord", "IntegrationSession", "IntegrationValidation",
+    "AgentInvocationReceipt", "InvocationReceiptLedger", "RunLifecycle", "RunLifecycleSnapshot",
+    "classify_invocation_terminal_reason", "classify_terminal_reason", "recovery_classification",
+    "FREEZE_MARKER_FIELDS", "FreezeMarkers", "ProductContractError", "decode_freeze_markers",
+    "validate_freeze_markers",
 ]

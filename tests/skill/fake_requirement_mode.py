@@ -1,20 +1,25 @@
-"""Deterministic fake-role harness for offline Requirement Mode coverage.
+"""Deterministic protocol harness for offline Requirement Mode coverage.
 
-This harness is intentionally not an analytics implementation.  It exercises
-the boundaries between the Portfolio Planner, Navigator, Lead Analyst,
-Independent Reviewer fallback, and the run-local LEM acceptance matrix using
-small structured records only.  No model, core, source, network, or file
-system operation is involved.
+The harness models the ownership boundaries that are easy to regress without
+calling a model, reading a source, or pretending that prose is lifecycle
+state.  One Lead Analyst owns the item, a controlled runner feeds code errors
+back to that same attempt, one independent reviewer may request one business
+repair, and exactly one Result Integration Agent consumes accepted bytes.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass
+import hashlib
 from typing import Any, Iterable, Mapping, Sequence
 
 
-class ExactIDValidationError(ValueError):
-    """A Navigator bundle ID is unknown, out of scope, or not evidence-bound."""
+class CodeFeedbackError(ValueError):
+    """A compile/dependency/script validation defect for the current attempt."""
+
+
+class IntegrationValidationError(ValueError):
+    """A deterministic integration boundary rejected a structured value."""
 
 
 @dataclass(frozen=True)
@@ -27,41 +32,116 @@ class FakeRequirement:
 
 
 @dataclass(frozen=True)
-class CompactIndexRecord:
-    record_id: str
-    layer: str
-    record_type: str
-    run_id: str
-    evidence_refs: tuple[str, ...]
-    effective_scope: str
+class InvocationReceipt:
+    """A completed invocation receipt, including literal unavailable facts."""
+
+    attempt_id: str
+    status: str
+    lane: str = "lead"
+    provider: str = "unavailable"
+    model: str = "unavailable"
+    host: str = "unavailable"
+    process: str = "unavailable"
+    completed: bool = True
+
+    @property
+    def proves_execution_loss(self) -> bool:
+        """Only a completed receipt explicitly marked lost authorizes recovery."""
+
+        return self.completed and self.status == "lost"
 
 
 @dataclass(frozen=True)
-class CandidateLEMRecord:
-    record_id: str
-    semantic_key: str
-    definition: str
-    effective_scope: str
-    evidence_refs: tuple[str, ...]
+class ScriptExecutionReceipt:
+    """One emitted preflight-failure or runtime execution receipt."""
 
-
-@dataclass
-class StoredLEMRecord:
-    record_id: str
-    semantic_key: str
-    definition: str
-    effective_scope: str
-    evidence_refs: tuple[str, ...]
-    status: str = "promoted_with_limits"
-    supersedes: str | None = None
+    attempt_id: str
+    phase: str
+    status: str
 
 
 @dataclass(frozen=True)
-class PlannerResult:
-    ordered_ids: tuple[str, ...]
-    classifications: Mapping[str, str]
-    rationale: Mapping[str, str]
-    full_portfolio_seen: bool
+class ScriptRunReport:
+    """Pipeline result: checks are separate from emitted runtime receipts."""
+
+    attempt_id: str
+    status: str
+    receipts: tuple[ScriptExecutionReceipt, ...]
+    deterministic_match: bool | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.status == "passed"
+
+
+class ControlledScriptRunner:
+    """Model the real pipeline's preflight checks and runtime receipt phases."""
+
+    runtime_phases = ("smoke", "full")
+    preflight_failure_phases = {
+        "syntax_error": "compile",
+        "missing_import": "dependency_check",
+    }
+
+    def run(
+        self,
+        source: str,
+        *,
+        attempt_id: str,
+        deterministic: bool = False,
+    ) -> ScriptRunReport:
+        if source in self.preflight_failure_phases:
+            # Compile/dependency preflight emits a receipt only when it fails;
+            # successful preflight has no separate receipt.
+            return ScriptRunReport(
+                attempt_id,
+                "failed",
+                (
+                    ScriptExecutionReceipt(
+                        attempt_id,
+                        self.preflight_failure_phases[source],
+                        "failed",
+                    ),
+                ),
+            )
+        if source in {"name_error", "type_error", "invalid"}:
+            # Runtime coding/script-validation errors are reported by the
+            # smoke pass and routed back to the same attempt.
+            return ScriptRunReport(
+                attempt_id,
+                "failed",
+                (ScriptExecutionReceipt(attempt_id, "smoke", "failed"),),
+            )
+        phases = [
+            ScriptExecutionReceipt(attempt_id, phase, "passed")
+            for phase in self.runtime_phases
+        ]
+        if deterministic:
+            # The deterministic comparison is a second full runtime pass, not
+            # a distinct receipt phase.
+            phases.append(ScriptExecutionReceipt(attempt_id, "full", "passed"))
+        return ScriptRunReport(
+            attempt_id,
+            "passed",
+            tuple(phases),
+            deterministic_match=True if deterministic else None,
+        )
+
+
+@dataclass(frozen=True)
+class RecoveryDecision:
+    action: str
+    reason_class: str
+
+
+def decide_recovery(*, invocation_receipt: InvocationReceipt | None, materialized: bool) -> RecoveryDecision:
+    """Classify a stalled lane without turning filesystem silence into recovery."""
+
+    if invocation_receipt is not None and invocation_receipt.proves_execution_loss:
+        return RecoveryDecision("execution_recovery", "execution_recovery")
+    if materialized:
+        return RecoveryDecision("await_runtime", "await_runtime")
+    return RecoveryDecision("materialization_guidance", "await_runtime")
 
 
 @dataclass(frozen=True)
@@ -72,178 +152,169 @@ class ReviewResult:
 
 
 @dataclass(frozen=True)
+class AcceptedSnapshot:
+    """Immutable accepted answer bytes; lifecycle state is not embedded."""
+
+    answer_bytes: bytes
+    content_hash: str
+
+    @classmethod
+    def from_text(cls, text: str) -> "AcceptedSnapshot":
+        payload = text.encode("utf-8")
+        return cls(payload, hashlib.sha256(payload).hexdigest())
+
+
+@dataclass(frozen=True)
+class AcceptanceEnvelope:
+    """Program-owned lifecycle envelope bound to an accepted snapshot hash."""
+
+    snapshot_hash: str
+    lifecycle_state: str = "accepted"
+    terminal_reason_class: str = "business_repair"
+
+
+@dataclass(frozen=True)
+class PreparedAsset:
+    asset_id: str
+    source_hash: str
+    core_version: str
+    schema: str
+    scope: str
+    reusable: bool = True
+
+
+class CanonicalCatalog:
+    """Immutable canonical asset identities with derived visibility views."""
+
+    def __init__(self) -> None:
+        self._entries: dict[tuple[str, str, str], PreparedAsset] = {}
+
+    def register(self, asset: PreparedAsset) -> PreparedAsset:
+        key = (asset.source_hash, asset.core_version, asset.schema)
+        existing = self._entries.get(key)
+        if existing is not None and existing != asset:
+            raise IntegrationValidationError("canonical catalog identity is immutable")
+        self._entries.setdefault(key, asset)
+        return self._entries[key]
+
+    def visible(self, *, scope: str) -> tuple[PreparedAsset, ...]:
+        return tuple(asset for asset in self._entries.values() if asset.scope == scope)
+
+
+@dataclass(frozen=True)
+class IntegrationReceipt:
+    claims: tuple[str, ...]
+    metrics: tuple[str, ...]
+    limitations: tuple[str, ...]
+    evidence_refs: tuple[str, ...]
+    prepared_asset_ids: tuple[str, ...]
+    ontology_refs: tuple[str, ...]
+    relationship_refs: tuple[str, ...]
+    dashboard_facts: tuple[str, ...]
+
+
+class ResultIntegrationAgent:
+    """The single post-acceptance owner; validation remains deterministic."""
+
+    def __init__(self, catalog: CanonicalCatalog | None = None) -> None:
+        self.catalog = catalog or CanonicalCatalog()
+        self.calls = 0
+
+    def integrate(
+        self,
+        *,
+        claims: Iterable[str],
+        metrics: Iterable[str],
+        limitations: Iterable[str],
+        evidence_refs: Iterable[str],
+        prepared_assets: Iterable[PreparedAsset],
+        ontology_refs: Iterable[str],
+        relationship_refs: Iterable[str],
+        dashboard_facts: Iterable[str],
+    ) -> IntegrationReceipt:
+        self.calls += 1
+        values = {
+            "claims": tuple(claims),
+            "metrics": tuple(metrics),
+            "limitations": tuple(limitations),
+            "evidence_refs": tuple(evidence_refs),
+            "ontology_refs": tuple(ontology_refs),
+            "relationship_refs": tuple(relationship_refs),
+            "dashboard_facts": tuple(dashboard_facts),
+        }
+        if any(not isinstance(value, str) or not value.strip() for group in values.values() for value in group):
+            raise IntegrationValidationError("integration values require non-empty strings")
+        registered = tuple(self.catalog.register(asset).asset_id for asset in prepared_assets)
+        return IntegrationReceipt(**values, prepared_asset_ids=registered)
+
+
+@dataclass(frozen=True)
 class RequirementResult:
     requirement_id: str
-    route: str
-    selected_ids: tuple[str, ...]
+    script_receipt: ScriptRunReport
+    code_feedback_count: int
     review: ReviewResult
-    lem_action: str
-
-
-class FakePortfolioPlanner:
-    """See the entire portfolio, then honor explicit priority deterministically."""
-
-    def __init__(self) -> None:
-        self.portfolios_seen: list[tuple[str, ...]] = []
-
-    def plan(self, requirements: Sequence[FakeRequirement]) -> PlannerResult:
-        ids = tuple(item.requirement_id for item in requirements)
-        self.portfolios_seen.append(ids)
-        if len(set(ids)) != len(ids):
-            raise ValueError("duplicate requirement IDs")
-        by_id = {item.requirement_id: item for item in requirements}
-        if any(item.scope_classification not in {"analytics_in_scope", "analytics_requires_missing_data", "out_of_analytics_scope"} for item in requirements):
-            raise ValueError("invalid semantic scope classification")
-        # Explicit priority is primary; unset items retain supplied order in
-        # this fake so dependency/reuse rationale remains observable.
-        ordered = tuple(
-            item.requirement_id
-            for item in sorted(
-                requirements,
-                key=lambda item: (item.priority is None, item.priority if item.priority is not None else len(requirements), ids.index(item.requirement_id)),
-            )
-        )
-        rationale = {
-            item.requirement_id: ("explicit priority" if item.priority is not None else "supplied order; no explicit priority")
-            for item in requirements
-        }
-        # Referencing dependencies here proves the planner saw them without
-        # silently creating a second requirement or keyword router.
-        for item in requirements:
-            for dependency in item.dependencies:
-                if dependency not in by_id:
-                    rationale[item.requirement_id] += "; dependency missing"
-        return PlannerResult(ordered, {item.requirement_id: item.scope_classification for item in requirements}, rationale, True)
-
-
-class FakeNavigator:
-    """Validate exact compact-index IDs before returning any full records."""
-
-    def __init__(self) -> None:
-        self.selections: list[tuple[str, tuple[str, ...]]] = []
-
-    def select(
-        self,
-        requirement: FakeRequirement,
-        compact_indexes: Mapping[str, CompactIndexRecord],
-        selected_ids: Iterable[str],
-        *,
-        run_id: str,
-        allowed_layers: set[str],
-    ) -> tuple[CompactIndexRecord, ...]:
-        selected = tuple(selected_ids)
-        result: list[CompactIndexRecord] = []
-        for record_id in selected:
-            record = compact_indexes.get(record_id)
-            if record is None:
-                raise ExactIDValidationError(f"unknown exact ID: {record_id}")
-            if record.run_id != run_id:
-                raise ExactIDValidationError(f"cross-run exact ID: {record_id}")
-            if record.layer not in allowed_layers:
-                raise ExactIDValidationError(f"layer out of scope for {record_id}: {record.layer}")
-            if not record.evidence_refs:
-                raise ExactIDValidationError(f"evidence missing for exact ID: {record_id}")
-            result.append(record)
-        self.selections.append((requirement.requirement_id, selected))
-        return tuple(result)
-
-
-class FakeLeadAnalyst:
-    """Produce a bounded answer envelope from the Navigator bundle only."""
-
-    def __init__(self) -> None:
-        self.calls: list[str] = []
-
-    def analyze(self, requirement: FakeRequirement, bundle: Sequence[CompactIndexRecord], lem_action: str) -> dict[str, Any]:
-        if not bundle:
-            raise ValueError("fake analyst requires a bounded bundle")
-        self.calls.append(requirement.requirement_id)
-        route = "prepared_reuse" if lem_action == "found_reuse" else ("extend_reuse" if lem_action == "extend" else "fresh")
-        return {
-            "requirement_id": requirement.requirement_id,
-            "route": route,
-            "answer": f"bounded fake answer for {requirement.requirement_id}",
-            "evidence_refs": [ref for record in bundle for ref in record.evidence_refs],
-            "new_analytics": False,
-        }
-
-
-class FakeReviewer:
-    """Model independent review and explicit unavailable fallback disclosure."""
-
-    def __init__(self, available: bool) -> None:
-        self.available = available
-        self.calls: list[str] = []
-
-    def review(self, answer: Mapping[str, Any]) -> ReviewResult:
-        requirement_id = str(answer["requirement_id"])
-        self.calls.append(requirement_id)
-        if self.available:
-            return ReviewResult("available", "independent", "accept_with_limits")
-        # An uninvoked reviewer cannot issue an acceptance verdict.  The Lead
-        # Analyst may still complete the item with an explicit limits outcome,
-        # but the review record itself is not_reviewed.
-        return ReviewResult("unavailable", "none", "not_reviewed")
-
-
-class FakeLivingEnterpriseModel:
-    """Small acceptance matrix: reuse, extend, fresh, conflict/supersession."""
-
-    def __init__(self, records: Iterable[StoredLEMRecord] = ()) -> None:
-        self.records: list[StoredLEMRecord] = list(records)
-        self.history: list[StoredLEMRecord] = []
-
-    def accept(self, candidate: CandidateLEMRecord) -> str:
-        matches = [record for record in self.records if record.semantic_key == candidate.semantic_key]
-        if not matches:
-            self.records.append(
-                StoredLEMRecord(candidate.record_id, candidate.semantic_key, candidate.definition, candidate.effective_scope, candidate.evidence_refs)
-            )
-            return "fresh"
-        current = matches[-1]
-        if current.definition != candidate.definition:
-            superseded = replace(current, status="superseded", supersedes=candidate.record_id)
-            self.history.append(superseded)
-            self.records.remove(current)
-            self.records.append(
-                StoredLEMRecord(candidate.record_id, candidate.semantic_key, candidate.definition, candidate.effective_scope, candidate.evidence_refs, supersedes=current.record_id)
-            )
-            return "conflict_supersession"
-        if current.effective_scope == candidate.effective_scope and set(candidate.evidence_refs).issubset(current.evidence_refs):
-            return "found_reuse"
-        current.effective_scope = candidate.effective_scope
-        current.evidence_refs = tuple(dict.fromkeys((*current.evidence_refs, *candidate.evidence_refs)))
-        current.status = "promoted_with_limits"
-        return "extend"
+    business_repair_count: int
+    recovery: RecoveryDecision
+    accepted_snapshot: AcceptedSnapshot
+    acceptance_envelope: AcceptanceEnvelope
+    integration: IntegrationReceipt
 
 
 class FakeRequirementRun:
-    """Execute one planner/navigator/analyst/reviewer pass per requirement."""
+    """Run one requirement through the settled ownership protocol."""
 
-    def __init__(self, *, reviewer_available: bool = False) -> None:
-        self.planner = FakePortfolioPlanner()
-        self.navigator = FakeNavigator()
-        self.analyst = FakeLeadAnalyst()
-        self.reviewer = FakeReviewer(reviewer_available)
-        self.lem = FakeLivingEnterpriseModel()
+    def __init__(self, *, reviewer_verdicts: Sequence[str] = ("accept",)) -> None:
+        self.runner = ControlledScriptRunner()
+        self.reviewer_verdicts = tuple(reviewer_verdicts)
+        self.lead_attempts: list[str] = []
+        self.reviewer_calls = 0
+        self.business_repair_count = 0
+        self.integration_agent = ResultIntegrationAgent()
 
     def run(
         self,
-        requirements: Sequence[FakeRequirement],
-        indexes: Mapping[str, CompactIndexRecord],
-        selected_ids: Mapping[str, Sequence[str]],
-        candidates: Mapping[str, CandidateLEMRecord],
+        requirement: FakeRequirement,
         *,
-        run_id: str,
-    ) -> tuple[PlannerResult, tuple[RequirementResult, ...]]:
-        plan = self.planner.plan(requirements)
-        results: list[RequirementResult] = []
-        by_id = {item.requirement_id: item for item in requirements}
-        for requirement_id in plan.ordered_ids:
-            requirement = by_id[requirement_id]
-            bundle = self.navigator.select(requirement, indexes, selected_ids[requirement_id], run_id=run_id, allowed_layers={"ontology", "prepared"})
-            lem_action = self.lem.accept(candidates[requirement_id])
-            answer = self.analyst.analyze(requirement, bundle, lem_action)
-            review = self.reviewer.review(answer)
-            results.append(RequirementResult(requirement_id, answer["route"], tuple(record.record_id for record in bundle), review, lem_action))
-        return plan, tuple(results)
+        script_sources: Sequence[str] = ("valid",),
+        invocation_receipt: InvocationReceipt | None = None,
+    ) -> RequirementResult:
+        attempt_id = f"{requirement.requirement_id}:attempt-1"
+        self.lead_attempts.append(attempt_id)
+        script_receipt: ScriptRunReport | None = None
+        code_feedback_count = 0
+        for source in script_sources:
+            report = self.runner.run(source, attempt_id=attempt_id)
+            if report.succeeded:
+                script_receipt = report
+                break
+            code_feedback_count += 1
+        if script_receipt is None:
+            raise CodeFeedbackError("same-attempt code feedback exhausted")
+
+        recovery = decide_recovery(invocation_receipt=invocation_receipt, materialized=True)
+        self.reviewer_calls += 1
+        verdict = self.reviewer_verdicts[0] if self.reviewer_verdicts else "accept"
+        review = ReviewResult("available", "independent", verdict)
+        if verdict == "repair_once":
+            self.business_repair_count += 1
+            if len(self.reviewer_verdicts) < 2:
+                raise ValueError("repair_once requires one re-review verdict")
+            self.reviewer_calls += 1
+            review = ReviewResult("available", "independent", self.reviewer_verdicts[1])
+        if self.business_repair_count > 1:
+            raise ValueError("at most one business repair is allowed")
+
+        snapshot = AcceptedSnapshot.from_text(f"accepted answer for {requirement.requirement_id}")
+        envelope = AcceptanceEnvelope(snapshot.content_hash, terminal_reason_class=("business_repair" if self.business_repair_count else "same_attempt_feedback"))
+        integration = self.integration_agent.integrate(
+            claims=(f"claim:{requirement.requirement_id}",),
+            metrics=("metric:bounded",),
+            limitations=("fixture-only",),
+            evidence_refs=(f"evidence:{requirement.requirement_id}",),
+            prepared_assets=(PreparedAsset("asset-1", "a" * 64, "0.3.0", "fixture-v1", "source"),),
+            ontology_refs=("ontology:fixture",),
+            relationship_refs=("relationship:fixture",),
+            dashboard_facts=("dashboard:fixture",),
+        )
+        return RequirementResult(requirement.requirement_id, script_receipt, code_feedback_count, review, self.business_repair_count, recovery, snapshot, envelope, integration)

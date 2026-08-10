@@ -2,7 +2,7 @@
 
 The program owns one run-local data room, one source catalog, and two linked
 LEM layers. This reference defines the knowledge boundary; it does not create
-a separate planner, navigation role, or lifecycle gate.
+a Portfolio Planner, Navigator, separate navigation role, or lifecycle gate.
 
 ## Data room and source catalog
 
@@ -32,7 +32,10 @@ relationship measurements, prepared tables, and other bounded views. Each
 entry records source references, an exact asset ID, a run-local loadable
 location, content hash, schema, grain, lineage/source IDs, scope, effective
 period, transformations, evidence, limits, and whether it is reusable
-preparation or a requirement-scoped view.
+preparation or a requirement-scoped view. Every accepted asset is registered
+in a canonical catalog whose identity is immutable by source hash, core
+version, and schema. Samples and categories are derived views; scope and reuse
+eligibility control visibility only.
 
 Entries may be source-scoped when their evidence, scope, and period support
 reuse. Keep reusable preparation distinct from a requirement-scoped view and
@@ -41,19 +44,27 @@ cross-run cache.
 
 Both layers start empty at the start of a clean-room run. Compact source,
 ontology, and prepared indexes may be searched, but the Lead Analyst selects
-relevant IDs directly. There is no mandatory Navigator role and no per-item
-Capability Catalog compliance artifact.
+relevant IDs directly. There is no Navigator, descriptor/typed-validation role,
+or per-item Capability Catalog compliance artifact.
 
 ## Durable item workspace and bounded selection
 
-The program creates `questions/<id>/work` or `requirements/<id>/work` and
-authoritative `item_state.json` before invoking the Lead Analyst. The Lead
-Analyst writes a plan and source map first, then appends findings and prepared
-asset references. The program validates every selected ID deterministically:
+The program creates `questions/<id>/work` or `requirements/<id>/work`,
+authoritative `item_state.json`, and immutable `BoundAnalysisContext` before
+invoking the Lead Analyst. The Lead Analyst writes a plan, script, and source
+map first, then appends findings and prepared asset references. The program
+validates every selected ID deterministically:
 existence, current-run ownership, expected layer/type, allowed scope,
 effective period, hash/location, schema, grain, lineage, and evidence
 references. Missing, duplicated, or out-of-scope IDs are a bundle failure; do
 not guess or broaden the selection.
+
+After acceptance, exactly one Result Integration Agent incrementally consumes
+claims, metrics, limitations, evidence refs, prepared assets, ontology,
+relationships, and dashboard facts through small program APIs. It performs
+semantic mapping; deterministic code validates types, paths, refs, hashes,
+stages, and commits. There is no prose parser, giant mandatory JSON,
+Integration Reviewer, or finalizer chain.
 
 ## Knowledge item shape
 

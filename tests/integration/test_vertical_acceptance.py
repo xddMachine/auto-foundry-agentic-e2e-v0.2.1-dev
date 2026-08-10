@@ -442,6 +442,13 @@ def test_complete_generic_offline_vertical_path(tmp_path: Path) -> None:
                 "run_id": context.run_id,
                 "review_status": "not_reviewed",
                 "limitations": ["Reviewer unavailable; values are fixture-only."],
+                "freeze_markers": {
+                    "answers_frozen": True,
+                    "living_enterprise_model_frozen": True,
+                    "prepared_data_registry_frozen": True,
+                    "dashboard_frozen": True,
+                    "telemetry_frozen": True,
+                },
                 "domains": [
                     {
                         "id": "fixture-domain",
@@ -466,7 +473,7 @@ def test_complete_generic_offline_vertical_path(tmp_path: Path) -> None:
                         "unit": "fixture units",
                         "review_status": "not_reviewed",
                         "reviewed_item_ref": "REQ-ALPHA",
-                        "reviewed_output_ref": "requirements/REQ-ALPHA/final.json",
+                        "reviewed_output_ref": "requirements/REQ-ALPHA/accepted/answer_content.json",
                         "evidence_refs": ["prepared/shared-id"],
                         "trace_refs": ["telemetry/events.jsonl"],
                     },
@@ -478,9 +485,9 @@ def test_complete_generic_offline_vertical_path(tmp_path: Path) -> None:
                         "rows": [{"key": "entity-event", "overlap": "2"}],
                         "review_status": "not_reviewed",
                         "reviewed_item_ref": "REQ-BETA",
-                        "reviewed_output_ref": "requirements/REQ-BETA/final.json",
+                        "reviewed_output_ref": "requirements/REQ-BETA/accepted/answer_content.json",
                         "evidence_refs": ["relationship-entity-event"],
-                        "trace_refs": ["requirements/REQ-BETA/final.json"],
+                        "trace_refs": ["requirements/REQ-BETA/accepted/answer_content.json"],
                     },
                 ],
             }
@@ -507,11 +514,13 @@ def test_complete_generic_offline_vertical_path(tmp_path: Path) -> None:
     # collector reads only run-relative evidence and writes only optimizer/*.
     products_manifest = {
         "run_id": context.run_id,
-        "answers_frozen": True,
-        "living_enterprise_model_frozen": True,
-        "prepared_assets_frozen": True,
-        "dashboard_frozen": True,
-        "telemetry_frozen": True,
+        "freeze_markers": {
+            "answers_frozen": True,
+            "living_enterprise_model_frozen": True,
+            "prepared_data_registry_frozen": True,
+            "dashboard_frozen": True,
+            "telemetry_frozen": True,
+        },
         "review_routing": {"fresh_sol_review_available": False},
         "review": review_unavailable,
     }

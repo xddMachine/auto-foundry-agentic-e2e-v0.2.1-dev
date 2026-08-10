@@ -11,9 +11,8 @@ import zipfile
 import pytest
 
 from auto_foundry_core.contracts import DataAssetRef
-from auto_foundry_core.enterprise_model import LivingEnterpriseModel
 from auto_foundry_core.telemetry import TelemetryRecorder
-from auto_foundry_core.workbench import DataRoom, DataRoomCatalogEntry, DataRoomWorkbench
+from auto_foundry_core.workbench import CatalogCounts, DataRoom, DataRoomCatalogEntry, DataRoomWorkbench
 from auto_foundry_core.workspace import RunContext
 
 
@@ -56,7 +55,7 @@ def room_fixture(tmp_path: Path) -> tuple[RunContext, Path, dict[str, bytes]]:
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
         for name, data in payloads.items():
             output.writestr(name, data)
-    context = RunContext("RUN-TEST", run_root, (input_root,), core_version="0.2.2-test")
+    context = RunContext("RUN-TEST", run_root, (input_root,), core_version="0.3.0-test")
     return context, archive, payloads
 
 
@@ -76,13 +75,22 @@ def test_inventory_hash_search_and_read_formats(room_fixture: tuple[RunContext, 
     assert room.read_rows("events.jsonl", offset=1) == [{"event": "close"}]
     assert room.document_excerpt("readme.txt", max_bytes=8) == "Data roo"
 
-    catalog = room.build_catalog(sample_rows=1, categorical_limit=2)
+    catalog = room.build_catalog()
     assert all(isinstance(entry, DataRoomCatalogEntry) for entry in catalog)
     assert any(entry.path == "sales.csv" and entry.columns == ("order_id", "amount") for entry in catalog)
+    assert all(not entry.sample_values and not entry.sample_rows for entry in catalog)
     assert room.search("sales.csv", catalog=catalog, limit=1)[0].path == "sales.csv"
     assert room.search("region", catalog=catalog)[0].path == "sales.tsv"
+    sales_entry = next(entry for entry in catalog if entry.path == "sales.csv")
+    assert room.sample(sales_entry, limit=1) == ({"order_id": "A-1", "amount": "10"},)
+    assert room.categories(sales_entry, "order_id", limit=2) == ("A-1", "A-2")
+    counts = room.catalog_counts(catalog)
+    assert isinstance(counts, CatalogCounts)
+    assert counts.archive_members == len(payloads)
+    assert counts.catalog_entries == len(catalog)
     assert room.catalog_path.is_file()
-    assert room.build_catalog(sample_rows=1, categorical_limit=2) == catalog
+    assert room.catalog_path.parent.name == "catalogs"
+    assert room.build_catalog() == catalog
     assert {event.event_type for event in telemetry.events} >= {
         "data_room_archive_read",
         "data_room_member_read",
@@ -317,11 +325,10 @@ def test_zip_bomb_and_member_bounds(tmp_path: Path) -> None:
         DataRoom.open(context, archive, max_compression_ratio=1.0)
 
 
-def test_prepared_materialization_descriptor_load_and_lem(room_fixture: tuple[RunContext, Path, dict[str, bytes]]) -> None:
+def test_prepared_materialization_descriptor_load_and_registry(room_fixture: tuple[RunContext, Path, dict[str, bytes]]) -> None:
     context, archive, _ = room_fixture
     telemetry = TelemetryRecorder(context=context)
-    lem = LivingEnterpriseModel(run_id=context.run_id)
-    workbench = DataRoomWorkbench(context, DataAssetRef.from_path(archive), telemetry=telemetry, lem=lem)
+    workbench = DataRoomWorkbench(context, DataAssetRef.from_path(archive), telemetry=telemetry)
     descriptor = workbench.save_prepared(
         "sales-prepared",
         "sales.csv",
@@ -339,6 +346,7 @@ def test_prepared_materialization_descriptor_load_and_lem(room_fixture: tuple[Ru
     assert descriptor.row_count == 2
     assert descriptor.byte_count == prepared_path.stat().st_size
     assert descriptor.core_version == context.core_version
+    assert descriptor.scope == "requirement_scoped"
     assert descriptor.source_hashes
     assert descriptor.lineage["members"][0]["path"] == "sales.csv"
     assert descriptor.transformations == ("read_csv", "bounded")
@@ -346,7 +354,8 @@ def test_prepared_materialization_descriptor_load_and_lem(room_fixture: tuple[Ru
     loaded = workbench.prepared("sales-prepared")
     assert len(loaded) == 2
     assert loaded[0]["order_id"] == "A-1"
-    assert lem.lookup_prepared_asset("sales-prepared") == descriptor
+    assert workbench.prepared_registry.search(prepared_asset_id="sales-prepared") == (descriptor,)
+    assert workbench.prepared_registry.load("sales-prepared").descriptor == descriptor
     assert any(event.event_type == "data_room_prepared_write" for event in telemetry.events)
 
     prepared_path.write_text(prepared_path.read_text(encoding="utf-8") + "{}\n", encoding="utf-8")

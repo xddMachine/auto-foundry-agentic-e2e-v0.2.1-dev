@@ -24,11 +24,12 @@ status and outcome
 ```
 
 The program first opens the shared `DataRoomWorkbench`, then creates
-`questions/<id>/work` or `requirements/<id>/work` and authoritative
-`item_state.json` before invoking the Lead Analyst. Requirement Mode honors
-explicit user priority first; unprioritized items may be ordered one at a time
-for observed dependencies or safe reuse. There is no separate planner
-framework, keyword router, or business-term dictionary.
+`questions/<id>/work` or `requirements/<id>/work`, authoritative
+`item_state.json`, and an immutable `BoundAnalysisContext` before invoking the
+Lead Analyst. Requirement Mode honors explicit user priority first;
+unprioritized items may be ordered one at a time for observed dependencies or
+safe reuse. There is no Portfolio Planner, separate planner framework,
+keyword router, or business-term dictionary.
 
 ## 2. Data room and compact indexes
 
@@ -42,32 +43,45 @@ period, hash/location, schema, grain, lineage, and evidence references before
 the Lead Analyst uses it. A failed validation is recorded and does not justify
 an unbounded read or guessed ID.
 
-There is no mandatory Navigator role and no per-item Capability Catalog
-lookup/compliance artifact. The Lead Analyst selects IDs directly. Catalog
-capabilities may be recommended or used internally when they fit; custom code
-is allowed when it is the clearest reproducible route.
+There is no Navigator, descriptor/typed-validation role, or per-item Capability
+Catalog lookup/compliance artifact. The Lead Analyst selects IDs directly.
+Catalog capabilities may be recommended or used internally when they fit;
+custom code is allowed when it is the clearest reproducible route.
 
 ## 3. Plan/source map and artifact progress
 
-The Lead Analyst writes a concise `plan` and `source_map` into `work/` before
-analysis, then appends material findings, evidence references, and any
-loadable prepared assets. `draft` is written only when its content is
-materialized; `accepted` is written atomically after review and any one
-business repair. Work remains mutable scratch.
+The Lead Analyst writes a concise `plan`, reproducible script, and `source_map`
+into `work/` before analysis, then appends material findings, evidence
+references, and any loadable prepared assets. `ControlledScriptRunner` performs
+compile/dependency preflight checks; successful pipelines emit `smoke` and
+`full` runtime receipts, with an optional second `full` receipt for a
+deterministic comparison, while a failed preflight emits only its `compile` or
+`dependency_check` receipt. Coding errors (`SyntaxError`, `NameError`, `TypeError`, or script
+validation) return to the same analyst and attempt and never authorize
+execution recovery. `draft` is
+written only when its content is materialized; accepted answer bytes are
+immutable and separate from the program-owned acceptance envelope. Work
+remains mutable scratch.
 
 After each response, the Run Director checks structured `artifact_progress`,
 not prose activity:
 
 1. progress in material artifacts or counts → continue;
-2. first consecutive no-progress response → require materialization;
-3. second consecutive no-progress response → stop the lane and recover from
-   the durable handoff.
+2. filesystem no-progress → return `await_runtime` or
+   `materialization_guidance`, preserving the handoff;
+3. a completed invocation receipt explicitly proving lane/provider/host/process
+   loss → authorize execution recovery from the durable handoff.
 
 Execution recovery preserves scratch and is counted separately from the one
-business repair. The host/Run Director creates or restarts the replacement
-thread; the core only records state. No wall-time deadline or terminalizer
-agent is used. After recovery routes are exhausted, the program writes typed
-`technical_failure`, which is never a data conclusion.
+business repair. Provider/model identity may be literal `unavailable`; do not
+invent identity. The host creates or restarts the replacement thread; the core
+only records state. No wall-time deadline or terminalizer/manual finalizer is
+used. After recovery routes are exhausted, the program writes typed
+`technical_failure`, with classifier output restricted to
+`same_attempt_feedback`, `business_repair`, `execution_recovery`,
+`abort_and_new_clean_run`, or `null`. The raw `terminal_reason` remains a
+specific fact such as `syntax_error` or `core_defect`; this is never a data
+conclusion.
 
 ## 4. Interpret the decision
 
@@ -198,6 +212,15 @@ repaired points. Then the program validates and atomically applies one
 reviewed Knowledge Delta (`promoted`, `promoted_with_limits`, or `no_change`);
 `no_change` includes a concrete reason. Custom question code does not apply the
 delta.
+
+After acceptance, exactly one Result Integration Agent incrementally consumes
+claims, metrics, limitations, evidence refs, prepared assets, ontology,
+relationships, and dashboard facts through small program APIs. It performs
+semantic mapping; deterministic code validates types, paths, refs, hashes,
+stages, and commits. Every accepted prepared asset is registered in a
+canonical catalog immutable by source hash/core/schema; scope/reuse controls
+visibility only and sample/category views are derived. There is no prose
+parser, giant mandatory JSON, Integration Reviewer, or finalizer chain.
 
 ## 12. Queue continuation
 

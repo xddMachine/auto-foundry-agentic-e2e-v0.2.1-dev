@@ -1,4 +1,4 @@
-"""Behavioral, offline fake-role coverage for Requirement Mode."""
+"""Behavioral, offline coverage for the settled Requirement Mode protocol."""
 
 from __future__ import annotations
 
@@ -11,76 +11,112 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fake_requirement_mode import (  # noqa: E402
-    CandidateLEMRecord,
-    CompactIndexRecord,
-    ExactIDValidationError,
-    FakeLivingEnterpriseModel,
+    CodeFeedbackError,
     FakeRequirement,
     FakeRequirementRun,
-    StoredLEMRecord,
+    InvocationReceipt,
+    PreparedAsset,
+    ResultIntegrationAgent,
+    decide_recovery,
 )
 
 
-def test_requirement_roles_plan_navigate_analyze_and_disclose_reviewer_fallback() -> None:
-    requirements = (
-        FakeRequirement("R-001", "Review late delivery concentration", 2, "analytics_in_scope"),
-        FakeRequirement("R-002", "Reconcile a missing field", 1, "analytics_requires_missing_data"),
+def _requirement() -> FakeRequirement:
+    return FakeRequirement("R-001", "Review a bounded fixture", 1, "analytics_in_scope")
+
+
+def test_same_attempt_code_feedback_uses_controlled_receipts_without_recovery() -> None:
+    run = FakeRequirementRun()
+    result = run.run(_requirement(), script_sources=("syntax_error", "valid"))
+
+    assert result.code_feedback_count == 1
+    assert result.script_receipt.attempt_id == "R-001:attempt-1"
+    assert result.script_receipt.succeeded
+    assert [receipt.phase for receipt in result.script_receipt.receipts] == [
+        "smoke",
+        "full",
+    ]
+    assert all(receipt.status == "passed" for receipt in result.script_receipt.receipts)
+    assert run.lead_attempts == ["R-001:attempt-1"]
+    assert result.recovery.action == "await_runtime"
+    assert result.business_repair_count == 0
+    assert result.acceptance_envelope.terminal_reason_class == "same_attempt_feedback"
+    assert run.integration_agent.calls == 1
+    assert result.acceptance_envelope.snapshot_hash == result.accepted_snapshot.content_hash
+
+
+def test_controlled_runner_emits_only_failure_preflight_or_runtime_phases() -> None:
+    run = FakeRequirementRun()
+    failed_preflight = run.runner.run("syntax_error", attempt_id="R-001:attempt-1")
+    assert failed_preflight.status == "failed"
+    assert [receipt.phase for receipt in failed_preflight.receipts] == ["compile"]
+
+    missing_import = run.runner.run("missing_import", attempt_id="R-001:attempt-1")
+    assert missing_import.status == "failed"
+    assert [receipt.phase for receipt in missing_import.receipts] == ["dependency_check"]
+
+    deterministic = run.runner.run(
+        "valid",
+        attempt_id="R-001:attempt-1",
+        deterministic=True,
     )
-    indexes = {
-        "O-001": CompactIndexRecord("O-001", "ontology", "metric", "RUN-FAKE", ("E-O-001",), "2024"),
-        "P-001": CompactIndexRecord("P-001", "prepared", "view", "RUN-FAKE", ("E-P-001",), "2024"),
-    }
-    candidates = {
-        "R-001": CandidateLEMRecord("LEM-001", "delivery.late_rate", "late rate", "2024", ("E-O-001",)),
-        "R-002": CandidateLEMRecord("LEM-002", "payments.reconciliation", "receipt match", "2024", ("E-P-001",)),
-    }
-    run = FakeRequirementRun(reviewer_available=False)
-    plan, results = run.run(
-        requirements,
-        indexes,
-        {"R-001": ("O-001",), "R-002": ("P-001",)},
-        candidates,
-        run_id="RUN-FAKE",
+    assert [receipt.phase for receipt in deterministic.receipts] == [
+        "smoke",
+        "full",
+        "full",
+    ]
+    assert deterministic.deterministic_match is True
+
+
+def test_filesystem_no_progress_guides_materialization_but_completed_loss_allows_recovery() -> None:
+    no_receipt = decide_recovery(invocation_receipt=None, materialized=False)
+    assert no_receipt.action == "materialization_guidance"
+    assert no_receipt.reason_class == "await_runtime"
+
+    loss = InvocationReceipt("R-001:attempt-1", "lost")
+    recovered = decide_recovery(invocation_receipt=loss, materialized=False)
+    assert recovered.action == "execution_recovery"
+    assert recovered.reason_class == "execution_recovery"
+    assert loss.provider == "unavailable"
+    assert loss.model == "unavailable"
+
+
+def test_one_reviewer_one_business_repair_then_re_review() -> None:
+    run = FakeRequirementRun(reviewer_verdicts=("repair_once", "accept_with_limits"))
+    result = run.run(_requirement())
+
+    assert run.reviewer_calls == 2
+    assert result.business_repair_count == 1
+    assert result.review.verdict == "accept_with_limits"
+    assert result.acceptance_envelope.terminal_reason_class == "business_repair"
+
+
+def test_result_integration_agent_is_single_owner_and_catalog_scope_is_visibility_only() -> None:
+    agent = ResultIntegrationAgent()
+    asset = PreparedAsset("asset-1", "b" * 64, "0.3.0", "fixture-v1", "source")
+    receipt = agent.integrate(
+        claims=("claim",),
+        metrics=("metric",),
+        limitations=("limit",),
+        evidence_refs=("evidence",),
+        prepared_assets=(asset,),
+        ontology_refs=("ontology",),
+        relationship_refs=("relationship",),
+        dashboard_facts=("dashboard",),
     )
+    assert agent.calls == 1
+    assert receipt.prepared_asset_ids == ("asset-1",)
+    assert agent.catalog.visible(scope="source") == (asset,)
+    assert agent.catalog.visible(scope="other") == ()
 
-    assert plan.full_portfolio_seen is True
-    assert plan.ordered_ids == ("R-002", "R-001")
-    assert plan.classifications["R-002"] == "analytics_requires_missing_data"
-    assert results[0].requirement_id == "R-002"
-    assert all(result.route == "fresh" for result in results)
-    assert all(result.review.review_status == "unavailable" for result in results)
-    assert all(result.review.review_strength == "none" for result in results)
-    assert all(result.review.verdict == "not_reviewed" for result in results)
-    assert run.planner.portfolios_seen == [("R-001", "R-002")]
-    assert run.navigator.selections == [("R-002", ("P-001",)), ("R-001", ("O-001",))]
-    assert run.analyst.calls == ["R-002", "R-001"]
-    assert run.reviewer.calls == ["R-002", "R-001"]
+    # The canonical identity is immutable by source hash/core/schema; a
+    # different scope is a visibility decision, not a second canonical row.
+    with pytest.raises(ValueError, match="immutable"):
+        agent.catalog.register(PreparedAsset("asset-2", asset.source_hash, asset.core_version, asset.schema, "requirement"))
 
 
-def test_lem_acceptance_matrix_found_reuse_extend_fresh_and_conflict_supersession() -> None:
-    lem = FakeLivingEnterpriseModel(
-        [StoredLEMRecord("LEM-OLD", "orders.otif", "arrival proxy", "2024-Q1", ("E-1",))]
-    )
-    assert lem.accept(CandidateLEMRecord("LEM-REUSE", "orders.otif", "arrival proxy", "2024-Q1", ("E-1",))) == "found_reuse"
-    assert lem.accept(CandidateLEMRecord("LEM-EXTEND", "orders.otif", "arrival proxy", "2024-Q2", ("E-2",))) == "extend"
-    assert lem.records[0].effective_scope == "2024-Q2"
-    assert lem.records[0].evidence_refs == ("E-1", "E-2")
-    assert lem.accept(CandidateLEMRecord("LEM-FRESH", "orders.promise", "accepted promise", "2024-Q2", ("E-3",))) == "fresh"
-    assert lem.accept(CandidateLEMRecord("LEM-CONFLICT", "orders.otif", "customer promise", "2024-Q2", ("E-4",))) == "conflict_supersession"
-    assert any(record.record_id == "LEM-OLD" and record.status == "superseded" for record in lem.history)
-    current = [record for record in lem.records if record.semantic_key == "orders.otif"][-1]
-    assert current.record_id == "LEM-CONFLICT"
-    assert current.supersedes == "LEM-OLD"
-
-
-def test_navigator_rejects_scoped_exact_ids_before_analysis() -> None:
-    requirement = FakeRequirement("R-001", "Use a reviewed view", 1, "analytics_in_scope")
-    navigator = FakeRequirementRun().navigator
-    indexes = {
-        "P-OTHER-RUN": CompactIndexRecord("P-OTHER-RUN", "prepared", "view", "RUN-OTHER", ("E-1",), "2024"),
-        "O-WRONG-LAYER": CompactIndexRecord("O-WRONG-LAYER", "ontology", "metric", "RUN-FAKE", ("E-2",), "2024"),
-        "P-NO-EVIDENCE": CompactIndexRecord("P-NO-EVIDENCE", "prepared", "view", "RUN-FAKE", (), "2024"),
-    }
-    for selected in (("UNKNOWN",), ("P-OTHER-RUN",), ("O-WRONG-LAYER",), ("P-NO-EVIDENCE",)):
-        with pytest.raises(ExactIDValidationError):
-            navigator.select(requirement, indexes, selected, run_id="RUN-FAKE", allowed_layers={"prepared"})
+def test_failed_same_attempt_feedback_does_not_silently_recover() -> None:
+    run = FakeRequirementRun()
+    with pytest.raises(CodeFeedbackError):
+        run.run(_requirement(), script_sources=("type_error", "invalid"))
+    assert run.lead_attempts == ["R-001:attempt-1"]

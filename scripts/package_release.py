@@ -13,7 +13,7 @@ import zipfile
 from pathlib import Path
 
 
-ZIP_NAME = "auto-foundry-agentic-e2e-v0.2.2.zip"
+ZIP_NAME = "auto-foundry-agentic-e2e-v0.2.3.zip"
 REQUIRED_SKILL_FILES = (
     "SKILL.md",
     "README.md",
@@ -74,7 +74,7 @@ def _cleanup_build_outputs(root: Path) -> None:
 
 
 def _build_wheel(root: Path, dist: Path) -> Path:
-    before = set(dist.glob("auto_foundry_core-0.2.0-*.whl"))
+    before = set(dist.glob("auto_foundry_core-0.3.0-*.whl"))
     command = [
         sys.executable,
         "-m",
@@ -96,7 +96,7 @@ def _build_wheel(root: Path, dist: Path) -> Path:
         raise RuntimeError(f"offline wheel build failed: {detail}") from exc
     finally:
         _cleanup_build_outputs(root)
-    after = sorted(set(dist.glob("auto_foundry_core-0.2.0-*.whl")) - before)
+    after = sorted(set(dist.glob("auto_foundry_core-0.3.0-*.whl")) - before)
     if len(after) != 1:
         # A clean build should produce one wheel.  Reusing an existing exact
         # artifact is not deterministic, so fail rather than guessing.
@@ -126,7 +126,7 @@ def package_release(root: Path, dist: Path) -> dict[str, object]:
     zip_path = dist / ZIP_NAME
     if zip_path.exists():
         zip_path.unlink()
-    for wheel in dist.glob("auto_foundry_core-0.2.0-*.whl"):
+    for wheel in dist.glob("auto_foundry_core-0.3.0-*.whl"):
         wheel.unlink()
     wheel_path = _build_wheel(root, dist)
     zip_info = _write_deterministic_zip(skill_root, zip_path)

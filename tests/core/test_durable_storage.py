@@ -22,7 +22,7 @@ def test_create_makes_workspace_and_authoritative_state_before_agent(tmp_path: P
     assert workspace.item_root == context.run_root / "questions/Q-001"
     assert workspace.work_root.is_dir()
     assert workspace.draft_root == workspace.item_root / "draft.json"
-    assert workspace.accepted_root == workspace.item_root / "accepted.json"
+    assert workspace.accepted_root == workspace.item_root / "accepted"
     assert not workspace.accepted_root.exists()
     state_path = workspace.item_root / "item_state.json"
     assert state_path.is_file() and state_path.stat().st_size > 0

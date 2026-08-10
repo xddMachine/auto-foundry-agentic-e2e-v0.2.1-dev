@@ -16,6 +16,7 @@ from auto_foundry_core.durable import (
     ItemWorkspace,
     ProgressDecision,
 )
+from auto_foundry_core.lifecycle import AgentInvocationReceipt
 from auto_foundry_core.telemetry import TelemetryRecorder
 from auto_foundry_core.workspace import AllowedRootError, RunContext
 
@@ -46,9 +47,9 @@ def test_attempt_progress_decisions_are_deterministic_and_reloadable(tmp_path: P
     assert workspace.state["consecutive_no_progress"] == 1
 
     second = workspace.observe_attempt("A-001")
-    assert second.action == "recover"
+    assert second.action == "await_runtime"
     assert workspace.state["consecutive_no_progress"] == 2
-    assert workspace.state["lifecycle_state"] == "recovery_ready"
+    assert workspace.state["lifecycle_state"] == "work"
 
     workspace.write_plan({"objective": "bounded"})
     progressed = workspace.observe_attempt("A-001")
@@ -69,7 +70,13 @@ def test_recovery_is_separate_from_business_repair_and_preserves_handoff(tmp_pat
     workspace.observe_attempt(attempt.attempt_id)
     workspace.observe_attempt(attempt.attempt_id)
 
-    recovery = workspace.begin_recovery("lane-2", "Lead Analyst", prior_attempt_id=attempt.attempt_id)
+    receipt = AgentInvocationReceipt(
+        "I-001", "Q-001", "Lead Analyst", "lead", start="2026-01-01T00:00:00Z",
+        finish="2026-01-01T00:00:01Z", terminal_reason="process_lost",
+    )
+    recovery = workspace.begin_recovery(
+        "lane-2", "Lead Analyst", prior_attempt_id=attempt.attempt_id, receipt=receipt
+    )
     assert recovery.attempt_id == "A-002"
     assert recovery.route == "recovery"
     assert workspace.state["execution_recovery_count"] == 1
@@ -79,7 +86,7 @@ def test_recovery_is_separate_from_business_repair_and_preserves_handoff(tmp_pat
     assert record["handoff_ref"] == "work/handoff.json"
     assert workspace.state["lifecycle_state"] == "recovering"
 
-    with pytest.raises(ValueError, match="recovery_ready"):
+    with pytest.raises(ValueError, match="active work"):
         workspace.begin_recovery("lane-3", "Lead Analyst", prior_attempt_id="A-002")
 
 
@@ -104,12 +111,15 @@ def test_review_guards_repair_once_and_acceptance_are_immutable(tmp_path: Path) 
     assert isinstance(accepted, AcceptedSnapshot)
     accepted_dir = workspace.accepted_root
     assert accepted_dir.is_dir()
-    assert (accepted_dir / "final_answer.json").read_bytes() == reviewed_draft
+    assert (accepted_dir / "answer_content.json").read_bytes() == reviewed_draft
+    envelope = json.loads((accepted_dir / "acceptance_envelope.json").read_text(encoding="utf-8"))
+    assert envelope["outcome"] == "accepted_with_limits"
+    assert envelope["review_status"] == "reviewed"
+    assert envelope["review_verdict"] == "accept_with_limits"
     manifest = json.loads((accepted_dir / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["knowledge_delta"] == "no_change"
-    assert manifest["accepted_refs"] == ["work/findings.jsonl"]
+    assert envelope["knowledge_delta"] == "no_change"
+    assert envelope["accepted_refs"] == ["work/findings.jsonl"]
     assert manifest["content_hash"] == reviewed_hash
-    assert manifest["draft_hash"] == reviewed_hash
     assert workspace.state["lifecycle_state"] == "accepted"
     with pytest.raises(FileExistsError):
         workspace.accept()
@@ -127,8 +137,54 @@ def test_unavailable_review_disclosure_can_be_accepted_with_limits(tmp_path: Pat
         "draft_hash": hashlib.sha256(workspace.draft_root.read_bytes()).hexdigest(),
     }
     accepted = workspace.accept(knowledge_delta="promoted_with_limits")
-    assert accepted.outcome == "accepted"
-    assert (workspace.accepted_root / "final_answer.json").is_file()
+    assert accepted.outcome == "accepted_with_limits"
+    assert (workspace.accepted_root / "answer_content.json").is_file()
+
+
+def test_limited_acceptance_reload_keeps_canonical_accepted_lifecycle(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    workspace.write_draft({"answer": "limited"})
+    workspace.record_review("accept_with_limits", reviewer_ref="review-limited")
+    accepted = workspace.accept()
+    assert accepted.outcome == "accepted_with_limits"
+    assert workspace.state["lifecycle_state"] == "accepted"
+    assert workspace.state["terminal_outcome"]["status"] == "accepted_with_limits"
+    reloaded = ItemWorkspace.load(workspace.context, workspace.item_id)
+    assert reloaded.state["lifecycle_state"] == "accepted"
+    assert reloaded.state["terminal_outcome"]["outcome"] == "accepted_with_limits"
+
+
+def test_limited_acceptance_reconciles_after_directory_publish_crash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace = _workspace(tmp_path)
+    workspace.write_draft({"answer": "limited"})
+    workspace.record_review("accept_with_limits", reviewer_ref="review-limited")
+    original_persist = workspace._persist_state
+    calls = 0
+
+    def interrupted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected limited state persistence gap")
+        return original_persist(*args, **kwargs)
+
+    monkeypatch.setattr(workspace, "_persist_state", interrupted)
+    with pytest.raises(OSError, match="limited state persistence gap"):
+        workspace.accept()
+    assert workspace.accepted_root.is_dir()
+    reloaded = ItemWorkspace.load(workspace.context, workspace.item_id)
+    assert reloaded.state["lifecycle_state"] == "accepted"
+    assert reloaded.state["terminal_outcome"]["status"] == "accepted_with_limits"
+
+
+def test_unavailable_limited_acceptance_reload_keeps_canonical_lifecycle(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    workspace.write_draft({"answer": "not independently reviewed"})
+    workspace.record_review("not_reviewed", review_status="unavailable")
+    workspace.accept()
+    reloaded = ItemWorkspace.load(workspace.context, workspace.item_id)
+    assert reloaded.state["lifecycle_state"] == "accepted"
+    assert reloaded.state["terminal_outcome"]["status"] == "accepted_with_limits"
 
 
 def test_technical_failure_requires_exhaustion_and_preserves_work(tmp_path: Path) -> None:
@@ -215,7 +271,7 @@ def test_accept_reconciles_if_state_persistence_is_interrupted(tmp_path: Path, m
     reloaded = ItemWorkspace.load(workspace.context, workspace.item_id)
     assert reloaded.state["lifecycle_state"] == "accepted"
     assert reloaded.state["terminal_outcome"]["content_hash"] == hashlib.sha256(
-        (reloaded.accepted_root / "final_answer.json").read_bytes()
+        (reloaded.accepted_root / "answer_content.json").read_bytes()
     ).hexdigest()
     assert original_persist is not None
 
@@ -304,30 +360,30 @@ def test_terminal_manifest_schema_and_hash_bind_every_field(tmp_path: Path) -> N
     assert set(manifest) == {
         "item_id",
         "outcome",
-        "final_answer",
+        "content_path",
         "content_hash",
-        "draft_hash",
+        "envelope_path",
+        "envelope_hash",
         "hashes",
         "artifact_progress",
-        "refs",
-        "accepted_refs",
-        "knowledge_delta",
         "manifest_hash",
     }
     unsigned = {key: value for key, value in manifest.items() if key != "manifest_hash"}
     expected_hash = hashlib.sha256((json.dumps(unsigned, sort_keys=True, separators=(",", ":")) + "\n").encode()).hexdigest()
     assert manifest["manifest_hash"] == expected_hash
-    assert manifest["draft_hash"] == manifest["content_hash"] == hashlib.sha256(
-        (workspace.accepted_root / "final_answer.json").read_bytes()
+    assert manifest["content_hash"] == hashlib.sha256(
+        (workspace.accepted_root / "answer_content.json").read_bytes()
+    ).hexdigest()
+    assert manifest["envelope_hash"] == hashlib.sha256(
+        (workspace.accepted_root / "acceptance_envelope.json").read_bytes()
     ).hexdigest()
 
 
 @pytest.mark.parametrize(
     "mutation",
     [
-        lambda manifest: manifest.__setitem__("refs", ["work/other.json"]),
-        lambda manifest: manifest.__setitem__("accepted_refs", ["work/other.json"]),
-        lambda manifest: manifest.__setitem__("knowledge_delta", "promoted"),
+        lambda manifest: manifest.__setitem__("content_hash", "0" * 64),
+        lambda manifest: manifest.__setitem__("envelope_hash", "0" * 64),
         lambda manifest: manifest["artifact_progress"].__setitem__("finding_count", 9),
         lambda manifest: manifest.__setitem__("manifest_hash", "0" * 64),
     ],
@@ -345,7 +401,7 @@ def test_manifest_mutations_fail_closed(tmp_path: Path, mutation) -> None:
 @pytest.mark.parametrize(
     "change",
     [
-        lambda manifest: manifest.pop("refs"),
+        lambda manifest: manifest.pop("envelope_hash"),
         lambda manifest: manifest.__setitem__("unexpected", True),
     ],
 )
@@ -361,7 +417,7 @@ def test_manifest_missing_or_extra_fields_fail_closed(tmp_path: Path, change) ->
 
 def test_manifest_draft_content_mismatch_fails_closed(tmp_path: Path) -> None:
     workspace = _accepted_workspace(tmp_path)
-    final_path = workspace.accepted_root / "final_answer.json"
+    final_path = workspace.accepted_root / "answer_content.json"
     final_path.write_bytes(b'{"answer":"tampered"}\n')
     with pytest.raises(ValueError, match="hash"):
         ItemWorkspace.load(workspace.context, workspace.item_id)
@@ -438,5 +494,5 @@ def test_accept_reads_and_publishes_one_exact_draft_buffer(tmp_path: Path, monke
     monkeypatch.setattr(Path, "read_bytes", raced_read)
     accepted = workspace.accept()
     assert reads == 1
-    assert (workspace.accepted_root / "final_answer.json").read_bytes() == b'{"answer":"original"}\n'
+    assert (workspace.accepted_root / "answer_content.json").read_bytes() == b'{"answer":"original"}\n'
     assert accepted.content_hash == hashlib.sha256(b'{"answer":"original"}\n').hexdigest()

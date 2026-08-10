@@ -11,12 +11,14 @@ registry, and closed telemetry before building products.
 
 The program-owned workbench controls physical evidence access and durable
 execution: it opens the supplied archive read-only, builds one bounded source
-catalog, creates each item workspace before an attempt, records artifact
-progress, and preserves recovery handoffs. The Lead Analyst owns semantic
-judgment: selecting useful source/member IDs, defining the analytical route,
-interpreting evidence, and writing a bounded draft. The workbench does not
-infer business meaning, and the analyst does not bypass its path, hash, or
-workspace controls.
+catalog, creates each item workspace and immutable `BoundAnalysisContext`
+before an attempt, records artifact progress and controlled-script receipts,
+and preserves recovery handoffs. The Lead Analyst owns semantic judgment:
+selecting useful source/member IDs, defining the analytical route,
+interpreting evidence, and writing a bounded draft. Coding defects return to
+the same analyst/attempt; recovery requires a completed invocation loss receipt.
+The workbench does not infer business meaning, and the analyst does not bypass
+its path, hash, or workspace controls.
 
 ## Cross-item synthesis
 
@@ -53,13 +55,14 @@ self-check and reviewer verdict; review availability; Knowledge Delta; passive
 telemetry references; dashboard element lineage; and all limitations. Structured
 JSON remains authoritative for status.
 
-## Product review
+## Product check
 
-Use one independent Product Reviewer when available. Check values, labels,
-periods, populations, units/currencies, claim strength, visible limitations,
-offline rendering, internal links, and traceability. A presentation defect is
-fixed in the product. A genuine analytical defect returns to the originating
-item for its single permitted repair; do not create a second review pipeline.
+The program checks values, labels, periods, populations, units/currencies,
+claim strength, visible limitations, offline rendering, internal links, and
+traceability while integrating products. A presentation defect is fixed in the
+product. A genuine analytical defect returns to the originating item for its
+single permitted repair; do not create a second review pipeline or an
+Integration Reviewer.
 
 ## Post-run evidence and optimization
 
@@ -89,3 +92,16 @@ No benchmark is invented, and no code, configuration, source, state, LEM,
 prepared asset, or product is mutated or auto-promoted. Collector or agent
 failure is recorded as `optimizer_status: technical_failure` without changing
 the analytical completion state.
+
+## Result integration boundary
+
+Accepted answer bytes are immutable and stored separately from the
+program-owned acceptance envelope and lifecycle state. After acceptance,
+exactly one Result Integration Agent incrementally uses small program APIs for
+claims, metrics, limitations, evidence references, prepared assets, ontology,
+relationships, and dashboard facts. It performs semantic mapping; deterministic
+code validates types, paths, refs, hashes, stages, and commits. Every accepted
+prepared asset is registered in a canonical catalog immutable by source hash,
+core version, and schema. Scope and reuse eligibility control visibility only;
+samples and categories are derived views. There is no prose parser, giant
+mandatory JSON, Integration Reviewer, or finalizer chain.

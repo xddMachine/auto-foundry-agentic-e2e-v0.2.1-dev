@@ -22,11 +22,13 @@ import sys
 from typing import Any, Iterable, Mapping
 
 try:
+    from auto_foundry_core.product_contracts import ProductContractError, validate_product_manifest
     from auto_foundry_core.workspace import AllowedRootError, RunContext
 except ModuleNotFoundError:  # pragma: no cover - direct script execution
     _SRC = Path(__file__).resolve().parents[3] / "src"
     if str(_SRC) not in sys.path:
         sys.path.insert(0, str(_SRC))
+    from auto_foundry_core.product_contracts import ProductContractError, validate_product_manifest
     from auto_foundry_core.workspace import AllowedRootError, RunContext
 
 
@@ -105,25 +107,16 @@ def _read_text(paths: Iterable[Path]) -> str:
     return "\n".join(chunks)
 
 
-def _truthy_frozen(manifest: Mapping[str, Any]) -> bool:
-    """Require each separately recorded freeze marker."""
+def _frozen_markers(manifest: Mapping[str, Any]):
+    """Decode the one canonical nested marker object before collection."""
 
-    mappings: list[Mapping[str, Any]] = [manifest]
-    for key in ("freeze", "preconditions", "product_freeze", "freeze_manifest", "frozen_products"):
-        value = manifest.get(key)
-        if isinstance(value, Mapping):
-            mappings.append(value)
-    aliases = (
-        ("answers_frozen",),
-        ("living_enterprise_model_frozen", "lem_frozen"),
-        ("prepared_assets_frozen", "prepared_data_registry_frozen"),
-        ("dashboard_frozen",),
-        ("telemetry_frozen",),
-    )
-    return all(
-        any(any(mapping.get(name) is True for name in names) for mapping in mappings)
-        for names in aliases
-    )
+    try:
+        return validate_product_manifest(manifest, require_all=True)
+    except ProductContractError as exc:
+        # Keep the contract error as the cause so callers retain the precise
+        # missing/extra/false-field diagnosis while seeing the collector's
+        # public precondition type.
+        raise EvidenceCollectorPreconditionError(f"invalid freeze_markers: {exc}") from exc
 
 
 def _forbidden_classification(value: Any, key: str = "") -> str | None:
@@ -388,8 +381,7 @@ def collect_evidence(
     manifest = _load_json(manifest_path)
     if not isinstance(manifest, Mapping):
         raise EvidenceCollectorPreconditionError("products manifest must be a JSON object")
-    if not _truthy_frozen(manifest):
-        raise EvidenceCollectorPreconditionError("all five frozen-run markers are required")
+    _frozen_markers(manifest)
     forbidden = _forbidden_classification(manifest)
     if forbidden:
         raise EvidenceCollectorPreconditionError(f"client-business-automation classification rejected: {forbidden}")

@@ -15,6 +15,13 @@ Write a structured `dashboard_manifest.json` beside the prototype:
   "organization": "business_domain_and_decision_flow",
   "assets_local": true,
   "internal_links_checked": true,
+  "freeze_markers": {
+    "answers_frozen": true,
+    "living_enterprise_model_frozen": true,
+    "prepared_data_registry_frozen": true,
+    "dashboard_frozen": true,
+    "telemetry_frozen": true
+  },
   "items": [
     {
       "element_id": "kpi-orders-on-time",
@@ -33,7 +40,8 @@ Write a structured `dashboard_manifest.json` beside the prototype:
 }
 ```
 
-The reviewed widget fixture must also supply non-empty, ordered `domains`.
+The reviewed widget fixture must also supply the exact nested `freeze_markers`
+object above and non-empty, ordered `domains`.
 Each domain has a unique `id`, `title`, positive contiguous `order`, and a
 non-empty `decision_flow` list. Each decision-flow record has a unique `id`,
 `title`, positive contiguous `order`, and non-empty `widget_ids`. Every widget
@@ -56,7 +64,8 @@ domain or flow.
   `reviewed_output_ref`, and at least one non-empty `evidence_refs` or
   `trace_refs` provenance reference before claiming the manifest is valid.
 - Read the frozen reviewed-output manifest; never query raw sources or calculate
-  a new metric while rendering.
+  a new metric while rendering. Top-level marker aliases and alternate freeze
+  containers are invalid.
 - Keep HTML, CSS, images, and scripts local and usable offline.
 - Use stable internal anchors such as `#trace-Q-001` and check every link.
 - Show `review_status: unavailable`, `review_strength: none`, and

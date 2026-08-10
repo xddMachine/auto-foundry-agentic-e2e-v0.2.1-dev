@@ -1,4 +1,4 @@
-# `auto_foundry_core` 0.2.0
+# `auto_foundry_core` 0.3.0
 
 `auto_foundry_core` is a small offline, source-agnostic deterministic substrate
 for local analytics and durable item execution. It is intentionally not an
@@ -12,11 +12,15 @@ adapters, or cross-run state.
   records.
 - `workspace.py` provides the immutable `RunContext` and clean-room allowed
   roots before a source is read or a derived output is written. `workbench.py`
-  provides the program-owned read-only data room, bounded source catalog,
-  archive/member hash checks, and run-local prepared assets. `durable.py`
-  provides `ItemWorkspace`, artifact progress, execution attempts/recovery,
-  review, and immutable accepted/technical-failure snapshots. These helpers do
-  not make semantic business judgments or invoke model threads.
+  provides the program-owned read-only data room, one immutable physical
+  catalog at `data_room/catalogs/<catalog_key>.json`, derived sample/category
+  views, archive/member hash checks, and prepared materialization. `prepared.py`
+  durably registers every accepted asset and separates scope/reuse visibility.
+  `durable.py` provides `ItemWorkspace`, artifact progress, execution
+  attempts/recovery, review, and immutable accepted/technical-failure
+  snapshots under `accepted/answer_content.json` plus a separate
+  `acceptance_envelope.json`. These helpers do not make semantic business
+  judgments or invoke model threads.
 - `sources.py` provides read-only bounded CSV/TSV, JSON/JSONL, Excel, Parquet,
   and text registration, discovery, hashing, and previews.  Excel uses
   `openpyxl` and Parquet uses `pyarrow` only when those optional dependencies are
@@ -33,6 +37,21 @@ adapters, or cross-run state.
   computes deterministic input hashes, checks the run-local cache, dispatches a
   catalog capability, records an `OperationReceipt`, emits passive telemetry,
   and returns a `CoreExecutionResult`.
+- `analysis.py` binds one source/catalog/item/LEM snapshot in a hash-validated
+  `BoundAnalysisContext` and performs compile/dependency preflight checks before
+  emitting `smoke` and `full` runtime receipts (plus an optional second `full`
+  receipt for deterministic comparison). A failed preflight emits whichever
+  failure receipt phase applies: `compile` or `dependency_check`. It is a
+  path/process boundary, not a hostile-code security sandbox; use an
+  OS/container boundary for that.
+- `integration.py` owns one Result Integration `IntegrationSession` per item.
+  It stages typed claim/metric/limitation/evidence/prepared/ontology/
+  relationship/dashboard records under `integration/staging/` and atomically
+  commits `integration/committed/records.jsonl` plus `manifest.json` without
+  parsing analytical prose.
+- `lifecycle.py` owns run-level `RunLifecycle` transitions and durable
+  `AgentInvocationReceipt` ledgers; `product_contracts.py` owns exact nested
+  `freeze_markers` and singular `decision_flow` product validation.
 - `enterprise_model.py` stores a run-local extensible ontology and prepared-data
   registry.  Accepted `KnowledgeDelta` values are applied atomically and
   conflicts/supersession are retained.
@@ -99,21 +118,17 @@ and are never shared implicitly between runs.
 
 ## Offline vertical proofs
 
-`tests/integration/test_vertical_acceptance.py` and
-`tests/integration/test_workbench_durable_vertical.py` exercise the complete
-offline paths. The first covers source registration/profile/normalization,
-cache miss then hit, receipts and telemetry, reviewed identity and relationship
-evidence, prepared-asset hash verification, namespace-safe ontology/prepared
-reuse, a traceable reviewed fixture dashboard, non-blocking optimizer evidence
-collection, and terminal export. The second covers a safe source ZIP, the
-program-owned catalog/search/read/save-prepared path, item creation before an
-attempt, materialization then execution recovery, a separate bounded business
-repair, review/accept/reload, telemetry, immutable source hashing, and sibling
-path rejection. Both fixtures use no model or network call.
+`tests/integration/test_vertical_acceptance.py`,
+`tests/integration/test_workbench_durable_vertical.py`, and
+`tests/integration/test_v023_normal_path.py` exercise the complete offline
+paths, including bound script execution, accepted-byte/envelope separation,
+one-owner integration staging/commit, reusable prepared assets, lifecycle
+barriers, strict product markers, and optimizer evidence. All fixtures use no
+model or network call.
 
-The candidate is labelled **v0.2.2 — offline acceptance ready for later
-Benchmark A** only when these vertical proofs and the full offline suite pass.
-Benchmark A is not run here.
+The candidate is labelled **v0.2.3 / core 0.3.0 — offline program validation
+complete for later Benchmark A** only when these vertical proofs and the full
+offline suite pass. Benchmark A is not run here.
 This remains an experimental release candidate, not a production-hardened
 sandbox.
 

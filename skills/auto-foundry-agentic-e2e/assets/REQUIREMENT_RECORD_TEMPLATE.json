@@ -30,5 +30,30 @@
     "verdict": null,
     "repair_count": 0
   },
+  "execution_contract": {
+    "bound_analysis_context_before_attempt": true,
+    "lead_analyst_attempt_owner": true,
+    "controlled_script_preflight_checks": ["compile", "dependency_check"],
+    "successful_runtime_receipt_phases": ["smoke", "full"],
+    "deterministic_comparison": "optional_second_full_receipt",
+    "failed_preflight_receipt_phase": "compile|dependency_check",
+    "code_error_route": "same_attempt_feedback",
+    "filesystem_no_progress_route": "await_runtime_or_materialization_guidance",
+    "execution_recovery_authority": "completed_invocation_loss_receipt_only"
+  },
+  "result_integration": {
+    "owner": "one_result_integration_agent",
+    "api_surfaces": [
+      "claims",
+      "metrics",
+      "limitations",
+      "evidence",
+      "prepared_assets",
+      "ontology",
+      "relationships",
+      "dashboard_facts"
+    ],
+    "deterministic_validation": ["types", "paths", "refs", "hashes", "stages", "commits"]
+  },
   "outcome": null
 }

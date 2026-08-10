@@ -31,6 +31,7 @@ def _load(name: str, path: Path):
 dashboard_renderer = _load("dashboard_renderer_integration", SCRIPTS / "dashboard_renderer.py")
 evidence_collector = _load("optimizer_evidence_collector_integration", SCRIPTS / "optimizer_evidence_collector.py")
 
+from auto_foundry_core.product_contracts import FORBIDDEN_FREEZE_SIBLINGS  # noqa: E402
 from auto_foundry_core.workspace import AllowedRootError, RunContext  # noqa: E402
 
 
@@ -53,6 +54,13 @@ def _fixture() -> dict[str, object]:
         "title": "Reviewed fixture",
         "run_id": "RUN-TEST",
         "limitations": ["Proxy only; no new metric calculation."],
+        "freeze_markers": {
+            "answers_frozen": True,
+            "living_enterprise_model_frozen": True,
+            "prepared_data_registry_frozen": True,
+            "dashboard_frozen": True,
+            "telemetry_frozen": True,
+        },
         "domains": [
             {"id": "second", "title": "Second domain first", "order": 1, "decision_flow": [{"id": "flow", "title": "Decision flow supplied", "order": 1, "widget_ids": ["line-1"]}]},
             {"id": "first", "title": "First domain second", "order": 2, "decision_flow": [{"id": "flow", "title": "Second decision flow", "order": 1, "widget_ids": ["kpi-1", "bar-1", "stack-1", "heat-1", "scatter-1", "donut-1", "table-1"]}]},
@@ -71,6 +79,13 @@ def test_dashboard_renders_in_run_and_preserves_reviewed_provenance(tmp_path: Pa
     document = (run_root / "products" / "dashboard.html").read_text(encoding="utf-8")
     assert manifest["internal_links_checked"] is True
     assert manifest["new_analytics"] is False
+    assert manifest["freeze_markers"] == {
+        "answers_frozen": True,
+        "living_enterprise_model_frozen": True,
+        "prepared_data_registry_frozen": True,
+        "dashboard_frozen": True,
+        "telemetry_frozen": True,
+    }
     assert manifest["organization"] == "business_domain_and_decision_flow"
     assert manifest["domain_order"] == ["second", "first"]
     assert manifest["decision_flow_order"] == [{"domain_id": "second", "flow_id": "flow"}, {"domain_id": "first", "flow_id": "flow"}]
@@ -124,14 +139,22 @@ def test_dashboard_rejects_escape_before_probe_or_output_creation(tmp_path: Path
 
 def _freeze_manifest() -> dict[str, object]:
     return {
-        "answers_frozen": True,
-        "living_enterprise_model_frozen": True,
-        "prepared_assets_frozen": True,
-        "dashboard_frozen": True,
-        "telemetry_frozen": True,
+        "freeze_markers": {
+            "answers_frozen": True,
+            "living_enterprise_model_frozen": True,
+            "prepared_data_registry_frozen": True,
+            "dashboard_frozen": True,
+            "telemetry_frozen": True,
+        },
         "run_id": "RUN-TEST",
         "review_routing": {"fresh_sol_review_available": False},
     }
+
+
+def _freeze_sibling_value(name: str) -> object:
+    if name in {"freeze", "preconditions", "product_freeze", "freeze_manifest", "frozen_products"}:
+        return {"answers_frozen": True}
+    return True
 
 
 def _digest(path: Path) -> str:
@@ -191,6 +214,90 @@ def test_evidence_collector_non_blocking_failure_preserves_analytical_completion
 
     with pytest.raises(AllowedRootError):
         evidence_collector.collect_evidence(context, products_manifest=tmp_path / "sibling.json")
+
+
+@pytest.mark.parametrize(
+    "legacy_markers",
+    [
+        {sibling: _freeze_sibling_value(sibling)}
+        for sibling in FORBIDDEN_FREEZE_SIBLINGS
+    ],
+)
+def test_evidence_collector_rejects_legacy_freeze_shapes(tmp_path: Path, legacy_markers: dict[str, object]) -> None:
+    context = RunContext("RUN-TEST", tmp_path / "run")
+    products = context.run_root / "products"
+    products.mkdir(parents=True)
+    manifest_path = products / "product_manifest.json"
+    manifest_path.write_text(json.dumps(legacy_markers), encoding="utf-8")
+
+    with pytest.raises(evidence_collector.EvidenceCollectorPreconditionError) as exc_info:
+        evidence_collector.collect_evidence(context, products_manifest="products/product_manifest.json")
+    assert isinstance(exc_info.value.__cause__, ValueError)
+    assert "freeze_markers" in str(exc_info.value)
+    assert not (context.run_root / "optimizer").exists()
+
+
+@pytest.mark.parametrize("sibling", FORBIDDEN_FREEZE_SIBLINGS)
+def test_evidence_collector_rejects_canonical_freeze_with_every_forbidden_sibling(
+    tmp_path: Path,
+    sibling: str,
+) -> None:
+    context = RunContext("RUN-TEST", tmp_path / "run")
+    products = context.run_root / "products"
+    products.mkdir(parents=True)
+    manifest = _freeze_manifest()
+    manifest[sibling] = _freeze_sibling_value(sibling)
+    (products / "product_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(evidence_collector.EvidenceCollectorPreconditionError, match=sibling):
+        evidence_collector.collect_evidence(context, products_manifest="products/product_manifest.json")
+
+
+def test_evidence_collector_rejects_malformed_or_false_canonical_markers(tmp_path: Path) -> None:
+    context = RunContext("RUN-TEST", tmp_path / "run")
+    products = context.run_root / "products"
+    products.mkdir(parents=True)
+    manifest_path = products / "product_manifest.json"
+    marker_values = _freeze_manifest()["freeze_markers"]
+    assert isinstance(marker_values, dict)
+
+    marker_values["telemetry_frozen"] = False
+    manifest_path.write_text(json.dumps({"freeze_markers": marker_values}), encoding="utf-8")
+    with pytest.raises(evidence_collector.EvidenceCollectorPreconditionError, match="telemetry_frozen"):
+        evidence_collector.collect_evidence(context, products_manifest="products/product_manifest.json")
+
+    marker_values.pop("telemetry_frozen")
+    manifest_path.write_text(json.dumps({"freeze_markers": marker_values}), encoding="utf-8")
+    with pytest.raises(evidence_collector.EvidenceCollectorPreconditionError, match="missing fields"):
+        evidence_collector.collect_evidence(context, products_manifest="products/product_manifest.json")
+
+
+def test_dashboard_rejects_plural_decision_flow_metadata(tmp_path: Path) -> None:
+    fixture = _fixture()
+    domain = fixture["domains"][0]
+    assert isinstance(domain, dict)
+    domain["decision_flows"] = domain.pop("decision_flow")
+    with pytest.raises(ValueError, match="singular decision_flow"):
+        dashboard_renderer.render_dashboard(fixture)
+
+
+@pytest.mark.parametrize("sibling", FORBIDDEN_FREEZE_SIBLINGS)
+def test_dashboard_rejects_canonical_freeze_with_every_forbidden_sibling(sibling: str) -> None:
+    fixture = _fixture()
+    fixture[sibling] = _freeze_sibling_value(sibling)
+
+    with pytest.raises(ValueError, match=sibling):
+        dashboard_renderer.render_dashboard(fixture)
+
+
+@pytest.mark.parametrize("sibling", FORBIDDEN_FREEZE_SIBLINGS)
+def test_dashboard_rejects_every_legacy_freeze_shape_without_canonical(sibling: str) -> None:
+    fixture = _fixture()
+    fixture.pop("freeze_markers")
+    fixture[sibling] = _freeze_sibling_value(sibling)
+
+    with pytest.raises(ValueError, match=sibling):
+        dashboard_renderer.render_dashboard(fixture)
 
 
 def test_benchmark_a_is_preparation_only_and_launch_has_no_extra_step() -> None:

@@ -2,7 +2,7 @@
 
 ## Architecture
 
-- `auto_foundry_core` v0.2.0 is a small, source-agnostic deterministic
+- `auto_foundry_core` v0.3.0 is a small, source-agnostic deterministic
   substrate with typed contracts, local source/profile/normalization,
   identity/relationship/population/aggregation operations, artifact and cache
   boundaries, telemetry, a Living Enterprise Model, a capability catalog, a
@@ -17,7 +17,7 @@
   capability, records an `OperationReceipt`, and emits passive telemetry. Its
   `CoreExecutionResult` carries the value, receipt, and cache status. The
   deprecated mutable `Workspace` facade is removed.
-- `auto-foundry-agentic-e2e` v0.2.2 is a natural reviewed workflow with
+- `auto-foundry-agentic-e2e` v0.2.3 is a natural reviewed workflow with
   Question and analytics-only Requirement modes, progressive run-local LEM
   layers, exact-ID evidence selection, review routing, clean-room controls,
   passive telemetry, and reviewed-output-only products.
@@ -29,22 +29,27 @@
   emits standalone HTML/CSS, and validates internal trace links. It calculates
   no analytical metric and reads no source.
 - `skills/auto-foundry-agentic-e2e/scripts/optimizer_evidence_collector.py` is
-  development-only, deterministic, and read-only. It
-  requires an explicit mapping with `answers_frozen`,
-  `living_enterprise_model_frozen`/`lem_frozen`,
-  `prepared_assets_frozen`/`prepared_data_registry_frozen`,
-  `dashboard_frozen`, and `telemetry_frozen` all true. It hashes analytical
-  inputs before and after observation, reports five workflow/substrate
-  evidence categories and exact duplicate groups, and writes exactly two
-  evidence-bundle files. Client-business automation is rejected. A separate
-  fresh Optimization Agent is described but is not invoked by this helper;
-  collection failure is non-blocking.
+  development-only, deterministic, and read-only. It accepts only the exact
+  nested `freeze_markers` object with these five boolean fields all true:
+  `answers_frozen`, `living_enterprise_model_frozen`,
+  `prepared_data_registry_frozen`, `dashboard_frozen`, and
+  `telemetry_frozen`. Top-level containers, aliases, and extra marker fields
+  are invalid. It hashes analytical inputs before and after observation,
+  reports five workflow/substrate evidence categories and exact duplicate
+  groups, and writes exactly two evidence-bundle files. Client-business
+  automation is rejected. A separate fresh Optimization Agent is described
+  but is not invoked by this helper; collection failure is non-blocking.
+- `analysis.py`, `integration.py`, `lifecycle.py`, `prepared.py`, and
+  `product_contracts.py` provide the current v0.3.0 public runtime,
+  integration, registry, receipt, and strict product contracts. Accepted
+  answer bytes remain immutable and separate from `acceptance_envelope.json`;
+  integration commits are under each item's `integration/committed/` path.
 
 ## Complete offline vertical proof
 
 `tests/integration/test_vertical_acceptance.py` remains the broader closure
 proof for source/runtime/LEM/product behavior. The companion
-`tests/integration/test_workbench_durable_vertical.py` proves the normal v0.2.2
+`tests/integration/test_workbench_durable_vertical.py` proves the normal v0.2.3
 program path with a safe generic ZIP: catalog/search/read/save-prepared,
 workspace creation before an attempt, materialization then execution recovery,
 a separate one-time business repair, review/accept/reload, telemetry, source
@@ -64,7 +69,7 @@ contract for the same ten questions, but no raw source, prompt archive,
 benchmark run, fake result, or model call. Dist artifacts are generated and
 ignored; primary owns commits and any future publication.
 
-The v0.2.0 baseline remains a read-only evidence reference. Its immutable
+The historical v0.2.0 baseline remains a read-only evidence reference. Its immutable
 source ZIP hash, eight `answered_with_limits` outcomes, two `partial_answer`
 outcomes, nine repairs, 53 ontology items, ten scripts/8,016 LOC, reviewer
 limitation, product refs, Q-004 blocked reproduction, and unknown wall time
@@ -73,7 +78,7 @@ are recorded in Benchmark A's baseline JSON.
 ## Release candidate boundary
 
 When the vertical proofs and full offline suite pass, the status is
-**v0.2.2 — offline acceptance ready for later Benchmark A**. Benchmark A
+**v0.2.3 / core 0.3.0 — offline program validation complete for later Benchmark A**. Benchmark A
 remains prepared and unexecuted. This is an experimental release candidate, not
 a production-hardened sandbox. A Coding Agent with unrestricted host
 shell/filesystem access cannot

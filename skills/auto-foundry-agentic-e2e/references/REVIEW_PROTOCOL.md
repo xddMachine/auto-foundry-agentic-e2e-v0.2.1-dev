@@ -67,7 +67,11 @@ review layer.
 
 After `repair_once`, perform one short fresh recheck of the repaired points.
 Do not restart the item or create another business repair. Execution recovery
-before review is a separate program decision and does not consume this repair.
+before review is a separate program decision and does not consume this repair;
+it requires a completed invocation receipt proving lane/provider/host/process
+loss. Filesystem no-progress alone yields `await_runtime` or
+`materialization_guidance`. Provider/model identity may be literal
+`unavailable`.
 If the issue remains, record the supported outcome and disclose the unresolved
 component. The program then validates and atomically applies the reviewed
 Knowledge Delta; custom question code does not apply it.
@@ -83,6 +87,8 @@ Do not parse free-form prose, headings, bullets, or wording to determine state.
 Mechanical checks may verify structured fields, file existence, script
 results, exact IDs, raw-source immutability, artifact progress, and internal-
 link integrity; business judgment remains with the Lead Analyst and reviewer.
+There is no reviewer-of-reviewer, business-repair finalizer, manual terminalizer,
+or Integration Reviewer.
 
 ## Technical defects
 
@@ -90,4 +96,8 @@ Record workflow/tool/parser defects as `technical_failure` only after the
 program's allowed execution-recovery routes are exhausted. Preserve valid
 supported analysis, disclose review availability, preserve scratch, and
 continue the queue when possible. A technical defect is not a conclusion
-about the data, and no terminalizer agent is involved.
+about the data, and no terminalizer agent is involved. Classifier output is
+restricted to `same_attempt_feedback`, `business_repair`,
+`execution_recovery`, `abort_and_new_clean_run`, or `null`; raw
+`terminal_reason` values remain specific facts such as `syntax_error` or
+`core_defect`.

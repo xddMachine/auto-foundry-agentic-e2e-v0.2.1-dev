@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 try:
+    from auto_foundry_core.product_contracts import validate_product_manifest
     from auto_foundry_core.workspace import AllowedRootError, RunContext
 except ModuleNotFoundError:  # pragma: no cover - direct script execution
     # The skill is installable independently of the source checkout.  When a
@@ -35,6 +36,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution
     _SRC = Path(__file__).resolve().parents[3] / "src"
     if str(_SRC) not in sys.path:
         sys.path.insert(0, str(_SRC))
+    from auto_foundry_core.product_contracts import validate_product_manifest
     from auto_foundry_core.workspace import AllowedRootError, RunContext
 
 
@@ -349,6 +351,8 @@ def _normalize_domains(fixture: Mapping[str, Any], widgets: list[Mapping[str, An
         domain_id = _text(domain.get("id"))
         if not domain_id or domain_id in domain_ids:
             raise ValueError("domains require unique non-empty ids")
+        if "decision_flows" in domain:
+            raise ValueError(f"domain {domain_id or '<unknown>'} must use singular decision_flow")
         domain_ids.add(domain_id)
         domain_order = _ordered_positive_int(domain.get("order"), f"domain {domain_id}")
         domain_orders.append(domain_order)
@@ -364,6 +368,8 @@ def _normalize_domains(fixture: Mapping[str, Any], widgets: list[Mapping[str, An
         for flow in decisions:
             if not isinstance(flow, Mapping):
                 raise ValueError(f"domain {domain_id} has invalid decision_flow entry")
+            if "widgets" in flow:
+                raise ValueError(f"decision flow {domain_id} requires widget_ids")
             flow_id = _text(flow.get("id"))
             if not flow_id or flow_id in flow_ids:
                 raise ValueError(f"domain {domain_id} requires unique decision-flow ids")
@@ -435,6 +441,7 @@ def _validate_links(document: str) -> None:
 def render_dashboard(fixture: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
     """Return ``(html, manifest)`` for a reviewed fixture."""
 
+    freeze_markers = validate_product_manifest(fixture)
     raw_widgets = fixture.get("widgets") or fixture.get("items")
     if not isinstance(raw_widgets, list) or not raw_widgets:
         raise ValueError("fixture must contain a non-empty widgets list")
@@ -503,7 +510,7 @@ def render_dashboard(fixture: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
         for flow in _as_list(domain.get("decision_flow")):
             if not isinstance(flow, Mapping):
                 continue
-            wanted = {_text(v.get("id") if isinstance(v, Mapping) else v) for v in _as_list(flow.get("widget_ids") or flow.get("widgets"))}
+            wanted = {_text(v.get("id") if isinstance(v, Mapping) else v) for v in _as_list(flow.get("widget_ids"))}
             # Use the already ordered blocks by their explicit IDs.  The
             # marker keeps domain/decision-flow order from the reviewed input.
             selected = []
@@ -557,8 +564,9 @@ def render_dashboard(fixture: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
         "organization": "business_domain_and_decision_flow",
         "assets_local": True,
         "internal_links_checked": True,
+        "freeze_markers": freeze_markers.to_dict(),
         "run_id": _text(fixture.get("run_id")),
-        "skill_version": _text(fixture.get("skill_version"), "0.2.2"),
+        "skill_version": _text(fixture.get("skill_version"), "0.2.3"),
         "domain_order": [domain["id"] for domain in domains],
         "decision_flow_order": [
             {"domain_id": domain["id"], "flow_id": flow["id"]}

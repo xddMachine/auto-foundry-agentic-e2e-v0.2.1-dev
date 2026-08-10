@@ -1,7 +1,7 @@
-# Auto Foundry Agentic E2E v0.2.2 / core v0.2.0
+# Auto Foundry Agentic E2E v0.2.3 / core v0.3.0
 
-This repository contains the v0.2.2 reviewed-analysis skill and the
-source-agnostic, deterministic `auto_foundry_core` v0.2.0 substrate. The
+This repository contains the v0.2.3 reviewed-analysis skill and the
+source-agnostic, deterministic `auto_foundry_core` v0.3.0 substrate. The
 deliverable is offline-friendly: the skill keeps a run-local data room, durable
 item workspaces, Living Enterprise Model, and reviewed outputs, while the core
 provides typed local operations, bounded catalog access, and durable artifact
@@ -15,6 +15,7 @@ remains available for deterministic operations:
 ```text
 RunContext
   -> DataRoomWorkbench(context, archive_path) -> catalog/search/read/save_prepared
+  -> immutable BoundAnalysisContext -> controlled script receipts
   -> ItemWorkspace.create before the Lead Analyst attempt
   -> artifact progress -> execution recovery when needed
   -> draft -> one review -> optional one business repair
@@ -26,8 +27,11 @@ RunContext
 
 The public entry points include `RunContext`, `DataRoom`,
 `DataRoomWorkbench`, `DataRoomMember`, `DataRoomCatalogEntry`,
-`PreparedAsset`, `ItemWorkspace`, `ArtifactProgress`, `ProgressDecision`,
-`ExecutionAttempt`, `AcceptedSnapshot`, `CoreRuntime`, `CoreExecutionResult`,
+`PreparedAsset`, `PreparedAssetRegistry`, `CatalogSnapshot`,
+`BoundAnalysisContext`, `ControlledScriptRunner`, `ItemWorkspace`,
+`ArtifactProgress`, `ProgressDecision`, `ExecutionAttempt`, `AcceptedSnapshot`,
+`AcceptedAnalysisBundle`, `IntegrationSession`, `RunLifecycle`,
+`AgentInvocationReceipt`, `FreezeMarkers`, `CoreRuntime`, `CoreExecutionResult`,
 `LEMRef`, and the immutable contracts exported from `auto_foundry_core`. The
 old mutable `Workspace` facade is not part of the package API. The workbench
 owns physical source access and durable state; the Lead Analyst owns semantic
@@ -68,13 +72,14 @@ python3 scripts/validate_release.py
 ```
 
 The complete offline vertical proofs are
-`tests/integration/test_vertical_acceptance.py` and
-`tests/integration/test_workbench_durable_vertical.py`; together they use
+`tests/integration/test_vertical_acceptance.py`,
+`tests/integration/test_workbench_durable_vertical.py`, and
+`tests/integration/test_v023_normal_path.py`; together they use
 generic local fixtures, real workbench/durable/cache/telemetry/filesystem
 wiring, and no model or network call. When those proofs and the full offline
-suite pass, the candidate status is **v0.2.2 — offline acceptance ready for
-later Benchmark A**. Benchmark A remains prepared but unexecuted in this
-repository.
+suite pass, the candidate status is **v0.2.3 / core 0.3.0 — offline program
+validation complete for later Benchmark A**. Benchmark A remains prepared but
+unexecuted in this repository.
 
 The package script creates ignored local artifacts under `dist/`; no command
 in this repository pushes or publishes them. Start a fresh Codex task after

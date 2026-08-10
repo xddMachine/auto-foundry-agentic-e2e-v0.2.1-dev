@@ -1,78 +1,11 @@
 {
-  "run_id": "RUN-...",
-  "skill_name": "auto-foundry-agentic-e2e",
-  "skill_version": "0.2.2",
-  "core_name": "auto_foundry_core",
-  "core_version": "0.2.0",
+  "run_id": "RUN-example",
+  "run_root": "/current/run",
+  "item_ids": ["Q-001"],
   "mode": "question|requirement",
-  "status": "initialized|running|products_frozen|completed|global_failure",
-  "allowed_roots": ["/current/run", "/supplied/input", "/approved/tool"],
-  "clean_room": {
-    "enabled": false,
-    "empty_lem_at_start": true,
-    "empty_cache_at_start": true,
-    "incidents": []
-  },
-  "workbench": {
-    "data_room": "data_room",
-    "source_catalog": "data_room/source_catalog.json",
-    "catalog_kind": "zip_member_metadata",
-    "raw_archive_read_only": true,
-    "bounded_metadata": [
-      "columns",
-      "samples_or_values",
-      "hashes",
-      "sheet_info"
-    ],
-    "item_workspace_pattern": "questions|requirements/<id>/work",
-    "item_state_pattern": "questions|requirements/<id>/item_state.json"
-  },
-  "active_item_id": null,
-  "questions": [],
-  "requirements": [],
-  "foundation_tasks": [],
-  "queue": {
-    "ordered_item_ids": [],
-    "priority_rule": "explicit_user_priority_first",
-    "parallel_question_wave": false
-  },
-  "lem": {
-    "enterprise_ontology": "lem/enterprise_ontology.jsonl",
-    "prepared_data_registry": "lem/prepared_data_registry.jsonl",
-    "knowledge_delta_status": "pending|promoted|promoted_with_limits|no_change",
-    "no_change_reason": null
-  },
-  "indexes": {
-    "source": "indexes/source_index.json",
-    "ontology": "indexes/ontology_index.json",
-    "prepared": "indexes/prepared_index.json"
-  },
-  "telemetry": {
-    "path": "telemetry/events.jsonl",
-    "status": "open|closed",
-    "passive": true,
-    "records_raw_rows": false,
-    "controls_route": false
-  },
-  "execution": {
-    "recovery_count": 0,
-    "business_repair_count": 0,
-    "terminalizer_agent": false,
-    "wall_time_deadline": false
-  },
-  "products": {
-    "status": "pending|built|reviewed",
-    "dashboard_manifest": null,
-    "traceability_check": null,
-    "whole_run_freeze": false,
-    "accepted_snapshots_frozen": false
-  },
-  "optimizer": {
-    "status": "not_ready|ready|written|technical_failure",
-    "evidence_bundle": "optimizer/optimizer_evidence_bundle.md",
-    "evidence_appendix": "optimizer/optimizer_evidence_appendix.md",
-    "reasoning_agent": "one_fresh_optimization_agent_after_collection|not_invoked",
-    "analytical_complete": true,
-    "read_only": true
-  }
+  "status": "initialized|running|analytical_complete|integration_complete|products_complete|complete|complete_with_limits",
+  "generation": 0,
+  "manifest_hash": "<sha256(run_state fields excluding manifest_hash)>",
+  "created_at": "2026-01-01T00:00:00+00:00",
+  "updated_at": "2026-01-01T00:00:00+00:00"
 }

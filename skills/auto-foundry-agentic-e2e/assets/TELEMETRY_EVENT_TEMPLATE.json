@@ -5,13 +5,18 @@
   "event_type": "invocation|artifact_progress|source_read|recovery|review_routed|review_completed|item_completed|product_built|optimizer_observed",
   "invocation": {
     "lane": "lead|reviewer|specialist|program|collector|host",
-    "role": "Lead Analyst|Independent Reviewer|Run Director|Specialist|Product Builder|Evidence Collector|host",
+    "role": "Lead Analyst|Independent Reviewer|Result Integration Agent|Evidence Collector|program|host",
     "route": "...",
+    "provider": "unavailable",
+    "model": "unavailable",
+    "host": "unavailable",
+    "process": "unavailable",
     "started_at": "2026-01-01T00:00:00Z",
     "ended_at": "2026-01-01T00:00:00Z"
   },
   "occurred_at": "2026-01-01T00:00:00Z",
   "status": "started|completed|failed|unavailable|recovered",
+  "terminal_reason_class": "same_attempt_feedback|business_repair|execution_recovery|abort_and_new_clean_run|null",
   "error": {
     "class": null,
     "message": null
@@ -34,6 +39,7 @@
     "source_reads": 0,
     "member_reads": 0
   },
+  "recovery_decision": "continue|await_runtime|materialization_guidance|execution_recovery|null",
   "source_reads": [],
   "member_reads": [],
   "core_cache": {

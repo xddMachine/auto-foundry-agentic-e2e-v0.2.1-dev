@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.2.3 — Program-owned integration and controlled analysis runtime
+
+Added:
+
+- exact run markers for skill `0.2.3` and core `0.3.0`;
+- immutable canonical physical catalogs keyed by source hash, core version,
+  and catalog schema, with derived sample/category views;
+- durable prepared-asset registration independent of reuse visibility;
+- immutable `BoundAnalysisContext` manifests and controlled script execution:
+  compile/dependency preflight checks, successful `smoke`/`full` runtime
+  receipts, an optional second `full` receipt for deterministic comparison,
+  and whichever preflight failure phase applies (`compile` or
+  `dependency_check`);
+- receipt-gated lifecycle/recovery APIs and one-owner incremental result
+  integration staging/commit records;
+- separate accepted answer bytes, acceptance envelope, integration manifests,
+  and strict nested product freeze markers.
+- canonical terminal-reason classifier outputs: `same_attempt_feedback`,
+  `business_repair`, `execution_recovery`, `abort_and_new_clean_run`, or
+  `null`; raw terminal reasons remain specific observed facts.
+
+Changed:
+
+- the current normal path uses `data_room/catalogs/<catalog_key>.json`,
+  `accepted/answer_content.json`, `accepted/acceptance_envelope.json`, and
+  `integration/{staging,committed}/` artifacts;
+- offline release validation now checks all public runtime/integration/product
+  exports and the 0.3.0 core wheel.
+
+This release is an offline program-validation package, not a benchmark run or
+production isolation boundary. Hostile script isolation still requires an
+OS/container boundary.
+
 ## 0.2.2 — Agent Workbench + Durable Execution
 
 Added:
@@ -11,8 +44,9 @@ Added:
   created before the Lead Analyst is invoked;
 - plan/source-map-first analysis, append-only material findings, materialized
   drafts, and atomic immutable accepted snapshots;
-- structured artifact-progress checks with first no-progress materialization
-  request and second no-progress lane recovery;
+- structured artifact-progress checks where filesystem no-progress yields
+  `await_runtime`/materialization guidance and only a completed invocation loss
+  receipt authorizes execution recovery;
 - execution recovery that preserves scratch and is counted separately from the
   single targeted business repair;
 - run-local, loadable Prepared Data Registry assets with hash, location,
@@ -21,6 +55,18 @@ Added:
   repairs, source/member reads, and core/cache observations;
 - identity escalation and focused source-catalog completeness review for
   material absence claims.
+- explicit `BoundAnalysisContext` creation before each Lead Analyst;
+- deterministic `ControlledScriptRunner` receipts for compile/import, smoke,
+  full, and deterministic checks, with code errors returned to the same
+  analyst and attempt;
+- receipt-gated execution recovery, where filesystem no-progress yields
+  `await_runtime`/materialization guidance and provider/model identity may be
+  literal `unavailable`;
+- immutable accepted answer bytes separated from the program-owned acceptance
+  envelope, followed by exactly one incremental Result Integration Agent;
+- canonical prepared-asset registration and visibility-only scope/reuse views,
+  plus explicit terminal reason classes for code error, business repair,
+  execution recovery, and core defect.
 
 Changed:
 
@@ -41,6 +87,9 @@ Removed or prohibited:
   lookup/compliance artifact;
 - terminalizer agent, wall-time deadline, parallel question wave, per-question
   freeze/mutation incident, and any second review or business repair;
+- Portfolio Planner, Navigator, descriptor/typed-validation role,
+  business-repair finalizer, reviewer-of-reviewer, manual terminalizer,
+  Integration Reviewer, and finalizer chain;
 - planner framework, fixed business-term dictionary, domain recipe, central
   ontology, cross-run cache, external/model call, production application, and
   compatibility wrapper;
