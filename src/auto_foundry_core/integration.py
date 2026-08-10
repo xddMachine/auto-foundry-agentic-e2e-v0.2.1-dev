@@ -4,7 +4,10 @@ The integration agent supplies typed records and explicit evidence.  This
 module persists those records, verifies their local identity, and applies them
 through the public prepared-registry and Living Enterprise Model APIs.  It
 never parses answer prose, recalculates metrics, launches a model, or infers
-semantic relationships.
+semantic relationships.  Mechanical validation cannot prove semantic
+completeness; a live Integration Agent and an external test-only fidelity
+audit are required for that judgment.  There is deliberately no prose parser,
+semantic compiler, or Integration Reviewer hidden in this boundary.
 """
 
 from __future__ import annotations
@@ -30,7 +33,7 @@ except ImportError:  # pragma: no cover - defensive fallback
 from .contracts import KnowledgeDelta, LEMRef, OntologyItem, PreparedAssetDescriptor
 from .durable import _atomic_write_bytes, _atomic_write_json, _json_bytes, _sha256_bytes
 from .enterprise_model import LivingEnterpriseModel
-from .prepared import PreparedAssetRegistry
+from .prepared import PreparedAssetRegistry, _new_registry_commit_authority
 from .workspace import AllowedRootError, RunContext
 
 
@@ -92,6 +95,22 @@ def _is_sha256(value: Any) -> bool:
 
 def _copy_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
     return MappingProxyType(copy.deepcopy(dict(value)))
+
+
+def _deep_freeze(value: Any) -> Any:
+    """Recursively freeze JSON-shaped accepted metadata for in-memory use."""
+
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _deep_freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_deep_freeze(item) for item in value)
+    return value
+
+
+def _deep_freeze_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
+    return _deep_freeze(dict(value))
 
 
 def _fsync_directory(path: Path) -> None:
@@ -269,9 +288,9 @@ class AcceptedAnalysisBundle:
             outcome=str(manifest["outcome"]),
             answer_content=bytes(answer_content),
             content_hash=str(manifest["content_hash"]),
-            acceptance_envelope=_copy_mapping(envelope),
+            acceptance_envelope=_deep_freeze_mapping(envelope),
             envelope_hash=envelope_hash,
-            manifest=_copy_mapping(manifest),
+            manifest=_deep_freeze_mapping(manifest),
             manifest_hash=str(manifest["manifest_hash"]),
         )
 
@@ -610,9 +629,15 @@ class IntegrationSession:
             }),
         }
         session = cls(context, item_workspace, lem, prepared_registry, owner_id, bundle, state, records)
-        session._preflight_all()
-        session._apply_records()
-        session._finish_committed(manifest)
+        if item_workspace.integration_state == "pending":
+            session._preflight_all()
+            session._apply_records()
+            session._finish_committed(manifest)
+        else:
+            session._ensure_bundle_current()
+            if item_workspace.integration_manifest_hash != manifest.get("manifest_hash"):
+                raise ValueError("item integration state does not match committed manifest")
+            session._finish_committed(manifest)
         return session
 
     @staticmethod
@@ -661,6 +686,21 @@ class IntegrationSession:
         self._state = state
         self._records = records
         self._by_id = {record.record_id: record for record in records}
+
+    def _ensure_bundle_current(self) -> None:
+        """Reject any accepted-directory replacement after session creation."""
+
+        current = AcceptedAnalysisBundle.load(self.item_workspace)
+        if (
+            current.item_id != self.bundle.item_id
+            or current.content_hash != self.bundle.content_hash
+            or current.envelope_hash != self.bundle.envelope_hash
+            or current.manifest_hash != self.bundle.manifest_hash
+            or current.answer_content != self.bundle.answer_content
+            or current.acceptance_envelope != self.bundle.acceptance_envelope
+            or current.manifest != self.bundle.manifest
+        ):
+            raise ValueError("accepted analysis bundle changed after integration session creation")
 
     @staticmethod
     def _snapshot_value(state: Mapping[str, Any], records: Sequence[IntegrationRecord]) -> dict[str, Any]:
@@ -860,7 +900,98 @@ class IntegrationSession:
             raise ValueError("integration scope is required")
         return _validate_scope(value)
 
-    def _evidence(self, evidence_refs: Any, *, required: bool = True) -> tuple[tuple[str, ...], dict[str, str]]:
+    def _prepared_candidate_root(self) -> Path:
+        """Return the only location where this item may stage a candidate."""
+
+        root = self.item_workspace.work_root / "prepared"
+        _assert_no_symlink(root, label="prepared candidate root")
+        # Check the lexical work/item components as well as the resolved root;
+        # a symlink that points back inside the item is still not an accepted
+        # candidate boundary.
+        current = self.item_workspace.item_root
+        try:
+            relative = root.relative_to(current)
+        except ValueError as exc:  # pragma: no cover - defensive ItemWorkspace contract
+            raise AllowedRootError("prepared candidate root escapes item workspace") from exc
+        for component in relative.parts:
+            current = current / component
+            if current.is_symlink():
+                raise AllowedRootError("prepared candidate root cannot use symlinks")
+        return root
+
+    def _resolve_prepared_candidate(self, descriptor: PreparedAssetDescriptor) -> Path:
+        """Resolve and constrain one staged candidate to item ``work/prepared``."""
+
+        root = self._prepared_candidate_root()
+        raw = Path(descriptor.location).expanduser()
+        if raw.is_absolute():
+            lexical = raw
+        else:
+            # Workbench descriptors are absolute in normal operation.  The
+            # relative forms below keep the public contract deterministic for
+            # manually-created offline candidates and recovery fixtures.
+            if raw.parts and raw.parts[0] in {"questions", "requirements"}:
+                lexical = self.context.run_root / raw
+            elif raw.parts and raw.parts[0] == "work":
+                lexical = self.item_workspace.item_root / raw
+            else:
+                lexical = root / raw
+        try:
+            candidate = self.context.resolve_run_path(lexical)
+            resolved_root = self.context.resolve_run_path(root)
+        except Exception as exc:
+            raise AllowedRootError("prepared candidate location escapes run context") from exc
+        if resolved_root != candidate and resolved_root not in candidate.parents:
+            raise AllowedRootError("prepared candidate must be under item work/prepared")
+        _assert_no_symlink(candidate, label="prepared candidate")
+        if not candidate.is_file():
+            raise ValueError("prepared candidate must be a regular file")
+        # Do not follow lexical parent symlinks even when their resolved target
+        # happens to remain inside the item root.
+        current = self.item_workspace.item_root
+        try:
+            relative = lexical.relative_to(current)
+        except ValueError:
+            try:
+                relative = lexical.relative_to(self.context.run_root)
+            except ValueError as exc:
+                raise AllowedRootError("prepared candidate location escapes item workspace") from exc
+        for component in relative.parts:
+            current = current / component
+            if current.is_symlink():
+                raise AllowedRootError("prepared candidate cannot use symlinks")
+        return candidate
+
+    def _prepared_descriptor_for_path(self, relative: str) -> PreparedAssetDescriptor | None:
+        """Return a staged descriptor whose candidate path is ``relative``."""
+
+        try:
+            path = self._resolve_item_ref(relative)
+        except (AllowedRootError, FileNotFoundError, ValueError):
+            return None
+        for record in self._records:
+            if record.kind != "prepared_asset":
+                continue
+            try:
+                descriptor = PreparedAssetDescriptor.from_dict(record.payload)
+                candidate = self._resolve_prepared_candidate(descriptor)
+            except Exception:
+                continue
+            if candidate == path:
+                return descriptor
+        return None
+
+    def _evidence(
+        self,
+        evidence_refs: Any,
+        *,
+        required: bool = True,
+        prepared_descriptor: PreparedAssetDescriptor | None = None,
+    ) -> tuple[tuple[str, ...], dict[str, str]]:
+        # Evidence authorization is bound to the exact accepted bytes and
+        # manifest at the moment refs are resolved, including link_evidence,
+        # which performs its check before the generic staging helper.
+        self._ensure_bundle_current()
         if evidence_refs is None:
             evidence_refs = ()
         if isinstance(evidence_refs, (str, Mapping)):
@@ -881,7 +1012,7 @@ class IntegrationSession:
                 actual_hash = self._by_id[ref].record_hash
             else:
                 relative = _safe_relative_ref(ref, "evidence reference")
-                expected = self._evidence_expected_hash(relative)
+                expected = self._evidence_expected_hash(relative, prepared_descriptor=prepared_descriptor)
                 path = self._resolve_item_ref(relative)
                 actual_hash = _sha256_bytes(path.read_bytes())
                 if expected != actual_hash:
@@ -894,7 +1025,12 @@ class IntegrationSession:
             raise ValueError("integration evidence is required")
         return tuple(refs), hashes
 
-    def _evidence_expected_hash(self, relative: str) -> str:
+    def _evidence_expected_hash(
+        self,
+        relative: str,
+        *,
+        prepared_descriptor: PreparedAssetDescriptor | None = None,
+    ) -> str:
         if relative in {"answer_content.json", "accepted/answer_content.json"}:
             return self.bundle.content_hash
         progress = self.bundle.manifest.get("artifact_progress", {})
@@ -905,6 +1041,16 @@ class IntegrationSession:
             name = relative.split("/", 1)[1]
             if name == "acceptance_envelope.json":
                 return self.bundle.envelope_hash
+        # A prepared candidate may be created after analytical acceptance, so
+        # it need not appear in the accepted artifact-progress hash map.  Its
+        # descriptor is the explicit mechanical evidence binding instead.
+        if prepared_descriptor is not None:
+            candidate = self._resolve_prepared_candidate(prepared_descriptor)
+            if self._resolve_item_ref(relative) == candidate and prepared_descriptor.prepared_content_hash:
+                return prepared_descriptor.prepared_content_hash
+        staged = self._prepared_descriptor_for_path(relative)
+        if staged is not None and staged.prepared_content_hash:
+            return staged.prepared_content_hash
         raise ValueError(f"evidence reference is not bound by accepted manifest: {relative}")
 
     def _resolve_item_ref(self, relative: str) -> Path:
@@ -943,11 +1089,21 @@ class IntegrationSession:
         record_id: str | None = None,
     ) -> str:
         self._require_open()
+        self._ensure_bundle_current()
         if kind not in _RECORD_KINDS:
             raise ValueError("unsupported integration record kind")
         normalized_payload = self._payload(payload, kind)
         normalized_scope = self._scope(scope, normalized_payload)
-        refs, hashes = self._evidence(evidence_refs, required=kind != "prepared_asset")
+        prepared_descriptor = None
+        if kind == "prepared_asset":
+            prepared_descriptor = PreparedAssetDescriptor.from_dict(normalized_payload)
+            self._resolve_prepared_candidate(prepared_descriptor)
+            self.prepared_registry.preflight_candidate(prepared_descriptor, self.item_workspace)
+        refs, hashes = self._evidence(
+            evidence_refs,
+            required=kind != "prepared_asset",
+            prepared_descriptor=prepared_descriptor,
+        )
         body = {
             "kind": kind,
             "item_id": self.item_id,
@@ -1011,8 +1167,10 @@ class IntegrationSession:
     def register_prepared_asset(self, descriptor: PreparedAssetDescriptor | Mapping[str, Any], *, evidence_refs: Any = (), asset_record_id: str | None = None) -> str:
         value = descriptor if isinstance(descriptor, PreparedAssetDescriptor) else PreparedAssetDescriptor.from_dict(descriptor)
         # Verify descriptor/file/hash/scope and same-ID collisions without
-        # publishing registry state during staging.
-        self.prepared_registry.preflight_register(value)
+        # publishing registry state during staging.  The candidate remains in
+        # the item work area until the accepted commit boundary.
+        self._resolve_prepared_candidate(value)
+        self.prepared_registry.preflight_candidate(value, self.item_workspace)
         payload = value.to_dict()
         return self._stage("prepared_asset", payload, scope=value.scope, evidence_refs=evidence_refs, record_id=asset_record_id)
 
@@ -1049,6 +1207,7 @@ class IntegrationSession:
     def _correct_record_unlocked(self, record_id: str, payload: Mapping[str, Any], *, evidence_refs: Any = None, scope: str | None = None) -> str:
         """Replace one same-session record while retaining deterministic identity."""
         self._require_open()
+        self._ensure_bundle_current()
         target = str(record_id).strip()
         existing = self._by_id.get(target)
         if existing is None:
@@ -1057,7 +1216,9 @@ class IntegrationSession:
             raise ValueError("integration commit intent exists; corrections are closed")
         normalized_payload = self._payload(payload, existing.kind)
         if existing.kind == "prepared_asset":
-            self.prepared_registry.preflight_register(PreparedAssetDescriptor.from_dict(normalized_payload))
+            descriptor = PreparedAssetDescriptor.from_dict(normalized_payload)
+            self._resolve_prepared_candidate(descriptor)
+            self.prepared_registry.preflight_candidate(descriptor, self.item_workspace)
         elif existing.kind == "ontology_item":
             normalized_payload = OntologyItem.from_dict(normalized_payload).to_dict()
         elif existing.kind == "metric":
@@ -1066,7 +1227,11 @@ class IntegrationSession:
             self._preview_relationship(normalized_payload, self.lem.run_id)
         normalized_scope = self._scope(scope if scope is not None else existing.scope, normalized_payload)
         refs = existing.evidence_refs if evidence_refs is None else evidence_refs
-        normalized_refs, hashes = self._evidence(refs, required=existing.kind != "prepared_asset")
+        normalized_refs, hashes = self._evidence(
+            refs,
+            required=existing.kind != "prepared_asset",
+            prepared_descriptor=descriptor if existing.kind == "prepared_asset" else None,
+        )
         body = {
             "record_id": target,
             "kind": existing.kind,
@@ -1112,7 +1277,24 @@ class IntegrationSession:
         if str(source) not in known or str(target) not in known:
             raise ValueError("relationship references unknown ontology item")
 
+    def _validate_prepared_candidate(self, record: IntegrationRecord) -> PreparedAssetDescriptor:
+        """Re-check one candidate at every validation/commit boundary."""
+
+        descriptor = PreparedAssetDescriptor.from_dict(record.payload)
+        if descriptor.scope != record.scope:
+            raise ValueError("prepared asset record scope does not match descriptor")
+        candidate = self._resolve_prepared_candidate(descriptor)
+        if descriptor.prepared_content_hash is None or descriptor.byte_count is None or descriptor.row_count is None:
+            raise ValueError("prepared asset descriptor is missing exact content binding")
+        if candidate.stat().st_size != descriptor.byte_count:
+            raise ValueError(f"prepared candidate byte count changed: {descriptor.prepared_asset_id}")
+        # ``preflight_register`` performs the exact hash/row decode and same-ID
+        # conflict check without mutating the accepted registry.
+        self.prepared_registry.preflight_register(descriptor, item_workspace=self.item_workspace)
+        return descriptor
+
     def validate(self) -> IntegrationValidation:
+        self._ensure_bundle_current()
         counts = {kind: 0 for kind in sorted(_RECORD_KINDS)}
         omissions: list[str] = []
         errors: list[str] = []
@@ -1140,7 +1322,7 @@ class IntegrationSession:
                     _relationship_id, _relationship_payload, relationship_item = self._preview_relationship(record.payload, self.lem.run_id)
                     known_ontology_ids.add(relationship_item.item_id)
                 if record.kind == "prepared_asset":
-                    PreparedAssetDescriptor.from_dict(record.payload)
+                    self._validate_prepared_candidate(record)
             except Exception as exc:
                 errors.append(f"{record.record_id}: {exc}")
         return IntegrationValidation(not errors, counts, tuple(omissions), tuple(errors))
@@ -1166,10 +1348,10 @@ class IntegrationSession:
     def _preflight_registry(self) -> None:
         for record in self._records:
             if record.kind == "prepared_asset":
-                descriptor = PreparedAssetDescriptor.from_dict(record.payload)
+                descriptor = self._validate_prepared_candidate(record)
                 # Public, lock-protected and non-mutating.  This must happen
                 # before commit intent or any registry/LEM mutation.
-                self.prepared_registry.preflight_register(descriptor)
+                self.prepared_registry.preflight_register(descriptor, item_workspace=self.item_workspace)
 
     def _preflight_lem(self) -> None:
         simulated_ontology = dict(self.lem.ontology)
@@ -1226,17 +1408,47 @@ class IntegrationSession:
                     }
 
     def _preflight_all(self) -> None:
+        self._ensure_bundle_current()
         validation = self.validate()
         if not validation.valid:
             raise ValueError(f"integration validation failed: {list(validation.errors)}")
         self._preflight_registry()
         self._preflight_lem()
 
+    def _commit_registry_authority(self) -> Any:
+        """Mint the registry capability from the exact durable commit intent."""
+
+        intent_path = self.staging_root / _INTENT_FILENAME
+        intent = self._read_intent(
+            intent_path,
+            self.bundle,
+            session_id=self.session_id,
+            owner_id=self.owner_id,
+        )
+        if intent is None:
+            raise ValueError("accepted registry publication requires a persisted commit intent")
+        return _new_registry_commit_authority(
+            self.item_workspace,
+            session_id=self.session_id,
+            owner_id=self.owner_id,
+            intent_path=intent_path,
+            intent_hash=str(intent["intent_hash"]),
+        )
+
     def _apply_records(self) -> None:
+        self._ensure_bundle_current()
+        authority = self._commit_registry_authority()
         for record in self._records:
+            # Revalidate accepted bytes/envelope/manifest immediately before
+            # each external mutation, including registry repair retries.
+            self._ensure_bundle_current()
             if record.kind == "prepared_asset":
-                descriptor = PreparedAssetDescriptor.from_dict(record.payload)
-                self.prepared_registry.register_accepted(descriptor)
+                descriptor = self._validate_prepared_candidate(record)
+                self.prepared_registry.register_accepted(
+                    descriptor,
+                    item_workspace=self.item_workspace,
+                    _commit_authority=authority,
+                )
             self._apply_lem_record(record)
 
     def _apply_lem_record(self, record: IntegrationRecord) -> None:
@@ -1435,9 +1647,15 @@ class IntegrationSession:
             existing_records = self._read_records(self.committed_root / _RECORDS_FILENAME, manifest, self.bundle)
             if tuple(existing_records) != tuple(self._records):
                 raise ValueError("committed integration records differ from staging")
-            self._preflight_all()
-            self._apply_records()
-            self._finish_committed(manifest)
+            if self.item_workspace.integration_state == "pending":
+                self._preflight_all()
+                self._apply_records()
+                self._finish_committed(manifest)
+            else:
+                self._ensure_bundle_current()
+                if self.item_workspace.integration_manifest_hash != manifest.get("manifest_hash"):
+                    raise ValueError("item integration state does not match committed manifest")
+                self._finish_committed(manifest)
             return dict(manifest)
         self._require_open()
         existing_manifest = self._committed_manifest(self.item_workspace)
@@ -1455,9 +1673,15 @@ class IntegrationSession:
             )
             if tuple(existing_records) != tuple(self._records):
                 raise ValueError("committed integration records differ from staging")
-            self._preflight_all()
-            self._apply_records()
-            self._finish_committed(existing_manifest)
+            if self.item_workspace.integration_state == "pending":
+                self._preflight_all()
+                self._apply_records()
+                self._finish_committed(existing_manifest)
+            else:
+                self._ensure_bundle_current()
+                if self.item_workspace.integration_manifest_hash != existing_manifest.get("manifest_hash"):
+                    raise ValueError("item integration state does not match committed manifest")
+                self._finish_committed(existing_manifest)
             return dict(existing_manifest)
         if self.item_workspace.integration_state != "pending":
             raise ValueError("item integration is no longer pending")
@@ -1504,6 +1728,12 @@ class IntegrationSession:
         reason = str(reason).strip()
         if not reason:
             raise ValueError("technical failure reason is required")
+        # Once a commit intent exists, registry/LEM application may already be
+        # partially durable.  Terminalizing the item at that point would leave
+        # an accepted registry entry without an accepted integration outcome;
+        # recovery must instead retry the exact intent to convergence.
+        if (self.staging_root / _INTENT_FILENAME).exists() or (self.staging_root / _INTENT_FILENAME).is_symlink():
+            raise ValueError("integration commit intent exists; retry commit instead of technical failure")
         failure_root = self._integration_root(self.item_workspace) / _TECHNICAL_FAILURE_DIR
         failure_path = failure_root / _MANIFEST_FILENAME
         manifest: dict[str, Any] | None = None

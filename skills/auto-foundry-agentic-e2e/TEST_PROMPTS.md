@@ -44,8 +44,11 @@ analyst and attempt; they never authorize recovery.
 After each response, use structured `artifact_progress`: progress continues
 the lane; filesystem no-progress returns `await_runtime` or
 `materialization_guidance`. Recover only when a completed invocation receipt
-proves lane/provider/host/process loss. Do not use a wall-time deadline or a
-terminalizer agent. Preserve scratch during execution recovery; it does not
+proves lane/provider/host/process loss. The receipt must be a canonical
+persisted `receipt_ref`/hash matching the active attempt and lane; unpersisted
+or mismatched references fail closed. Do not use a workflow wall-time deadline
+or a terminalizer agent; the runner's explicit default 3600-second process
+guard is not an agent reasoning deadline. Preserve scratch during execution recovery; it does not
 consume the one business repair allowed only after a reviewer `repair_once`
 verdict. Materialize `draft`, then immutable accepted answer bytes plus a
 separate program-owned acceptance envelope only when their contents exist.
@@ -57,12 +60,19 @@ telemetry passive: record invocation lane/role/route, status/errors,
 artifact-before/after/counts, recovery and repair counts, source/member reads,
 and core/cache facts, never raw rows or route control.
 
+Record run-level physical-inventory operation names/counters (one initial full
+bind, child loads without re-inventory, selected-member verification, and an
+explicit final `verify_source_full()` check). Opaque members may be copied only
+through safe explicit materialization and are never semantically parsed.
+
 Continue after partial, blocked, unsupported, or technical outcomes. After each
 accepted result, exactly one Result Integration Agent incrementally consumes
 claims, metrics, limitations, evidence refs, prepared assets, ontology,
 relationships, and dashboard facts through small program APIs; deterministic
 code validates types, paths, refs, hashes, stages, and commits. Build the final
 accepted-snapshot-only dashboard after the complete queue and whole-run freeze.
+Mechanical validation cannot prove semantic completeness; the live Integration
+Agent and an external test-only fidelity audit remain required.
 Do not run Benchmark A, call a model, access a network, or publish.
 ```
 
@@ -95,21 +105,28 @@ Build one data room/source catalog. Before each Lead Analyst call, create the
 item workspace, authoritative state, and `BoundAnalysisContext`. The Lead
 Analyst selects relevant IDs directly from compact source/LEM/prepared indexes,
 writes a plan/script/source map first, and appends material findings and
-loadable run-local prepared assets. There is no Portfolio Planner, Navigator,
+loadable run-local prepared assets. Stage candidates through
+`BoundAnalysisContext.save_prepared_candidate(...)` below the current item's
+`work/prepared/`; the accepted registry remains empty until one accepted Result
+Integration commit validates and registers the exact descriptor. There is no
+Portfolio Planner, Navigator,
 descriptor/typed-validation role, or per-item Capability Catalog compliance
 artifact; catalog operations may be used internally when they fit, and custom
 reproducible code is allowed.
 
 Use artifact_progress after each response. Filesystem no-progress yields
 await_runtime/materialization guidance; recover execution separately from the
-one business repair only after a completed loss receipt. Preserve scratch and
+one business repair only after a canonical persisted loss receipt reference.
+Preserve scratch and
 write technical_failure only after allowed recovery routes are exhausted. Have
 one reviewer check source-catalog completeness and identity escalation where
 material, with at most one business repair and re-review. Materialize draft and
 then immutable answer bytes plus a separate acceptance envelope. Apply reviewed
 Knowledge Delta in program code; a no_change delta has a concrete reason.
 Every accepted prepared asset is registered in a canonical source-hash/core/
-schema catalog, while scope/reuse controls visibility only. Build products
+schema catalog, while scope/reuse controls visibility only; rejected or
+technical-failure items leave no accepted registry entry, and exact retries are
+idempotent. Build products
 only after the whole-run freeze, then collect the deterministic read-only
 optimizer evidence bundle. Do not run a model, network, benchmark, or
 client-business automation.
@@ -121,6 +138,8 @@ The offline tests should demonstrate:
 
 - v0.2.3 skill and v0.3.0 core markers in instructions and run metadata;
 - one data room/source catalog, read-only raw archive, and bounded metadata;
+- one run-level physical inventory with passive operation counters, safe opaque
+  materialization, and explicit final verification;
 - item workspace/state creation before agent invocation;
 - plan/source-map-first work, materialized draft, atomic accepted snapshot,
   and mutable scratch;
@@ -136,14 +155,15 @@ The offline tests should demonstrate:
   phases (`compile`/`dependency_check` only on failed preflight; `smoke`/`full`,
   with an optional second `full` for deterministic comparison, on a successful
   pipeline);
-- receipt-gated execution recovery, with filesystem no-progress guidance only;
+- receipt-gated execution recovery using only a canonical persisted ref/hash,
+  with filesystem no-progress guidance only;
 - immutable answer bytes separate from the acceptance envelope;
-- one incremental Result Integration Agent and canonical prepared-asset
-  registration;
+- one incremental Result Integration Agent and accepted-only canonical
+  prepared-asset registration (candidate first, registry entry only at commit);
 - source-completeness search, identity escalation, scoped knowledge, concrete
   `no_change`, loadable prepared assets, and program-owned delta application;
 - passive attempt/artifact telemetry without rows or route control;
 - reviewed-output dashboard, whole-run freeze, and read-only optimizer boundary;
 - prohibitions on planner frameworks, dictionaries, domain recipes, central or
   cross-run caches, parallel question waves, production apps, external calls,
-  compatibility wrappers, and stale v0.2.1 current instructions.
+  fallback wrappers, and stale v0.2.1 current instructions.

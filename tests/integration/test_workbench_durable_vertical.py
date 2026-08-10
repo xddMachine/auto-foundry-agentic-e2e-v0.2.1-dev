@@ -17,16 +17,19 @@ if str(SRC) not in sys.path:
 
 from auto_foundry_core import (
     AcceptedSnapshot,
+    BoundAnalysisContext,
     DataAssetRef,
     DataRoomCatalogEntry,
     DataRoomWorkbench,
+    IntegrationSession,
     ITEM_STATE_FIELDS,
     ITEM_STATE_SCHEMA,
     ItemWorkspace,
+    LivingEnterpriseModel,
     RunContext,
 )
 from auto_foundry_core.telemetry import TelemetryRecorder
-from auto_foundry_core.lifecycle import AgentInvocationReceipt, RUN_STATES
+from auto_foundry_core.lifecycle import AgentInvocationReceipt, InvocationReceiptLedger, RUN_STATES
 from auto_foundry_core.workspace import AllowedRootError
 
 
@@ -34,7 +37,10 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def test_complete_offline_workbench_and_durable_vertical_path(tmp_path: Path) -> None:
+def test_complete_offline_workbench_and_durable_vertical_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Exercise physical access, durable execution, and terminal reload once."""
 
     input_root = tmp_path / "inputs"
@@ -50,6 +56,7 @@ def test_complete_offline_workbench_and_durable_vertical_path(tmp_path: Path) ->
             b'{"entity_id":"left-2","label":"South"}\n'
         ),
         "notes.md": b"Generic fixture notes\nNo business interpretation is embedded.\n",
+        "legacy.bin": b"opaque-bytes\x00\x01\x02",
     }
     archive = input_root / "supplied-fixture.zip"
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
@@ -88,17 +95,14 @@ def test_complete_offline_workbench_and_durable_vertical_path(tmp_path: Path) ->
         {"order_id": "left-2", "amount": "20"},
     )
     assert workbench.data_room.categories(order_entry, "order_id", limit=2) == ("left-1", "left-2")
-    prepared_descriptor = workbench.save_prepared(
-        "orders-prepared",
-        order_entry,
-        transformations=("bounded_csv_read",),
-        limitations=("Generic fixture only",),
-    )
-    prepared = workbench.prepared("orders-prepared")
-    assert prepared_descriptor.prepared_content_hash
-    assert prepared_descriptor.row_count == 2
-    assert len(prepared) == 2
-    assert prepared[0]["order_id"] == "left-1"
+    opaque_entry = workbench.data_room.search("legacy", catalog=catalog, limit=1)[0]
+    assert opaque_entry.member.kind == "opaque"
+    with pytest.raises(ValueError, match="explicit materialization"):
+        workbench.data_room.read_rows(opaque_entry)
+    opaque_destination = workbench.data_room.materialize_opaque(opaque_entry, "work/legacy.bin")
+    assert opaque_destination.read_bytes() == payloads["legacy.bin"]
+    with pytest.raises(AllowedRootError):
+        workbench.data_room.materialize_opaque(opaque_entry, sibling_root / "unsafe.bin")
 
     # The authoritative item state and work directory exist before any attempt.
     item = ItemWorkspace.create(
@@ -109,6 +113,22 @@ def test_complete_offline_workbench_and_durable_vertical_path(tmp_path: Path) ->
     )
     assert (item.item_root / "item_state.json").is_file()
     assert item.work_root.is_dir()
+    bound = BoundAnalysisContext.create(
+        context,
+        DataAssetRef.from_path(archive),
+        item,
+        ontology_bundle={"relevant": ("orders",)},
+        workbench=workbench,
+    )
+    prepared_descriptor = bound.save_prepared_candidate(
+        "orders-prepared",
+        order_entry,
+        transformations=("bounded_csv_read",),
+        limitations=("Generic fixture only",),
+    )
+    assert prepared_descriptor.prepared_content_hash
+    assert prepared_descriptor.row_count == 2
+    assert bound.prepared_assets.search() == ()
     attempt = item.begin_attempt("lane-lead", "Lead Analyst")
     first = item.observe_attempt(attempt.attempt_id)
     assert first.action == "materialize_now"
@@ -117,6 +137,8 @@ def test_complete_offline_workbench_and_durable_vertical_path(tmp_path: Path) ->
     loss_receipt = AgentInvocationReceipt(
         "I-WORKBENCH-LOSS",
         item.item_id,
+        attempt.attempt_id,
+        "lane-lead",
         "Lead Analyst",
         "lead",
         provider="unavailable",
@@ -125,14 +147,59 @@ def test_complete_offline_workbench_and_durable_vertical_path(tmp_path: Path) ->
         finish="2026-01-01T00:00:01+00:00",
         terminal_reason="process_lost",
     )
+    ledger = InvocationReceiptLedger(context)
+    receipt_ref = ledger.append(loss_receipt)
     item.write_handoff({"next": "resume from the prepared orders asset"})
-    recovery = item.begin_recovery("lane-recovery", "Lead Analyst", prior_attempt_id=attempt.attempt_id, receipt=loss_receipt)
+    with pytest.raises(ValueError, match="stable|unknown|attempt|valid persisted"):
+        item.begin_recovery(
+            "lane-recovery",
+            "Lead Analyst",
+            prior_attempt_id=attempt.attempt_id,
+            receipt_ref="telemetry/invocation_receipts.jsonl#not-persisted",
+        )
+    recovery = item.begin_recovery(
+        "lane-recovery",
+        "Lead Analyst",
+        prior_attempt_id=attempt.attempt_id,
+        receipt_ref=receipt_ref,
+    )
     assert item.state["lifecycle_state"] == "recovering"
 
     # Execution recovery is a distinct route and does not consume business repair.
     assert recovery.route == "recovery"
     assert item.state["execution_recovery_count"] == 1
     assert item.state["business_repair_count"] == 0
+
+    runner_output = item.work_root / "runner-output.json"
+    runner_output.write_text("sentinel", encoding="utf-8")
+    calculations_root = item.work_root / "calculations"
+    calculations_root.mkdir(parents=True, exist_ok=True)
+    changing = calculations_root / "changing.py"
+    changing.write_text(
+        "import time\nfrom pathlib import Path\nPath('runner-output.json').write_text(str(time.time_ns()), encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    mismatch = bound.script_runner.run_pipeline(
+        changing,
+        allowed_outputs=(runner_output,),
+        deterministic_outputs=(runner_output,),
+        timeout_seconds=3600,
+    )
+    assert mismatch.status == "failed"
+    assert runner_output.read_text(encoding="utf-8") == "sentinel"
+    corrected = calculations_root / "corrected.py"
+    corrected.write_text(
+        "import json\nfrom pathlib import Path\nPath('runner-output.json').write_text(json.dumps({'ok': True}), encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    corrected_report = bound.script_runner.run_pipeline(
+        corrected,
+        allowed_outputs=(runner_output,),
+        deterministic_outputs=(runner_output,),
+        timeout_seconds=3600,
+    )
+    assert corrected_report.succeeded
+    assert not any(path.suffix == ".pyc" for path in run_root.rglob("*"))
     assert item.state["attempts"][-1]["handoff_ref"] == "work/handoff.json"
 
     item.write_draft({"answer": "bounded fixture summary", "refs": ["orders-prepared"]})
@@ -190,6 +257,37 @@ def test_complete_offline_workbench_and_durable_vertical_path(tmp_path: Path) ->
     )
     assert source_hash_before == _sha256(archive)
     assert json.loads((item.accepted_root / "manifest.json").read_text(encoding="utf-8"))["outcome"] == "accepted"
+
+    # Candidate registration is a post-acceptance integration side effect. A
+    # crash after registry publication is retried from the exact intent and
+    # converges without mutating immutable accepted answer/envelope bytes.
+    registry = bound.prepared_assets
+    lem = LivingEnterpriseModel(run_id=context.run_id)
+    integration = IntegrationSession.create(context, item, lem, registry, "result-integration")
+    integration.register_prepared_asset(prepared_descriptor)
+    answer_before = (item.accepted_root / "answer_content.json").read_bytes()
+    envelope_before = (item.accepted_root / "acceptance_envelope.json").read_bytes()
+    original_apply = integration._apply_lem_record
+    raised = {"value": False}
+
+    def fail_once(record):
+        if record.kind == "prepared_asset" and not raised["value"]:
+            raised["value"] = True
+            raise RuntimeError("integration apply crash")
+        return original_apply(record)
+
+    monkeypatch.setattr(integration, "_apply_lem_record", fail_once)
+    with pytest.raises(RuntimeError, match="integration apply crash"):
+        integration.commit()
+    assert item.integration_state == "pending"
+    assert len(registry.search(prepared_asset_id="orders-prepared")) == 1
+    monkeypatch.setattr(integration, "_apply_lem_record", original_apply)
+    manifest = integration.commit()
+    assert manifest["status"] == "committed"
+    assert item.integration_state == "integrated"
+    assert len(registry.search(prepared_asset_id="orders-prepared")) == 1
+    assert (item.accepted_root / "answer_content.json").read_bytes() == answer_before
+    assert (item.accepted_root / "acceptance_envelope.json").read_bytes() == envelope_before
 
 
 def test_run_context_defaults_to_core_v030(tmp_path: Path) -> None:

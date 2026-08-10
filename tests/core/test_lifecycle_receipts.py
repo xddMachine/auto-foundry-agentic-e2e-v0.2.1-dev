@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -29,10 +30,19 @@ def _accepted(tmp_path: Path, item_id: str = "Q-001") -> ItemWorkspace:
     return workspace
 
 
-def _receipt(item_id: str = "Q-001", *, reason: str = "process_lost", invocation_id: str = "I-001") -> AgentInvocationReceipt:
+def _receipt(
+    item_id: str = "Q-001",
+    *,
+    reason: str = "process_lost",
+    invocation_id: str = "I-001",
+    attempt_id: str = "A-001",
+    lane_id: str = "lane-1",
+) -> AgentInvocationReceipt:
     return AgentInvocationReceipt(
         invocation_id,
         item_id,
+        attempt_id,
+        lane_id,
         "Lead Analyst",
         "lead",
         provider="unavailable",
@@ -46,6 +56,18 @@ def _receipt(item_id: str = "Q-001", *, reason: str = "process_lost", invocation
         artifact_delta={"files": ["work/plan.json"]},
         tool_calls=0,
     )
+
+
+def _append_receipt_in_process(args: tuple[str, str, str]) -> tuple[str, str]:
+    """Process worker used to exercise the POSIX ledger advisory lock."""
+
+    run_id, run_root, invocation_id = args
+    context = RunContext(run_id, Path(run_root))
+    receipt = _receipt(invocation_id=invocation_id)
+    try:
+        return "ok", InvocationReceiptLedger(context).append(receipt)
+    except Exception as exc:
+        return type(exc).__name__, str(exc)
 
 
 def test_acceptance_publishes_exact_content_and_separate_self_contained_envelope(tmp_path: Path) -> None:
@@ -178,25 +200,27 @@ def test_filesystem_no_progress_does_not_authorize_recovery_and_reason_classifie
     attempt = workspace.begin_attempt("lane-1", "Lead Analyst")
     assert workspace.observe_attempt(attempt.attempt_id).action == "materialize_now"
     assert workspace.observe_attempt(attempt.attempt_id).action == "await_runtime"
-    with pytest.raises(ValueError, match="completed invocation receipt"):
-        workspace.begin_recovery("lane-2", "Lead Analyst", prior_attempt_id=attempt.attempt_id)
+    with pytest.raises(ValueError, match="receipt_ref"):
+        workspace.begin_recovery("lane-2", "Lead Analyst", prior_attempt_id=attempt.attempt_id, receipt_ref=None)
     for reason in ("syntax_error", "name_error", "type_error", "dependency_error"):
         assert classify_terminal_reason(reason) == "same_attempt_feedback"
     assert classify_terminal_reason("business_review_error") == "business_repair"
     assert classify_terminal_reason("process_lost") == "execution_recovery"
     assert classify_terminal_reason("core_defect") == "abort_and_new_clean_run"
     assert classify_terminal_reason(None) is None
+    ledger = InvocationReceiptLedger(workspace.context)
+    coding_ref = ledger.append(_receipt(reason="syntax_error", attempt_id=attempt.attempt_id, lane_id=attempt.lane_id))
     with pytest.raises(ValueError, match="does not authorize"):
-        workspace.begin_recovery("lane-2", "Lead Analyst", prior_attempt_id=attempt.attempt_id, receipt=_receipt(reason="syntax_error"))
+        workspace.begin_recovery("lane-2", "Lead Analyst", prior_attempt_id=attempt.attempt_id, receipt_ref=coding_ref)
 
 
 def test_receipt_ledger_reload_tamper_path_safety_and_passive_telemetry(tmp_path: Path) -> None:
     context = _context(tmp_path)
     ledger = InvocationReceiptLedger(context)
     receipt = _receipt()
-    ledger.append(receipt)
-    assert ledger.get("I-001").provider == "unavailable"
-    assert ledger.get("I-001").model == "unavailable"
+    receipt_ref = ledger.append(receipt)
+    assert ledger.get(receipt_ref).provider == "unavailable"
+    assert ledger.get(receipt_ref).model == "unavailable"
     reloaded = InvocationReceiptLedger(context)
     assert reloaded.receipts == (receipt,)
     lines = ledger.path.read_text(encoding="utf-8").splitlines()
@@ -220,11 +244,61 @@ def test_receipt_ledger_reload_tamper_path_safety_and_passive_telemetry(tmp_path
     assert recorder.record_invocation(_receipt(invocation_id="I-003")) is not None
 
 
+def test_receipt_ledger_thread_lock_serializes_duplicate_and_distinct_appends(tmp_path: Path) -> None:
+    context = _context(tmp_path, run_id="RUN-LEDGER-THREADS")
+
+    def append_same(_: int) -> tuple[str, str]:
+        try:
+            return "ok", InvocationReceiptLedger(context).append(_receipt(invocation_id="I-SAME"))
+        except Exception as exc:
+            return type(exc).__name__, str(exc)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        duplicate_results = tuple(executor.map(append_same, range(8)))
+    assert sum(status == "ok" for status, _ in duplicate_results) == 1
+    assert sum(status == "ValueError" and message == "invocation_id is already recorded" for status, message in duplicate_results) == 7
+
+    def append_distinct(index: int) -> tuple[str, str]:
+        try:
+            return "ok", InvocationReceiptLedger(context).append(_receipt(invocation_id=f"I-DISTINCT-{index}"))
+        except Exception as exc:
+            return type(exc).__name__, str(exc)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        distinct_results = tuple(executor.map(append_distinct, range(8)))
+    assert all(status == "ok" for status, _ in distinct_results)
+    ledger = InvocationReceiptLedger(context)
+    assert {receipt.invocation_id for receipt in ledger.receipts} == {
+        "I-SAME",
+        *(f"I-DISTINCT-{index}" for index in range(8)),
+    }
+
+
+def test_receipt_ledger_process_lock_serializes_duplicate_and_distinct_appends(tmp_path: Path) -> None:
+    run_id = "RUN-LEDGER-PROCESSES"
+    run_root = tmp_path / "run"
+    same_args = tuple((run_id, str(run_root), "I-SAME") for _ in range(2))
+    with ProcessPoolExecutor(max_workers=2) as executor:
+        duplicate_results = tuple(executor.map(_append_receipt_in_process, same_args))
+    assert sorted(status for status, _ in duplicate_results) == ["ValueError", "ok"]
+    assert sum(message == "invocation_id is already recorded" for _, message in duplicate_results) == 1
+
+    distinct_args = tuple((run_id, str(run_root), f"I-DISTINCT-{index}") for index in range(4))
+    with ProcessPoolExecutor(max_workers=4) as executor:
+        distinct_results = tuple(executor.map(_append_receipt_in_process, distinct_args))
+    assert all(status == "ok" for status, _ in distinct_results)
+    ledger = InvocationReceiptLedger(RunContext(run_id, run_root))
+    assert {receipt.invocation_id for receipt in ledger.receipts} == {
+        "I-SAME",
+        *(f"I-DISTINCT-{index}" for index in range(4)),
+    }
+
+
 def test_receipt_requires_terminal_reason_at_finish(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="terminal_reason"):
         AgentInvocationReceipt(
-            "I-001", "Q-001", "Lead Analyst", "lead", finish="2026-01-01T00:00:00Z"
+            "I-001", "Q-001", "A-001", "lane-1", "Lead Analyst", "lead", finish="2026-01-01T00:00:00Z"
         )
     ledger = InvocationReceiptLedger(_context(tmp_path))
     with pytest.raises(ValueError, match="completed"):
-        ledger.append(AgentInvocationReceipt("I-001", "Q-001", "Lead Analyst", "lead"))
+        ledger.append(AgentInvocationReceipt("I-001", "Q-001", "A-001", "lane-1", "Lead Analyst", "lead"))

@@ -48,6 +48,24 @@
     "cache_hit": null,
     "receipt_ref": null
   },
+  "physical_inventory": {
+    "binding": "run_level_canonical",
+    "operation": "archive_full_hash|member_content_hash|selected_member_read|catalog_created|catalog_reused|catalog_loaded|verify_source_full|null",
+    "counters": {
+      "initial_full_bind": 0,
+      "child_context_reinventory": 0,
+      "selected_member_verified": 0,
+      "final_explicit_verification": 0
+    },
+    "source_hash": null,
+    "member_hash": null
+  },
+  "recovery": {
+    "receipt_ref": null,
+    "receipt_hash": null,
+    "attempt_id": null,
+    "lane_id": null
+  },
   "artifact_refs": [],
   "passive": true,
   "records_raw_rows": false,

@@ -26,6 +26,7 @@ OWNED_MARKDOWN = (
     SKILL / "references" / "KNOWLEDGE_AND_REUSE.md",
     SKILL / "references" / "REVIEW_PROTOCOL.md",
     SKILL / "references" / "ARTIFACT_AND_EFFICIENCY_POLICY.md",
+    SKILL / "references" / "FINAL_PRODUCT_AND_AUTOMATION.md",
     SKILL / "assets" / "QUESTION_RESULT_TEMPLATE.md",
     SKILL / "assets" / "DASHBOARD_PROTOTYPE_TEMPLATE.md",
 )
@@ -150,6 +151,16 @@ def test_telemetry_template_observes_attempts_and_artifacts_only() -> None:
     assert {"core_operation", "cache_checked", "cache_hit", "receipt_ref"} <= set(
         event["core_cache"]
     )
+    assert event["physical_inventory"]["binding"] == "run_level_canonical"
+    assert {
+        "initial_full_bind",
+        "child_context_reinventory",
+        "selected_member_verified",
+        "final_explicit_verification",
+    } <= set(event["physical_inventory"]["counters"])
+    assert {"receipt_ref", "receipt_hash", "attempt_id", "lane_id"} <= set(
+        event["recovery"]
+    )
     assert event["passive"] is True
     assert event["records_raw_rows"] is False
     assert event["controls_route"] is False
@@ -167,7 +178,10 @@ def test_requirement_and_dashboard_templates_use_program_owned_boundaries() -> N
     assert execution["controlled_script_preflight_checks"] == ["compile", "dependency_check"]
     assert execution["successful_runtime_receipt_phases"] == ["smoke", "full"]
     assert execution["failed_preflight_receipt_phase"] == "compile|dependency_check"
-    assert execution["execution_recovery_authority"] == "completed_invocation_loss_receipt_only"
+    assert execution["script_timeout_seconds"] == 3600
+    assert execution["execution_recovery_authority"] == "canonical_persisted_receipt_ref_and_hash_only"
+    assert execution["prepared_asset_boundary"].startswith("candidate_under_item_work_prepared")
+    assert "live_integration_agent" in execution["semantic_completeness_boundary"]
     integration = requirement["result_integration"]
     assert integration["owner"] == "one_result_integration_agent"
     assert "integration_reviewer" not in integration
@@ -267,6 +281,19 @@ def test_requirement_mode_is_analytics_only_and_priority_owned() -> None:
     assert "result integration agent" in normalized
 
 
+def test_question_result_no_progress_decisions_exclude_recovery() -> None:
+    lines = _read(SKILL / "assets" / "QUESTION_RESULT_TEMPLATE.md").splitlines()
+    no_progress = next(line for line in lines if line.startswith("- No-progress decisions:"))
+    assert no_progress == "- No-progress decisions: `await_runtime` | `materialization_guidance`"
+    assert "recover" not in no_progress
+    recovery = " ".join(
+        line.strip()
+        for line in lines[lines.index(no_progress) + 1 : lines.index(no_progress) + 3]
+    )
+    assert "separate from no-progress decisions" in recovery
+    assert "canonical persisted execution-loss receipt" in recovery
+
+
 def test_workbench_sequence_and_recovery_are_progressive_and_separate() -> None:
     skill = _read(SKILL / "SKILL.md")
     workflow = skill.split("For each item, use this progressive sequence:", 1)[1]
@@ -276,7 +303,7 @@ def test_workbench_sequence_and_recovery_are_progressive_and_separate() -> None:
         "Lead Analyst writes plan, script, and source map first",
         "Lead Analyst appends findings, evidence, and loadable prepared assets",
         "Run Director checks artifact_progress after each response",
-        "completed invocation receipt proves lane/provider/host/process loss",
+        "canonical persisted invocation receipt_ref/hash proves lane/provider/host/process loss",
         "materialized draft",
         "one Independent Reviewer",
         "at most one targeted business repair",
@@ -315,6 +342,13 @@ def test_data_room_identity_review_and_prepared_asset_contract() -> None:
         "lineage",
         "concrete reason",
         "applies the reviewed knowledge delta",
+        "candidate",
+        "accepted-only",
+        "semantic completeness",
+        "external test-only fidelity audit",
+        "opaque",
+        "inventory counters",
+        "receipt_ref",
     ):
         assert phrase in text, phrase
 
@@ -375,6 +409,9 @@ def test_dashboard_telemetry_and_optimizer_boundary_remains_intact() -> None:
 
 def test_regression_prohibitions_do_not_reintroduce_legacy_workflow() -> None:
     text = _owned_text().lower()
+    active_text = "\n".join(
+        _read(path) for path in OWNED_MARKDOWN if path.name != "CHANGELOG.md"
+    ).lower()
     fake_text = _read(ROOT / "tests" / "skill" / "fake_requirement_mode.py")
     # Exact old markers and positive legacy workflow instructions are absent.
     assert "skill_version: 0.2.1" not in text
@@ -389,6 +426,10 @@ def test_regression_prohibitions_do_not_reintroduce_legacy_workflow() -> None:
     assert "no mandatory navigator role" in text
     assert "no terminalizer agent" in text
     assert "no wall-time deadline" in text
+    assert "fallback wrapper" in active_text
+    assert "compatibility wrapper" not in active_text
+    assert not re.search(r"\bsave_prepared\s*\(", active_text)
+    assert "materialize_accepted" not in active_text
     assert "parallel question wave" in text
     assert "production application" in text  # explicit prohibition/boundary
     for obsolete in ("Fake" + "PortfolioPlanner", "Fake" + "Navigator"):

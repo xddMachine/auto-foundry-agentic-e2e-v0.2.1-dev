@@ -36,10 +36,13 @@
     "controlled_script_preflight_checks": ["compile", "dependency_check"],
     "successful_runtime_receipt_phases": ["smoke", "full"],
     "deterministic_comparison": "optional_second_full_receipt",
+    "script_timeout_seconds": 3600,
     "failed_preflight_receipt_phase": "compile|dependency_check",
     "code_error_route": "same_attempt_feedback",
     "filesystem_no_progress_route": "await_runtime_or_materialization_guidance",
-    "execution_recovery_authority": "completed_invocation_loss_receipt_only"
+    "execution_recovery_authority": "canonical_persisted_receipt_ref_and_hash_only",
+    "prepared_asset_boundary": "candidate_under_item_work_prepared_until_accepted_integration_commit",
+    "semantic_completeness_boundary": "mechanical_validation_requires_live_integration_agent_and_external_test_only_fidelity_audit"
   },
   "result_integration": {
     "owner": "one_result_integration_agent",

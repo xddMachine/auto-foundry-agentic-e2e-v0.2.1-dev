@@ -46,6 +46,39 @@ source access and durable execution, while the Lead Analyst owns semantic
 judgment. A normal run begins from the explicit task and does not require
 manual authorization or an extra confirmation step.
 
+For prepared data, the Lead Analyst writes a candidate through the bound item
+context; the accepted registry stays empty until Result Integration commits the
+accepted item:
+
+```python
+bound = BoundAnalysisContext.create(context, archive_path, item, workbench=workbench)
+candidate = bound.save_prepared_candidate(
+    "orders-prepared", rows, scope="reusable",
+    transformations=("bounded_csv_read",),
+)
+assert bound.prepared_assets.search() == ()
+# After review/acceptance, one IntegrationSession stages `candidate` and its
+# accepted commit registers it exactly once, retaining its scope.
+```
+
+The candidate descriptor and bytes remain under the current item's
+`work/prepared/` directory. Rejected items and technical-failure integrations
+do not create accepted registry entries. Registry registration validates exact
+path, hash, byte/row counts, scope, and provenance; these mechanical checks
+cannot prove semantic completeness, so a live Integration Agent and an
+external test-only fidelity audit remain required.
+
+The run-level physical inventory is bound once and exposed through passive
+counter operations (`archive_full_hash`, `member_content_hash`,
+`selected_member_read`, `catalog_created`, `catalog_reused`, and
+`catalog_loaded`). Bound child contexts reuse it; call `verify_source_full()`
+explicitly before final publication to detect mutation. Opaque members are
+safe to copy only with explicit materialization and are not semantically
+parsed. `ControlledScriptRunner` has a configurable 3600-second process guard
+by default; it is not an agent reasoning or workflow wall-time deadline.
+Recovery accepts only a canonical persisted `receipt_ref` whose receipt has the
+active attempt and lane; unpersisted or mismatched references fail closed.
+
 ## Skill replacement (same name)
 
 1. Build/validate `dist/auto-foundry-agentic-e2e-v0.2.3.zip` locally.
@@ -112,8 +145,8 @@ PYTHONPATH="$TARGET" python3 -m auto_foundry_core catalog list
 
 For a same-environment migration, record the existing wheel/package version,
 install the new wheel with `--no-index --no-deps`, and run the import/catalog
-smoke before removing the old package. Do not add compatibility wrappers or
-mix two same-name skill trees.
+smoke before removing the old package. Do not add fallback wrappers or mix two
+same-name skill trees.
 
 Rollback is similarly explicit: uninstall/restore the previously recorded
 `auto_foundry_core` wheel in the chosen target/environment, then rerun the

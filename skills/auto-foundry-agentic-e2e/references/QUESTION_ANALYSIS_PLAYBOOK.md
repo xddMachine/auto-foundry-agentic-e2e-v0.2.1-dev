@@ -73,9 +73,13 @@ not prose activity:
    loss → authorize execution recovery from the durable handoff.
 
 Execution recovery preserves scratch and is counted separately from the one
-business repair. Provider/model identity may be literal `unavailable`; do not
-invent identity. The host creates or restarts the replacement thread; the core
-only records state. No wall-time deadline or terminalizer/manual finalizer is
+business repair. It requires a canonical persisted invocation `receipt_ref` and
+hash proving lane/provider/host/process loss and matching the active attempt
+and lane; unpersisted or mismatched references fail closed. Provider/model
+identity may be literal `unavailable`; do not invent identity. The host creates
+or restarts the replacement thread; the core only records state. No wall-time
+deadline applies to the workflow; the runner's explicit default 3600-second
+process guard is not an agent reasoning deadline, and no terminalizer/manual finalizer is
 used. After recovery routes are exhausted, the program writes typed
 `technical_failure`, with classifier output restricted to
 `same_attempt_feedback`, `business_repair`, `execution_recovery`,
@@ -167,10 +171,13 @@ joins, coverage gaps, or stale periods.
 
 Use the least invasive transformation: normalization, explicit mapping,
 evidence-supported correction, exclusion with a count, or quarantine. Preserve
-raw values and write derived assets to the run-local Prepared Data Registry.
-Each reusable asset must be loadable and carry a hash, location, schema, grain,
+raw values and write derived assets as item-local candidates below
+`work/prepared/` through `BoundAnalysisContext.save_prepared_candidate(...)`.
+Candidates carry a hash, location, byte/row counts, schema, grain,
 lineage/source IDs, scope, effective period, transformations, evidence, and
-limits.
+limits, but do not enter the accepted Prepared Data Registry until one accepted
+Result Integration commit validates and registers them. Exact retries are
+idempotent; rejected or technical-failure items leave no accepted entry.
 
 Record base population, eligible population, exclusions by reason, unresolved
 records, denominator, grain, period, dimensions, units, and coverage.
@@ -219,8 +226,11 @@ relationships, and dashboard facts through small program APIs. It performs
 semantic mapping; deterministic code validates types, paths, refs, hashes,
 stages, and commits. Every accepted prepared asset is registered in a
 canonical catalog immutable by source hash/core/schema; scope/reuse controls
-visibility only and sample/category views are derived. There is no prose
-parser, giant mandatory JSON, Integration Reviewer, or finalizer chain.
+visibility only and sample/category views are derived. Mechanical validation
+cannot prove semantic completeness; the live Integration Agent and an
+external test-only fidelity audit remain required. There is no prose parser,
+semantic compiler, giant mandatory JSON, Integration Reviewer, or finalizer
+chain.
 
 ## 12. Queue continuation
 

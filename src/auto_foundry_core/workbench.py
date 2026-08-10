@@ -17,10 +17,13 @@ import io
 import json
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import stat
+import struct
 import tempfile
 from types import MappingProxyType
 from typing import Any, Iterable, Iterator, Mapping, Sequence
+import uuid
 import zipfile
 
 try:  # pragma: no cover - supported macOS/POSIX hosts provide fcntl
@@ -31,7 +34,7 @@ except ImportError:  # pragma: no cover - defensive for non-POSIX packaging
 from .contracts import DataAssetRef, PreparedAssetDescriptor
 from .prepared import PreparedAssetRegistry
 from .telemetry import TelemetryRecorder
-from .workspace import RunContext
+from .workspace import AllowedRootError, RunContext
 
 
 DEFAULT_JSON_MAX_BYTES = 16 * 1024 * 1024
@@ -47,6 +50,7 @@ DEFAULT_XLSX_COMPRESSION_RATIO = 10_000.0
 DEFAULT_XLSX_ENTRY_LIMIT = 4096
 DEFAULT_PREPARED_MAX_BYTES = 64 * 1024 * 1024
 CATALOG_SCHEMA_VERSION = "1"
+INSTRUMENTATION_SCHEMA_VERSION = "1"
 # Canonical physical metadata must not depend on a caller's sampling profile.
 # Keep one bounded scan budget for every catalog identity; derived sample and
 # category views use their own explicit limits later.
@@ -105,6 +109,136 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _source_stat_signature(path: Path) -> dict[str, int]:
+    """Return a cheap identity check used between explicit full hashes."""
+
+    stat_result = path.stat()
+    return {
+        "device": int(stat_result.st_dev),
+        "inode": int(stat_result.st_ino),
+        "size_bytes": int(stat_result.st_size),
+        "mtime_ns": int(stat_result.st_mtime_ns),
+    }
+
+
+def _central_directory_fingerprint(path: Path) -> dict[str, Any]:
+    """Hash ZIP central-directory bytes without enumerating ``ZipInfo`` rows."""
+
+    file_size = path.stat().st_size
+    # EOCD is at most 22 bytes plus a 65,535-byte archive comment from EOF.
+    tail_size = min(file_size, 22 + 65_535)
+    with path.open("rb") as stream:
+        stream.seek(file_size - tail_size)
+        tail = stream.read(tail_size)
+    marker = tail.rfind(b"PK\x05\x06")
+    if marker < 0 or marker + 22 > len(tail):
+        raise ValueError("ZIP central directory end record is missing")
+    fields = struct.unpack_from("<4s4H2LH", tail, marker)
+    _, disk_number, central_disk, disk_entries, total_entries, central_size, central_offset, _comment_length = fields
+    if disk_number != 0 or central_disk != 0 or disk_entries != total_entries:
+        raise ValueError("multi-disk ZIP archives are not supported")
+    if central_size == 0xFFFFFFFF or central_offset == 0xFFFFFFFF or total_entries == 0xFFFF:
+        raise ValueError("ZIP64 central-directory fingerprints are not supported")
+    if central_offset < 0 or central_size < 0 or central_offset + central_size > file_size:
+        raise ValueError("ZIP central directory bounds are invalid")
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        stream.seek(central_offset)
+        remaining = central_size
+        while remaining:
+            chunk = stream.read(min(1024 * 1024, remaining))
+            if not chunk:
+                raise ValueError("ZIP central directory is truncated")
+            digest.update(chunk)
+            remaining -= len(chunk)
+    return {
+        "offset": int(central_offset),
+        "size_bytes": int(central_size),
+        "entry_count": int(total_entries),
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _atomic_write_bytes(path: Path, content: bytes) -> None:
+    """Atomically publish bytes below a run-owned directory."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("wb", dir=path.parent, prefix=f".{path.name}.", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        try:
+            directory = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            try:
+                os.fsync(directory)
+            except OSError:
+                pass
+        finally:
+            os.close(directory)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _instrumentation_path(context: RunContext) -> Path:
+    return context.resolve_run_path(Path("telemetry") / "inventory_counters.json")
+
+
+@contextmanager
+def _instrumentation_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_name(f".{path.name}.lock").open("a+b") as stream:
+        if fcntl is not None:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def _record_instrumentation(context: RunContext | None, operation: str, *, bytes_processed: int = 0) -> None:
+    """Persist bounded operation counters without recording source contents."""
+
+    if context is None:
+        return
+    if bytes_processed < 0:
+        raise ValueError("instrumentation bytes cannot be negative")
+    path = _instrumentation_path(context)
+    with _instrumentation_lock(path):
+        payload: dict[str, Any] = {
+            "schema_version": INSTRUMENTATION_SCHEMA_VERSION,
+            "run_id": context.run_id,
+            "operations": {},
+        }
+        if path.is_file():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("inventory instrumentation is unreadable") from exc
+            if not isinstance(loaded, Mapping) or loaded.get("schema_version") != INSTRUMENTATION_SCHEMA_VERSION:
+                raise ValueError("inventory instrumentation schema is unsupported")
+            if loaded.get("run_id") != context.run_id:
+                raise ValueError("inventory instrumentation run identity does not match")
+            operations = loaded.get("operations")
+            if not isinstance(operations, Mapping):
+                raise ValueError("inventory instrumentation operations are invalid")
+            payload["operations"] = {str(key): dict(value) for key, value in operations.items() if isinstance(value, Mapping)}
+        operation_payload = payload["operations"].setdefault(operation, {"count": 0, "bytes": 0})
+        if not isinstance(operation_payload, dict):
+            raise ValueError(f"inventory instrumentation operation is invalid: {operation}")
+        operation_payload["count"] = int(operation_payload.get("count", 0)) + 1
+        operation_payload["bytes"] = int(operation_payload.get("bytes", 0)) + int(bytes_processed)
+        _atomic_write_json(path, payload)
+
+
 def _catalog_identity_key(source_hash: str, core_version: str) -> str:
     """Return the stable key for one immutable physical catalog."""
 
@@ -117,6 +251,25 @@ def _safe_id(value: str, label: str = "identifier") -> str:
     if not value or value in {".", ".."} or Path(value).name != value or "\\" in value:
         raise ValueError(f"{label} must be a simple path component")
     return value
+
+
+def _assert_no_symlink_components(path: Path, *, root: Path) -> Path:
+    """Validate lexical containment and reject symlink path components."""
+
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise AllowedRootError(f"path escapes bound root: {path}") from exc
+    resolved_root = root.resolve(strict=False)
+    resolved_path = path.resolve(strict=False)
+    if not resolved_path.is_relative_to(resolved_root):
+        raise AllowedRootError(f"path escapes bound root: {path}")
+    current = root
+    for component in relative.parts:
+        current = current / component
+        if current.is_symlink():
+            raise AllowedRootError(f"bound path cannot use symlink: {current}")
+    return path
 
 
 def _format_for_name(name: str) -> str:
@@ -133,7 +286,9 @@ def _member_kind(fmt: str) -> str:
         return "table"
     if fmt in DOCUMENT_FORMATS or fmt == "document":
         return "document"
-    return "unsupported"
+    # Unknown/legacy binary formats remain physically addressable but are
+    # deliberately opaque: no parser or semantic fields are inferred.
+    return "opaque"
 
 
 def _validate_member_name(name: str) -> None:
@@ -557,8 +712,6 @@ def _inspect_archive_member(
     if _is_ignored_archive_metadata(info.filename):
         return None
     fmt = _format_for_name(info.filename)
-    if _member_kind(fmt) == "unsupported":
-        raise ValueError(f"unsupported ZIP member format: {info.filename} ({fmt})")
     digest = hashlib.sha256()
     xlsx_bytes = bytearray() if fmt == "xlsx" else None
     with source.open(info, "r") as stream:
@@ -584,7 +737,12 @@ def _inspect_archive_member(
     )
 
 
-def _inventory_archive(archive_path: Path, *, limits: _ArchiveLimits) -> tuple[DataRoomMember, ...]:
+def _inventory_archive(
+    archive_path: Path,
+    *,
+    limits: _ArchiveLimits,
+    context: RunContext | None = None,
+) -> tuple[DataRoomMember, ...]:
     members: list[DataRoomMember] = []
     seen_names: set[str] = set()
     total_size = 0
@@ -605,6 +763,7 @@ def _inventory_archive(archive_path: Path, *, limits: _ArchiveLimits) -> tuple[D
                 if total_size > limits.max_total_bytes:
                     raise ValueError(f"ZIP exceeds max_total_bytes: {total_size} > {limits.max_total_bytes}")
                 members.append(member)
+                _record_instrumentation(context, "member_content_hash", bytes_processed=member.size_bytes)
     except zipfile.BadZipFile as exc:
         raise ValueError(f"invalid ZIP archive: {archive_path}") from exc
     return tuple(sorted(members, key=lambda item: item.path))
@@ -622,6 +781,7 @@ class DataRoom:
         *,
         limits: _ArchiveLimits,
         telemetry: TelemetryRecorder | None = None,
+        bound_inventory: bool = False,
     ) -> None:
         self.context = context
         self.archive_path = archive_path
@@ -629,6 +789,8 @@ class DataRoom:
         self._members = members
         self.limits = limits
         self.telemetry = telemetry
+        self._bound_inventory = bool(bound_inventory)
+        self._source_stat = _source_stat_signature(archive_path)
         self.catalog_schema_version = CATALOG_SCHEMA_VERSION
         self.catalog_key = _catalog_identity_key(archive_ref.content_hash or "", context.core_version)
         self.catalog_root = context.resolve_run_path(Path("data_room") / "catalogs")
@@ -651,6 +813,10 @@ class DataRoom:
         max_xlsx_total_bytes: int = DEFAULT_XLSX_TOTAL_MAX_BYTES,
         max_xlsx_compression_ratio: float = DEFAULT_XLSX_COMPRESSION_RATIO,
         max_xlsx_entries: int = DEFAULT_XLSX_ENTRY_LIMIT,
+        bound_members: Sequence[DataRoomMember] | None = None,
+        bound_archive_hash: str | None = None,
+        bound_source_stat: Mapping[str, Any] | None = None,
+        bound_central_directory_fingerprint: Mapping[str, Any] | None = None,
     ) -> "DataRoom":
         limits = _archive_limits(
             max_member_bytes=max_member_bytes,
@@ -671,10 +837,36 @@ class DataRoom:
         archive_path = context.resolve_input(archive_value)
         if not archive_path.exists() or not archive_path.is_file():
             raise FileNotFoundError(archive_path)
-        archive_hash = _sha256_file(archive_path)
-        if supplied_hash and supplied_hash != archive_hash:
-            raise ValueError(f"source changed after registration: {archive_path}")
-        members_tuple = _inventory_archive(archive_path, limits=limits)
+        current_stat = _source_stat_signature(archive_path)
+        expected_stat = dict(bound_source_stat or {})
+        if expected_stat and current_stat != {str(key): int(value) for key, value in expected_stat.items()}:
+            raise ValueError(f"source stat changed after binding: {archive_path}")
+        central_fingerprint = _central_directory_fingerprint(archive_path)
+        expected_central = dict(bound_central_directory_fingerprint or {})
+        if bound_members is not None and not expected_central:
+            raise ValueError("bound source identity must contain a central-directory fingerprint")
+        if expected_central and central_fingerprint != expected_central:
+            raise ValueError(f"archive central directory changed after binding: {archive_path}")
+        _record_instrumentation(
+            context,
+            "central_directory_fingerprint",
+            bytes_processed=int(central_fingerprint["size_bytes"]),
+        )
+        if bound_members is None:
+            archive_hash = _sha256_file(archive_path)
+            _record_instrumentation(context, "archive_full_hash", bytes_processed=archive_path.stat().st_size)
+            if supplied_hash and supplied_hash != archive_hash:
+                raise ValueError(f"source changed after registration: {archive_path}")
+            members_tuple = _inventory_archive(archive_path, limits=limits, context=context)
+            bound_inventory = False
+        else:
+            archive_hash = str(bound_archive_hash or supplied_hash or "")
+            if not archive_hash:
+                raise ValueError("bound source identity must contain an archive hash")
+            if supplied_hash and supplied_hash != archive_hash:
+                raise ValueError(f"bound source hash does not match: {archive_path}")
+            members_tuple = cls._validate_bound_inventory(tuple(bound_members), limits=limits)
+            bound_inventory = True
         room = cls(
             context,
             archive_path,
@@ -683,11 +875,16 @@ class DataRoom:
                 format="zip",
                 content_hash=archive_hash,
                 size_bytes=archive_path.stat().st_size,
-                metadata={"read_only": True},
+                metadata={
+                    "read_only": True,
+                    "source_stat": current_stat,
+                    "central_directory_fingerprint": central_fingerprint,
+                },
             ),
             members_tuple,
             limits=limits,
             telemetry=telemetry,
+            bound_inventory=bound_inventory,
         )
         room._emit(
             "data_room_archive_read",
@@ -696,8 +893,33 @@ class DataRoom:
         )
         return room
 
+    @staticmethod
+    def _validate_bound_inventory(
+        members: tuple[DataRoomMember, ...],
+        *,
+        limits: _ArchiveLimits,
+    ) -> tuple[DataRoomMember, ...]:
+        """Validate persisted member metadata without opening the ZIP."""
+
+        expected = {member.path: member for member in members}
+        if len(expected) != len(members):
+            raise ValueError("bound physical inventory contains duplicate members")
+        total_size = 0
+        for member in members:
+            _validate_member_name(member.path)
+            if member.kind not in {"table", "document", "opaque"}:
+                raise ValueError(f"bound member kind is invalid: {member.path}")
+            if member.size_bytes < 0 or member.compressed_size_bytes < 0:
+                raise ValueError(f"bound member sizes are invalid: {member.path}")
+            if not member.content_hash or len(member.content_hash) != 64:
+                raise ValueError(f"bound member hash is invalid: {member.path}")
+            total_size += member.size_bytes
+            if total_size > limits.max_total_bytes:
+                raise ValueError(f"ZIP exceeds max_total_bytes: {total_size} > {limits.max_total_bytes}")
+        return tuple(sorted(members, key=lambda item: item.path))
+
     def members(self) -> tuple[DataRoomMember, ...]:
-        self._check_archive_unchanged()
+        self._check_archive_stat()
         return self._members
 
     def _emit(self, event_type: str, *, bytes_processed: int | None = None, facts: Mapping[str, Any] | None = None) -> None:
@@ -715,8 +937,51 @@ class DataRoom:
 
     def _check_archive_unchanged(self) -> None:
         current = _sha256_file(self.archive_path)
+        _record_instrumentation(self.context, "archive_full_hash", bytes_processed=self.archive_path.stat().st_size)
         if current != self.archive_ref.content_hash:
             raise ValueError(f"archive changed after registration: {self.archive_path}")
+
+    def _check_archive_stat(self) -> None:
+        expected = self.archive_ref.metadata.get("source_stat", self._source_stat)
+        if _source_stat_signature(self.archive_path) != dict(expected):
+            raise ValueError(f"archive changed after binding (source stat): {self.archive_path}")
+
+    def verify_source_full(self) -> str:
+        """Explicitly re-hash the bound archive at a final/freeze boundary."""
+
+        self._check_archive_stat()
+        _record_instrumentation(
+            self.context,
+            "verify_source_full",
+            bytes_processed=self.archive_path.stat().st_size,
+        )
+        self._check_archive_unchanged()
+        return self.archive_ref.content_hash or ""
+
+    @property
+    def source_stat_signature(self) -> Mapping[str, int]:
+        return MappingProxyType(dict(self._source_stat))
+
+    @property
+    def central_directory_fingerprint(self) -> Mapping[str, Any]:
+        return MappingProxyType(dict(self.archive_ref.metadata.get("central_directory_fingerprint", {})))
+
+    @property
+    def instrumentation_path(self) -> Path:
+        return _instrumentation_path(self.context)
+
+    @property
+    def instrumentation_counters(self) -> Mapping[str, Any]:
+        path = self.instrumentation_path
+        if not path.is_file():
+            return MappingProxyType({})
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("inventory instrumentation is unreadable") from exc
+        if not isinstance(payload, Mapping) or payload.get("run_id") != self.context.run_id:
+            raise ValueError("inventory instrumentation identity is invalid")
+        return MappingProxyType(_jsonable(payload.get("operations", {})))
 
     def _resolve_member(self, member: DataRoomMember | DataRoomCatalogEntry | str | Path) -> DataRoomMember:
         expected_hash: str | None = None
@@ -755,23 +1020,36 @@ class DataRoom:
         *,
         max_bytes: int | None = None,
         allow_truncate: bool = False,
+        count_selected: bool = True,
     ) -> bytes:
-        self._check_archive_unchanged()
+        self._check_archive_stat()
         info = self._zip_info(member)
         cap = self.limits.max_member_bytes if max_bytes is None else max_bytes
         if cap < 0:
             raise ValueError("max_bytes cannot be negative")
         if info.file_size > cap and not allow_truncate:
             raise ValueError(f"member exceeds max_bytes: {member.path} ({info.file_size} > {cap})")
+        digest = hashlib.sha256()
+        chunks: list[bytes] = []
+        total = 0
         with zipfile.ZipFile(self.archive_path, "r") as source, source.open(info, "r") as stream:
-            data = stream.read(cap + 1 if not allow_truncate else cap)
-        if len(data) > cap and not allow_truncate:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+                previous_total = total
+                total += len(chunk)
+                if previous_total < cap:
+                    chunks.append(chunk[: cap - previous_total])
+        data = b"".join(chunks)
+        if total > cap and not allow_truncate:
             raise ValueError(f"member exceeds max_bytes: {member.path}")
-        if not allow_truncate and _sha256_bytes(data) != member.content_hash:
+        if digest.hexdigest() != member.content_hash:
             raise ValueError(f"archive member content changed: {member.path}")
+        _record_instrumentation(self.context, "member_content_hash", bytes_processed=total)
+        if count_selected:
+            _record_instrumentation(self.context, "selected_member_read", bytes_processed=total)
         self._emit(
             "data_room_member_read",
-            bytes_processed=len(data),
+            bytes_processed=total,
             facts={"member_path": member.path, "format": member.format},
         )
         return data
@@ -784,21 +1062,21 @@ class DataRoom:
         limit: int | None,
         offset: int,
     ) -> list[dict[str, Any]]:
-        self._check_archive_unchanged()
+        data = self._read_member_bytes(member, max_bytes=self.limits.max_member_bytes)
         info = self._zip_info(member)
         output: list[dict[str, Any]] = []
-        with zipfile.ZipFile(self.archive_path, "r") as source, source.open(info, "r") as raw:
-            with io.TextIOWrapper(raw, encoding="utf-8-sig", newline="") as stream:
-                reader = csv.DictReader(stream, delimiter=delimiter)
-                for index, row in enumerate(reader):
-                    if index < offset:
-                        continue
-                    output.append(dict(row))
-                    if limit is not None and len(output) >= limit:
-                        break
+        del info  # metadata validation is performed by _read_member_bytes.
+        with io.TextIOWrapper(io.BytesIO(data), encoding="utf-8-sig", newline="") as stream:
+            reader = csv.DictReader(stream, delimiter=delimiter)
+            for index, row in enumerate(reader):
+                if index < offset:
+                    continue
+                output.append(dict(row))
+                if limit is not None and len(output) >= limit:
+                    break
         self._emit(
             "data_room_member_read",
-            bytes_processed=member.size_bytes,
+            bytes_processed=len(data),
             facts={"member_path": member.path, "format": member.format, "rows": len(output)},
         )
         return output
@@ -810,11 +1088,13 @@ class DataRoom:
         limit: int | None,
         offset: int,
         max_json_bytes: int | None = None,
+        count_selected: bool = True,
     ) -> list[dict[str, Any]]:
         if member.format == "json":
             data = self._read_member_bytes(
                 member,
                 max_bytes=self.limits.max_json_bytes if max_json_bytes is None else max_json_bytes,
+                count_selected=count_selected,
             )
             value = json.loads(data.decode("utf-8-sig"))
             if isinstance(value, Mapping):
@@ -826,27 +1106,29 @@ class DataRoom:
             selected = rows[offset:] if limit is None else rows[offset : offset + limit]
             return [dict(row) for row in selected]
 
-        self._check_archive_unchanged()
-        info = self._zip_info(member)
+        data = self._read_member_bytes(
+            member,
+            max_bytes=self.limits.max_member_bytes,
+            count_selected=count_selected,
+        )
         output: list[dict[str, Any]] = []
         row_index = 0
-        with zipfile.ZipFile(self.archive_path, "r") as source, source.open(info, "r") as raw:
-            with io.TextIOWrapper(raw, encoding="utf-8-sig") as stream:
-                for line_number, line in enumerate(stream, 1):
-                    if not line.strip():
-                        continue
-                    value = json.loads(line)
-                    row = dict(value) if isinstance(value, Mapping) else {"value": value, "_line": line_number}
-                    if row_index < offset:
-                        row_index += 1
-                        continue
-                    output.append(row)
+        with io.TextIOWrapper(io.BytesIO(data), encoding="utf-8-sig") as stream:
+            for line_number, line in enumerate(stream, 1):
+                if not line.strip():
+                    continue
+                value = json.loads(line)
+                row = dict(value) if isinstance(value, Mapping) else {"value": value, "_line": line_number}
+                if row_index < offset:
                     row_index += 1
-                    if limit is not None and len(output) >= limit:
-                        break
+                    continue
+                output.append(row)
+                row_index += 1
+                if limit is not None and len(output) >= limit:
+                    break
         self._emit(
             "data_room_member_read",
-            bytes_processed=member.size_bytes,
+            bytes_processed=len(data),
             facts={"member_path": member.path, "format": member.format, "rows": len(output)},
         )
         return output
@@ -915,8 +1197,8 @@ class DataRoom:
         resolved = self._resolve_member(member)
         if isinstance(member, DataRoomCatalogEntry) and sheet is None:
             sheet = member.sheet_name
-        if resolved.kind == "unsupported":
-            raise ValueError(f"unsupported data-room member format: {resolved.format}")
+        if resolved.kind == "opaque":
+            raise ValueError(f"opaque data-room member requires explicit materialization: {resolved.path}")
         if resolved.format == "csv":
             return self._iter_csv_rows(resolved, delimiter=",", limit=limit, offset=offset)
         if resolved.format == "tsv":
@@ -946,8 +1228,8 @@ class DataRoom:
         if max_bytes < 0:
             raise ValueError("max_bytes cannot be negative")
         resolved = self._resolve_member(member)
-        if resolved.kind == "unsupported":
-            raise ValueError(f"unsupported data-room member format: {resolved.format}")
+        if resolved.kind == "opaque":
+            raise ValueError(f"opaque data-room member requires explicit materialization: {resolved.path}")
         if resolved.kind != "document":
             raise ValueError(f"member is tabular, not a document: {resolved.path}")
         if resolved.format == "pdf":
@@ -955,9 +1237,50 @@ class DataRoom:
         data = self._read_member_bytes(resolved, max_bytes=max_bytes, allow_truncate=True)
         return data.decode("utf-8-sig", errors="replace")
 
+    def materialize_opaque(
+        self,
+        member: DataRoomMember | DataRoomCatalogEntry | str | Path,
+        destination: str | Path,
+        *,
+        max_bytes: int | None = None,
+    ) -> Path:
+        """Copy one opaque member to an explicit run-local regular file."""
+
+        resolved = self._resolve_member(member)
+        if resolved.kind != "opaque":
+            raise ValueError(f"opaque materialization requires an opaque member: {resolved.path}")
+        cap = self.limits.max_member_bytes if max_bytes is None else int(max_bytes)
+        if cap < 0:
+            raise ValueError("max_bytes cannot be negative")
+        if resolved.size_bytes > cap:
+            raise ValueError(f"opaque member exceeds max_bytes: {resolved.path}")
+        # Check the lexical destination before resolving it.  Resolving first
+        # would silently collapse a pre-existing symlink alias that still
+        # lands inside ``run_root`` and would make the write path ambiguous.
+        raw_destination = Path(destination).expanduser()
+        lexical_target = raw_destination if raw_destination.is_absolute() else self.context.run_root / raw_destination
+        _assert_no_symlink_components(lexical_target, root=self.context.run_root)
+        target = self.context.resolve_run_path(lexical_target)
+        if target.exists() and (target.is_symlink() or not target.is_file()):
+            raise ValueError(f"opaque materialization destination must be a regular file: {target}")
+        data = self._read_member_bytes(resolved, max_bytes=cap)
+        _atomic_write_bytes(target, data)
+        if _sha256_file(target) != resolved.content_hash:
+            target.unlink(missing_ok=True)
+            raise ValueError(f"opaque materialization hash mismatch: {resolved.path}")
+        return target
+
     def _catalog_for_member(self, member: DataRoomMember) -> list[DataRoomCatalogEntry]:
-        if member.kind == "unsupported":
-            raise ValueError(f"unsupported data-room member format: {member.format}")
+        if member.kind == "opaque":
+            return [
+                DataRoomCatalogEntry(
+                    member=member,
+                    row_count=None,
+                    row_count_exact=False,
+                    row_count_lower_bound=None,
+                    metadata={"extraction": "opaque", "requires_custom_code": True},
+                )
+            ]
         if member.kind == "document":
             return self._catalog_document(member)
         if member.format == "xlsx":
@@ -987,7 +1310,7 @@ class DataRoom:
         ]
 
     def _catalog_xlsx(self, member: DataRoomMember) -> list[DataRoomCatalogEntry]:
-        data = self._read_member_bytes(member)
+        data = self._read_member_bytes(member, count_selected=False)
         _preflight_xlsx_bytes(
             data,
             max_member_bytes=self.limits.max_xlsx_member_bytes,
@@ -1042,7 +1365,7 @@ class DataRoom:
         return self._entry_from_rows(member, headers, sheet_name, count, exhausted)
 
     def _catalog_json(self, member: DataRoomMember) -> list[DataRoomCatalogEntry]:
-        rows = self._iter_json_rows(member, limit=CANONICAL_CATALOG_ROWS + 1, offset=0)
+        rows = self._iter_json_rows(member, limit=CANONICAL_CATALOG_ROWS + 1, offset=0, count_selected=False)
         headers: list[str] = []
         for row in rows:
             for key in row:
@@ -1053,26 +1376,24 @@ class DataRoom:
         return [self._entry_from_rows(member, headers, None, count, exhausted)]
 
     def _catalog_delimited(self, member: DataRoomMember) -> list[DataRoomCatalogEntry]:
-        self._check_archive_unchanged()
-        info = self._zip_info(member)
+        data = self._read_member_bytes(member, max_bytes=self.limits.max_member_bytes, count_selected=False)
         delimiter = "\t" if member.format == "tsv" else ","
         count = 0
         exhausted = True
-        with zipfile.ZipFile(self.archive_path, "r") as source, source.open(info, "r") as raw:
-            with io.TextIOWrapper(raw, encoding="utf-8-sig", newline="") as stream:
-                reader = csv.DictReader(stream, delimiter=delimiter)
-                headers = [str(value) for value in (reader.fieldnames or ())]
-                for row in reader:
-                    count += 1
-                    if count >= CANONICAL_CATALOG_ROWS:
-                        try:
-                            next(reader)
-                        except StopIteration:
-                            pass
-                        else:
-                            exhausted = False
-                        break
-        self._emit("data_room_member_read", bytes_processed=member.size_bytes, facts={"member_path": member.path, "format": member.format, "rows": count})
+        with io.TextIOWrapper(io.BytesIO(data), encoding="utf-8-sig", newline="") as stream:
+            reader = csv.DictReader(stream, delimiter=delimiter)
+            headers = [str(value) for value in (reader.fieldnames or ())]
+            for row in reader:
+                count += 1
+                if count >= CANONICAL_CATALOG_ROWS:
+                    try:
+                        next(reader)
+                    except StopIteration:
+                        pass
+                    else:
+                        exhausted = False
+                    break
+        self._emit("data_room_member_read", bytes_processed=len(data), facts={"member_path": member.path, "format": member.format, "rows": count})
         return [self._entry_from_rows(member, headers, None, count, exhausted)]
 
     @staticmethod
@@ -1150,9 +1471,11 @@ class DataRoom:
         catalog identity or trigger a full archive rescan.
         """
 
-        self._check_archive_unchanged()
+        self._check_archive_stat()
         if self.catalog_path.is_file():
             entries = self._load_canonical_catalog()
+            _record_instrumentation(self.context, "catalog_loaded")
+            _record_instrumentation(self.context, "catalog_reused")
             self._emit(
                 "data_room_catalog_reused",
                 facts={
@@ -1164,11 +1487,13 @@ class DataRoom:
             )
             return entries
         with _catalog_lock(self.catalog_lock_path):
-            self._check_archive_unchanged()
+            self._check_archive_stat()
             # A concurrent opener may have won publication while this caller
             # waited for the lock.  Recheck before touching any member.
             if self.catalog_path.is_file():
                 entries = self._load_canonical_catalog()
+                _record_instrumentation(self.context, "catalog_loaded")
+                _record_instrumentation(self.context, "catalog_reused")
                 self._emit(
                     "data_room_catalog_reused",
                     facts={
@@ -1184,7 +1509,7 @@ class DataRoom:
                 entries.extend(self._catalog_for_member(member))
             # A source mutation during the bounded scan must fail closed and
             # must never publish a partial catalog under the old identity.
-            self._check_archive_unchanged()
+            self._check_archive_stat()
             result = tuple(sorted(entries, key=lambda item: (item.path, item.sheet_name or "")))
             counts = self.catalog_counts(result)
             payload = {
@@ -1197,6 +1522,7 @@ class DataRoom:
                 "entries": [entry.to_dict() for entry in result],
             }
             _atomic_write_json(self.catalog_path, payload)
+            _record_instrumentation(self.context, "catalog_created")
             self._emit(
                 "data_room_catalog_created",
                 facts={
@@ -1346,6 +1672,21 @@ def _catalog_lock(path: Path):
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
+@contextmanager
+def _candidate_lock(path: Path):
+    """Serialize candidate publication within one item workspace."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as stream:
+        if fcntl is not None:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
 class DataRoomWorkbench:
     """Analyst-facing workbench for one archive and one run context."""
 
@@ -1356,6 +1697,10 @@ class DataRoomWorkbench:
         *,
         runtime: Any = None,
         telemetry: TelemetryRecorder | None = None,
+        _bound_members: Sequence[DataRoomMember] | None = None,
+        _bound_archive_hash: str | None = None,
+        _bound_source_stat: Mapping[str, Any] | None = None,
+        _bound_central_directory_fingerprint: Mapping[str, Any] | None = None,
         **limits: Any,
     ) -> None:
         if runtime is not None and getattr(runtime, "context", context) is not context:
@@ -1363,7 +1708,16 @@ class DataRoomWorkbench:
         self.context = context
         self.runtime = runtime
         self.telemetry = telemetry or getattr(runtime, "telemetry", None) or TelemetryRecorder(context=context)
-        self._room = DataRoom.open(context, archive, telemetry=self.telemetry, **limits)
+        self._room = DataRoom.open(
+            context,
+            archive,
+            telemetry=self.telemetry,
+            bound_members=_bound_members,
+            bound_archive_hash=_bound_archive_hash,
+            bound_source_stat=_bound_source_stat,
+            bound_central_directory_fingerprint=_bound_central_directory_fingerprint,
+            **limits,
+        )
         self.prepared_registry = PreparedAssetRegistry(context, telemetry=self.telemetry)
         self._prepared: dict[str, PreparedAssetDescriptor] = {}
 
@@ -1573,11 +1927,12 @@ class DataRoomWorkbench:
             },
         )
 
-    def save_prepared(
+    def _save_prepared_candidate(
         self,
         prepared_asset_id: str,
         rows: Iterable[Mapping[str, Any]] | DataRoomMember | DataRoomCatalogEntry | str | Path,
         *,
+        candidate_root: Path,
         format: str = "jsonl",
         sheet: str | None = None,
         source_members: Iterable[DataRoomMember | DataRoomCatalogEntry | str | Path] = (),
@@ -1610,7 +1965,7 @@ class DataRoomWorkbench:
             max_bytes = max_output_bytes
         if max_bytes < 0:
             raise ValueError("max_bytes cannot be negative")
-        self._room._check_archive_unchanged()
+        self._room._check_archive_stat()
         source_members = tuple(source_members)
         source_refs = tuple(source_refs)
         transformations = tuple(str(value) for value in transformations)
@@ -1624,8 +1979,12 @@ class DataRoomWorkbench:
             source_refs,
         )
         inferred_schema = self._infer_schema(materialized, schema)
+        candidate_root = self.context.resolve_run_path(candidate_root)
+        target_root = candidate_root / prepared_asset_id
+        if not target_root.is_relative_to(candidate_root):
+            raise ValueError("prepared candidate path escapes item workspace")
         filename = f"{prepared_asset_id}.{normalized_format}"
-        destination = self.context.resolve_run_path(Path("prepared") / filename)
+        destination = target_root / filename
         encoded = self._encode_prepared_rows(materialized, normalized_format, inferred_schema)
         if len(encoded) > max_bytes:
             raise ValueError(f"prepared asset exceeds max_bytes: {len(encoded)} > {max_bytes}")
@@ -1649,12 +2008,57 @@ class DataRoomWorkbench:
             sheet=sheet,
             max_bytes=max_bytes,
         )
-        descriptor_path = self.context.resolve_run_path(Path("prepared") / f"{prepared_asset_id}.descriptor.json")
-        descriptor = self.prepared_registry.materialize_accepted(
-            descriptor,
-            encoded,
-            descriptor_path,
-        )
+        descriptor_path = target_root / f"{prepared_asset_id}.descriptor.json"
+        sidecar_bytes = (json.dumps(descriptor.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+        lock_path = candidate_root / ".candidates.lock"
+        with _candidate_lock(lock_path):
+            if target_root.exists():
+                if target_root.is_symlink() or not target_root.is_dir():
+                    raise ValueError(f"prepared candidate residue is not a directory: {target_root}")
+                if not destination.is_file() or destination.is_symlink() or not descriptor_path.is_file() or descriptor_path.is_symlink():
+                    raise ValueError(f"prepared candidate residue is incomplete: {prepared_asset_id}")
+                try:
+                    existing = PreparedAssetDescriptor.from_dict(json.loads(descriptor_path.read_text(encoding="utf-8")))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
+                    raise ValueError(f"prepared candidate descriptor is invalid: {prepared_asset_id}") from exc
+                if existing != descriptor or destination.read_bytes() != encoded:
+                    raise ValueError(f"prepared candidate already exists with different descriptor: {prepared_asset_id}")
+                descriptor = existing
+            else:
+                residue = tuple(candidate_root.glob(f".{prepared_asset_id}.staging-*"))
+                if residue:
+                    raise ValueError(f"prepared candidate staging residue exists: {prepared_asset_id}")
+                temporary_root = candidate_root / f".{prepared_asset_id}.staging-{uuid.uuid4().hex}"
+                temporary_root.mkdir(parents=True, exist_ok=False)
+                try:
+                    temporary_destination = temporary_root / filename
+                    temporary_descriptor = temporary_root / f"{prepared_asset_id}.descriptor.json"
+                    _atomic_write_bytes(temporary_destination, encoded)
+                    _atomic_write_bytes(temporary_descriptor, sidecar_bytes)
+                    directory = os.open(temporary_root, os.O_RDONLY)
+                    try:
+                        try:
+                            os.fsync(directory)
+                        except OSError:
+                            pass
+                    finally:
+                        os.close(directory)
+                    os.replace(temporary_root, target_root)
+                    try:
+                        parent_fd = os.open(candidate_root, os.O_RDONLY)
+                    except OSError:
+                        parent_fd = None
+                    if parent_fd is not None:
+                        try:
+                            try:
+                                os.fsync(parent_fd)
+                            except OSError:
+                                pass
+                        finally:
+                            os.close(parent_fd)
+                finally:
+                    if temporary_root.exists():
+                        shutil.rmtree(temporary_root, ignore_errors=True)
         self._prepared[prepared_asset_id] = descriptor
         self._emit_prepared(descriptor)
         return descriptor

@@ -147,6 +147,15 @@ not rewrite or rescan the canonical catalog. A source/member read is recorded
 as passive telemetry, and all later source selection uses catalog IDs and the
 original read-only input.
 
+The physical source binding is run-level: the initial full archive/member
+inventory is recorded once, bound child contexts reuse it, and selected-member
+reads are counted separately. `DataRoom.instrumentation_counters` records
+bounded operations such as `archive_full_hash`, `member_content_hash`,
+`selected_member_read`, `catalog_created`, `catalog_reused`, and
+`catalog_loaded`; an explicit final `verify_source_full()` check detects a
+late mutation. Opaque members are safe to copy only through explicit
+materialization and are not semantically parsed.
+
 Before invoking the Lead Analyst, the program creates exactly one durable item
 workspace and authoritative state:
 
@@ -172,6 +181,15 @@ freeze or mutation incident: work remains mutable until acceptance, while the
 final whole-run freeze still precedes products and optimizer evidence
 collection.
 
+The Lead Analyst writes prepared data through
+`BoundAnalysisContext.save_prepared_candidate(...)`. The descriptor and bytes
+are atomically staged under the current item's `work/prepared/` directory and
+are not registry entries. After acceptance, one Result Integration Agent
+stages the descriptor and the commit validates exact path, hash, byte/row
+counts, scope, and provenance before calling the accepted-only registry API.
+Rejected or technical-failure items leave no accepted registry entry; exact
+retries are idempotent and conflicting same IDs fail before external mutation.
+
 ## 3. Durable execution and artifact progress
 
 After every agent response, the Run Director reads structured
@@ -181,14 +199,17 @@ plans without files, and claims of progress do not count. The decision is:
 - progress in material artifacts or counts → continue the current lane;
 - filesystem no-progress → return `await_runtime` or
   `materialization_guidance`, preserving the durable handoff;
-- a completed invocation receipt proving lane/provider/host/process loss →
+- a canonical persisted invocation receipt_ref/hash proving lane/provider/host/process loss →
   authorize execution recovery from that handoff.
 
-There is no wall-time deadline. Filesystem silence or no artifact progress by
-itself is not execution loss: return `await_runtime` or
+There is no wall-time deadline for the workflow. The controlled script runner
+does use an explicit configurable 3600-second process guard by default; this
+is not an agent reasoning deadline. Filesystem silence or no artifact progress
+by itself is not execution loss: return `await_runtime` or
 `materialization_guidance` and preserve the handoff. Execution recovery is
-allowed only when a completed invocation receipt proves lane/provider/host/
-process loss. Provider and model identity may be the literal value
+allowed only when a canonical persisted invocation receipt reference proves
+lane/provider/host/process loss and matches the active attempt and lane.
+Unpersisted or mismatched receipt references fail closed. Provider and model identity may be the literal value
 `unavailable`; never invent an identity. When authorized, recovery preserves
 the existing scratch and handoff, increments an execution-recovery count
 separate from business repair, and resumes the same item without rerunning
@@ -227,7 +248,9 @@ freeze, and Knowledge Delta application.
 - **Result Integration Agent** is the one post-acceptance owner. It incrementally
   consumes program APIs for claims, metrics, limitations, evidence, prepared
   assets, ontology, relationships, and dashboard facts; deterministic program
-  code validates types, paths, refs, hashes, stages, and commits.
+  code validates types, paths, refs, hashes, stages, and commits. These
+  mechanical checks cannot prove semantic completeness; the live Integration
+  Agent and an external test-only fidelity audit remain required.
 - **Evidence Collector** is a post-run deterministic observer of workflow and
   substrate evidence. A separate fresh Optimization Agent may later reason
   from its bounded bundle.
@@ -253,7 +276,7 @@ program builds data room/source catalog
   → Lead Analyst appends findings, evidence, and loadable prepared assets
   → Run Director checks artifact_progress after each response
   → filesystem no-progress returns materialization_guidance
-  → completed invocation receipt proves lane/provider/host/process loss
+  → canonical persisted invocation receipt_ref/hash proves lane/provider/host/process loss
   → optional execution recovery only after the completed loss receipt
   → materialized draft
   → one Independent Reviewer (source completeness and identity route included)
@@ -285,14 +308,19 @@ linked, separately addressable layers:
    source/evidence references. Entries may be source-scoped or
    requirement-scoped.
 
-Prepared Registry entries must refer to loadable run-local assets and record an
-asset hash, location, schema, grain, lineage/source IDs, effective period,
-transformations, evidence, and limits. Every accepted prepared asset is
-registered. A canonical catalog identity is immutable by source hash, core
-version, and schema; derived samples/categories and scope/reuse visibility
-views never mutate that identity. Scope and reuse eligibility control
-visibility only. Keep reusable preparation distinct from a requirement-scoped
-view and preserve conflicting definitions rather than overwriting them.
+Prepared candidates are mutable analysis outputs below the current item's
+`work/prepared/` directory. A candidate descriptor records the asset hash,
+location, schema, grain, lineage/source IDs, effective period, transformations,
+evidence, limits, byte/row counts, and scope, but it is not registry state.
+Prepared Registry entries refer only to accepted, loadable run-local assets;
+the accepted Result Integration commit validates the exact candidate and
+registers it once. Registration is idempotent for an exact descriptor and
+rejects a same-ID conflict before registry/LEM mutation. A canonical catalog
+identity is immutable by source hash, core version, and schema; derived
+samples/categories and scope/reuse visibility views never mutate that identity.
+Scope and reuse eligibility control visibility only. Keep reusable preparation
+distinct from a requirement-scoped view and preserve conflicting definitions
+rather than overwriting them.
 
 The compact source, ontology, and prepared indexes are searchable; both LEM
 layers start empty in clean-room mode. Before reuse, check source scope,
@@ -313,8 +341,10 @@ After acceptance, the Result Integration Agent uses small program-owned APIs
 for claims, metrics, limitations, evidence references, prepared assets,
 ontology records, relationship facts, and dashboard facts. It performs
 semantic mapping only; deterministic code validates types, paths, refs,
-hashes, stages, and commits. There is no prose parser, giant mandatory JSON
-envelope, or finalizer chain at this boundary.
+hashes, stages, and commits. Mechanical validation cannot prove semantic
+completeness; a live Integration Agent and an external test-only fidelity audit
+remain required. There is no prose parser, semantic compiler, giant mandatory
+JSON envelope, Integration Reviewer, or finalizer chain at this boundary.
 
 ## 6. Deterministic operations and custom work
 
@@ -325,7 +355,7 @@ item. `CoreRuntime` remains available for deterministic operations, while
 the runtime `smoke`/`full` receipts. A deterministic comparison adds an
 optional second `full` receipt, while a failed preflight emits its `compile` or
 `dependency_check` receipt. The runner bounds paths, process, environment,
-timeouts, and output;
+timeouts (default 3600 seconds, an explicit process guard), and output;
 it is not a security sandbox and hostile code requires a host/container
 isolation boundary:
 
@@ -476,7 +506,9 @@ Terminal reason classifier output is exactly `same_attempt_feedback`,
 raw terminal reasons remain specific facts. Telemetry must not
 contain raw rows, secrets, tokens, or unnecessary personal data. It observes
 the run; it never selects a route, creates a gate, restarts a thread, or
-changes an answer.
+changes an answer. Run-level physical-inventory operation names/counters and
+canonical recovery receipt references/hashes may be recorded, but raw source
+data is never included.
 
 Only after accepted snapshots and outcomes are frozen, the LEM and prepared
 registry are frozen, the dashboard prototype is complete, and telemetry is
@@ -545,7 +577,7 @@ artifacts, or central/cross-run caches.
   business-repair finalizer, reviewer-of-reviewer, manual terminalizer,
   Integration Reviewer, wall-time deadline, parallel question
   wave, business-term dictionary, domain recipe, central ontology, cross-run
-  cache, production app, external call, compatibility wrapper, or a second
+  cache, production app, external call, fallback wrapper, or a second
   repair.
 - Do not let filesystem no-progress authorize recovery; return
   `await_runtime` or `materialization_guidance` until a completed invocation

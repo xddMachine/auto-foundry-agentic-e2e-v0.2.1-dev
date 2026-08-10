@@ -13,6 +13,12 @@ hashes, bounded columns/types, bounded samples or values, and workbook sheet
 metadata. The raw archive remains read-only; the catalog is not a transaction
 copy. Source/member reads are observed in passive telemetry.
 
+Physical binding is run-level: the initial full archive/member inventory is
+counted once, bound child contexts reuse it, and selected-member verification
+is counted separately. An explicit final `verify_source_full()` detects a late
+mutation. Opaque members have no semantic parser; copy them only through the
+safe explicit materialization operation.
+
 ## Two linked layers
 
 Keep these run-local layers separate but link them with evidence references:
@@ -27,15 +33,18 @@ ontology.
 
 ### Prepared Data Registry
 
-A registry of reusable derived assets: profiles, normalized values, mappings,
-relationship measurements, prepared tables, and other bounded views. Each
-entry records source references, an exact asset ID, a run-local loadable
-location, content hash, schema, grain, lineage/source IDs, scope, effective
-period, transformations, evidence, limits, and whether it is reusable
-preparation or a requirement-scoped view. Every accepted asset is registered
-in a canonical catalog whose identity is immutable by source hash, core
-version, and schema. Samples and categories are derived views; scope and reuse
-eligibility control visibility only.
+Analysis first writes a candidate asset and descriptor atomically below the
+current item's `work/prepared/` directory. A candidate records source
+references, an exact asset ID, loadable location, content hash, byte/row counts,
+schema, grain, lineage/source IDs, scope, effective period, transformations,
+evidence, and limits, but it is not registry state. After item acceptance, one
+Result Integration Agent stages that descriptor and the accepted commit
+performs exact path/hash/row/byte/scope/provenance checks before calling the
+accepted-only registry API. Every accepted asset is registered once in a
+canonical catalog whose identity is immutable by source hash, core version,
+and schema. Samples and categories are derived views; scope and reuse
+eligibility control visibility only. Exact retries are idempotent; a conflicting
+same-ID descriptor fails before registry/LEM mutation.
 
 Entries may be source-scoped when their evidence, scope, and period support
 reuse. Keep reusable preparation distinct from a requirement-scoped view and
@@ -63,7 +72,9 @@ After acceptance, exactly one Result Integration Agent incrementally consumes
 claims, metrics, limitations, evidence refs, prepared assets, ontology,
 relationships, and dashboard facts through small program APIs. It performs
 semantic mapping; deterministic code validates types, paths, refs, hashes,
-stages, and commits. There is no prose parser, giant mandatory JSON,
+stages, and commits. Mechanical validation cannot prove semantic completeness;
+the live Integration Agent and an external test-only fidelity audit remain
+required. There is no prose parser, semantic compiler, giant mandatory JSON,
 Integration Reviewer, or finalizer chain.
 
 ## Knowledge item shape

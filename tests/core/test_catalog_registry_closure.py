@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import zipfile
 
@@ -12,8 +12,8 @@ import pytest
 
 from auto_foundry_core.contracts import DataAssetRef
 from auto_foundry_core.telemetry import TelemetryRecorder
-from auto_foundry_core.workbench import CatalogCounts, DataRoom, DataRoomWorkbench
-from auto_foundry_core.workspace import AllowedRootError, RunContext
+from auto_foundry_core.workbench import CatalogCounts, DataRoom
+from auto_foundry_core.workspace import RunContext
 
 
 def _xlsx_bytes() -> bytes | None:
@@ -129,162 +129,70 @@ def test_catalog_counts_keep_physical_and_expanded_xlsx_entries_distinct(tmp_pat
         CatalogCounts(archive_members="3", catalog_entries=4, table_members=2, sheet_entries=2)  # type: ignore[arg-type]
 
 
-def test_prepared_registry_records_scope_independently_of_reuse(tmp_path: Path) -> None:
-    context, archive = _room(tmp_path)
-    workbench = DataRoomWorkbench(context, DataAssetRef.from_path(archive))
-    requirement = workbench.save_prepared("requirement", [{"value": 1}])
-    reusable = workbench.save_prepared("reusable", [{"value": 2}], scope="reusable")
-    exploratory = workbench.save_prepared("exploratory", [{"value": 3}], scope="exploratory")
-    superseded = workbench.save_prepared("superseded", [{"value": 4}], scope="superseded")
-
-    assert requirement.scope == "requirement_scoped"
-    assert tuple(item.prepared_asset_id for item in workbench.prepared_registry.search()) == (
-        "exploratory",
-        "requirement",
-        "reusable",
-    )
-    assert tuple(item.prepared_asset_id for item in workbench.prepared_registry.search(reusable_only=True)) == ("reusable",)
-    assert workbench.prepared_registry.search(scope="requirement_scoped") == (requirement,)
-    assert workbench.prepared_registry.search(include_superseded=True)[-1] == superseded
-    assert workbench.prepared_registry.load("reusable").descriptor == reusable
-    assert workbench.prepared_registry.load("requirement").descriptor.source_refs == requirement.source_refs
-
-    registry_lines = (context.run_root / "lem" / "prepared_data_registry.jsonl").read_text(encoding="utf-8").splitlines()
-    index = json.loads((context.run_root / "indexes" / "prepared_index.json").read_text(encoding="utf-8"))
-    assert len(registry_lines) == 4
-    assert len(index["entries"]) == 4
-    assert {json.loads(line)["prepared_asset_id"] for line in registry_lines} == {"requirement", "reusable", "exploratory", "superseded"}
-
-    # Exact duplicate registration is idempotent, while same-ID descriptor
-    # collisions fail before changing registry state.
-    assert workbench.prepared_registry.preflight_register(requirement) == requirement
-    workbench.prepared_registry.register_accepted(requirement)
-    before_collision = (context.run_root / "lem" / "prepared_data_registry.jsonl").read_bytes()
-    with pytest.raises(ValueError, match="different descriptor"):
-        workbench.save_prepared("requirement", [{"value": 999}])
-    assert (context.run_root / "lem" / "prepared_data_registry.jsonl").read_bytes() == before_collision
-
-
-def test_prepared_registry_rejects_tamper_and_path_escape(tmp_path: Path) -> None:
-    context, archive = _room(tmp_path)
-    workbench = DataRoomWorkbench(context, archive)
-    descriptor = workbench.save_prepared("tamper", [{"value": 1}], scope="reusable")
-    prepared_path = context.resolve_run_path("prepared/tamper.jsonl")
-    prepared_path.write_text(prepared_path.read_text(encoding="utf-8") + '{"value":2}\n', encoding="utf-8")
-    with pytest.raises(ValueError, match="content changed"):
-        workbench.prepared_registry.load("tamper")
-
-    outside = tmp_path / "outside.jsonl"
-    outside.write_text('{"value":1}\n', encoding="utf-8")
-    escaped = replace(descriptor, prepared_asset_id="escaped", location=str(outside))
-    with pytest.raises(AllowedRootError):
-        workbench.prepared_registry.register_accepted(escaped)
-    assert workbench.prepared_registry.search(prepared_asset_id="escaped", include_superseded=True) == ()
-
-
-def test_prepared_materialization_is_one_locked_transaction_for_two_writers(tmp_path: Path) -> None:
-    context, archive = _room(tmp_path)
-    workbenches = tuple(
-        DataRoomWorkbench(context, DataAssetRef.from_path(archive))
-        for _ in range(2)
-    )
-
-    def save(workbench: DataRoomWorkbench, value: int) -> tuple[str, object]:
-        try:
-            return "ok", workbench.save_prepared(
-                "same-id",
-                [{"value": value}],
-                scope="reusable",
-            )
-        except Exception as exc:  # one writer must lose the same-ID decision
-            return "error", exc
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        results = tuple(executor.map(save, workbenches, (1, 2)))
-
-    assert sum(status == "ok" for status, _ in results) == 1
-    errors = [value for status, value in results if status == "error"]
-    assert len(errors) == 1
-    assert isinstance(errors[0], ValueError)
-    assert "different descriptor" in str(errors[0])
-
-    payload_path = context.resolve_run_path("prepared/same-id.jsonl")
-    sidecar_path = context.resolve_run_path("prepared/same-id.descriptor.json")
-    registry_path = context.resolve_run_path("lem/prepared_data_registry.jsonl")
-    index_path = context.resolve_run_path("indexes/prepared_index.json")
-    descriptor_payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
-    registry_payload = json.loads(registry_path.read_text(encoding="utf-8").splitlines()[0])
-    index_payload = json.loads(index_path.read_text(encoding="utf-8"))
-    expected_hash = hashlib.sha256(payload_path.read_bytes()).hexdigest()
-    assert descriptor_payload["prepared_content_hash"] == expected_hash
-    assert registry_payload == descriptor_payload
-    assert index_payload["entries"] == [
-        {
-            "byte_count": descriptor_payload["byte_count"],
-            "core_version": descriptor_payload["core_version"],
-            "effective_period": descriptor_payload["effective_period"],
-            "location": descriptor_payload["location"],
-            "operation_manifest_hash": descriptor_payload["operation_manifest_hash"],
-            "prepared_asset_id": "same-id",
-            "prepared_content_hash": expected_hash,
-            "row_count": descriptor_payload["row_count"],
-            "scope": descriptor_payload["scope"],
-            "source_hashes": descriptor_payload["source_hashes"],
-            "source_refs": descriptor_payload["source_refs"],
-            "status": descriptor_payload["status"],
-        }
-    ]
-
-
-def test_prepared_materialization_equal_concurrent_writers_are_idempotent(tmp_path: Path) -> None:
-    context, archive = _room(tmp_path)
-    workbenches = tuple(
-        DataRoomWorkbench(context, DataAssetRef.from_path(archive))
-        for _ in range(2)
-    )
-
-    def save(workbench: DataRoomWorkbench) -> object:
-        return workbench.save_prepared(
-            "same-id",
-            [{"value": 7}],
-            scope="reusable",
-        )
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        descriptors = tuple(executor.map(save, workbenches))
-    assert descriptors[0] == descriptors[1]
-    assert workbenches[0].prepared_registry.search(prepared_asset_id="same-id") == (descriptors[0],)
-
-
-def test_prepared_materialization_retry_repairs_registry_index_after_crash(
+def test_bound_child_reuses_persisted_inventory_and_catalog_counters(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     context, archive = _room(tmp_path)
-    workbench = DataRoomWorkbench(context, DataAssetRef.from_path(archive))
-    import auto_foundry_core.prepared as prepared_module
+    from auto_foundry_core.analysis import BoundAnalysisContext, load_bound_analysis_context
+    from auto_foundry_core.durable import ItemWorkspace
 
-    original_atomic_write = prepared_module._atomic_write
-    calls = 0
+    item = ItemWorkspace.create(context, "Q-001", original_text="catalog")
+    bound = BoundAnalysisContext.create(context, DataAssetRef.from_path(archive), item)
+    for _ in range(2):
+        monkeypatch.setattr(
+            zipfile.ZipFile,
+            "infolist",
+            lambda _zip: (_ for _ in ()).throw(AssertionError("bound reload enumerated ZipInfo")),
+        )
+        loaded = load_bound_analysis_context(context, path=bound.manifest_path)
+        assert loaded.source_catalog.entries == bound.source_catalog.entries
+        monkeypatch.undo()
 
-    def fail_before_index(path: Path, content: str) -> None:
-        nonlocal calls
-        calls += 1
-        # Sidecar is call one, registry projection call two, index call three.
-        if calls == 3:
-            raise RuntimeError("injected publication crash")
-        original_atomic_write(path, content)
+    counters = bound.data_room.instrumentation_counters
+    assert counters["archive_full_hash"]["count"] == 1
+    assert counters["catalog_created"]["count"] == 1
+    assert counters["catalog_loaded"]["count"] == 2
+    assert counters["catalog_reused"]["count"] == 2
+    assert counters["central_directory_fingerprint"]["count"] == 3
+    assert counters["member_content_hash"]["bytes"] >= sum(member.size_bytes for member in bound.data_room.members())
+    assert "selected_member_read" not in counters
 
-    monkeypatch.setattr(prepared_module, "_atomic_write", fail_before_index)
-    with pytest.raises(RuntimeError, match="publication crash"):
-        workbench.save_prepared("crash-resume", [{"value": 1}], scope="reusable")
-    assert context.resolve_run_path("prepared/crash-resume.jsonl").is_file()
-    assert context.resolve_run_path("prepared/crash-resume.descriptor.json").is_file()
-    assert context.resolve_run_path("lem/prepared_data_registry.jsonl").is_file()
-    assert not context.resolve_run_path("indexes/prepared_index.json").exists()
+    loaded.data_room.read_rows("orders.csv", limit=1)
+    counters = loaded.data_room.instrumentation_counters
+    assert counters["selected_member_read"]["count"] == 1
+    assert counters["selected_member_read"]["bytes"] == len(b"order_id,region\nA-1,DE\nA-2,FR\n")
+    loaded.data_room.verify_source_full()
+    assert loaded.data_room.instrumentation_counters["verify_source_full"]["count"] == 1
 
-    monkeypatch.setattr(prepared_module, "_atomic_write", original_atomic_write)
-    descriptor = workbench.save_prepared("crash-resume", [{"value": 1}], scope="reusable")
-    assert descriptor.prepared_asset_id == "crash-resume"
-    assert context.resolve_run_path("indexes/prepared_index.json").is_file()
-    assert workbench.prepared_registry.load("crash-resume").descriptor == descriptor
+
+def test_candidate_materialization_stays_out_of_accepted_registry(tmp_path: Path) -> None:
+    context, archive = _room(tmp_path)
+    from auto_foundry_core.analysis import BoundAnalysisContext
+    from auto_foundry_core.durable import ItemWorkspace
+
+    item = ItemWorkspace.create(context, "Q-001", original_text="prepared")
+    bound = BoundAnalysisContext.create(context, DataAssetRef.from_path(archive), item)
+    descriptor = bound.save_prepared_candidate("candidate", [{"value": 1}], scope="reusable")
+    assert Path(descriptor.location).is_file()
+    assert Path(descriptor.location).parent.parent == item.work_root / "prepared"
+    assert bound.prepared_assets.search(prepared_asset_id="candidate") == ()
+    assert bound.save_prepared_candidate("candidate", [{"value": 1}], scope="reusable") == descriptor
+    with pytest.raises(ValueError, match="different descriptor"):
+        bound.save_prepared_candidate("candidate", [{"value": 2}], scope="reusable")
+
+
+def test_bound_reload_rejects_central_directory_mutation_with_same_stat(tmp_path: Path) -> None:
+    context, archive = _room(tmp_path)
+    from auto_foundry_core.analysis import BoundAnalysisContext, load_bound_analysis_context
+    from auto_foundry_core.durable import ItemWorkspace
+
+    item = ItemWorkspace.create(context, "Q-CENTRAL", original_text="central")
+    bound = BoundAnalysisContext.create(context, DataAssetRef.from_path(archive), item)
+    original_stat = archive.stat()
+    changed = archive.read_bytes().replace(b"notes.txt", b"notes.bin")
+    assert changed != archive.read_bytes() and len(changed) == len(archive.read_bytes())
+    archive.write_bytes(changed)
+    os.utime(archive, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    with pytest.raises(ValueError, match="central directory"):
+        load_bound_analysis_context(context, path=bound.manifest_path)

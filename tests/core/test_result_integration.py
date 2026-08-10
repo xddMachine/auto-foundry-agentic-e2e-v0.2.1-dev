@@ -29,8 +29,23 @@ def _accepted(context: RunContext, item_id: str, value: object | None = None) ->
     return workspace
 
 
-def _asset(context: RunContext, asset_id: str, *, scope: str = "reusable") -> PreparedAssetDescriptor:
-    path = context.run_root / "prepared" / f"{asset_id}.jsonl"
+def _asset(
+    context: RunContext,
+    asset_id: str,
+    *,
+    scope: str = "reusable",
+    workspace: ItemWorkspace | None = None,
+) -> PreparedAssetDescriptor:
+    if workspace is None:
+        # Existing tests create exactly one accepted question before creating a
+        # candidate.  Keeping this fallback makes the helper convenient while
+        # the public workbench candidate API is exercised by integration tests.
+        question_roots = sorted((context.run_root / "questions").glob("*/work"))
+        if not question_roots:
+            raise AssertionError("candidate helper requires an accepted item workspace")
+        path = question_roots[0] / "prepared" / f"{asset_id}.jsonl"
+    else:
+        path = workspace.work_root / "prepared" / f"{asset_id}.jsonl"
     payload = b'{"asset": "' + asset_id.encode("utf-8") + b'"}\n'
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(payload)
@@ -242,7 +257,7 @@ def test_intent_before_apply_and_retry_after_publish_or_item_state_crash(tmp_pat
 def test_partial_external_apply_retries_without_duplicates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     context = RunContext("RUN", tmp_path / "run")
     workspace, lem, registry, session = _session(context)
-    first = _asset(context, "asset-first")
+    first = _asset(context, "asset-first", workspace=workspace)
     session.register_prepared_asset(first)
     session.add_claim("later", scope="question", evidence_refs=("work/plan.json",))
     original_apply = session._apply_lem_record
@@ -359,8 +374,8 @@ def test_technical_failure_manifest_and_item_state_crashes_converge(tmp_path: Pa
 def test_prepared_assets_all_scopes_register_and_reusable_loads_next_item(tmp_path: Path) -> None:
     context = RunContext("RUN", tmp_path / "run")
     workspace1, lem, registry, session1 = _session(context, "Q-001")
-    reusable = _asset(context, "asset-reusable", scope="reusable")
-    scoped = _asset(context, "asset-scoped", scope="requirement_scoped")
+    reusable = _asset(context, "asset-reusable", scope="reusable", workspace=workspace1)
+    scoped = _asset(context, "asset-scoped", scope="requirement_scoped", workspace=workspace1)
     session1.register_prepared_asset(reusable)
     session1.register_prepared_asset(scoped)
     session1.commit()
@@ -375,6 +390,142 @@ def test_prepared_assets_all_scopes_register_and_reusable_loads_next_item(tmp_pa
     session2.commit()
     assert "item-2" in lem.ontology
     assert workspace1.accepted_root.joinpath("answer_content.json").read_bytes()
+
+
+def test_prepared_candidate_is_staged_without_registry_mutation_until_commit(tmp_path: Path) -> None:
+    context = RunContext("RUN", tmp_path / "run")
+    workspace, lem, registry, session = _session(context)
+    candidate = _asset(context, "candidate-staged", workspace=workspace)
+    session.register_prepared_asset(candidate)
+    assert registry.search(prepared_asset_id=candidate.prepared_asset_id) == ()
+    assert not registry.registry_path.exists()
+    session.commit()
+    assert registry.search(prepared_asset_id=candidate.prepared_asset_id) == (candidate,)
+
+
+def test_direct_registry_publication_bypass_requires_integration_commit_authority(tmp_path: Path) -> None:
+    context = RunContext("RUN", tmp_path / "run")
+    workspace, _lem, registry, integration_session = _session(context)
+    candidate = _asset(context, "direct-bypass", workspace=workspace)
+    with pytest.raises(ValueError, match="IntegrationSession commit authority"):
+        registry.register_accepted(candidate, item_workspace=workspace)
+    assert registry.search(prepared_asset_id=candidate.prepared_asset_id) == ()
+
+
+def test_registry_index_crash_repairs_on_exact_integration_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = RunContext("RUN", tmp_path / "run")
+    workspace, _lem, registry, session = _session(context)
+    candidate = _asset(context, "index-retry", workspace=workspace)
+    session.register_prepared_asset(candidate)
+
+    import auto_foundry_core.prepared as prepared_module
+
+    original_atomic_write = prepared_module._atomic_write
+    crashed = {"value": False}
+
+    def fail_index_once(path: Path, content: str) -> None:
+        if path == registry.index_path and not crashed["value"]:
+            crashed["value"] = True
+            raise RuntimeError("index publication crash")
+        original_atomic_write(path, content)
+
+    monkeypatch.setattr(prepared_module, "_atomic_write", fail_index_once)
+    with pytest.raises(RuntimeError, match="index publication crash"):
+        session.commit()
+    assert registry.search(prepared_asset_id=candidate.prepared_asset_id) == (candidate,)
+    assert workspace.integration_state == "pending"
+    monkeypatch.setattr(prepared_module, "_atomic_write", original_atomic_write)
+
+    manifest = session.commit()
+    assert manifest["status"] == "committed"
+    assert workspace.integration_state == "integrated"
+    index = json.loads(registry.index_path.read_text(encoding="utf-8"))
+    assert [entry["prepared_asset_id"] for entry in index["entries"]] == [candidate.prepared_asset_id]
+
+
+def test_accepted_bundle_metadata_is_deeply_immutable(tmp_path: Path) -> None:
+    context = RunContext("RUN", tmp_path / "run")
+    workspace, _lem, _registry, session = _session(context, value={"nested": ["answer"]})
+    bundle = AcceptedAnalysisBundle.load(workspace)
+
+    assert isinstance(bundle.acceptance_envelope["accepted_refs"], tuple)
+    with pytest.raises(TypeError):
+        bundle.acceptance_envelope["accepted_refs"] = ("tampered",)  # type: ignore[index]
+    with pytest.raises(TypeError):
+        bundle.manifest["artifact_progress"]["hashes"]["tampered"] = "0" * 64  # type: ignore[index]
+    with pytest.raises(AttributeError):
+        bundle.manifest["artifact_progress"]["files"].append("tampered")  # type: ignore[union-attr]
+
+    session.add_claim("still bound", scope="question", evidence_refs=("answer_content.json",))
+    session.commit()
+
+
+def test_rejected_or_item_technical_failure_cannot_register_prepared_asset(tmp_path: Path) -> None:
+    context = RunContext("RUN", tmp_path / "run")
+    rejected = ItemWorkspace.create(context, "Q-REJECTED", original_text="rejected")
+    rejected.write_plan({"item_id": rejected.item_id})
+    rejected.write_draft({"answer": "no"})
+    rejected.record_review("block_specific_claims", reviewer_ref="synthetic-reviewer")
+    with pytest.raises(ValueError):
+        rejected.accept(accepted_refs=("work/plan.json",))
+    registry = PreparedAssetRegistry(context)
+    assert registry.search() == ()
+
+    failed = ItemWorkspace.create(context, "Q-FAILED", original_text="failed")
+    failed.write_plan({"item_id": failed.item_id})
+    failed.write_draft({"answer": "failed"})
+    failed.technical_failure("unrecoverable", recovery_exhausted=True)
+    assert registry.search() == ()
+    with pytest.raises(ValueError):
+        IntegrationSession.create(context, failed, LivingEnterpriseModel(run_id=context.run_id), registry, "owner")
+    assert registry.search() == ()
+
+
+def test_prepared_candidate_scope_and_same_id_conflict_fail_before_commit_intent(tmp_path: Path) -> None:
+    context = RunContext("RUN", tmp_path / "run")
+    workspace1, lem, registry, session1 = _session(context, "Q-001")
+    first = _asset(context, "same-id", scope="exploratory", workspace=workspace1)
+    session1.register_prepared_asset(first)
+    session1.commit()
+    assert registry.search(prepared_asset_id="same-id", scope="exploratory") == (first,)
+
+    workspace2 = _accepted(context, "Q-002")
+    session2 = IntegrationSession.create(context, workspace2, lem, registry, "integration-owner")
+    conflict = _asset(context, "same-id", scope="superseded", workspace=workspace2)
+    with pytest.raises(ValueError, match="different descriptor"):
+        session2.register_prepared_asset(conflict)
+    assert not (session2.staging_root / "commit_intent.json").exists()
+    assert workspace2.integration_state == "pending"
+    assert registry.search(prepared_asset_id="same-id", scope="exploratory") == (first,)
+
+
+def test_prepared_candidate_mutation_after_staging_fails_without_registry_entry(tmp_path: Path) -> None:
+    context = RunContext("RUN", tmp_path / "run")
+    workspace, lem, registry, session = _session(context)
+    candidate = _asset(context, "candidate-mutated", workspace=workspace)
+    session.register_prepared_asset(candidate)
+    path = Path(candidate.location)
+    path.write_bytes(b'{"asset":"tampered"}\n')
+    with pytest.raises(ValueError, match="changed|match|byte"):
+        session.commit()
+    assert registry.search(prepared_asset_id=candidate.prepared_asset_id) == ()
+    assert workspace.integration_state == "pending"
+
+
+def test_accepted_bundle_mutation_after_staging_is_rejected_before_external_apply(tmp_path: Path) -> None:
+    context = RunContext("RUN", tmp_path / "run")
+    workspace, lem, registry, session = _session(context)
+    session.add_claim("bound claim", scope="question", evidence_refs=("answer_content.json",))
+    accepted_path = workspace.accepted_root / "answer_content.json"
+    accepted_path.write_bytes(b'{"answer":"tampered"}\n')
+    with pytest.raises(ValueError, match="terminal|bundle|hash"):
+        session.commit()
+    assert workspace.integration_state == "pending"
+    assert lem.ontology == {}
+    assert registry.search() == ()
 
 
 def test_record_shape_and_snapshot_tamper_rejected(tmp_path: Path) -> None:

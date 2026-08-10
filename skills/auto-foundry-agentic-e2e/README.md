@@ -24,6 +24,12 @@ available for deterministic operations. The program owns lifecycle,
 integration/product/optimizer transitions, strict freeze markers, and terminal
 state. Agents never hand-edit terminal state.
 
+The run binds one physical source inventory. Initial archive/member hashes are
+counted once; bound child contexts reuse that inventory, selected-member reads
+are counted separately, and an explicit `verify_source_full()` call performs
+the final mutation check. Opaque members may be copied only through explicit
+safe materialization and are never semantically parsed.
+
 ## Choose one mode
 
 - **Question Mode** preserves supplied wording and order, processes one
@@ -34,8 +40,9 @@ state. Agents never hand-edit terminal state.
   emits successful runtime receipts for `smoke` and `full`; a requested
   deterministic comparison adds a second `full` receipt, while a failed
   preflight emits its `compile` or `dependency_check` receipt. Coding errors
-  return to the same attempt, while execution recovery requires a completed invocation receipt
-  proving lane/provider/host/process loss. The program then routes one
+  return to the same attempt, while execution recovery requires a canonical
+  persisted receipt reference/hash proving lane/provider/host/process loss and
+  matching the active attempt and lane. The program then routes one
   reviewer, allows at most one targeted business repair plus re-review, and
   writes immutable accepted answer bytes beside a separate acceptance envelope
   before continuing. It builds the dashboard after the complete queue and
@@ -69,8 +76,11 @@ while a failed preflight emits only its `compile` or `dependency_check` receipt.
 `draft` appears only when materialized. Accepted answer bytes are immutable and separate from the
 program-owned acceptance envelope; `work` remains mutable. Filesystem
 no-progress produces `await_runtime` or `materialization_guidance`, not
-recovery. Only a completed invocation receipt proving lane/provider/host/
-process loss authorizes execution recovery. There is no wall-time deadline,
+recovery. Only a canonical persisted receipt reference/hash proving lane/
+provider/host/process loss and matching the active attempt/lane authorizes
+execution recovery. There is no wall-time deadline for the workflow; the
+runner's explicit default 3600-second process guard is not an agent reasoning
+deadline,
 terminalizer agent, or per-question freeze incident.
 
 Compact source/LEM/prepared indexes remain searchable and the Lead Analyst
@@ -79,6 +89,17 @@ used internally; custom reproducible code is allowed. There is no Portfolio
 Planner, Navigator, descriptor/typed-validation role, business-repair
 finalizer, reviewer-of-reviewer, manual terminalizer, or per-item
 catalog-compliance artifact.
+
+Prepared data is first a candidate written atomically below the current item's
+`work/prepared/` directory through
+`BoundAnalysisContext.save_prepared_candidate(...)`; the candidate is absent
+from `PreparedAssetRegistry`. After acceptance, exactly one Result Integration
+Agent stages it and the commit validates exact path, hash, byte/row counts,
+scope, and provenance before registering it once. Scope is retained, exact
+retries are idempotent, and rejected or technical-failure items leave no
+accepted entry. Mechanical validation cannot prove semantic completeness;
+the live Integration Agent and an external test-only fidelity audit remain
+required.
 
 When exact identity overlap is absent but same-object representations are
 materially plausible, the run records candidates, evidence/coverage, a
@@ -99,8 +120,12 @@ After acceptance, exactly one Result Integration Agent incrementally consumes
 small program APIs for claims, metrics, limitations, evidence, prepared
 assets, ontology, relationships, and dashboard facts. It performs semantic
 mapping; deterministic code validates types, paths, refs, hashes, stages, and
-commits. There is no prose parser, giant mandatory JSON, Integration Reviewer,
-or finalizer chain.
+commits. There is no prose parser, semantic compiler, giant mandatory JSON,
+Integration Reviewer, or finalizer chain. The runner's explicit configurable
+default is a 3600-second process guard, not an agent reasoning or workflow
+wall-time deadline. Recovery accepts only a canonical persisted receipt
+reference/hash with the active attempt and lane; unpersisted or mismatched
+references fail closed.
 
 Passive attempt/artifact telemetry records invocation lane/role/route,
 start/end/status/error when available, artifact before/after/counts, recovery

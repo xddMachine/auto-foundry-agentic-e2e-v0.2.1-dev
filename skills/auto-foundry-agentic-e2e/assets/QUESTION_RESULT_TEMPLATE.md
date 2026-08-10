@@ -17,11 +17,17 @@
 - Data-room source catalog:
 - Raw archive read-only: `true` | `false`
 - Source/member metadata and bounded reads:
+- Run-level physical inventory counters (initial full bind, child loads without
+  re-inventory, selected-member verification, final explicit verification):
+- Opaque-member materialization (safe explicit copy only; no semantic parser):
 - Compact source/LEM/prepared IDs selected directly by Lead Analyst:
 - Plan/source map materialized before analysis:
 - Artifact progress before/after/counts:
-- No-progress decisions: `continue` | `require_materialization` | `recover`
+- No-progress decisions: `await_runtime` | `materialization_guidance`
+- Execution recovery is separate from no-progress decisions and requires a
+  canonical persisted execution-loss receipt; it is not a no-progress decision:
 - Execution recovery count/routes and scratch preservation:
+- Recovery receipt reference/hash (canonical persisted ref; attempt/lane match):
 
 ## User-owned request
 
@@ -75,7 +81,8 @@
 - Knowledge Delta: `promoted` | `promoted_with_limits` | `no_change`
 - Concrete `no_change` reason (when applicable):
 - Atomic application receipt (program-owned):
-- Prepared assets (loadable run-local hash/location/schema/grain/lineage):
+- Prepared candidates (item `work/prepared/` hash/location/schema/grain/lineage;
+  not registry state before accepted integration):
 - Telemetry event references:
 
 ## Result integration
@@ -86,3 +93,7 @@
 - Semantic mappings:
 - Deterministic validation: types, paths, refs, hashes, stages, commits
 - Integration state/receipt:
+- Accepted registry publication (exactly once at accepted commit; scope retained;
+  rejected/technical-failure leaves no entry):
+- Mechanical validation limitation: semantic completeness requires the live
+  Integration Agent and an external test-only fidelity audit:

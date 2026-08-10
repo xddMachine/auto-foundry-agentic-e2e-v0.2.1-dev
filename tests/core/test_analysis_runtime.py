@@ -177,6 +177,97 @@ def test_output_escape_timeout_and_output_cap_are_rejected_or_bounded(tmp_path: 
     assert capped.same_attempt_feedback
 
 
+def test_runner_manifest_timeout_and_output_integrity_guards(tmp_path: Path) -> None:
+    context, _, item, bound = _fixture(tmp_path)
+    assert bound.runner_config["default_timeout_seconds"] == 3600.0
+    manifest = json.loads(bound.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["runner_config"]["default_timeout_seconds"] == 3600.0
+
+    undeclared = _write_script(
+        item,
+        "undeclared.py",
+        "from pathlib import Path\nPath('undeclared.txt').write_text('no', encoding='utf-8')\n",
+    )
+    report = bound.script_runner.run_pipeline(undeclared)
+    assert report.status == "failed"
+    assert report.receipts[0].error_type == "UndeclaredOutput"
+    assert not (item.work_root / "undeclared.txt").exists()
+
+    bytecode = _write_script(
+        item,
+        "bytecode.py",
+        "from pathlib import Path\nPath('manual.pyc').write_bytes(b'bad')\n",
+    )
+    report = bound.script_runner.run_pipeline(bytecode)
+    assert report.status == "failed"
+    assert report.receipts[0].error_type == "BytecodeArtifact"
+    assert not any(path.suffix == ".pyc" for path in context.run_root.rglob("*"))
+
+    preexisting = item.work_root / "preexisting.txt"
+    preexisting.write_text("before", encoding="utf-8")
+    mutate = _write_script(
+        item,
+        "mutate_preexisting.py",
+        "from pathlib import Path\nPath('preexisting.txt').write_text('mutated', encoding='utf-8')\n",
+    )
+    report = bound.script_runner.run_pipeline(mutate)
+    assert report.status == "failed"
+    assert report.receipts[0].error_type == "UndeclaredOutput"
+    assert preexisting.read_text(encoding="utf-8") == "before"
+
+
+def test_runner_subprocess_oserror_rolls_back_child_declared_and_undeclared_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, item, bound = _fixture(tmp_path)
+    output = item.work_root / "child-output.json"
+    output.write_text("before", encoding="utf-8")
+    undeclared = item.work_root / "child-undeclared.txt"
+    script = _write_script(item, "child_oserror.py", "print('child')")
+
+    import auto_foundry_core.analysis as analysis_module
+
+    def child_writes_then_process_lookup_error(*args: object, **kwargs: object) -> object:
+        cwd = Path(str(kwargs["cwd"]))
+        (cwd / output.name).write_text("mutated", encoding="utf-8")
+        (cwd / undeclared.name).write_text("must-roll-back", encoding="utf-8")
+        raise ProcessLookupError("child disappeared")
+
+    monkeypatch.setattr(analysis_module.subprocess, "Popen", child_writes_then_process_lookup_error)
+    report = bound.script_runner.run_pipeline(script, allowed_outputs=(output,))
+
+    assert report.status == "failed"
+    assert report.receipts[0].error_type == "UndeclaredOutput"
+    assert output.read_text(encoding="utf-8") == "before"
+    assert not undeclared.exists()
+
+
+def test_runner_subprocess_oserror_rolls_back_declared_write_without_early_return(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, item, bound = _fixture(tmp_path)
+    output = item.work_root / "child-output.json"
+    output.write_text("before", encoding="utf-8")
+    script = _write_script(item, "child_oserror_declared.py", "print('child')")
+
+    import auto_foundry_core.analysis as analysis_module
+
+    def child_writes_then_oserror(*args: object, **kwargs: object) -> object:
+        cwd = Path(str(kwargs["cwd"]))
+        (cwd / output.name).write_text("mutated", encoding="utf-8")
+        raise OSError("transport failed")
+
+    monkeypatch.setattr(analysis_module.subprocess, "Popen", child_writes_then_oserror)
+    report = bound.script_runner.run_pipeline(script, allowed_outputs=(output,))
+
+    assert report.status == "failed"
+    assert report.receipts[0].error_type == "OSError"
+    assert report.receipts[0].error_category == "same_attempt_feedback"
+    assert output.read_text(encoding="utf-8") == "before"
+
+
 def test_deterministic_rerun_match_and_mismatch_do_not_publish_mismatch(tmp_path: Path) -> None:
     _, _, item, bound = _fixture(tmp_path)
     output = item.work_root / "deterministic.json"

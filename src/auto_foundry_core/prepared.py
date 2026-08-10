@@ -1,10 +1,16 @@
-"""Durable run-local registry for accepted prepared assets.
+"""Durable registry for *accepted* prepared candidates.
 
-The registry is deliberately independent of the in-memory Living Enterprise
-Model.  A materialized prepared asset is registered once it has passed the
-descriptor/content checks, regardless of whether its scope makes it eligible
-for reuse.  Later integration code can search the registry and explicitly
-load an asset without treating registration as a semantic promotion.
+Prepared data is first written by the analysis/workbench owner below an
+accepted item's ``work/prepared`` directory.  The candidate descriptor and
+payload are deliberately not registry state: :class:`PreparedAssetRegistry`
+only records a candidate after an accepted ``IntegrationSession`` has
+validated the exact bytes, row count, byte count, scope, and provenance.  The
+registry references that immutable, hash-verified candidate in place; it does
+not contain a compatibility materializer or a parser/semantic compiler.
+
+The checks here are mechanical integrity checks.  They cannot prove semantic
+completeness, so a live Integration Agent and an external test-only fidelity
+audit remain required for that judgment.
 """
 
 from __future__ import annotations
@@ -34,6 +40,46 @@ ALLOWED_SCOPES = frozenset({"requirement_scoped", "reusable", "exploratory", "su
 _REGISTRY_RELATIVE = Path("lem") / "prepared_data_registry.jsonl"
 _INDEX_RELATIVE = Path("indexes") / "prepared_index.json"
 _LOCK_RELATIVE = Path("lem") / ".prepared_data_registry.lock"
+
+
+class _RegistryCommitAuthority:
+    """Opaque capability minted only after an Integration commit intent."""
+
+    __slots__ = ("item_workspace", "session_id", "owner_id", "intent_path", "intent_hash")
+
+    def __init__(
+        self,
+        item_workspace: Any,
+        *,
+        session_id: str,
+        owner_id: str,
+        intent_path: Path,
+        intent_hash: str,
+    ) -> None:
+        self.item_workspace = item_workspace
+        self.session_id = str(session_id)
+        self.owner_id = str(owner_id)
+        self.intent_path = intent_path
+        self.intent_hash = str(intent_hash)
+
+
+def _new_registry_commit_authority(
+    item_workspace: Any,
+    *,
+    session_id: str,
+    owner_id: str,
+    intent_path: Path,
+    intent_hash: str,
+) -> _RegistryCommitAuthority:
+    """Create the private registry publication capability for one intent."""
+
+    return _RegistryCommitAuthority(
+        item_workspace,
+        session_id=session_id,
+        owner_id=owner_id,
+        intent_path=intent_path,
+        intent_hash=intent_hash,
+    )
 
 
 def _sha256(path: Path) -> str:
@@ -95,6 +141,25 @@ def _registry_lock(path: Path):
 
 
 def _regular_file(context: RunContext, value: str | Path, *, label: str) -> Path:
+    """Resolve one run-local regular file without following a symlink.
+
+    ``RunContext.resolve_run_path`` returns a resolved path.  Inspecting the
+    lexical path first is therefore necessary to reject a symlink that points
+    back inside the run (a symlink target can otherwise look safe after
+    resolution).
+    """
+
+    raw = Path(value).expanduser()
+    lexical = raw if raw.is_absolute() else context.run_root / raw
+    try:
+        relative = lexical.relative_to(context.run_root)
+    except ValueError as exc:
+        raise AllowedRootError(f"{label} escapes current run") from exc
+    current = context.run_root
+    for component in relative.parts:
+        current = current / component
+        if current.is_symlink():
+            raise AllowedRootError(f"{label} cannot use a symlink: {current}")
     try:
         resolved = context.resolve_run_path(value)
     except Exception as exc:
@@ -130,10 +195,16 @@ def _decode_rows(path: Path, descriptor: PreparedAssetDescriptor) -> list[dict[s
     return _decode_rows_bytes(path.read_bytes(), descriptor, fallback_format=path.suffix.lstrip("."))
 
 
-def _verify_descriptor(context: RunContext, descriptor: PreparedAssetDescriptor) -> Path:
+def _verify_descriptor(context: RunContext, descriptor: PreparedAssetDescriptor, *, item_workspace: Any = None) -> Path:
     if descriptor.scope not in ALLOWED_SCOPES:
         raise ValueError(f"prepared asset scope is invalid: {descriptor.scope!r}")
-    path = _regular_file(context, descriptor.location, label="prepared asset location")
+    raw = Path(descriptor.location).expanduser()
+    if not raw.is_absolute() and item_workspace is not None:
+        if raw.parts and raw.parts[0] == "work":
+            raw = item_workspace.item_root / raw
+        elif not (raw.parts and raw.parts[0] in {"questions", "requirements"}):
+            raw = item_workspace.work_root / "prepared" / raw
+    path = _regular_file(context, raw, label="prepared asset location")
     actual_hash = _sha256(path)
     if descriptor.prepared_content_hash and actual_hash != descriptor.prepared_content_hash:
         raise ValueError(f"prepared asset content changed: {descriptor.prepared_asset_id}")
@@ -143,52 +214,6 @@ def _verify_descriptor(context: RunContext, descriptor: PreparedAssetDescriptor)
     if descriptor.row_count is not None and descriptor.row_count != len(rows):
         raise ValueError(f"prepared asset row count changed: {descriptor.prepared_asset_id}")
     return path
-
-
-def _resolve_materialization_path(context: RunContext, value: str | Path, *, label: str) -> Path:
-    """Resolve a run-owned destination before a materialization transaction.
-
-    ``RunContext.resolve_run_path`` resolves containment and symlinks.  The
-    additional regular-file check rejects a pre-existing directory while still
-    allowing a not-yet-created file, which is required for crash-resume
-    publication.
-    """
-
-    try:
-        resolved = context.resolve_run_path(value)
-    except Exception as exc:
-        raise AllowedRootError(f"{label} escapes current run") from exc
-    if resolved.exists() and (resolved.is_symlink() or not resolved.is_file()):
-        raise ValueError(f"{label} must be a regular run-local file: {resolved}")
-    return resolved
-
-
-def _atomic_write_bytes(path: Path, content: bytes) -> None:
-    """Atomically publish one prepared payload and fsync its parent."""
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile("wb", dir=path.parent, prefix=f".{path.name}.", delete=False) as stream:
-            temporary = Path(stream.name)
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        try:
-            directory = os.open(path.parent, os.O_RDONLY)
-        except OSError:
-            return
-        try:
-            try:
-                os.fsync(directory)
-            except OSError:
-                pass
-        finally:
-            os.close(directory)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
 
 
 def _read_descriptor_sidecar(path: Path) -> PreparedAssetDescriptor | None:
@@ -279,139 +304,165 @@ class PreparedAssetRegistry:
     def _coerce_descriptor(descriptor: PreparedAssetDescriptor | Mapping[str, Any]) -> PreparedAssetDescriptor:
         return descriptor if isinstance(descriptor, PreparedAssetDescriptor) else PreparedAssetDescriptor.from_dict(descriptor)
 
-    def _validated_descriptor(self, descriptor: PreparedAssetDescriptor | Mapping[str, Any]) -> PreparedAssetDescriptor:
+    def _validated_descriptor(
+        self,
+        descriptor: PreparedAssetDescriptor | Mapping[str, Any],
+        *,
+        require_accepted_item: bool = True,
+        item_workspace: Any = None,
+    ) -> PreparedAssetDescriptor:
         value = self._coerce_descriptor(descriptor)
-        _verify_descriptor(self.context, value)
+        # Registry entries are accepted candidates, never open-ended
+        # descriptors.  These three fields are the mechanical content binding
+        # used by integration retries and registry loads.
+        if value.prepared_content_hash is None:
+            raise ValueError("accepted prepared asset requires prepared_content_hash")
+        if value.byte_count is None:
+            raise ValueError("accepted prepared asset requires byte_count")
+        if value.row_count is None:
+            raise ValueError("accepted prepared asset requires row_count")
+        _verify_descriptor(self.context, value, item_workspace=item_workspace)
+        self._validate_candidate_sidecar(value, item_workspace=item_workspace)
+        if item_workspace is not None:
+            self._validate_candidate_location(value, item_workspace)
+        if require_accepted_item:
+            self._validate_accepted_item(value, item_workspace=item_workspace)
         return value
 
-    def _validated_materialization(
-        self,
-        descriptor: PreparedAssetDescriptor | Mapping[str, Any],
-        content: bytes | bytearray | memoryview,
-        descriptor_path: str | Path,
-    ) -> tuple[PreparedAssetDescriptor, bytes, Path, Path]:
-        """Validate an in-memory payload before entering publication.
+    def _validate_candidate_sidecar(self, descriptor: PreparedAssetDescriptor, *, item_workspace: Any = None) -> None:
+        """Validate an optional workbench sidecar without trusting it.
 
-        This validation deliberately does not touch a destination file.  It
-        lets :meth:`materialize_accepted` make the same-ID decision and then
-        publish payload, descriptor sidecar, registry, and index while holding
-        one lock.
+        The descriptor supplied to the registry remains authoritative.  A
+        malformed or conflicting sidecar is treated as a tamper signal, while
+        a missing sidecar is allowed so manually-created test candidates can
+        exercise the integration boundary.
         """
 
-        value = self._coerce_descriptor(descriptor)
-        if value.scope not in ALLOWED_SCOPES:
-            raise ValueError(f"prepared asset scope is invalid: {value.scope!r}")
-        if not isinstance(content, (bytes, bytearray, memoryview)):
-            raise TypeError("prepared asset content must be bytes-like")
-        encoded = bytes(content)
-        if value.prepared_content_hash is None:
-            raise ValueError("prepared asset content hash is required for materialization")
-        if value.byte_count is None:
-            raise ValueError("prepared asset byte count is required for materialization")
-        if value.row_count is None:
-            raise ValueError("prepared asset row count is required for materialization")
-        actual_hash = hashlib.sha256(encoded).hexdigest()
-        if value.prepared_content_hash != actual_hash:
-            raise ValueError(f"prepared asset content hash does not match: {value.prepared_asset_id}")
-        if value.byte_count != len(encoded):
-            raise ValueError(f"prepared asset byte count does not match: {value.prepared_asset_id}")
-        rows = _decode_rows_bytes(
-            encoded,
-            value,
-            fallback_format=Path(value.location).suffix.lstrip("."),
-        )
-        if value.row_count != len(rows):
-            raise ValueError(f"prepared asset row count does not match: {value.prepared_asset_id}")
-        payload_path = _resolve_materialization_path(self.context, value.location, label="prepared asset location")
-        sidecar = _resolve_materialization_path(self.context, descriptor_path, label="prepared descriptor location")
-        return value, encoded, payload_path, sidecar
+        raw = Path(descriptor.location).expanduser()
+        if not raw.is_absolute() and item_workspace is not None:
+            if raw.parts and raw.parts[0] == "work":
+                raw = item_workspace.item_root / raw
+            elif not (raw.parts and raw.parts[0] in {"questions", "requirements"}):
+                raw = item_workspace.work_root / "prepared" / raw
+        payload_path = _regular_file(self.context, raw, label="prepared asset location")
+        sidecar_path = payload_path.parent / f"{descriptor.prepared_asset_id}.descriptor.json"
+        if not sidecar_path.exists() and not sidecar_path.is_symlink():
+            return
+        sidecar = _regular_file(self.context, sidecar_path, label="prepared descriptor sidecar")
+        loaded = _read_descriptor_sidecar(sidecar)
+        if loaded is None or loaded != descriptor:
+            raise ValueError(f"prepared descriptor sidecar does not match: {descriptor.prepared_asset_id}")
+
+    def _validate_candidate_location(self, descriptor: PreparedAssetDescriptor, item_workspace: Any) -> Path:
+        """Require a descriptor location below one item's work/prepared root."""
+
+        if not hasattr(item_workspace, "item_root") or not hasattr(item_workspace, "work_root"):
+            raise TypeError("item_workspace must expose item_root and work_root")
+        root = item_workspace.work_root / "prepared"
+        raw = Path(descriptor.location).expanduser()
+        if raw.is_absolute():
+            lexical = raw
+        elif raw.parts and raw.parts[0] == "work":
+            lexical = item_workspace.item_root / raw
+        elif raw.parts and raw.parts[0] in {"questions", "requirements"}:
+            lexical = self.context.run_root / raw
+        else:
+            lexical = root / raw
+        _regular_file(self.context, lexical, label="prepared asset location")
+        candidate = self.context.resolve_run_path(lexical)
+        resolved_root = self.context.resolve_run_path(root)
+        if resolved_root != candidate and resolved_root not in candidate.parents:
+            raise AllowedRootError("prepared candidate must be under item work/prepared")
+        return candidate
+
+    def _validate_accepted_item(self, descriptor: PreparedAssetDescriptor, *, item_workspace: Any = None) -> None:
+        """Require the candidate to belong to an accepted item workspace."""
+
+        path = _regular_file(self.context, descriptor.location, label="prepared asset location")
+        if item_workspace is not None:
+            self._validate_candidate_location(descriptor, item_workspace)
+            state = getattr(item_workspace, "state", {})
+            lifecycle_state = state.get("lifecycle_state") if isinstance(state, Mapping) else None
+            integration_state = getattr(item_workspace, "integration_state", None)
+            if lifecycle_state != "accepted" or integration_state not in {"pending", "integrated"}:
+                raise ValueError("prepared asset requires an accepted item")
+            accepted_root = getattr(item_workspace, "accepted_root", None)
+            if accepted_root is None or accepted_root.is_symlink() or not accepted_root.is_dir():
+                raise ValueError("prepared asset item acceptance state is missing")
+            return
+        try:
+            relative = path.relative_to(self.context.run_root)
+        except ValueError as exc:
+            raise AllowedRootError("prepared asset location escapes current run") from exc
+        parts = relative.parts
+        if len(parts) < 5 or parts[0] not in {"questions", "requirements"} or parts[2:4] != ("work", "prepared"):
+            raise ValueError("accepted prepared asset must be under an item work/prepared directory")
+        item_root = self.context.run_root / parts[0] / parts[1]
+        state_path = item_root / "item_state.json"
+        accepted_root = item_root / "accepted"
+        if state_path.is_symlink() or accepted_root.is_symlink() or not state_path.is_file() or not accepted_root.is_dir():
+            raise ValueError("prepared asset item acceptance state is missing")
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("prepared asset item acceptance state is invalid") from exc
+        if not isinstance(state, Mapping) or state.get("lifecycle_state") != "accepted":
+            raise ValueError("prepared asset requires an accepted item")
+        if state.get("integration_state") not in {"pending", "integrated"}:
+            raise ValueError("prepared asset item integration is not accepted")
 
     @staticmethod
-    def _check_residue(
-        path: Path,
-        expected: bytes,
-        *,
-        label: str,
-    ) -> None:
-        """Reject an unregistered crash residue that does not match exactly."""
+    def _validate_commit_authority(
+        authority: Any,
+        item_workspace: Any,
+    ) -> _RegistryCommitAuthority:
+        """Require the exact persisted IntegrationSession commit intent."""
 
-        if not path.exists():
-            return
+        if not isinstance(authority, _RegistryCommitAuthority):
+            raise ValueError("accepted registry publication requires IntegrationSession commit authority")
+        if authority.item_workspace is not item_workspace:
+            raise ValueError("accepted registry publication authority is bound to another item")
+        path = authority.intent_path
         if path.is_symlink() or not path.is_file():
-            raise ValueError(f"{label} residue is not a regular file: {path}")
+            raise ValueError("accepted registry publication requires a persisted commit intent")
         try:
-            current = path.read_bytes()
-        except OSError as exc:
-            raise ValueError(f"{label} residue is unreadable: {path}") from exc
-        if current != expected:
-            raise ValueError(f"{label} residue differs from accepted descriptor")
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("accepted registry publication commit intent is invalid") from exc
+        if not isinstance(payload, Mapping):
+            raise ValueError("accepted registry publication commit intent is invalid")
+        if payload.get("session_id") != authority.session_id or payload.get("owner_id") != authority.owner_id:
+            raise ValueError("accepted registry publication commit intent identity is invalid")
+        unsigned = {key: value for key, value in payload.items() if key != "intent_hash"}
+        expected_hash = hashlib.sha256(
+            (
+                json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                + "\n"
+            ).encode("utf-8")
+        ).hexdigest()
+        if payload.get("intent_hash") != authority.intent_hash or payload.get("intent_hash") != expected_hash:
+            raise ValueError("accepted registry publication commit intent hash is invalid")
+        return authority
 
-    def materialize_accepted(
+    def preflight_candidate(
         self,
         descriptor: PreparedAssetDescriptor | Mapping[str, Any],
-        content: bytes | bytearray | memoryview,
-        descriptor_path: str | Path,
+        item_workspace: Any,
     ) -> PreparedAssetDescriptor:
-        """Atomically materialize and register one accepted prepared asset.
+        """Validate an item-local candidate without requiring acceptance state.
 
-        The lock covers the same-ID decision, crash-residue checks, payload and
-        sidecar writes, and registry/index publication.  A retry after any
-        boundary failure therefore either observes exact residue and resumes,
-        or fails closed before changing a conflicting asset.
+        Candidate publication is owned by the workbench/analysis layer.  This
+        method only performs exact descriptor/content checks and the same-ID
+        collision check; it never writes registry state and deliberately does
+        not infer whether the item is accepted.  The commit path supplies the
+        accepted item workspace to :meth:`register_accepted`.
         """
 
-        value, encoded, payload_path, sidecar_path = self._validated_materialization(
+        value = self._validated_descriptor(
             descriptor,
-            content,
-            descriptor_path,
+            require_accepted_item=False,
+            item_workspace=item_workspace,
         )
-        sidecar_text = json.dumps(value.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n"
-        sidecar_bytes = sidecar_text.encode("utf-8")
-        with _registry_lock(self.lock_path):
-            records = self._read_records()
-            existing = next(
-                (record for record in records if record.prepared_asset_id == value.prepared_asset_id),
-                None,
-            )
-            if existing is not None and existing != value:
-                raise ValueError(f"prepared asset already exists with different descriptor: {value.prepared_asset_id}")
-
-            # A registered equal descriptor may repair missing files/index
-            # projections.  An unregistered residue may only be resumed when
-            # both payload and sidecar are exact; otherwise a prior failed or
-            # conflicting writer must not be overwritten.
-            if existing is None:
-                self._check_residue(payload_path, encoded, label="prepared payload")
-                self._check_residue(sidecar_path, sidecar_bytes, label="prepared descriptor")
-            else:
-                if payload_path.exists() and payload_path.read_bytes() != encoded:
-                    raise ValueError(f"registered prepared payload changed: {value.prepared_asset_id}")
-                sidecar_existing = _read_descriptor_sidecar(sidecar_path)
-                if sidecar_existing is not None and sidecar_existing != value:
-                    raise ValueError(f"registered prepared descriptor changed: {value.prepared_asset_id}")
-
-            # Publication order is intentional: payload, sidecar, registry,
-            # then derived index.  Each step is atomic and the enclosing lock
-            # makes crash retries converge without a competing writer.
-            _atomic_write_bytes(payload_path, encoded)
-            _atomic_write(sidecar_path, sidecar_text)
-            if existing is None:
-                records.append(value)
-            self._write_records(records)
-
-        if existing is None:
-            self._emit("prepared_registry_registered", value)
-        return existing or value
-
-    def preflight_register(self, descriptor: PreparedAssetDescriptor | Mapping[str, Any]) -> PreparedAssetDescriptor:
-        """Validate an accepted descriptor without publishing registry state.
-
-        The same-ID decision is made while holding the registry lock so an
-        integration owner can preflight a complete bundle before its first
-        commit and receive the exact descriptor that would be accepted.
-        """
-
-        value = self._validated_descriptor(descriptor)
         with _registry_lock(self.lock_path):
             records = self._read_records()
             existing = next((record for record in records if record.prepared_asset_id == value.prepared_asset_id), None)
@@ -419,21 +470,54 @@ class PreparedAssetRegistry:
                 raise ValueError(f"prepared asset already exists with different descriptor: {value.prepared_asset_id}")
             return existing or value
 
-    def register_accepted(self, descriptor: PreparedAssetDescriptor | Mapping[str, Any]) -> PreparedAssetDescriptor:
-        """Register one verified descriptor; duplicate registration is idempotent."""
+    def preflight_register(
+        self,
+        descriptor: PreparedAssetDescriptor | Mapping[str, Any],
+        *,
+        item_workspace: Any = None,
+    ) -> PreparedAssetDescriptor:
+        """Validate an accepted descriptor without publishing registry state.
 
-        descriptor = self._validated_descriptor(descriptor)
+        The same-ID decision is made while holding the registry lock so an
+        integration owner can preflight a complete bundle before its first
+        commit and receive the exact descriptor that would be accepted.
+        """
+
+        value = self._validated_descriptor(descriptor, item_workspace=item_workspace)
+        with _registry_lock(self.lock_path):
+            records = self._read_records()
+            existing = next((record for record in records if record.prepared_asset_id == value.prepared_asset_id), None)
+            if existing is not None and existing != value:
+                raise ValueError(f"prepared asset already exists with different descriptor: {value.prepared_asset_id}")
+            return existing or value
+
+    def register_accepted(
+        self,
+        descriptor: PreparedAssetDescriptor | Mapping[str, Any],
+        item_workspace: Any = None,
+        *,
+        _commit_authority: Any = None,
+    ) -> PreparedAssetDescriptor:
+        """Register one verified descriptor through an Integration commit only."""
+
+        self._validate_commit_authority(_commit_authority, item_workspace)
+        descriptor = self._validated_descriptor(descriptor, item_workspace=item_workspace)
         with _registry_lock(self.lock_path):
             records = self._read_records()
             existing = next((record for record in records if record.prepared_asset_id == descriptor.prepared_asset_id), None)
             if existing is not None:
                 if existing != descriptor:
                     raise ValueError(f"prepared asset already exists with different descriptor: {descriptor.prepared_asset_id}")
-                return existing
-            records.append(descriptor)
+            else:
+                records.append(descriptor)
+            # Always rewrite both durable projections, including an exact
+            # duplicate.  A crash after the registry file is replaced but
+            # before the derived index is written is repaired by the retry.
             self._write_records(records)
-        self._emit("prepared_registry_registered", descriptor)
-        return descriptor
+        if existing is None:
+            self._emit("prepared_registry_registered", descriptor)
+            return descriptor
+        return existing
 
     def search(
         self,
@@ -487,7 +571,7 @@ class PreparedAssetRegistry:
         matches = self.search(prepared_asset_id=prepared_asset_id, include_superseded=True)
         if not matches:
             raise FileNotFoundError(f"prepared asset is not registered: {prepared_asset_id}")
-        descriptor = matches[0]
+        descriptor = self._validated_descriptor(matches[0])
         path = _verify_descriptor(self.context, descriptor)
         rows = tuple(_decode_rows(path, descriptor))
         # Import lazily to avoid the workbench -> registry import cycle.

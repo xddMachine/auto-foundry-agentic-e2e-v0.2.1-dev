@@ -33,18 +33,18 @@ import uuid
 from .contracts import DataAssetRef
 from .durable import ItemWorkspace
 from .prepared import PreparedAssetRegistry
-from .workbench import CatalogCounts, DataRoomCatalogEntry, DataRoomWorkbench
+from .workbench import CatalogCounts, DataRoomCatalogEntry, DataRoomMember, DataRoomWorkbench
 from .workspace import AllowedRootError, RunContext
 
 
-ANALYSIS_CONTEXT_SCHEMA_VERSION = "1"
+ANALYSIS_CONTEXT_SCHEMA_VERSION = "2"
 ANALYSIS_CONTEXT_ENV = "AUTO_FOUNDRY_ANALYSIS_CONTEXT"
 ANALYSIS_PHASE_ENV = "AUTO_FOUNDRY_ANALYSIS_PHASE"
 ANALYSIS_SAMPLE_LIMIT_ENV = "AUTO_FOUNDRY_SAMPLE_LIMIT"
 ANALYSIS_OUTPUT_ROOT_ENV = "AUTO_FOUNDRY_ANALYSIS_OUTPUT_ROOT"
 _MANIFEST_FILENAME = "analysis_context.json"
 _RECEIPT_DIR = Path("script_receipts")
-_DEFAULT_TIMEOUT_SECONDS = 120.0
+_DEFAULT_TIMEOUT_SECONDS = 3600.0
 _DEFAULT_OUTPUT_BYTES = 256 * 1024
 _DEFAULT_SAMPLE_LIMIT = 100
 _VALID_PHASES = frozenset({"smoke", "full"})
@@ -96,6 +96,16 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _source_stat_signature(path: Path) -> dict[str, int]:
+    stat_result = path.stat()
+    return {
+        "device": int(stat_result.st_dev),
+        "inode": int(stat_result.st_ino),
+        "size_bytes": int(stat_result.st_size),
+        "mtime_ns": int(stat_result.st_mtime_ns),
+    }
 
 
 def _utc_now() -> str:
@@ -292,6 +302,7 @@ class BoundAnalysisContext:
         ontology_bundle: Any,
         manifest_path: Path,
         manifest_hash: str,
+        runner_config: Mapping[str, Any] | None = None,
         telemetry: Any = None,
     ) -> None:
         self.context = context
@@ -302,6 +313,14 @@ class BoundAnalysisContext:
         self._ontology_bundle = _freeze(ontology_bundle)
         self.manifest_path = manifest_path
         self.manifest_hash = manifest_hash
+        config = dict(runner_config or {})
+        timeout = float(config.get("default_timeout_seconds", _DEFAULT_TIMEOUT_SECONDS))
+        output_bytes = int(config.get("default_output_bytes", _DEFAULT_OUTPUT_BYTES))
+        if timeout <= 0 or output_bytes <= 0:
+            raise ValueError("analysis runner config must be positive")
+        self.runner_config = MappingProxyType(
+            {"default_timeout_seconds": timeout, "default_output_bytes": output_bytes}
+        )
         self.telemetry = telemetry
         self._script_runner: ControlledScriptRunner | None = None
 
@@ -328,6 +347,17 @@ class BoundAnalysisContext:
             raise ValueError("workbench must use the same RunContext")
         source_identity = workbench.data_room.archive_ref
         snapshot = CatalogSnapshot.from_workbench(workbench)
+        physical_members = [member.to_dict() for member in workbench.data_room.members()]
+        physical_inventory = {
+            "source_stat": dict(workbench.data_room.source_stat_signature),
+            "central_directory_fingerprint": dict(workbench.data_room.central_directory_fingerprint),
+            "inventory_hash": _sha256_bytes(_json_bytes(physical_members)),
+            "members": physical_members,
+        }
+        runner_config = {
+            "default_timeout_seconds": _DEFAULT_TIMEOUT_SECONDS,
+            "default_output_bytes": _DEFAULT_OUTPUT_BYTES,
+        }
         manifest_path = item_workspace.work_root / _MANIFEST_FILENAME
         _assert_no_symlink_components(manifest_path, root=item_workspace.item_root)
         unsigned = {
@@ -342,6 +372,8 @@ class BoundAnalysisContext:
             "item_mode": item_workspace.mode,
             "source_identity": source_identity.to_dict(),
             "catalog": snapshot.to_dict(),
+            "physical_inventory": physical_inventory,
+            "runner_config": runner_config,
             "ontology_bundle": _jsonable(ontology_bundle),
             "manifest_path": str(manifest_path),
         }
@@ -357,9 +389,14 @@ class BoundAnalysisContext:
             ontology_bundle=ontology_bundle,
             manifest_path=manifest_path,
             manifest_hash=manifest_hash,
+            runner_config=runner_config,
             telemetry=telemetry,
         )
-        bound._script_runner = ControlledScriptRunner(bound)
+        bound._script_runner = ControlledScriptRunner(
+            bound,
+            default_timeout_seconds=float(runner_config["default_timeout_seconds"]),
+            default_output_bytes=int(runner_config["default_output_bytes"]),
+        )
         return bound
 
     @property
@@ -393,21 +430,53 @@ class BoundAnalysisContext:
     @property
     def script_runner(self) -> "ControlledScriptRunner":
         if self._script_runner is None:
-            self._script_runner = ControlledScriptRunner(self)
+            self._script_runner = ControlledScriptRunner(
+                self,
+                default_timeout_seconds=float(self.runner_config["default_timeout_seconds"]),
+                default_output_bytes=int(self.runner_config["default_output_bytes"]),
+            )
         return self._script_runner
 
-    def ensure_valid(self) -> None:
-        """Fail closed if source, catalog, or context identity changed."""
+    def ensure_valid(self, *, final: bool = False) -> None:
+        """Fail closed cheaply; use ``final=True`` at a freeze boundary."""
 
         if not self.manifest_path.is_file() or _sha256_file(self.manifest_path) != self._manifest_file_hash():
             raise ValueError("analysis context manifest changed")
         source_path = self.context.resolve_input(self.source_identity.uri)
-        if not source_path.is_file() or _sha256_file(source_path) != self.source_identity.content_hash:
+        if not source_path.is_file():
             raise ValueError("analysis source changed after binding")
+        expected_stat = self.source_identity.metadata.get("source_stat")
+        if not isinstance(expected_stat, Mapping) or _source_stat_signature(source_path) != {
+            str(key): int(value) for key, value in expected_stat.items()
+        }:
+            raise ValueError("analysis source changed after binding (stat signature)")
         if not self.source_catalog.path.is_file() or _sha256_file(self.source_catalog.path) != self.source_catalog.content_hash:
             raise ValueError("analysis catalog changed after binding")
         if self.source_catalog.source_hash != self.source_identity.content_hash:
             raise ValueError("analysis source/catalog hash mismatch")
+        if final:
+            self._workbench.data_room.verify_source_full()
+
+    def finalize_source_verification(self) -> None:
+        """Re-hash source and catalog identity before final/freeze publication."""
+
+        self.ensure_valid(final=True)
+
+    def save_prepared_candidate(
+        self,
+        prepared_asset_id: str,
+        rows: Iterable[Mapping[str, Any]] | DataRoomMember | DataRoomCatalogEntry | str | Path,
+        **kwargs: Any,
+    ) -> Any:
+        """Materialize a mutable candidate below this item's work/prepared."""
+
+        candidate_root = self.item_workspace.work_root / "prepared"
+        return self._workbench._save_prepared_candidate(
+            prepared_asset_id,
+            rows,
+            candidate_root=candidate_root,
+            **kwargs,
+        )
 
     def _manifest_file_hash(self) -> str:
         try:
@@ -518,9 +587,56 @@ def load_bound_analysis_context(
     if not source_identity.content_hash:
         raise ValueError("analysis source identity must contain a content hash")
     source_path = context.resolve_input(source_identity.uri)
-    if not source_path.is_file() or _sha256_file(source_path) != source_identity.content_hash:
+    if not source_path.is_file():
         raise ValueError("analysis source changed after context binding")
-    workbench = DataRoomWorkbench(context, source_identity, telemetry=telemetry)
+    inventory_payload = unsigned.get("physical_inventory")
+    if not isinstance(inventory_payload, Mapping):
+        raise ValueError("analysis physical inventory binding is missing")
+    raw_members = inventory_payload.get("members")
+    inventory_hash = inventory_payload.get("inventory_hash")
+    source_stat = inventory_payload.get("source_stat")
+    central_fingerprint = inventory_payload.get("central_directory_fingerprint")
+    if (
+        not isinstance(raw_members, list)
+        or not isinstance(inventory_hash, str)
+        or not isinstance(source_stat, Mapping)
+        or not isinstance(central_fingerprint, Mapping)
+        or inventory_hash != _sha256_bytes(_json_bytes(raw_members))
+    ):
+        raise ValueError("analysis physical inventory binding is invalid")
+    normalized_stat = {str(key): int(value) for key, value in source_stat.items()}
+    if _source_stat_signature(source_path) != normalized_stat:
+        raise ValueError("analysis source changed after context binding (stat signature)")
+    try:
+        bound_members = tuple(DataRoomMember.from_dict(value) for value in raw_members)
+    except (TypeError, KeyError, ValueError) as exc:
+        raise ValueError("analysis physical inventory members are invalid") from exc
+    if source_identity.metadata.get("source_stat") != normalized_stat:
+        raise ValueError("analysis source/inventory stat binding does not match")
+    normalized_central_fingerprint = {str(key): value for key, value in central_fingerprint.items()}
+    if source_identity.metadata.get("central_directory_fingerprint") != normalized_central_fingerprint:
+        raise ValueError("analysis source/inventory central-directory binding does not match")
+    runner_config = unsigned.get("runner_config")
+    if not isinstance(runner_config, Mapping):
+        raise ValueError("analysis runner config is missing")
+    try:
+        normalized_runner_config = {
+            "default_timeout_seconds": float(runner_config["default_timeout_seconds"]),
+            "default_output_bytes": int(runner_config["default_output_bytes"]),
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("analysis runner config is invalid") from exc
+    if normalized_runner_config["default_timeout_seconds"] <= 0 or normalized_runner_config["default_output_bytes"] <= 0:
+        raise ValueError("analysis runner config must be positive")
+    workbench = DataRoomWorkbench(
+        context,
+        source_identity,
+        telemetry=telemetry,
+        _bound_members=bound_members,
+        _bound_archive_hash=source_identity.content_hash,
+        _bound_source_stat=normalized_stat,
+        _bound_central_directory_fingerprint=normalized_central_fingerprint,
+    )
     snapshot = CatalogSnapshot.from_workbench(workbench)
     catalog_payload = unsigned.get("catalog")
     if not isinstance(catalog_payload, Mapping):
@@ -541,9 +657,14 @@ def load_bound_analysis_context(
         ontology_bundle=unsigned.get("ontology_bundle", ()),
         manifest_path=manifest_path,
         manifest_hash=manifest_hash,
+        runner_config=normalized_runner_config,
         telemetry=telemetry,
     )
-    bound._script_runner = ControlledScriptRunner(bound)
+    bound._script_runner = ControlledScriptRunner(
+        bound,
+        default_timeout_seconds=normalized_runner_config["default_timeout_seconds"],
+        default_output_bytes=normalized_runner_config["default_output_bytes"],
+    )
     bound.ensure_valid()
     return bound
 
@@ -655,6 +776,102 @@ class ControlledScriptRunner:
         existing_pythonpath = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = source_root if not existing_pythonpath else source_root + os.pathsep + existing_pythonpath
         return env
+
+    @staticmethod
+    def _regular_files(root: Path) -> set[Path]:
+        if not root.exists():
+            return set()
+        return {path for path in root.rglob("*") if path.is_file() and not path.is_symlink()}
+
+    @classmethod
+    def _snapshot_workspace(cls, root: Path) -> dict[Path, bytes]:
+        return {path: path.read_bytes() for path in cls._regular_files(root)}
+
+    @classmethod
+    def _workspace_paths(cls, root: Path) -> set[Path]:
+        if not root.exists():
+            return set()
+        return {
+            path
+            for path in root.rglob("*")
+            if (path.is_file() or path.is_symlink())
+        }
+
+    @classmethod
+    def _workspace_violations(
+        cls,
+        root: Path,
+        snapshot: Mapping[Path, bytes],
+        allowed: Sequence[Path],
+        *,
+        ignored: Sequence[Path] = (),
+    ) -> tuple[Path, ...]:
+        before = set(snapshot)
+        current = cls._workspace_paths(root)
+        changed = {
+            path
+            for path in before & current
+            if path.is_file() and not path.is_symlink() and path.read_bytes() != snapshot[path]
+        }
+        changed.update(path for path in before & current if path.is_symlink())
+        violations = (current - before) | (before - current) | changed
+        excluded = set(allowed) | set(ignored)
+        return tuple(sorted(path for path in violations if path not in excluded))
+
+    @staticmethod
+    def _restore_workspace(root: Path, snapshot: Mapping[Path, bytes]) -> None:
+        current = {
+            path
+            for path in root.rglob("*")
+            if path.is_file() or path.is_symlink()
+        } if root.exists() else set()
+        for path in sorted(current - set(snapshot), key=lambda value: len(value.parts), reverse=True):
+            if path.is_symlink() or path.is_file():
+                path.unlink(missing_ok=True)
+        for path, content in snapshot.items():
+            if path.exists() and (path.is_symlink() or not path.is_file()):
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    path.unlink(missing_ok=True)
+            ControlledScriptRunner._atomic_write_bytes(path, content)
+
+    @staticmethod
+    def _remove_bytecode(root: Path) -> bool:
+        found = False
+        if not root.exists():
+            return False
+        for path in tuple(root.rglob("*.pyc")):
+            if path.is_file() and not path.is_symlink():
+                found = True
+                path.unlink(missing_ok=True)
+        for path in sorted(tuple(root.rglob("__pycache__")), key=lambda value: len(value.parts), reverse=True):
+            if path.is_dir() and not path.is_symlink():
+                found = True
+                shutil.rmtree(path, ignore_errors=True)
+        return found
+
+    @staticmethod
+    def _best_effort_stop(process: Any) -> None:
+        """Stop a process after a transport error without masking that error."""
+
+        try:
+            process.terminate()
+        except Exception:
+            pass
+        try:
+            process.wait(timeout=1.0)
+            return
+        except Exception:
+            pass
+        try:
+            process.kill()
+        except Exception:
+            pass
+        try:
+            process.wait(timeout=1.0)
+        except Exception:
+            pass
 
     def _write_receipt(self, receipt: ScriptExecutionReceipt) -> ScriptExecutionReceipt:
         receipt_dir = self.context.item_workspace.work_root / _RECEIPT_DIR
@@ -794,30 +1011,28 @@ class ControlledScriptRunner:
         timed_out = False
         output_limited = False
         exit_code: int | None = None
+        subprocess_error: OSError | None = None
+        process: Any | None = None
+        # Capture the complete pre-child state before creating the temporary
+        # stdout/stderr files.  If process creation itself raises after a
+        # child-side mutation (or a test double simulates one), the common
+        # cleanup below still has a complete rollback point.
+        workspace_snapshot = self._snapshot_workspace(self.context.item_workspace.work_root)
         try:
             with stdout_path.open("wb") as stdout_stream, stderr_path.open("wb") as stderr_stream:
-                process = subprocess.Popen(
-                    [self.python_executable, str(script_path)],
-                    cwd=str(cwd),
-                    env=self._environment(phase, sample_limit, output_root=output_root),
-                    stdin=subprocess.DEVNULL,
-                    stdout=stdout_stream,
-                    stderr=stderr_stream,
-                    shell=False,
-                )
-                while process.poll() is None:
-                    if time.monotonic() - start_mono > timeout:
-                        timed_out = True
-                        process.terminate()
-                        try:
-                            process.wait(timeout=1.0)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                            process.wait(timeout=1.0)
-                        break
-                    try:
-                        if stdout_path.stat().st_size + stderr_path.stat().st_size > cap:
-                            output_limited = True
+                try:
+                    process = subprocess.Popen(
+                        [self.python_executable, str(script_path)],
+                        cwd=str(cwd),
+                        env=self._environment(phase, sample_limit, output_root=output_root),
+                        stdin=subprocess.DEVNULL,
+                        stdout=stdout_stream,
+                        stderr=stderr_stream,
+                        shell=False,
+                    )
+                    while process.poll() is None:
+                        if time.monotonic() - start_mono > timeout:
+                            timed_out = True
                             process.terminate()
                             try:
                                 process.wait(timeout=1.0)
@@ -825,31 +1040,38 @@ class ControlledScriptRunner:
                                 process.kill()
                                 process.wait(timeout=1.0)
                             break
-                    except FileNotFoundError:
-                        pass
-                    time.sleep(0.01)
-                if process.poll() is None:
-                    process.wait(timeout=1.0)
-                exit_code = process.returncode
+                        try:
+                            if stdout_path.stat().st_size + stderr_path.stat().st_size > cap:
+                                output_limited = True
+                                process.terminate()
+                                try:
+                                    process.wait(timeout=1.0)
+                                except subprocess.TimeoutExpired:
+                                    process.kill()
+                                    process.wait(timeout=1.0)
+                                break
+                        except FileNotFoundError:
+                            pass
+                        time.sleep(0.01)
+                    if process.poll() is None:
+                        process.wait(timeout=1.0)
+                    exit_code = process.returncode
+                except OSError as exc:
+                    subprocess_error = exc
+                    if process is not None:
+                        self._best_effort_stop(process)
+                        try:
+                            exit_code = process.returncode
+                        except Exception:
+                            exit_code = None
         except OSError as exc:
-            finished = _utc_now()
-            receipt = ScriptExecutionReceipt(
-                receipt_id=receipt_id,
-                phase=phase,
-                script_path=str(script_path),
-                script_hash=script_hash,
-                context_path=str(self.context.manifest_path),
-                context_hash=self.context.manifest_hash,
-                source_hash=self.context.source_identity.content_hash or "",
-                started_at=started,
-                finished_at=finished,
-                wall_seconds=max(0.0, time.monotonic() - start_mono),
-                exit_code=None,
-                error_type=type(exc).__name__,
-                error_category="same_attempt_feedback",
-                traceback=str(exc),
-            )
-            return self._write_receipt(receipt)
+            subprocess_error = exc
+            if process is not None:
+                self._best_effort_stop(process)
+                try:
+                    exit_code = process.returncode
+                except Exception:
+                    exit_code = None
         stdout_bytes = stdout_path.read_bytes() if stdout_path.exists() else b""
         stderr_bytes = stderr_path.read_bytes() if stderr_path.exists() else b""
         if len(stdout_bytes) + len(stderr_bytes) > cap:
@@ -866,18 +1088,37 @@ class ControlledScriptRunner:
             self.context.ensure_valid()
         except Exception as exc:  # fail closed after a child-side mutation
             context_error = exc
+        bytecode_violation = self._remove_bytecode(self.context.context.run_root)
+        undeclared_outputs = self._workspace_violations(
+            self.context.item_workspace.work_root,
+            workspace_snapshot,
+            outputs,
+            ignored=(stdout_path, stderr_path),
+        )
         if context_error is not None:
             error_type, error_category, traceback_text = type(context_error).__name__, "context_integrity_failure", str(context_error)
+        elif bytecode_violation:
+            error_type, error_category, traceback_text = "BytecodeArtifact", "same_attempt_feedback", "bytecode artifacts are forbidden"
+        elif undeclared_outputs:
+            error_type, error_category = "UndeclaredOutput", "same_attempt_feedback"
+            traceback_text = "undeclared outputs: " + ", ".join(str(path.relative_to(output_root)) for path in undeclared_outputs)
         elif timed_out:
             error_type, error_category, traceback_text = "TimeoutExpired", "runtime_timeout", "script timed out"
         elif output_limited:
             error_type, error_category, traceback_text = "OutputLimitExceeded", "runtime_output_limit", "script output exceeded cap"
+        elif subprocess_error is not None:
+            error_type, error_category, traceback_text = (
+                type(subprocess_error).__name__,
+                "same_attempt_feedback",
+                str(subprocess_error),
+            )
         elif exit_code not in (0, None):
             error_type, error_category = _exception_from_text(stderr)
             traceback_text = stderr or None
             if error_category is None:
                 error_type, error_category = "ScriptError", "script_failure"
         if error_category is not None:
+            self._restore_workspace(self.context.item_workspace.work_root, workspace_snapshot)
             self._restore_outputs(output_snapshot)
         output_hashes = self._hash_outputs(outputs)
         receipt = ScriptExecutionReceipt(

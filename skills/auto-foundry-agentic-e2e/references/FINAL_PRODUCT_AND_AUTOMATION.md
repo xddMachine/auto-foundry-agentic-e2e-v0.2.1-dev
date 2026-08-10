@@ -16,9 +16,17 @@ before an attempt, records artifact progress and controlled-script receipts,
 and preserves recovery handoffs. The Lead Analyst owns semantic judgment:
 selecting useful source/member IDs, defining the analytical route,
 interpreting evidence, and writing a bounded draft. Coding defects return to
-the same analyst/attempt; recovery requires a completed invocation loss receipt.
+the same analyst/attempt; recovery requires a canonical persisted invocation
+receipt reference/hash matching the active attempt and lane.
 The workbench does not infer business meaning, and the analyst does not bypass
 its path, hash, or workspace controls.
+
+The physical binding is run-level: the initial full archive/member inventory is
+counted once, child contexts reuse it, selected-member reads are counted
+separately, and an explicit final `verify_source_full()` catches mutation.
+Opaque members remain opaque and may be copied only by safe explicit
+materialization. The runner's configurable 3600-second default is a process
+guard, not an agent reasoning or workflow wall-time deadline.
 
 ## Cross-item synthesis
 
@@ -96,12 +104,17 @@ the analytical completion state.
 ## Result integration boundary
 
 Accepted answer bytes are immutable and stored separately from the
-program-owned acceptance envelope and lifecycle state. After acceptance,
-exactly one Result Integration Agent incrementally uses small program APIs for
-claims, metrics, limitations, evidence references, prepared assets, ontology,
-relationships, and dashboard facts. It performs semantic mapping; deterministic
-code validates types, paths, refs, hashes, stages, and commits. Every accepted
-prepared asset is registered in a canonical catalog immutable by source hash,
-core version, and schema. Scope and reuse eligibility control visibility only;
-samples and categories are derived views. There is no prose parser, giant
-mandatory JSON, Integration Reviewer, or finalizer chain.
+program-owned acceptance envelope and lifecycle state. Prepared data starts as
+an item-local candidate under `work/prepared/`; it is absent from the accepted
+registry until one post-acceptance Result Integration commit validates exact
+path/hash/row/byte/scope/provenance and registers it once. Exact retries are
+idempotent; conflicting same IDs fail before registry/LEM mutation, and
+rejected or technical-failure items leave no accepted entry. Exactly one Result
+Integration Agent incrementally uses small program APIs for claims, metrics,
+limitations, evidence references, prepared assets, ontology, relationships,
+and dashboard facts. It performs semantic mapping; deterministic code
+validates types, paths, refs, hashes, stages, and commits. Mechanical
+validation cannot prove semantic completeness; the live Integration Agent and
+an external test-only fidelity audit remain required. There is no prose parser,
+semantic compiler, giant mandatory JSON, Integration Reviewer, or finalizer
+chain.

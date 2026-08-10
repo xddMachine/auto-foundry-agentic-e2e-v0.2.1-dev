@@ -20,7 +20,8 @@ paperwork, empty folders, or per-capability artifacts.
 - artifact-progress before/after counts and no-progress/recovery decisions;
 - evidence references, definitions, assumptions, limits, population, and
   denominator;
-- material findings and any run-local prepared assets;
+- material findings and any run-local prepared candidates (the accepted
+  registry is populated only by the post-acceptance integration commit);
 - materialized draft, Lead Analyst self-check, reviewer verdict, and any one
   business repair;
 - immutable accepted answer bytes plus a separate program-owned acceptance
@@ -38,8 +39,10 @@ asset, chart specification, dashboard source, command, and material output
 when it affects a result or improves reproducibility. Record purpose, material
 inputs and outputs, assumptions, limits, and a reproduction command. Prepared
 Registry entries must point to loadable run-local assets with hash, location,
-schema, grain, lineage/source IDs, scope, and effective period. Never overwrite
-raw evidence.
+schema, grain, lineage/source IDs, scope, and effective period. Candidate bytes
+and descriptors remain under the item `work/prepared/` path until accepted
+integration validates exact path/hash/row/byte/scope/provenance and registers
+once. Never overwrite raw evidence.
 
 ## Natural analysis trace
 
@@ -92,6 +95,13 @@ still apply; create a requirement-scoped view when they do not. Requirement
 Mode preserves explicit user priority and executes one item at a time; no
 second planning workflow is needed.
 
+The inventory counters distinguish the one initial full bind, child-context
+loads without re-inventory, selected-member verification, and an explicit final
+`verify_source_full()` mutation check. Opaque members remain opaque and may be
+copied only through safe explicit materialization. `ControlledScriptRunner`
+uses a configurable 3600-second process guard by default; it is not a workflow
+or agent reasoning deadline.
+
 ## Reproducibility
 
 For a material or repeated calculation, prefer preserved code. For a simple
@@ -107,7 +117,9 @@ store invocation lane/role/route, start/end/status/error when available,
 artifact before/after/counts, execution-recovery and business-repair counts,
 source/member reads, core/cache facts, literal provider/model/host/process
 identity (`unavailable` when unknown), terminal reason class, and artifact
-IDs—not raw business rows, secrets, tokens, or unnecessary personal data. Do
+IDs. Include run-level physical-inventory operation names/counters and
+canonical recovery receipt reference/hash when present—not raw business rows,
+secrets, tokens, or unnecessary personal data. Do
 not use telemetry to invent timing benchmarks, select a route, or alter an
 answer.
 

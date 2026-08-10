@@ -11,9 +11,11 @@ import zipfile
 import pytest
 
 from auto_foundry_core.contracts import DataAssetRef
+from auto_foundry_core.analysis import BoundAnalysisContext
+from auto_foundry_core.durable import ItemWorkspace
 from auto_foundry_core.telemetry import TelemetryRecorder
-from auto_foundry_core.workbench import CatalogCounts, DataRoom, DataRoomCatalogEntry, DataRoomWorkbench
-from auto_foundry_core.workspace import RunContext
+from auto_foundry_core.workbench import CatalogCounts, DataRoom, DataRoomCatalogEntry
+from auto_foundry_core.workspace import AllowedRootError, RunContext
 
 
 def _xlsx_bytes() -> bytes | None:
@@ -275,7 +277,7 @@ def test_unsafe_member_names_are_rejected(tmp_path: Path, name: str) -> None:
         DataRoom.open(context, archive)
 
 
-def test_symlink_and_unsupported_members_are_rejected(tmp_path: Path) -> None:
+def test_symlink_rejected_but_safe_unsupported_member_is_opaque(tmp_path: Path) -> None:
     input_root = tmp_path / "inputs"
     run_root = tmp_path / "run"
     input_root.mkdir()
@@ -292,8 +294,47 @@ def test_symlink_and_unsupported_members_are_rejected(tmp_path: Path) -> None:
 
     with zipfile.ZipFile(archive, "w") as output:
         output.writestr("legacy.xls", b"not supported")
-    with pytest.raises(ValueError, match="unsupported ZIP member format"):
-        DataRoom.open(context, archive)
+    room = DataRoom.open(context, archive)
+    member = room.members()[0]
+    assert member.kind == "opaque"
+    entry = room.build_catalog()[0]
+    assert entry.metadata["extraction"] == "opaque"
+    destination = room.materialize_opaque(member, "opaque/legacy.xls")
+    assert destination.read_bytes() == b"not supported"
+    with pytest.raises(ValueError, match="explicit materialization"):
+        room.read_rows(member)
+
+
+def test_opaque_materialization_rejects_lexical_symlink_destinations(tmp_path: Path) -> None:
+    input_root = tmp_path / "inputs"
+    run_root = tmp_path / "run"
+    input_root.mkdir()
+    run_root.mkdir()
+    archive = input_root / "opaque.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("legacy.xls", b"not supported")
+    context = RunContext("RUN-OPAQUE-SYMLINK-DESTINATION", run_root, (input_root,))
+    room = DataRoom.open(context, archive)
+    member = room.members()[0]
+
+    real_target = run_root / "real-target.xls"
+    real_target.write_bytes(b"sentinel")
+    direct_alias = run_root / "direct-alias.xls"
+    direct_alias.symlink_to(real_target)
+    with pytest.raises(AllowedRootError, match="symlink"):
+        room.materialize_opaque(member, direct_alias)
+    assert real_target.read_bytes() == b"sentinel"
+
+    real_parent = run_root / "real-parent"
+    real_parent.mkdir()
+    parent_alias = run_root / "parent-alias"
+    parent_alias.symlink_to(real_parent, target_is_directory=True)
+    with pytest.raises(AllowedRootError, match="symlink"):
+        room.materialize_opaque(member, parent_alias / "nested.xls")
+    assert not (real_parent / "nested.xls").exists()
+
+    normal = room.materialize_opaque(member, run_root / "opaque" / "normal.xls")
+    assert normal.read_bytes() == b"not supported"
 
 
 def test_bounded_json_and_archive_immutability(room_fixture: tuple[RunContext, Path, dict[str, bytes]]) -> None:
@@ -325,11 +366,11 @@ def test_zip_bomb_and_member_bounds(tmp_path: Path) -> None:
         DataRoom.open(context, archive, max_compression_ratio=1.0)
 
 
-def test_prepared_materialization_descriptor_load_and_registry(room_fixture: tuple[RunContext, Path, dict[str, bytes]]) -> None:
+def test_prepared_candidate_materialization_descriptor_and_registry_boundary(room_fixture: tuple[RunContext, Path, dict[str, bytes]]) -> None:
     context, archive, _ = room_fixture
-    telemetry = TelemetryRecorder(context=context)
-    workbench = DataRoomWorkbench(context, DataAssetRef.from_path(archive), telemetry=telemetry)
-    descriptor = workbench.save_prepared(
+    item = ItemWorkspace.create(context, "Q-PREPARED", original_text="prepared")
+    bound = BoundAnalysisContext.create(context, DataAssetRef.from_path(archive), item)
+    descriptor = bound.save_prepared_candidate(
         "sales-prepared",
         "sales.csv",
         format="jsonl",
@@ -338,8 +379,8 @@ def test_prepared_materialization_descriptor_load_and_registry(room_fixture: tup
         source_refs=(ref for ref in (DataAssetRef.from_path(archive),)),
         lineage={"purpose": "test"},
     )
-    prepared_path = context.resolve_run_path("prepared/sales-prepared.jsonl")
-    descriptor_path = context.resolve_run_path("prepared/sales-prepared.descriptor.json")
+    prepared_path = Path(descriptor.location)
+    descriptor_path = prepared_path.parent / "sales-prepared.descriptor.json"
     assert prepared_path.is_file() and descriptor_path.is_file()
     assert descriptor.location == str(prepared_path)
     assert descriptor.prepared_content_hash == hashlib.sha256(prepared_path.read_bytes()).hexdigest()
@@ -351,16 +392,20 @@ def test_prepared_materialization_descriptor_load_and_registry(room_fixture: tup
     assert descriptor.lineage["members"][0]["path"] == "sales.csv"
     assert descriptor.transformations == ("read_csv", "bounded")
 
-    loaded = workbench.prepared("sales-prepared")
-    assert len(loaded) == 2
-    assert loaded[0]["order_id"] == "A-1"
-    assert workbench.prepared_registry.search(prepared_asset_id="sales-prepared") == (descriptor,)
-    assert workbench.prepared_registry.load("sales-prepared").descriptor == descriptor
-    assert any(event.event_type == "data_room_prepared_write" for event in telemetry.events)
+    assert bound.prepared_assets.search(prepared_asset_id="sales-prepared") == ()
+    assert bound.save_prepared_candidate(
+        "sales-prepared",
+        "sales.csv",
+        format="jsonl",
+        grain="one row per order",
+        transformations=(step for step in ("read_csv", "bounded")),
+        source_refs=(ref for ref in (DataAssetRef.from_path(archive),)),
+        lineage={"purpose": "test"},
+    ) == descriptor
 
     prepared_path.write_text(prepared_path.read_text(encoding="utf-8") + "{}\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="content changed"):
-        workbench.prepared("sales-prepared")
+    with pytest.raises(ValueError, match="different descriptor|incomplete"):
+        bound.save_prepared_candidate("sales-prepared", "sales.csv")
 
 
 def _nested_zip(*entries: tuple[zipfile.ZipInfo | str, bytes], compression: int = zipfile.ZIP_STORED) -> bytes:
@@ -429,19 +474,20 @@ def test_xlsx_entry_bound_counts_directories_and_exact_valid_bound(room_fixture:
 
 def test_prepared_encoded_byte_cap_and_provenance_integrity(room_fixture: tuple[RunContext, Path, dict[str, bytes]]) -> None:
     context, archive, _ = room_fixture
-    workbench = DataRoomWorkbench(context, archive)
+    item = ItemWorkspace.create(context, "Q-PREPARED-CAPS", original_text="prepared")
+    bound = BoundAnalysisContext.create(context, archive, item)
     with pytest.raises(ValueError, match="max_bytes"):
-        workbench.save_prepared("too-large", [{"value": "0123456789"}], max_bytes=1)
-    assert not context.resolve_run_path("prepared/too-large.jsonl").exists()
+        bound.save_prepared_candidate("too-large", [{"value": "0123456789"}], max_bytes=1)
+    assert not (item.work_root / "prepared" / "too-large").exists()
 
     forged = DataAssetRef(uri="room.zip", format="zip", content_hash="0" * 64)
     with pytest.raises(ValueError, match="source changed after registration"):
-        workbench.save_prepared("forged", [{"value": 1}], source_refs=(forged,))
-    assert not context.resolve_run_path("prepared/forged.jsonl").exists()
+        bound.save_prepared_candidate("forged", [{"value": 1}], source_refs=(forged,))
+    assert not (item.work_root / "prepared" / "forged").exists()
 
     with pytest.raises(ValueError, match="reserved keys"):
-        workbench.save_prepared("lineage-override", [{"value": 1}], lineage={"archive": {"forged": True}})
-    assert not context.resolve_run_path("prepared/lineage-override.jsonl").exists()
+        bound.save_prepared_candidate("lineage-override", [{"value": 1}], lineage={"archive": {"forged": True}})
+    assert not (item.work_root / "prepared" / "lineage-override").exists()
 
 
 def test_json_override_does_not_mutate_room_limits(room_fixture: tuple[RunContext, Path, dict[str, bytes]]) -> None:
@@ -458,9 +504,10 @@ def test_json_override_does_not_mutate_room_limits(room_fixture: tuple[RunContex
 
 def test_prepared_rejects_archive_mutation_before_manual_materialization(room_fixture: tuple[RunContext, Path, dict[str, bytes]]) -> None:
     context, archive, _ = room_fixture
-    workbench = DataRoomWorkbench(context, archive)
+    item = ItemWorkspace.create(context, "Q-PREPARED-MUTATION", original_text="prepared")
+    bound = BoundAnalysisContext.create(context, archive, item)
     with zipfile.ZipFile(archive, "w") as output:
         output.writestr("sales.csv", b"order_id,amount\nCHANGED,1\n")
     with pytest.raises(ValueError, match="archive changed"):
-        workbench.save_prepared("mutated", [{"value": 1}])
-    assert not context.resolve_run_path("prepared/mutated.jsonl").exists()
+        bound.save_prepared_candidate("mutated", [{"value": 1}])
+    assert not (item.work_root / "prepared" / "mutated").exists()

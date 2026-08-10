@@ -9,9 +9,9 @@
   program-owned data room, and durable item workspaces.
 - The normal entry point is one immutable `RunContext` passed to one
   `DataRoomWorkbench` and one `ItemWorkspace` per active item. The workbench
-  owns read-only archive/member cataloging, hashes, bounded reads, prepared
-  assets, item state, artifact progress, execution recovery, review, and
-  immutable terminal snapshots. `CoreRuntime.execute()` remains available for
+  owns read-only archive/member cataloging, hashes, bounded reads, atomic
+  item-local prepared candidates, item state, artifact progress, execution
+  recovery, review, and immutable terminal snapshots. `CoreRuntime.execute()` remains available for
   deterministic operations: it validates the run/input boundary, hashes
   deterministic inputs, performs run-local cache lookup, dispatches the catalog
   capability, records an `OperationReceipt`, and emits passive telemetry. Its
@@ -50,11 +50,22 @@
 `tests/integration/test_vertical_acceptance.py` remains the broader closure
 proof for source/runtime/LEM/product behavior. The companion
 `tests/integration/test_workbench_durable_vertical.py` proves the normal v0.2.3
-program path with a safe generic ZIP: catalog/search/read/save-prepared,
-workspace creation before an attempt, materialization then execution recovery,
-a separate one-time business repair, review/accept/reload, telemetry, source
-hash immutability, sibling-path rejection, and no model/network calls. Both
-tests use real local filesystem wiring and generic fixtures only.
+program path with a safe generic ZIP: catalog/search/read, item-local
+candidate staging before acceptance, accepted-only Result Integration commit,
+workspace creation before an attempt, exact-receipt execution recovery, a
+separate one-time business repair, review/accept/reload, telemetry, source
+hash immutability, sibling-path rejection, safe opaque materialization, and no
+model/network calls. Both tests use real local filesystem wiring and generic
+fixtures only.
+
+The prelive verticals also prove one run-level physical inventory (initial full
+bind plus member hashes), child bound contexts without re-inventory, selected
+member verification, and explicit final verification that detects a mutation.
+Prepared candidate bytes remain unchanged across validation, correction, and
+commit, while an injected integration crash leaves a durable intent that
+converges on retry. Mechanical validation is intentionally limited: semantic
+completeness still requires the live Integration Agent and an external
+test-only fidelity audit.
 
 Two concrete integration defects found by this proof are fixed: contract
 hashing now uses `to_dict()` before `dataclasses.asdict()` (mapping proxies are

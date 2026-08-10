@@ -16,7 +16,7 @@ from auto_foundry_core.durable import (
     ItemWorkspace,
     ProgressDecision,
 )
-from auto_foundry_core.lifecycle import AgentInvocationReceipt
+from auto_foundry_core.lifecycle import AgentInvocationReceipt, InvocationReceiptLedger
 from auto_foundry_core.telemetry import TelemetryRecorder
 from auto_foundry_core.workspace import AllowedRootError, RunContext
 
@@ -71,11 +71,12 @@ def test_recovery_is_separate_from_business_repair_and_preserves_handoff(tmp_pat
     workspace.observe_attempt(attempt.attempt_id)
 
     receipt = AgentInvocationReceipt(
-        "I-001", "Q-001", "Lead Analyst", "lead", start="2026-01-01T00:00:00Z",
+        "I-001", "Q-001", attempt.attempt_id, attempt.lane_id, "Lead Analyst", "lead", start="2026-01-01T00:00:00Z",
         finish="2026-01-01T00:00:01Z", terminal_reason="process_lost",
     )
+    receipt_ref = InvocationReceiptLedger(workspace.context).append(receipt)
     recovery = workspace.begin_recovery(
-        "lane-2", "Lead Analyst", prior_attempt_id=attempt.attempt_id, receipt=receipt
+        "lane-2", "Lead Analyst", prior_attempt_id=attempt.attempt_id, receipt_ref=receipt_ref
     )
     assert recovery.attempt_id == "A-002"
     assert recovery.route == "recovery"
@@ -84,10 +85,126 @@ def test_recovery_is_separate_from_business_repair_and_preserves_handoff(tmp_pat
     record = workspace.state["attempts"][-1]
     assert record["prior_attempt_id"] == "A-001"
     assert record["handoff_ref"] == "work/handoff.json"
+    assert record["recovery_receipt_ref"] == receipt_ref
+    assert record["recovery_invocation_id"] == "I-001"
+    assert len(record["recovery_receipt_hash"]) == 64
     assert workspace.state["lifecycle_state"] == "recovering"
 
     with pytest.raises(ValueError, match="active work"):
-        workspace.begin_recovery("lane-3", "Lead Analyst", prior_attempt_id="A-002")
+        workspace.begin_recovery("lane-3", "Lead Analyst", prior_attempt_id="A-002", receipt_ref=receipt_ref)
+
+
+@pytest.mark.parametrize(
+    ("mismatch", "item_id", "attempt_id", "lane_id", "role"),
+    (
+        ("item_id", "Q-OTHER", "A-001", "lane-1", "Lead Analyst"),
+        ("attempt_id", "Q-001", "A-OTHER", "lane-1", "Lead Analyst"),
+        ("lane_id", "Q-001", "A-001", "lane-other", "Lead Analyst"),
+        ("role", "Q-001", "A-001", "lane-1", "Other Role"),
+    ),
+)
+def test_recovery_requires_exact_prior_item_attempt_lane_and_role(
+    tmp_path: Path,
+    mismatch: str,
+    item_id: str,
+    attempt_id: str,
+    lane_id: str,
+    role: str,
+) -> None:
+    workspace = _workspace(tmp_path / mismatch)
+    prior = workspace.begin_attempt("lane-1", "Lead Analyst")
+    receipt = AgentInvocationReceipt(
+        f"I-{mismatch}",
+        item_id,
+        attempt_id,
+        lane_id,
+        role,
+        "lead",
+        finish="2026-01-01T00:00:01Z",
+        terminal_reason="process_lost",
+    )
+    receipt_ref = InvocationReceiptLedger(workspace.context).append(receipt)
+    with pytest.raises(ValueError, match=mismatch):
+        workspace.begin_recovery(
+            "lane-2",
+            "Recovery Agent",
+            prior_attempt_id=prior.attempt_id,
+            receipt_ref=receipt_ref,
+        )
+    assert workspace.state["execution_recovery_count"] == 0
+    assert workspace.state["active_attempt_id"] == prior.attempt_id
+
+
+def test_recovery_rejects_unpersisted_receipt_stale_attempt_and_duplicate_ledger_id(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    prior = workspace.begin_attempt("lane-1", "Lead Analyst")
+    receipt = AgentInvocationReceipt(
+        "I-UNPERSISTED",
+        workspace.item_id,
+        prior.attempt_id,
+        prior.lane_id,
+        prior.role,
+        prior.route,
+        finish="2026-01-01T00:00:01Z",
+        terminal_reason="process_lost",
+    )
+    with pytest.raises(ValueError, match="stable|persisted"):
+        workspace.begin_recovery("lane-2", "Recovery Agent", prior_attempt_id=prior.attempt_id, receipt_ref=receipt)
+
+    ledger = InvocationReceiptLedger(workspace.context)
+    receipt_ref = ledger.append(receipt)
+    workspace.finish_attempt(prior.attempt_id, status="lost")
+    current = workspace.begin_attempt("lane-current", "Lead Analyst")
+    with pytest.raises(ValueError, match="current active"):
+        workspace.begin_recovery("lane-2", "Recovery Agent", prior_attempt_id=prior.attempt_id, receipt_ref=receipt_ref)
+
+    line = ledger.path.read_text(encoding="utf-8")
+    ledger.path.write_text(line + line, encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate"):
+        InvocationReceiptLedger(workspace.context)
+    assert workspace.state["execution_recovery_count"] == 0
+    assert workspace.state["active_attempt_id"] == current.attempt_id
+
+
+def test_recovery_state_and_ledger_tampering_fail_closed_after_reload(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    prior = workspace.begin_attempt("lane-1", "Lead Analyst")
+    receipt = AgentInvocationReceipt(
+        "I-TAMPER",
+        workspace.item_id,
+        prior.attempt_id,
+        prior.lane_id,
+        prior.role,
+        prior.route,
+        finish="2026-01-01T00:00:01Z",
+        terminal_reason="process_lost",
+    )
+    ledger = InvocationReceiptLedger(workspace.context)
+    receipt_ref = ledger.append(receipt)
+    workspace.begin_recovery("lane-2", "Recovery Agent", prior_attempt_id=prior.attempt_id, receipt_ref=receipt_ref)
+
+    state_path = workspace.item_root / "item_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["execution_recovery_count"] = 2
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    with pytest.raises(ValueError, match="execution_recovery_count"):
+        ItemWorkspace.load(workspace.context, workspace.item_id)
+
+    state["execution_recovery_count"] = 1
+    state["attempts"][-1]["recovery_receipt_hash"] = "f" * 64
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    with pytest.raises(ValueError, match="receipt hash"):
+        ItemWorkspace.load(workspace.context, workspace.item_id)
+
+    # Restore state and tamper only the ledger payload; state reload still
+    # fails because the append-only receipt hash no longer matches.
+    state["attempts"][-1]["recovery_receipt_hash"] = ledger.record_hash(receipt_ref)
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    line = json.loads(ledger.path.read_text(encoding="utf-8"))
+    line["terminal_reason"] = "syntax_error"
+    ledger.path.write_text(json.dumps(line) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="hash"):
+        ItemWorkspace.load(workspace.context, workspace.item_id)
 
 
 def test_review_guards_repair_once_and_acceptance_are_immutable(tmp_path: Path) -> None:
@@ -342,6 +459,9 @@ def test_state_is_deep_copied_and_schema_is_explicit(tmp_path: Path) -> None:
         "prior_attempt_id",
         "handoff_ref",
         "error",
+        "recovery_receipt_ref",
+        "recovery_invocation_id",
+        "recovery_receipt_hash",
     )
     assert set(ITEM_STATE_SCHEMA["review_fields"]) == {
         "status",

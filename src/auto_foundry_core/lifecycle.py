@@ -29,6 +29,7 @@ from .workspace import AllowedRootError, RunContext
 RUN_STATE_FILENAME = "run_state.json"
 _RUN_LOCK_FILENAME = ".run_state.lock"
 INVOCATION_LEDGER_FILENAME = "invocation_receipts.jsonl"
+_INVOCATION_LEDGER_LOCK_FILENAME = ".invocation_receipts.lock"
 RUN_STATES = (
     "initialized",
     "running",
@@ -50,6 +51,8 @@ _TRANSITIONS = {
 _RECEIPT_FIELDS = (
     "invocation_id",
     "item_id",
+    "attempt_id",
+    "lane_id",
     "role",
     "route",
     "provider",
@@ -224,6 +227,8 @@ class AgentInvocationReceipt:
 
     invocation_id: str
     item_id: str
+    attempt_id: str
+    lane_id: str
     role: str
     route: str
     provider: str = "unavailable"
@@ -238,7 +243,7 @@ class AgentInvocationReceipt:
     tool_calls: Any = ()
 
     def __post_init__(self) -> None:
-        for name in ("invocation_id", "item_id", "role", "route"):
+        for name in ("invocation_id", "item_id", "attempt_id", "lane_id", "role", "route"):
             value = str(getattr(self, name)).strip()
             if not value:
                 raise ValueError(f"{name} must be non-empty")
@@ -284,6 +289,8 @@ class AgentInvocationReceipt:
         return {
             "invocation_id": self.invocation_id,
             "item_id": self.item_id,
+            "attempt_id": self.attempt_id,
+            "lane_id": self.lane_id,
             "role": self.role,
             "route": self.route,
             "provider": self.provider,
@@ -313,7 +320,15 @@ class InvocationReceiptLedger:
             raise TypeError("InvocationReceiptLedger requires a RunContext")
         self.context = context
         self.path = _safe_telemetry_path(context, INVOCATION_LEDGER_FILENAME) if path is None else self._resolve_path(path)
+        self._lock_path = (
+            _safe_telemetry_path(context, _INVOCATION_LEDGER_LOCK_FILENAME)
+            if path is None
+            else self.path.with_name(f".{self.path.name}.lock")
+        )
+        if self._lock_path.is_symlink():
+            raise AllowedRootError("invocation ledger lock cannot be a symlink")
         self._receipts: dict[str, AgentInvocationReceipt] = {}
+        self._record_hashes: dict[str, str] = {}
         self.reload()
 
     @classmethod
@@ -336,34 +351,103 @@ class InvocationReceiptLedger:
         return resolved
 
     @property
-    def receipts(self) -> tuple[AgentInvocationReceipt, ...]:
-        return tuple(self._receipts.values())
+    def _reference_prefix(self) -> str:
+        """Return the run-relative ledger path used in stable references."""
 
-    def append(self, receipt: AgentInvocationReceipt | Mapping[str, Any]) -> AgentInvocationReceipt:
-        if isinstance(receipt, Mapping):
-            receipt = AgentInvocationReceipt.from_dict(receipt)
-        if not isinstance(receipt, AgentInvocationReceipt):
-            raise TypeError("receipt must be AgentInvocationReceipt")
-        if not receipt.completed:
-            raise ValueError("only completed invocation receipts may be appended")
-        if receipt.invocation_id in self._receipts:
-            raise ValueError("invocation_id is already recorded")
-        payload = receipt.to_dict()
-        record = {**payload, "record_hash": _sha256_bytes(_json_bytes(payload))}
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.is_symlink():
-            raise AllowedRootError("invocation ledger cannot be a symlink")
-        with self.path.open("ab") as stream:
-            stream.write(_json_bytes(record))
-            stream.flush()
-            os.fsync(stream.fileno())
-        self._receipts[receipt.invocation_id] = receipt
-        return receipt
+        try:
+            relative = self.path.relative_to(self.context.run_root)
+        except ValueError as exc:  # pragma: no cover - guarded by _resolve_path
+            raise AllowedRootError("invocation ledger escapes run context") from exc
+        return relative.as_posix()
+
+    def _stable_ref(self, invocation_id: str) -> str:
+        return f"{self._reference_prefix}#{invocation_id}"
+
+    @contextmanager
+    def _ledger_lock(self):
+        """Serialize ledger readers and writers across threads/processes."""
+
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        if self._lock_path.is_symlink():
+            raise AllowedRootError("invocation ledger lock cannot be a symlink")
+        with self._lock_path.open("a+b") as stream:
+            if fcntl is not None:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+    @property
+    def receipts(self) -> tuple[AgentInvocationReceipt, ...]:
+        """Return an authoritative, lock-protected ledger snapshot."""
+
+        with self._ledger_lock():
+            return self._reload_unlocked()
+
+    def _parse_stable_ref(self, receipt_ref: Any) -> str:
+        """Validate and extract an invocation ID from one canonical ref.
+
+        Recovery deliberately accepts no invocation-ID shorthand and no path
+        aliases.  The reference must point at this exact run-local ledger.
+        """
+
+        if not isinstance(receipt_ref, str) or not receipt_ref.strip():
+            raise ValueError("receipt_ref must be a stable ledger reference")
+        value = receipt_ref.strip()
+        prefix = f"{self._reference_prefix}#"
+        if not value.startswith(prefix):
+            raise ValueError("receipt_ref must use the canonical ledger path")
+        invocation_id = value[len(prefix) :]
+        if not invocation_id or "#" in invocation_id or "\\" in invocation_id or "/" in invocation_id:
+            raise ValueError("receipt_ref invocation_id is invalid")
+        return invocation_id
+
+    def append(self, receipt: AgentInvocationReceipt | Mapping[str, Any]) -> str:
+        """Persist one completed receipt and return its stable ledger reference.
+
+        The payload hash is computed before the fsync-backed append.  Callers
+        must retain the returned reference and use it for any later recovery;
+        the receipt object itself is never an authorization token.
+        """
+
+        with self._ledger_lock():
+            # Refresh before every append while holding the same advisory lock
+            # used by readers and other writers.  A ledger object held across
+            # concurrent writers therefore cannot append through a duplicate
+            # ID or a tampered ledger snapshot.
+            self._reload_unlocked()
+            if isinstance(receipt, Mapping):
+                receipt = AgentInvocationReceipt.from_dict(receipt)
+            if not isinstance(receipt, AgentInvocationReceipt):
+                raise TypeError("receipt must be AgentInvocationReceipt")
+            if not receipt.completed:
+                raise ValueError("only completed invocation receipts may be appended")
+            if receipt.invocation_id in self._receipts:
+                raise ValueError("invocation_id is already recorded")
+            payload = receipt.to_dict()
+            record = {**payload, "record_hash": _sha256_bytes(_json_bytes(payload))}
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if self.path.is_symlink():
+                raise AllowedRootError("invocation ledger cannot be a symlink")
+            with self.path.open("ab") as stream:
+                stream.write(_json_bytes(record))
+                stream.flush()
+                os.fsync(stream.fileno())
+            self._receipts[receipt.invocation_id] = receipt
+            self._record_hashes[receipt.invocation_id] = record["record_hash"]
+            return self._stable_ref(receipt.invocation_id)
 
     record = append
 
     def reload(self) -> tuple[AgentInvocationReceipt, ...]:
+        with self._ledger_lock():
+            return self._reload_unlocked()
+
+    def _reload_unlocked(self) -> tuple[AgentInvocationReceipt, ...]:
         self._receipts = {}
+        self._record_hashes = {}
         if not self.path.exists():
             return ()
         if self.path.is_symlink() or not self.path.is_file():
@@ -389,14 +473,37 @@ class InvocationReceiptLedger:
             if receipt.invocation_id in self._receipts:
                 raise ValueError("invocation ledger contains duplicate invocation_id")
             self._receipts[receipt.invocation_id] = receipt
-        return self.receipts
+            self._record_hashes[receipt.invocation_id] = expected
+        return tuple(self._receipts.values())
 
-    def get(self, invocation_id: str) -> AgentInvocationReceipt:
-        key = str(invocation_id).strip()
-        try:
-            return self._receipts[key]
-        except KeyError as exc:
-            raise KeyError(f"unknown invocation_id: {key}") from exc
+    def resolve(self, receipt_ref: str) -> tuple[AgentInvocationReceipt, str]:
+        """Resolve one exact, persisted reference and return receipt + hash."""
+
+        with self._ledger_lock():
+            # Re-read the ledger at the authorization boundary while holding
+            # the reader lock.  This closes the gap where a previously-created
+            # ledger object would otherwise trust a receipt after its JSONL
+            # line had been edited or replaced, and prevents a partial append
+            # from being observed.
+            self._reload_unlocked()
+            key = self._parse_stable_ref(receipt_ref)
+            try:
+                receipt = self._receipts[key]
+                return receipt, self._record_hashes[key]
+            except KeyError as exc:
+                raise KeyError(f"unknown receipt_ref: {receipt_ref}") from exc
+
+    def get(self, receipt_ref: str) -> AgentInvocationReceipt:
+        """Resolve a canonical stable reference to its persisted receipt."""
+
+        receipt, _record_hash = self.resolve(receipt_ref)
+        return receipt
+
+    def record_hash(self, receipt_ref: str) -> str:
+        """Return the hash bound to one canonical stable reference."""
+
+        _receipt, record_hash = self.resolve(receipt_ref)
+        return record_hash
 
 
 @dataclass(frozen=True)

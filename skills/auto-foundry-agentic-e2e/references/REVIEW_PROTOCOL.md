@@ -68,8 +68,9 @@ review layer.
 After `repair_once`, perform one short fresh recheck of the repaired points.
 Do not restart the item or create another business repair. Execution recovery
 before review is a separate program decision and does not consume this repair;
-it requires a completed invocation receipt proving lane/provider/host/process
-loss. Filesystem no-progress alone yields `await_runtime` or
+it requires a canonical persisted invocation `receipt_ref`/hash proving
+lane/provider/host/process loss and matching the active attempt/lane.
+Unpersisted or mismatched references fail closed. Filesystem no-progress alone yields `await_runtime` or
 `materialization_guidance`. Provider/model identity may be literal
 `unavailable`.
 If the issue remains, record the supported outcome and disclose the unresolved
@@ -88,7 +89,9 @@ Mechanical checks may verify structured fields, file existence, script
 results, exact IDs, raw-source immutability, artifact progress, and internal-
 link integrity; business judgment remains with the Lead Analyst and reviewer.
 There is no reviewer-of-reviewer, business-repair finalizer, manual terminalizer,
-or Integration Reviewer.
+or Integration Reviewer. Result Integration mechanical validation cannot prove
+semantic completeness; a live Integration Agent and an external test-only
+fidelity audit remain required, with no prose parser or semantic compiler.
 
 ## Technical defects
 

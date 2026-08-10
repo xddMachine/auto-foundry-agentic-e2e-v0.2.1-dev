@@ -111,6 +111,18 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
     source_before = archive.read_bytes()
     manifest_before = bound.manifest_path.read_bytes()
     assert bound.source_catalog.source_hash == archive_before
+    # Analysis materializes a candidate below this item only.  The accepted
+    # registry remains empty until Result Integration commits the accepted
+    # item; the candidate sidecar is not a registry entry.
+    prepared_descriptor = bound.save_prepared_candidate(
+        "generic-reusable",
+        record_entry,
+        scope="reusable",
+        transformations=("bounded_sample",),
+        limitations=("Synthetic fixture only",),
+    )
+    assert prepared_descriptor.scope == "reusable"
+    assert bound.prepared_assets.search() == ()
 
     attempt = item.begin_attempt("lane-lead", "Lead Analyst")
     invalid_script = item.work_root / "calculations" / "invalid.py"
@@ -141,12 +153,15 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
         corrected_script,
         allowed_outputs=(output,),
         deterministic_outputs=(output,),
+        timeout_seconds=3600,
     )
     assert corrected_report.succeeded
     assert corrected_report.deterministic_match is True
     assert [receipt.phase for receipt in corrected_report.receipts] == ["smoke", "full", "full"]
     assert all(receipt.same_attempt_feedback is False for receipt in corrected_report.receipts)
     assert json.loads(output.read_text(encoding="utf-8"))["status"] == "bounded"
+    assert bound.runner_config["default_timeout_seconds"] == 3600.0
+    assert not any(path.suffix == ".pyc" for path in run_root.rglob("*"))
     bound.ensure_valid()
     assert archive.read_bytes() == source_before
     assert bound.manifest_path.read_bytes() == manifest_before
@@ -157,6 +172,8 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
     unavailable = AgentInvocationReceipt(
         "I-V023-UNAVAILABLE",
         item.item_id,
+        attempt.attempt_id,
+        "lane-lead",
         "Lead Analyst",
         "lead",
         provider="unavailable",
@@ -166,8 +183,8 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
         terminal_reason="provider_failure",
         provider_error="host did not provide provider identity",
     )
-    ledger.append(unavailable)
-    assert ledger.get(unavailable.invocation_id).provider == "unavailable"
+    unavailable_ref = ledger.append(unavailable)
+    assert ledger.get(unavailable_ref).provider == "unavailable"
     item.write_draft({"answer": "bounded corrected result", "evidence": "work/analysis.json"})
     item.finish_attempt(attempt.attempt_id, status="completed")
     item.record_review("repair_once", reviewer_ref="synthetic-reviewer")
@@ -186,13 +203,7 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
     # Exactly one owner stages all integration kinds through the program API.
     lem = LivingEnterpriseModel(run_id=context.run_id)
     registry = workbench.prepared_registry
-    prepared_descriptor = workbench.save_prepared(
-        "generic-reusable",
-        record_entry,
-        scope="reusable",
-        transformations=("bounded_sample",),
-        limitations=("Synthetic fixture only",),
-    )
+    assert registry.search() == ()
     session = IntegrationSession.create(context, item, lem, registry, "result-integration")
     with pytest.raises(ValueError, match="owned by another"):
         IntegrationSession.create(context, item, lem, registry, "other-owner")
@@ -224,12 +235,28 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
     assert manifest["status"] == "committed"
     assert item.integration_state == "integrated"
     assert len(session.records) == 9
+    assert registry.search(prepared_asset_id="generic-reusable", scope="reusable") == (prepared_descriptor,)
     assert {record.kind for record in session.records} == {
         "ontology_item", "metric", "claim", "limitation", "evidence_link",
         "prepared_asset", "relationship", "dashboard_fact",
     }
 
     session2 = IntegrationSession.create(context, item2, lem, registry, "result-integration")
+    bound2 = BoundAnalysisContext.create(
+        context,
+        DataAssetRef.from_path(archive),
+        item2,
+        ontology_bundle={"relevant": ("generic-record",)},
+        workbench=workbench,
+    )
+    conflicting_descriptor = bound2.save_prepared_candidate(
+        "generic-reusable",
+        [{"record_id": "conflict", "value": 99}],
+        scope="requirement_scoped",
+    )
+    with pytest.raises(ValueError, match="different descriptor"):
+        session2.register_prepared_asset(conflicting_descriptor)
+    assert registry.search(prepared_asset_id="generic-reusable", scope="reusable") == (prepared_descriptor,)
     session2.add_ontology_item(
         OntologyItem(item_id="second-item", item_type="entity", label="Second item", scope="question"),
         evidence_refs=("work/plan.json",),

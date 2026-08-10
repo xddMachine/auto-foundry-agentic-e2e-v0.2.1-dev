@@ -95,6 +95,9 @@ _ATTEMPT_FIELDS = (
     "prior_attempt_id",
     "handoff_ref",
     "error",
+    "recovery_receipt_ref",
+    "recovery_invocation_id",
+    "recovery_receipt_hash",
 )
 _REVIEW_FIELDS = frozenset({"status", "strength", "verdict", "reviewer_ref", "draft_hash"})
 _REVIEW_VERDICTS = frozenset({"accept", "accept_with_limits", "repair_once", "block_specific_claims"})
@@ -287,6 +290,18 @@ def _sha256_bytes(payload: bytes) -> str:
 
 def _is_sha256(value: Any) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+
+
+_INVOCATION_RECEIPT_REF_PREFIX = "telemetry/invocation_receipts.jsonl#"
+
+
+def _is_stable_receipt_ref(value: Any) -> bool:
+    """Validate the exact run-local invocation ledger reference shape."""
+
+    if not isinstance(value, str) or not value.startswith(_INVOCATION_RECEIPT_REF_PREFIX):
+        return False
+    invocation_id = value[len(_INVOCATION_RECEIPT_REF_PREFIX) :]
+    return bool(invocation_id) and "#" not in invocation_id and "/" not in invocation_id and "\\" not in invocation_id
 
 
 def _manifest_hash(manifest: Mapping[str, Any]) -> str:
@@ -571,6 +586,7 @@ class ItemWorkspace:
             # state or terminal directory exists.
             if set(state) == _EXECUTION_STATE_FIELDS or workspace.accepted_root.exists() or workspace.accepted_root.is_symlink():
                 workspace._ensure_execution_state()
+                workspace._validate_recovery_authorizations()
                 workspace._reconcile_review_draft()
                 workspace._reconcile_terminal_snapshot()
             # A prior process may have been interrupted after state creation
@@ -655,6 +671,7 @@ class ItemWorkspace:
             state=state,
         )
         workspace._ensure_execution_state()
+        workspace._validate_recovery_authorizations()
         workspace._reconcile_review_draft()
         workspace._reconcile_terminal_snapshot()
         workspace._emit("item_workspace_load", artifact="item_state.json")
@@ -1031,6 +1048,22 @@ class ItemWorkspace:
         for optional in ("error", "prior_attempt_id", "handoff_ref"):
             if record[optional] is not None and not isinstance(record[optional], str):
                 raise ValueError(f"item_state.json attempt {optional} is invalid")
+        auth_fields = (
+            record["recovery_receipt_ref"],
+            record["recovery_invocation_id"],
+            record["recovery_receipt_hash"],
+        )
+        if record["route"] == "recovery":
+            if record["prior_attempt_id"] is None:
+                raise ValueError("recovery attempt must identify prior_attempt_id")
+            if not _is_stable_receipt_ref(record["recovery_receipt_ref"]):
+                raise ValueError("recovery attempt receipt_ref is invalid")
+            if not isinstance(record["recovery_invocation_id"], str) or not record["recovery_invocation_id"].strip():
+                raise ValueError("recovery attempt invocation_id is invalid")
+            if not _is_sha256(record["recovery_receipt_hash"]):
+                raise ValueError("recovery attempt receipt_hash is invalid")
+        elif any(value is not None for value in auth_fields):
+            raise ValueError("non-recovery attempt cannot contain recovery authorization")
         return record["status"] == "active"
 
     @staticmethod
@@ -1040,6 +1073,7 @@ class ItemWorkspace:
         attempt_ids: set[str] = set()
         active_ids: set[str] = set()
         active_count = 0
+        recovery_refs: set[str] = set()
         for record in attempts:
             active_count += int(ItemWorkspace._validate_attempt_record(record))
             attempt_id = record["attempt_id"]
@@ -1048,6 +1082,22 @@ class ItemWorkspace:
             attempt_ids.add(attempt_id)
             if record["status"] == "active":
                 active_ids.add(attempt_id)
+            if record["route"] == "recovery":
+                receipt_ref = record["recovery_receipt_ref"]
+                if receipt_ref in recovery_refs:
+                    raise ValueError("item_state.json recovery receipt references must be unique")
+                recovery_refs.add(receipt_ref)
+        for record in attempts:
+            if record["route"] != "recovery":
+                if record["prior_attempt_id"] is not None:
+                    raise ValueError("non-recovery attempt cannot identify prior_attempt_id")
+                continue
+            prior_id = record["prior_attempt_id"]
+            if prior_id not in attempt_ids or prior_id == record["attempt_id"]:
+                raise ValueError("recovery attempt prior_attempt_id is invalid")
+            prior = next(item for item in attempts if item["attempt_id"] == prior_id)
+            if prior["status"] != "recovered":
+                raise ValueError("recovery attempt prior attempt must be recovered")
         return attempt_ids, active_count, active_ids
 
     @staticmethod
@@ -1072,6 +1122,12 @@ class ItemWorkspace:
     def _validate_attempt_state(state: Mapping[str, Any]) -> str | None:
         attempt_ids, active_count, active_ids = ItemWorkspace._validate_attempt_collection(state["attempts"])
         return ItemWorkspace._validate_active_attempt(state, attempt_ids, active_count, active_ids)
+
+    @staticmethod
+    def _validate_recovery_count(state: Mapping[str, Any]) -> None:
+        expected = sum(1 for record in state["attempts"] if record.get("route") == "recovery")
+        if state["execution_recovery_count"] != expected:
+            raise ValueError("item_state.json execution_recovery_count does not match recovery attempts")
 
     @staticmethod
     def _validate_review_metadata(review: Mapping[str, Any]) -> tuple[str, Any, Any, Any]:
@@ -1209,6 +1265,7 @@ class ItemWorkspace:
         if not ItemWorkspace._validate_state_fields(state):
             return
         active = ItemWorkspace._validate_attempt_state(state)
+        ItemWorkspace._validate_recovery_count(state)
         review_status = ItemWorkspace._validate_review_state(state["review"])
         ItemWorkspace._validate_terminal_state(state, active, review_status)
         ItemWorkspace._validate_integration_state(state)
@@ -1273,8 +1330,50 @@ class ItemWorkspace:
         if touch:
             candidate["updated_at"] = _now()
         self._validate_state_shape(candidate)
+        self._validate_recovery_authorizations(candidate)
         _atomic_write_json(self._resolve_item_subpath(_STATE_FILENAME), candidate)
         self._state = candidate
+
+    def _validate_recovery_authorizations(self, state: Mapping[str, Any] | None = None) -> None:
+        """Verify every persisted recovery record against the append-only ledger.
+
+        Item state carries only a stable reference, invocation identity, and
+        record hash.  The ledger remains the authority for all receipt facts;
+        a changed reference/hash or a deleted/tampered ledger line therefore
+        makes reload and every subsequent state mutation fail closed.
+        """
+
+        candidate = self._state if state is None else state
+        if set(candidate) != _EXECUTION_STATE_FIELDS:
+            return
+        records = candidate.get("attempts", ())
+        recovery_records = [record for record in records if record.get("route") == "recovery"]
+        if not recovery_records:
+            return
+        from .lifecycle import InvocationReceiptLedger, classify_terminal_reason
+
+        ledger = InvocationReceiptLedger(context=self.context)
+        by_attempt = {record.get("attempt_id"): record for record in records}
+        for record in recovery_records:
+            receipt_ref = record["recovery_receipt_ref"]
+            receipt, record_hash = ledger.resolve(receipt_ref)
+            prior = by_attempt.get(record.get("prior_attempt_id"))
+            if prior is None:
+                raise ValueError("recovery authorization prior attempt is missing")
+            if record["recovery_receipt_hash"] != record_hash:
+                raise ValueError("recovery authorization receipt hash does not match ledger")
+            if record["recovery_invocation_id"] != receipt.invocation_id:
+                raise ValueError("recovery authorization invocation_id does not match ledger")
+            if receipt.item_id != candidate["item_id"]:
+                raise ValueError("recovery authorization item_id does not match workspace")
+            if receipt.attempt_id != prior["attempt_id"]:
+                raise ValueError("recovery authorization attempt_id does not match prior attempt")
+            if receipt.lane_id != prior["lane_id"]:
+                raise ValueError("recovery authorization lane_id does not match prior attempt")
+            if receipt.role != prior["role"]:
+                raise ValueError("recovery authorization role does not match prior attempt")
+            if receipt.finish is None or classify_terminal_reason(receipt.terminal_reason) != "execution_recovery":
+                raise ValueError("recovery authorization receipt does not prove execution loss")
 
     @staticmethod
     def _progress_from_dict(value: Mapping[str, Any]) -> ArtifactProgress:
@@ -1587,6 +1686,8 @@ class ItemWorkspace:
         route = str(route).strip()
         if not lane_id or not role or not route:
             raise ValueError("lane_id, role, and route must be non-empty")
+        if route == "recovery":
+            raise ValueError("route='recovery' requires begin_recovery authorization")
         if self._state.get("active_attempt_id") is not None:
             raise ValueError("an attempt is already active")
         if self._state.get("lifecycle_state") == "recovery_ready":
@@ -1596,7 +1697,16 @@ class ItemWorkspace:
         state = dict(self._state)
         state["attempts"] = [dict(record) for record in self._state["attempts"]]
         record = attempt.to_dict()
-        record.update({"prior_attempt_id": None, "handoff_ref": None, "error": None})
+        record.update(
+            {
+                "prior_attempt_id": None,
+                "handoff_ref": None,
+                "error": None,
+                "recovery_receipt_ref": None,
+                "recovery_invocation_id": None,
+                "recovery_receipt_hash": None,
+            }
+        )
         state["attempts"].append(record)
         state["active_attempt_id"] = attempt.attempt_id
         state["consecutive_no_progress"] = 0
@@ -1697,15 +1807,13 @@ class ItemWorkspace:
         role: str,
         *,
         prior_attempt_id: str,
-        receipt: Any = None,
-        receipt_ref: str | None = None,
+        receipt_ref: str,
     ) -> ExecutionAttempt:
-        """Start recovery only for a completed receipt proving execution loss.
+        """Start recovery only for one persisted, hash-bound loss receipt.
 
-        No-progress polling is intentionally insufficient.  ``receipt`` may
-        be an :class:`AgentInvocationReceipt` (or its exact mapping) or a
-        stable ``receipt_ref`` resolved through the run-local invocation
-        ledger.
+        Filesystem silence and direct receipt objects are deliberately not
+        authorization inputs.  The stable reference is resolved against a
+        freshly-reloaded run-local ledger before any item state is changed.
         """
 
         self._ensure_execution_state()
@@ -1718,41 +1826,27 @@ class ItemWorkspace:
         prior_index, prior = self._attempt_record(prior_attempt_id)
         if prior.get("status") != "active":
             raise ValueError("begin_recovery requires the current active attempt")
-        if receipt is None and receipt_ref is not None:
-            try:
-                from .lifecycle import InvocationReceiptLedger
-
-                ledger = InvocationReceiptLedger(context=self.context)
-                stable_ref = str(receipt_ref).strip()
-                # A caller may persist either the invocation ID or a
-                # run-local ledger reference of the form
-                # ``telemetry/invocation_receipts.jsonl#<invocation_id>``.
-                if "#" in stable_ref:
-                    stable_ref = stable_ref.rsplit("#", 1)[1]
-                elif ":" in stable_ref and stable_ref.rsplit(":", 1)[-1].startswith("I-"):
-                    stable_ref = stable_ref.rsplit(":", 1)[-1]
-                receipt = ledger.get(stable_ref)
-            except Exception as exc:
-                raise ValueError("begin_recovery requires a valid invocation receipt") from exc
-        if receipt is None:
-            raise ValueError("begin_recovery requires a completed invocation receipt")
         try:
-            from .lifecycle import AgentInvocationReceipt, classify_terminal_reason
+            from .lifecycle import InvocationReceiptLedger, classify_terminal_reason
 
-            if isinstance(receipt, Mapping):
-                receipt = AgentInvocationReceipt.from_dict(receipt)
-            if not isinstance(receipt, AgentInvocationReceipt):
-                raise TypeError("receipt must be AgentInvocationReceipt")
+            ledger = InvocationReceiptLedger(context=self.context)
+            receipt, receipt_hash = ledger.resolve(receipt_ref)
             if receipt.item_id != self.item_id:
                 raise ValueError("invocation receipt item_id does not match workspace")
+            if receipt.attempt_id != prior_attempt_id:
+                raise ValueError("invocation receipt attempt_id does not match prior attempt")
+            if receipt.lane_id != prior["lane_id"]:
+                raise ValueError("invocation receipt lane_id does not match prior attempt")
+            if receipt.role != prior["role"]:
+                raise ValueError("invocation receipt role does not match prior attempt")
             if receipt.finish is None or not receipt.terminal_reason:
                 raise ValueError("begin_recovery requires a completed invocation receipt")
             if classify_terminal_reason(receipt.terminal_reason) != "execution_recovery":
                 raise ValueError("invocation receipt does not authorize execution recovery")
-        except ValueError:
-            raise
         except Exception as exc:
-            raise ValueError("begin_recovery requires a valid invocation receipt") from exc
+            if isinstance(exc, ValueError):
+                raise
+            raise ValueError("begin_recovery requires a valid persisted invocation receipt") from exc
         lane_id = str(lane_id).strip()
         role = str(role).strip()
         if not lane_id or not role:
@@ -1768,6 +1862,9 @@ class ItemWorkspace:
         recovery_record["prior_attempt_id"] = prior_attempt_id
         recovery_record["handoff_ref"] = handoff_ref
         recovery_record["error"] = None
+        recovery_record["recovery_receipt_ref"] = str(receipt_ref).strip()
+        recovery_record["recovery_invocation_id"] = receipt.invocation_id
+        recovery_record["recovery_receipt_hash"] = receipt_hash
         state["attempts"].append(recovery_record)
         state["active_attempt_id"] = attempt.attempt_id
         state["consecutive_no_progress"] = 0
@@ -1783,6 +1880,9 @@ class ItemWorkspace:
             role=role,
             route="recovery",
             handoff_ref=handoff_ref,
+            recovery_receipt_ref=recovery_record["recovery_receipt_ref"],
+            recovery_invocation_id=receipt.invocation_id,
+            recovery_receipt_hash=receipt_hash,
         )
         return attempt
 

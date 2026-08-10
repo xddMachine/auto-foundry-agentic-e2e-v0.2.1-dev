@@ -14,8 +14,9 @@ adapters, or cross-run state.
   roots before a source is read or a derived output is written. `workbench.py`
   provides the program-owned read-only data room, one immutable physical
   catalog at `data_room/catalogs/<catalog_key>.json`, derived sample/category
-  views, archive/member hash checks, and prepared materialization. `prepared.py`
-  durably registers every accepted asset and separates scope/reuse visibility.
+  views, archive/member hash checks, and atomic item-local prepared candidates.
+  `prepared.py` durably registers accepted candidates only and separates
+  scope/reuse visibility; a staged candidate is not registry state.
   `durable.py` provides `ItemWorkspace`, artifact progress, execution
   attempts/recovery, review, and immutable accepted/technical-failure
   snapshots under `accepted/answer_content.json` plus a separate
@@ -42,13 +43,20 @@ adapters, or cross-run state.
   emitting `smoke` and `full` runtime receipts (plus an optional second `full`
   receipt for deterministic comparison). A failed preflight emits whichever
   failure receipt phase applies: `compile` or `dependency_check`. It is a
-  path/process boundary, not a hostile-code security sandbox; use an
-  OS/container boundary for that.
+  path/process boundary, not a hostile-code security sandbox; its explicit
+  configurable process timeout defaults to 3600 seconds and is not an agent
+  reasoning or workflow wall-time deadline. Use an OS/container boundary for
+  hostile code.
 - `integration.py` owns one Result Integration `IntegrationSession` per item.
   It stages typed claim/metric/limitation/evidence/prepared/ontology/
   relationship/dashboard records under `integration/staging/` and atomically
   commits `integration/committed/records.jsonl` plus `manifest.json` without
-  parsing analytical prose.
+  parsing analytical prose. Prepared candidates are preflighted without
+  registry mutation and registered exactly once at accepted commit; the durable
+  intent makes crash retries converge. Mechanical checks cannot prove semantic
+  completeness, so a live Integration Agent and an external test-only fidelity
+  audit remain required. There is no prose parser, semantic compiler, or
+  Integration Reviewer.
 - `lifecycle.py` owns run-level `RunLifecycle` transitions and durable
   `AgentInvocationReceipt` ledgers; `product_contracts.py` owns exact nested
   `freeze_markers` and singular `decision_flow` product validation.
@@ -122,9 +130,9 @@ and are never shared implicitly between runs.
 `tests/integration/test_workbench_durable_vertical.py`, and
 `tests/integration/test_v023_normal_path.py` exercise the complete offline
 paths, including bound script execution, accepted-byte/envelope separation,
-one-owner integration staging/commit, reusable prepared assets, lifecycle
-barriers, strict product markers, and optimizer evidence. All fixtures use no
-model or network call.
+candidate-to-accepted prepared registration, lifecycle barriers, strict
+product markers, physical-inventory counters, safe opaque materialization,
+and optimizer evidence. All fixtures use no model or network call.
 
 The candidate is labelled **v0.2.3 / core 0.3.0 — offline program validation
 complete for later Benchmark A** only when these vertical proofs and the full
