@@ -17,6 +17,7 @@ program-owned state field rather than business content.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import copy
 import hashlib
@@ -25,11 +26,17 @@ import os
 from pathlib import Path, PurePath
 import shutil
 import tempfile
+import threading
 from types import MappingProxyType
 from typing import Any, Mapping
 
 from .contracts import IncidentRecord
 from .workspace import AllowedRootError, RunContext
+
+try:  # pragma: no cover - POSIX hosts provide advisory flock
+    import fcntl
+except ImportError:  # pragma: no cover - defensive non-POSIX fallback
+    fcntl = None  # type: ignore[assignment]
 
 
 _VALID_MODES = frozenset({"question", "requirement"})
@@ -43,6 +50,8 @@ _DRAFT_FILENAME = "draft.json"
 _BUSINESS_REVIEW_FILENAME = "business_review.json"
 _BUSINESS_REVIEW_DISCARD_AUDIT_FILENAME = "business_review_discard_audit.jsonl"
 _BUSINESS_REVIEW_DISCARD_STATE_FILENAME = "business_review_discard_state.json"
+_ITEM_STATE_TRANSITION_LOCK_FILENAME = ".item_state_transition.lock"
+_HELD_ITEM_LOCKS = threading.local()
 _BUSINESS_REVIEW_DISCARD_AUDIT_FIELDS = frozenset(
     {
         "record_kind",
@@ -213,6 +222,43 @@ _SCRIPT_SUFFIXES = frozenset(
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _held_item_lock_paths() -> set[str]:
+    paths = getattr(_HELD_ITEM_LOCKS, "paths", None)
+    if paths is None:
+        paths = set()
+        _HELD_ITEM_LOCKS.paths = paths
+    return paths
+
+
+@contextmanager
+def _item_state_transition_lock(path: Path):
+    """One process-wide/per-item advisory lock for state transitions.
+
+    Callers acquire this after the transition-journal and lifecycle locks;
+    nested calls in the same thread reuse the held lock path and therefore do
+    not recurse into ``flock`` on a second file descriptor.
+    """
+
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise AllowedRootError("item state transition lock is not a regular file")
+    key = str(path)
+    held = _held_item_lock_paths()
+    if key in held:
+        yield
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as stream:
+        if fcntl is not None:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        held.add(key)
+        try:
+            yield
+        finally:
+            held.discard(key)
+            if fcntl is not None:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 def _simple_component(value: str, label: str) -> str:
@@ -1121,6 +1167,15 @@ class ItemWorkspace:
         lexical = self._item_root_lexical() / relative
         return self._validate_lexical_path(self.context, lexical)
 
+    @contextmanager
+    def _state_transition_lock(self):
+        """Serialize every durable ``item_state.json`` transition."""
+
+        with _item_state_transition_lock(
+            self._resolve_item_subpath(_ITEM_STATE_TRANSITION_LOCK_FILENAME)
+        ):
+            yield
+
     @staticmethod
     def _opposite_state_path(context: RunContext, item_id: str, mode: str) -> Path | None:
         namespace = "requirements" if mode == "question" else "questions"
@@ -1484,7 +1539,20 @@ class ItemWorkspace:
         state["updated_at"] = _now()
         self._persist_state(state, touch=False)
 
-    def _persist_state(self, state: Mapping[str, Any], *, touch: bool = True) -> None:
+    def _persist_state(
+        self,
+        state: Mapping[str, Any],
+        *,
+        touch: bool = True,
+        _lock_held: bool = False,
+    ) -> None:
+        if not _lock_held:
+            with self._state_transition_lock():
+                self._persist_state_unlocked(state, touch=touch)
+            return
+        self._persist_state_unlocked(state, touch=touch)
+
+    def _persist_state_unlocked(self, state: Mapping[str, Any], *, touch: bool = True) -> None:
         candidate = copy.deepcopy(dict(state))
         if touch:
             candidate["updated_at"] = _now()
@@ -1878,6 +1946,15 @@ class ItemWorkspace:
         roll back every touched byte before returning control to the caller.
         """
 
+        # Rebind validates the packet, discard audit, and item state as one
+        # boundary.  Keep the entire discard transaction under the same item
+        # lock so it cannot interleave with that authoritative reload.
+        with self._state_transition_lock():
+            return self._discard_business_review_locked(incident)
+
+    def _discard_business_review_locked(self, incident: IncidentRecord | Mapping[str, Any]) -> dict[str, Any]:
+        """Perform discard while ``_state_transition_lock`` is held."""
+
         self._ensure_not_terminal()
         self._require_no_active_attempt()
         if self._state.get("terminal_intent") is not None:
@@ -2211,23 +2288,40 @@ class ItemWorkspace:
     def _commit_business_review(self, packet: Mapping[str, Any], state: Mapping[str, Any]) -> None:
         """Publish a validated packet and state together, rolling back on I/O failure."""
 
-        state_path = self._resolve_item_subpath(_STATE_FILENAME)
-        packet_path = self.business_review_path
-        prior_state_bytes = state_path.read_bytes()
-        prior_state = copy.deepcopy(self._state)
-        prior_packet_exists = packet_path.exists()
-        prior_packet_bytes = packet_path.read_bytes() if prior_packet_exists else None
-        try:
-            self._write_business_review(packet, touch_state=False, emit=False)
-            self._persist_state(state)
-        except Exception:
-            _atomic_write_bytes(state_path, prior_state_bytes)
-            self._state = prior_state
-            if prior_packet_exists and prior_packet_bytes is not None:
-                _atomic_write_bytes(packet_path, prior_packet_bytes)
-            else:
-                packet_path.unlink(missing_ok=True)
-            raise
+        # Packet and state are one authority boundary.  Rebind acquires this
+        # same per-item lock before its authoritative item reload; holding it
+        # across both writes prevents a context transition from observing a
+        # packet without its matching review state (or vice versa).
+        with self._state_transition_lock():
+            state_path = self._resolve_item_subpath(_STATE_FILENAME)
+            packet_path = self.business_review_path
+            prior_state_bytes = state_path.read_bytes()
+            prior_state = copy.deepcopy(self._state)
+            prior_packet_exists = packet_path.exists()
+            prior_packet_bytes = packet_path.read_bytes() if prior_packet_exists else None
+            try:
+                self._write_business_review(packet, touch_state=False, emit=False)
+                # The lock is already held; bypass the public wrapper so an
+                # injected or nested lock cannot split the transaction.
+                self._persist_state_unlocked(state)
+            except Exception as exc:
+                rollback_errors: list[Exception] = []
+                try:
+                    _atomic_write_bytes(state_path, prior_state_bytes)
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+                self._state = prior_state
+                try:
+                    if prior_packet_exists and prior_packet_bytes is not None:
+                        _atomic_write_bytes(packet_path, prior_packet_bytes)
+                    else:
+                        packet_path.unlink(missing_ok=True)
+                        _fsync_directory(packet_path.parent)
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+                if rollback_errors:
+                    raise RuntimeError("business review commit rollback failed") from exc
+                raise
         self._emit("item_business_review_packet", artifact="work/business_review.json")
 
     def _current_draft_value_and_hash(self) -> tuple[Any, str]:

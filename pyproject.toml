@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auto_foundry_core"
-version = "0.3.3"
+version = "0.3.4"
 description = "Source-agnostic deterministic local analytics substrate"
 readme = "docs/CORE_ARCHITECTURE.md"
 requires-python = ">=3.10"

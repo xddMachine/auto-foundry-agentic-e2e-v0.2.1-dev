@@ -89,6 +89,22 @@ work and draft byte. The next review is a new full review, not a targeted
 recheck. Recovery never reinterprets findings or semantic content and has no
 compatibility fallback; it is not a general reset or a second repair route.
 
+### Implementation-context transition
+
+`BoundAnalysisContext.rebind_implementation(...)` is an identity-only,
+resumable transition. Require a contiguous ledger of old/new skill/core
+versions and repository SHA/tree identities, matching earliest affected item,
+preserved accepted hashes, revalidation reason, and resume point. Rebind must
+reuse the bound catalog, source hash/stat signature, and physical inventory;
+it must not read ZIP members, rebuild a catalog, increment inventory counters,
+emit read telemetry, create analysis, or reread raw sources. The durable intent,
+append-only audit, and anchored head reconcile idempotently after a crash and
+fail closed on tampering. Acquire locks only in journal → run lifecycle → item
+state order. The shared item state-transition lock covers reviewer packet
+commit/discard as well, so rebind cannot cross a half-written review packet.
+Reject any active attempt/review/terminal/accepted state; discard an invalid
+review packet before rebinding.
+
 The repair packet may authorize explicit dependent artifact roots and JSON
 fragments; these resolve to their owning artifact paths. Any unrelated artifact
 mutation remains fail-closed.

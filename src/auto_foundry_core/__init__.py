@@ -129,7 +129,7 @@ from .references import (
     is_explicit_reference_mapping,
 )
 
-__version__ = "0.3.3"
+__version__ = "0.3.4"
 
 __all__ = [
     "AggregationSpec", "AllowedRootError", "CanonicalMapping",

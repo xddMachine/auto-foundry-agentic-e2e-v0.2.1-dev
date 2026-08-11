@@ -1,8 +1,8 @@
-# Auto Foundry Agentic E2E Skill v0.2.6
+# Auto Foundry Agentic E2E Skill v0.2.7
 
 `auto-foundry-agentic-e2e` is a natural, reviewed, offline-friendly workflow
 for turning supplied enterprise evidence into bounded answers and a traceable
-management dashboard prototype. The v0.2.6 contract is **Agent Workbench +
+management dashboard prototype. The v0.2.7 contract is **Agent Workbench +
 Durable Execution**: the program owns one data room/source catalog and one
 durable item workspace before analysis, while the Lead Analyst remains free to
 choose the useful analytical route.
@@ -13,9 +13,9 @@ Every run records:
 
 ```text
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.2.6
+skill_version: 0.2.7
 core_name: auto_foundry_core
-core_version: 0.3.3
+core_version: 0.3.4
 ```
 
 The normal program path is `RunContext` + `DataRoomWorkbench` +
@@ -67,6 +67,18 @@ append-only hash-bound audit record, atomically removes the packet while
 preserving all existing work and draft bytes, resets pending review and the
 business-repair count, and requires a new full review. It does not reinterpret
 findings or provide a compatibility fallback.
+
+For an implementation change, use only the public
+`BoundAnalysisContext.rebind_implementation(...)` transition. It requires a
+contiguous SHA/tree/version ledger and preserves the same source, catalog,
+source-stat signature, and physical inventory while changing identity only.
+Its durable intent, append-only audit, and anchored head recover idempotently
+after a crash; the lock order is journal → run lifecycle → item state. The
+shared `ItemWorkspace` state-transition lock serializes this with reviewer
+packet commit/discard. Rebind requires no active attempt/review, terminal or
+accepted state; discard an invalid review first. It performs no ZIP/member or
+raw-source reads, catalog rebuild, inventory-counter increment, or new
+analysis.
 - **Requirement Mode** is analytics-only and keeps user-owned records and
   explicit priority semantics. It records original text, objective, expected
   analytical/visual outputs, internal and foundation dependencies, data/

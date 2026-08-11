@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-ZIP_NAME = "auto-foundry-agentic-e2e-v0.2.6.zip"
+ZIP_NAME = "auto-foundry-agentic-e2e-v0.2.7.zip"
 
 # The release deliberately replaces the old deterministic optimizer report
 # helper with the evidence collector.  Keep this check explicit so a stale
@@ -122,10 +122,10 @@ def _validate_zip(zip_path: Path, skill_root: Path) -> dict[str, object]:
         if not skill_text.startswith("---\n"):
             raise ValueError("SKILL.md frontmatter missing")
         frontmatter = skill_text.split("---\n", 2)[1]
-        required = ('name: auto-foundry-agentic-e2e', 'version: "0.2.6"', 'core_name: auto_foundry_core', 'core_version: "0.3.3"')
+        required = ('name: auto-foundry-agentic-e2e', 'version: "0.2.7"', 'core_name: auto_foundry_core', 'core_version: "0.3.4"')
         if any(marker not in frontmatter for marker in required):
             raise ValueError("SKILL.md frontmatter/version markers invalid")
-        for marker in ("skill_version: 0.2.6", "core_version: 0.3.3"):
+        for marker in ("skill_version: 0.2.7", "core_version: 0.3.4"):
             if marker not in skill_text:
                 raise ValueError(f"SKILL.md run marker missing: {marker}")
         return {
@@ -195,7 +195,7 @@ def _validate_wheel(wheel_path: Path, source_root: Path) -> dict[str, object]:
         if metadata_name is None:
             raise ValueError("wheel METADATA missing")
         metadata = _metadata(archive.read(metadata_name).decode("utf-8"))
-        if metadata.get("Name") != "auto_foundry_core" or metadata.get("Version") != "0.3.3":
+        if metadata.get("Name") != "auto_foundry_core" or metadata.get("Version") != "0.3.4":
             raise ValueError(f"wheel metadata mismatch: {metadata.get('Name')} {metadata.get('Version')}")
         missing = sorted(REQUIRED_CORE_MODULES - set(names))
         if missing:
@@ -246,7 +246,7 @@ def _offline_install_smoke(wheel_path: Path) -> dict[str, object]:
         )
         import_result = subprocess.run([sys.executable, "-c", import_script], check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         cli_result = subprocess.run([sys.executable, "-m", "auto_foundry_core", "catalog", "list"], check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if import_result.stdout.strip() != "0.3.3":
+        if import_result.stdout.strip() != "0.3.4":
             raise ValueError(f"installed import version mismatch: {import_result.stdout!r}")
         if not cli_result.stdout.strip().startswith("["):
             raise ValueError("installed catalog CLI did not return JSON list")
@@ -256,7 +256,7 @@ def _offline_install_smoke(wheel_path: Path) -> dict[str, object]:
 def validate_release(root: Path, dist: Path, zip_path: Path | None = None, wheel_path: Path | None = None) -> dict[str, object]:
     zip_path = zip_path or dist / ZIP_NAME
     if wheel_path is None:
-        wheels = sorted(dist.glob("auto_foundry_core-0.3.3-*.whl"))
+        wheels = sorted(dist.glob("auto_foundry_core-0.3.4-*.whl"))
         if len(wheels) != 1:
             raise ValueError(f"expected one core wheel in {dist}, found {wheels}")
         wheel_path = wheels[0]

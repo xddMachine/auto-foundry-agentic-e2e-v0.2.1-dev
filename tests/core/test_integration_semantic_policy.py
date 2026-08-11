@@ -1,4 +1,4 @@
-"""Focused regressions for the v0.3.3 semantic/result-integration boundary."""
+"""Focused regressions for the v0.3.4 semantic/result-integration boundary."""
 
 from __future__ import annotations
 

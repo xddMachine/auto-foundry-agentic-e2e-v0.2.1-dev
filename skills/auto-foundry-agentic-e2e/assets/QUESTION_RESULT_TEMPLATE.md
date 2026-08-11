@@ -81,6 +81,14 @@
   work/draft confirmation, pending-review reset, zero business-repair reset,
   and the required new full-review reference. Never reinterpret findings or
   use a compatibility fallback.
+- Implementation-context transition (when applicable): public
+  `BoundAnalysisContext.rebind_implementation(...)`, contiguous ledger,
+  old/new SHA/tree/version identities, earliest affected item, preserved
+  accepted hashes, revalidation reason, resume point, reused source/catalog/
+  stat/inventory proof, durable intent/audit/head refs, lock order, and proof
+  of no ZIP/member reads, catalog rebuild, counters, false telemetry, new
+  analysis, or raw reads. Reject active review/attempt/terminal/accepted
+  state; discard an invalid reviewer packet first.
 - Final outcome:
 - Accepted answer bytes (immutable ref/hash):
 - Acceptance envelope (program-owned ref/hash/lifecycle):

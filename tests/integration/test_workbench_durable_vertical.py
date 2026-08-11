@@ -70,8 +70,8 @@ def test_complete_offline_workbench_and_durable_vertical_path(
         "RUN-WORKBENCH-VERTICAL",
         run_root,
         (input_root,),
-        core_version="0.3.3",
-        skill_version="0.2.6",
+        core_version="0.3.4",
+        skill_version="0.2.7",
     )
     telemetry = TelemetryRecorder(context=context)
 
@@ -348,8 +348,8 @@ def test_complete_offline_workbench_and_durable_vertical_path(
 
 def test_run_context_defaults_to_current_versions(tmp_path: Path) -> None:
     context = RunContext("RUN-DEFAULT-VERSION", tmp_path / "run")
-    assert context.core_version == "0.3.3"
-    assert context.skill_version == "0.2.6"
+    assert context.core_version == "0.3.4"
+    assert context.skill_version == "0.2.7"
 
 
 def test_item_state_template_loads_through_durable_core(tmp_path: Path) -> None:
@@ -362,7 +362,7 @@ def test_item_state_template_loads_through_durable_core(tmp_path: Path) -> None:
     assert tuple(template) == tuple(ITEM_STATE_FIELDS)
     assert set(template) <= set(ITEM_STATE_SCHEMA["fields"])
 
-    context = RunContext("RUN-TEMPLATE", tmp_path / "run", core_version="0.3.3", skill_version="0.2.6")
+    context = RunContext("RUN-TEMPLATE", tmp_path / "run", core_version="0.3.4", skill_version="0.2.7")
     item_root = context.resolve_run_path(Path("questions") / template["item_id"])
     (item_root / "work").mkdir(parents=True)
     state_path = item_root / "item_state.json"

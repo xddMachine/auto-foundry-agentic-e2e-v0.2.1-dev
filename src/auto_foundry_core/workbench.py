@@ -791,6 +791,11 @@ class DataRoom:
         self.telemetry = telemetry
         self._bound_inventory = bool(bound_inventory)
         self._source_stat = _source_stat_signature(archive_path)
+        # A re-bound analysis context may deliberately keep using the exact
+        # catalog created by its previous implementation.  The workbench
+        # installs this private override after opening the bound archive; it
+        # is never inferred from the current core version.
+        self._bound_catalog_entries: tuple[DataRoomCatalogEntry, ...] | None = None
         self.catalog_schema_version = CATALOG_SCHEMA_VERSION
         self.catalog_key = _catalog_identity_key(archive_ref.content_hash or "", context.core_version)
         self.catalog_root = context.resolve_run_path(Path("data_room") / "catalogs")
@@ -817,6 +822,7 @@ class DataRoom:
         bound_archive_hash: str | None = None,
         bound_source_stat: Mapping[str, Any] | None = None,
         bound_central_directory_fingerprint: Mapping[str, Any] | None = None,
+        bound_identity_only: bool = False,
     ) -> "DataRoom":
         limits = _archive_limits(
             max_member_bytes=max_member_bytes,
@@ -841,17 +847,28 @@ class DataRoom:
         expected_stat = dict(bound_source_stat or {})
         if expected_stat and current_stat != {str(key): int(value) for key, value in expected_stat.items()}:
             raise ValueError(f"source stat changed after binding: {archive_path}")
-        central_fingerprint = _central_directory_fingerprint(archive_path)
         expected_central = dict(bound_central_directory_fingerprint or {})
-        if bound_members is not None and not expected_central:
-            raise ValueError("bound source identity must contain a central-directory fingerprint")
-        if expected_central and central_fingerprint != expected_central:
-            raise ValueError(f"archive central directory changed after binding: {archive_path}")
-        _record_instrumentation(
-            context,
-            "central_directory_fingerprint",
-            bytes_processed=int(central_fingerprint["size_bytes"]),
-        )
+        if bound_identity_only and bound_members is None:
+            raise ValueError("identity-only source binding requires bound physical inventory")
+        if bound_identity_only:
+            if not expected_central:
+                raise ValueError("bound source identity must contain a central-directory fingerprint")
+            # A context transition deliberately reuses the immutable physical
+            # inventory and central-directory fingerprint already bound in its
+            # manifest.  Only the cheap source stat is checked here; no ZIP
+            # central-directory or member read/counter is allowed.
+            central_fingerprint = expected_central
+        else:
+            central_fingerprint = _central_directory_fingerprint(archive_path)
+            if bound_members is not None and not expected_central:
+                raise ValueError("bound source identity must contain a central-directory fingerprint")
+            if expected_central and central_fingerprint != expected_central:
+                raise ValueError(f"archive central directory changed after binding: {archive_path}")
+            _record_instrumentation(
+                context,
+                "central_directory_fingerprint",
+                bytes_processed=int(central_fingerprint["size_bytes"]),
+            )
         if bound_members is None:
             archive_hash = _sha256_file(archive_path)
             _record_instrumentation(context, "archive_full_hash", bytes_processed=archive_path.stat().st_size)
@@ -886,11 +903,12 @@ class DataRoom:
             telemetry=telemetry,
             bound_inventory=bound_inventory,
         )
-        room._emit(
-            "data_room_archive_read",
-            bytes_processed=archive_path.stat().st_size,
-            facts={"archive_hash": archive_hash, "member_count": len(members_tuple)},
-        )
+        if not bound_identity_only:
+            room._emit(
+                "data_room_archive_read",
+                bytes_processed=archive_path.stat().st_size,
+                facts={"archive_hash": archive_hash, "member_count": len(members_tuple)},
+            )
         return room
 
     @staticmethod
@@ -1472,6 +1490,8 @@ class DataRoom:
         """
 
         self._check_archive_stat()
+        if self._bound_catalog_entries is not None:
+            return self._bound_catalog_entries
         if self.catalog_path.is_file():
             entries = self._load_canonical_catalog()
             _record_instrumentation(self.context, "catalog_loaded")
@@ -1701,6 +1721,9 @@ class DataRoomWorkbench:
         _bound_archive_hash: str | None = None,
         _bound_source_stat: Mapping[str, Any] | None = None,
         _bound_central_directory_fingerprint: Mapping[str, Any] | None = None,
+        _bound_catalog_entries: Sequence[DataRoomCatalogEntry] | None = None,
+        _bound_catalog_path: str | Path | None = None,
+        _bound_catalog_key: str | None = None,
         **limits: Any,
     ) -> None:
         if runtime is not None and getattr(runtime, "context", context) is not context:
@@ -1716,8 +1739,15 @@ class DataRoomWorkbench:
             bound_archive_hash=_bound_archive_hash,
             bound_source_stat=_bound_source_stat,
             bound_central_directory_fingerprint=_bound_central_directory_fingerprint,
+            bound_identity_only=_bound_catalog_entries is not None,
             **limits,
         )
+        if _bound_catalog_entries is not None:
+            self._room._bound_catalog_entries = tuple(_bound_catalog_entries)
+            if _bound_catalog_path is not None:
+                self._room.catalog_path = Path(_bound_catalog_path)
+            if _bound_catalog_key is not None:
+                self._room.catalog_key = str(_bound_catalog_key)
         self.prepared_registry = PreparedAssetRegistry(context, telemetry=self.telemetry)
         self._prepared: dict[str, PreparedAssetDescriptor] = {}
 

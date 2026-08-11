@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.7 — Resumable implementation-context transitions
+
+Changed:
+
+- the current package markers move directly to skill `0.2.7` and core `0.3.4`;
+- public `BoundAnalysisContext.rebind_implementation(...)` now documents and
+  enforces a contiguous implementation-transition ledger, preserving the
+  bound source/catalog/stat/inventory and changing identity only;
+- rebind uses durable intent, append-only audit, anchored heads, and crash
+  recovery under journal → run → item lock order, with no ZIP/member reads,
+  catalog rebuild, counter increments, or false telemetry;
+- rebind is allowed only for a nonterminal item with no active attempt/review,
+  accepted snapshot, or terminal intent; an invalid reviewer packet must be
+  discarded first, and no new analysis or raw-source read is created.
+
 ## 0.2.6 — Reviewer-scope packet recovery
 
 Changed:

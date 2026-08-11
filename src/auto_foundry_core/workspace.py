@@ -73,8 +73,8 @@ class RunContext:
     run_id: str
     run_root: Path | str
     input_roots: tuple[Path | str, ...] = ()
-    core_version: str = "0.3.3"
-    skill_version: str | None = "0.2.6"
+    core_version: str = "0.3.4"
+    skill_version: str | None = "0.2.7"
 
     def __post_init__(self) -> None:
         run_id = str(self.run_id).strip()

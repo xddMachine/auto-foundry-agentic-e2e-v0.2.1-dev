@@ -1,4 +1,4 @@
-# `auto_foundry_core` 0.3.3
+# `auto_foundry_core` 0.3.4
 
 `auto_foundry_core` is a small offline, source-agnostic deterministic substrate
 for local analytics and durable item execution. It is intentionally not an
@@ -67,6 +67,14 @@ adapters, or cross-run state.
   packet while preserving work/draft bytes, resets pending review and business
   repair, and requires a new full review. It never reinterprets semantic
   content and has no compatibility fallback.
+- `BoundAnalysisContext.rebind_implementation(...)` is the public resumable
+  implementation-transition API. It requires a contiguous SHA/tree/version
+  ledger and changes identity only while reusing the source, catalog, source
+  stat signature, and physical inventory. Durable intent, append-only audit,
+  and anchored heads recover crash boundaries idempotently under journal → run
+  → item lock order; active attempt/review/terminal/accepted state is rejected
+  (discard an invalid review first), and no ZIP/raw reads, catalog rebuild,
+  inventory counters, false telemetry, or new analysis occur.
 - `lifecycle.py` owns run-level `RunLifecycle` transitions, durable
   `AgentInvocationReceipt` ledgers, and explicit implementation transitions;
   `product_contracts.py` owns exact nested `freeze_markers` and singular
@@ -147,7 +155,7 @@ candidate-to-accepted prepared registration, lifecycle barriers, strict
 product markers, physical-inventory counters, safe opaque materialization,
 and optimizer evidence. All fixtures use no model or network call.
 
-The candidate is labelled **v0.2.6 / core 0.3.3 — offline program validation
+The candidate is labelled **v0.2.7 / core 0.3.4 — offline program validation
 complete for later Benchmark A** only when these vertical proofs and the full
 offline suite pass. Benchmark A is not run here.
 This remains an experimental release candidate, not a production-hardened

@@ -27,9 +27,9 @@ At run start, record these exact release markers in program run metadata and
 the final report (the lifecycle `run_state.json` remains the exact nine-field
 authority schema):
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.2.6
+skill_version: 0.2.7
 core_name: auto_foundry_core
-core_version: 0.3.3
+core_version: 0.3.4
 
 Build one program-owned data room/source catalog from the supplied archive and
 member metadata. Keep the archive read-only. Process the questions in exactly
@@ -76,6 +76,18 @@ If a reviewer packet is itself out of scope, recover it only through
 unchanged work/draft bytes, pending review, and zero business-repair count;
 then require a new full review. Do not reinterpret findings or add a
 compatibility fallback.
+
+When the implementation changes, call only
+`BoundAnalysisContext.rebind_implementation(...)`. Check a contiguous
+old/new SHA/tree/version ledger, the earliest affected item, preserved
+accepted hashes, and resume point. Verify that source/catalog/stat/inventory
+identity is reused without ZIP/member reads, catalog rebuilds, inventory
+counter changes, false telemetry, new analysis, or raw reads. Exercise the
+durable intent/audit/head crash-recovery path and strict journal → run → item
+lock order. Rebind is invalid while an attempt, review packet/reviewed state,
+terminal intent/outcome, accepted snapshot, or terminal lifecycle exists;
+discard an invalid reviewer packet first. The shared item state-transition
+lock must serialize reviewer packet atomicity with rebind.
 
 Record separate observed phase timing for analyst/model work, controlled
 execution, business review, business repair, fidelity/integration review,
@@ -167,7 +179,7 @@ client-business automation.
 
 The offline tests should demonstrate:
 
-- v0.2.6 skill and v0.3.3 core markers in instructions and run metadata;
+- v0.2.7 skill and v0.3.4 core markers in instructions and run metadata;
 - one data room/source catalog, read-only raw archive, and bounded metadata;
 - one run-level physical inventory with passive operation counters, safe opaque
   materialization, and explicit final verification;

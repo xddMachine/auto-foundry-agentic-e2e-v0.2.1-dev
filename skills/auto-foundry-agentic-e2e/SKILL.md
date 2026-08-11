@@ -3,14 +3,14 @@ name: auto-foundry-agentic-e2e
 description: Runs a natural, reviewed, offline-friendly enterprise analysis workflow for supplied questions or analytics-only manager requirements using a program-owned data room, durable item workspaces, artifact progress, and run-local prepared assets.
 metadata:
   author: auto-foundry
-  version: "0.2.6"
+  version: "0.2.7"
   core_name: auto_foundry_core
-  core_version: "0.3.3"
+  core_version: "0.3.4"
   architecture: agent-workbench-durable-execution
   release: program-owned-data-room-and-durable-item-workspaces
 ---
 
-# Auto Foundry Agentic E2E — v0.2.6
+# Auto Foundry Agentic E2E — v0.2.7
 
 ## 0. Run identity and authority
 
@@ -19,9 +19,9 @@ program's run report/metadata and repeat them in the final run report:
 
 ```text
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.2.6
+skill_version: 0.2.7
 core_name: auto_foundry_core
-core_version: 0.3.3
+core_version: 0.3.4
 ```
 
 `run_state.json` is the lifecycle authority and contains exactly these nine
@@ -384,8 +384,8 @@ context = RunContext(
     "RUN-example",
     run_root,
     (input_root,),
-    core_version="0.3.3",
-    skill_version="0.2.6",
+    core_version="0.3.4",
+    skill_version="0.2.7",
 )
 workbench = DataRoomWorkbench(context, archive_path)
 room = workbench.data_room
@@ -465,6 +465,32 @@ state to `work`; existing work and draft bytes are preserved. The next review
 must be a new full review. This path never reinterprets findings, changes
 semantic or draft content, or supplies a compatibility fallback, and it is not
 a general-purpose review reset.
+
+### Resumable implementation-context transition
+
+The public `BoundAnalysisContext.rebind_implementation(context,
+item_workspace, lifecycle)` API is the only route for moving a bound context
+across an implementation transition. It requires a contiguous, hash-bound
+ledger: every transition's old version/SHA/tree must equal the preceding
+identity's new values, the chain must reach the requested skill/core identity,
+and `earliest_affected_item`, preserved accepted hashes, revalidation reason,
+and resume point must remain consistent. The operation changes implementation
+identity only. It reuses the same physical source/catalog/stat signature and
+inventory, and therefore performs no ZIP/member reads, catalog rebuild,
+inventory-counter increment, or false read telemetry; it creates no new
+analysis and never rereads raw source data.
+
+Rebind is resumable across process loss through the durable intent,
+append-only transition audit, and anchored audit-head state under the bound
+item's `work/` directory. Recovery is hash-checked and idempotent; missing,
+stale, or tampered journal/audit/head bytes fail closed. The lock order is
+strictly journal → run lifecycle → item state. The shared
+`ItemWorkspace` state-transition lock also serializes reviewer packet commits
+and discard recovery, so a transition cannot publish through a half-written
+review boundary. Rebind requires no active attempt, review packet or reviewed
+state, terminal intent/outcome, accepted snapshot, or terminal lifecycle;
+discard an invalid reviewer packet first. It never creates a new item,
+analysis, catalog, raw read, or compatibility fallback.
 
 ## 9. Final products and dashboard prototype
 
@@ -620,7 +646,7 @@ artifacts, or central/cross-run caches.
 - Do not auto-promote custom code or confuse the development-only evidence
   collector and later Optimization Agent with client business automation.
 
-This v0.2.6 contract describes the minimal Agent Workbench + Durable
+This v0.2.7 contract describes the minimal Agent Workbench + Durable
 Execution path. It is an offline-friendly contract, not a claim of host-level
 sandboxing, benchmark completion, or production hardening.
 

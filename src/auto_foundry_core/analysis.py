@@ -14,6 +14,7 @@ isolation outside this package.
 from __future__ import annotations
 
 import ast
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
@@ -30,6 +31,11 @@ from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 import uuid
 
+try:  # pragma: no cover - POSIX hosts provide advisory flock
+    import fcntl
+except ImportError:  # pragma: no cover - defensive non-POSIX fallback
+    fcntl = None  # type: ignore[assignment]
+
 from .contracts import DataAssetRef
 from .durable import ItemWorkspace
 from .prepared import PreparedAssetRegistry
@@ -44,6 +50,60 @@ ANALYSIS_SAMPLE_LIMIT_ENV = "AUTO_FOUNDRY_SAMPLE_LIMIT"
 ANALYSIS_OUTPUT_ROOT_ENV = "AUTO_FOUNDRY_ANALYSIS_OUTPUT_ROOT"
 _MANIFEST_FILENAME = "analysis_context.json"
 _RECEIPT_DIR = Path("script_receipts")
+_TRANSITION_AUDIT_FILENAME = "analysis_context_transitions.jsonl"
+_TRANSITION_STATE_FILENAME = "analysis_context_transition_state.json"
+_TRANSITION_INTENT_FILENAME = "analysis_context_transition_intent.json"
+_TRANSITION_LOCK_FILENAME = "analysis_context_transition.lock"
+_TRANSITION_AUDIT_FIELDS = frozenset(
+    {
+        "record_kind",
+        "transition_id",
+        "run_id",
+        "item_id",
+        "before_manifest_hash",
+        "after_manifest_hash",
+        "old_core_version",
+        "new_core_version",
+        "old_skill_version",
+        "new_skill_version",
+        "old_sha",
+        "new_sha",
+        "old_tree",
+        "new_tree",
+        "previous_hash",
+        "record_hash",
+    }
+)
+_TRANSITION_STATE_FIELDS = frozenset(
+    {
+        "record_kind",
+        "run_id",
+        "item_id",
+        "audit_path",
+        "audit_count",
+        "audit_head",
+        "manifest_file_hash",
+        "state_hash",
+    }
+)
+_TRANSITION_INTENT_FIELDS = frozenset(
+    {
+        "record_kind",
+        "operation_id",
+        "run_id",
+        "item_id",
+        "audit_path",
+        "state_path",
+        "before_manifest_hash",
+        "after_manifest_hash",
+        "before_audit_count",
+        "before_audit_head",
+        "expected_audit",
+        "candidate_manifest",
+        "phase",
+        "intent_hash",
+    }
+)
 _DEFAULT_TIMEOUT_SECONDS = 3600.0
 _DEFAULT_OUTPUT_BYTES = 256 * 1024
 _DEFAULT_SAMPLE_LIMIT = 100
@@ -132,6 +192,339 @@ def _atomic_write_json(path: Path, value: Any) -> None:
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def _fsync_directory(path: Path) -> None:
+    """Durably publish a directory entry on POSIX filesystems."""
+
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError:
+            pass
+    finally:
+        os.close(descriptor)
+
+
+def _json_file_bytes(value: Any) -> bytes:
+    return (json.dumps(_jsonable(value), ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+
+
+def _atomic_write_json_durable(path: Path, value: Any) -> None:
+    """Atomically write a JSON object and fsync its containing directory."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("wb", dir=path.parent, prefix=f".{path.name}.", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(_json_file_bytes(value))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _transition_failpoint(stage: str) -> None:
+    """Test hook for process-loss boundaries; production execution is a no-op."""
+
+    return None
+
+
+def _transition_digest(value: Mapping[str, Any]) -> str:
+    unsigned = {key: value[key] for key in value if key not in {"record_hash", "state_hash", "intent_hash"}}
+    return _sha256_bytes(_json_bytes(unsigned))
+
+
+def _transition_regular(path: Path, *, label: str) -> Path:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{label} must be a regular file")
+    return path
+
+
+def _transition_paths(manifest_path: Path) -> tuple[Path, Path, Path]:
+    root = manifest_path.parent
+    return (
+        root / _TRANSITION_AUDIT_FILENAME,
+        root / _TRANSITION_STATE_FILENAME,
+        root / _TRANSITION_INTENT_FILENAME,
+    )
+
+
+@contextmanager
+def _transition_lock(manifest_path: Path):
+    """Serialize context transition reconciliation and publication."""
+
+    lock_path = manifest_path.parent / _TRANSITION_LOCK_FILENAME
+    if lock_path.is_symlink() or (lock_path.exists() and not lock_path.is_file()):
+        raise ValueError("analysis context transition lock is not a regular file")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as stream:
+        if fcntl is not None:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def _manifest_bytes(value: Mapping[str, Any]) -> bytes:
+    return _json_file_bytes(value)
+
+
+def _manifest_file_digest(path: Path) -> str:
+    return _sha256_file(_transition_regular(path, label="analysis context manifest"))
+
+
+def _append_transition_record(path: Path, record: Mapping[str, Any]) -> None:
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise ValueError("analysis context transition audit is not a regular file")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("ab") as stream:
+        stream.write(_json_bytes(record) + b"\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    # A directory fsync is needed both for first creation and for durable
+    # replacement/append visibility after a process loss.
+    _fsync_directory(path.parent)
+
+
+def _read_transition_audit(path: Path, *, run_id: str, item_id: str) -> list[dict[str, Any]]:
+    if not path.exists() and not path.is_symlink():
+        return []
+    _transition_regular(path, label="analysis context transition audit")
+    records: list[dict[str, Any]] = []
+    previous: str | None = None
+    for line_number, line in enumerate(path.read_bytes().splitlines(), 1):
+        try:
+            value = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"analysis context transition line {line_number} is invalid") from exc
+        if not isinstance(value, Mapping) or set(value) != _TRANSITION_AUDIT_FIELDS:
+            raise ValueError(f"analysis context transition line {line_number} fields are invalid")
+        value = dict(value)
+        if value["record_kind"] != "analysis_context_implementation_transition":
+            raise ValueError("analysis context transition record kind is invalid")
+        if value["run_id"] != run_id or value["item_id"] != item_id:
+            raise ValueError("analysis context transition identity does not match")
+        if value["previous_hash"] != previous:
+            raise ValueError("analysis context transition hash chain is broken")
+        if value["record_hash"] != _transition_digest(value):
+            raise ValueError("analysis context transition hash does not match content")
+        for field_name in ("before_manifest_hash", "after_manifest_hash"):
+            if not isinstance(value[field_name], str) or len(value[field_name]) != 64:
+                raise ValueError("analysis context transition manifest hash is invalid")
+        for field_name in ("old_sha", "new_sha", "old_tree", "new_tree"):
+            raw = value[field_name]
+            if not isinstance(raw, str) or len(raw) != 40 or any(char not in "0123456789abcdef" for char in raw):
+                raise ValueError("analysis context transition implementation identity is invalid")
+        if not isinstance(value["transition_id"], str) or not value["transition_id"]:
+            raise ValueError("analysis context transition ID is invalid")
+        if any(record["transition_id"] == value["transition_id"] for record in records):
+            raise ValueError("analysis context transition IDs must be unique")
+        previous = value["record_hash"]
+        records.append(value)
+    return records
+
+
+def _read_transition_state(path: Path, *, run_id: str, item_id: str) -> dict[str, Any] | None:
+    if not path.exists() and not path.is_symlink():
+        return None
+    _transition_regular(path, label="analysis context transition state")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("analysis context transition state is invalid") from exc
+    if not isinstance(value, Mapping) or set(value) != _TRANSITION_STATE_FIELDS:
+        raise ValueError("analysis context transition state fields are invalid")
+    value = dict(value)
+    if value["record_kind"] != "analysis_context_implementation_transition_state":
+        raise ValueError("analysis context transition state kind is invalid")
+    if value["run_id"] != run_id or value["item_id"] != item_id:
+        raise ValueError("analysis context transition state identity does not match")
+    if value["audit_path"] != f"work/{_TRANSITION_AUDIT_FILENAME}":
+        raise ValueError("analysis context transition state audit path is invalid")
+    count = value["audit_count"]
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise ValueError("analysis context transition state count is invalid")
+    head = value["audit_head"]
+    if head is not None and (not isinstance(head, str) or len(head) != 64):
+        raise ValueError("analysis context transition state head is invalid")
+    if count == 0 and head is not None or count > 0 and head is None:
+        raise ValueError("analysis context transition state head/count mismatch")
+    if not isinstance(value["manifest_file_hash"], str) or len(value["manifest_file_hash"]) != 64:
+        raise ValueError("analysis context transition state manifest hash is invalid")
+    if value["state_hash"] != _transition_digest(value):
+        raise ValueError("analysis context transition state hash does not match content")
+    return value
+
+
+def _read_transition_intent(path: Path, *, run_id: str, item_id: str) -> dict[str, Any] | None:
+    if not path.exists() and not path.is_symlink():
+        return None
+    _transition_regular(path, label="analysis context transition intent")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("analysis context transition intent is invalid") from exc
+    if not isinstance(value, Mapping) or set(value) != _TRANSITION_INTENT_FIELDS:
+        raise ValueError("analysis context transition intent fields are invalid")
+    value = dict(value)
+    if value["record_kind"] != "analysis_context_implementation_transition_intent":
+        raise ValueError("analysis context transition intent kind is invalid")
+    if value["run_id"] != run_id or value["item_id"] != item_id:
+        raise ValueError("analysis context transition intent identity does not match")
+    if value["audit_path"] != f"work/{_TRANSITION_AUDIT_FILENAME}" or value["state_path"] != f"work/{_TRANSITION_STATE_FILENAME}":
+        raise ValueError("analysis context transition intent paths are invalid")
+    if value["phase"] not in {"intent", "audit_appended", "manifest_persisted", "state_persisted"}:
+        raise ValueError("analysis context transition intent phase is invalid")
+    for field_name in ("before_manifest_hash", "after_manifest_hash"):
+        if not isinstance(value[field_name], str) or len(value[field_name]) != 64:
+            raise ValueError("analysis context transition intent manifest hash is invalid")
+    count = value["before_audit_count"]
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise ValueError("analysis context transition intent count is invalid")
+    head = value["before_audit_head"]
+    if head is not None and (not isinstance(head, str) or len(head) != 64):
+        raise ValueError("analysis context transition intent head is invalid")
+    expected = value["expected_audit"]
+    if not isinstance(expected, Mapping) or set(expected) != _TRANSITION_AUDIT_FIELDS:
+        raise ValueError("analysis context transition intent audit is invalid")
+    if expected["previous_hash"] != head or expected["record_hash"] != _transition_digest(expected):
+        raise ValueError("analysis context transition intent audit hash is invalid")
+    candidate = value["candidate_manifest"]
+    if not isinstance(candidate, Mapping):
+        raise ValueError("analysis context transition intent candidate is invalid")
+    if candidate.get("manifest_hash") != _sha256_bytes(_json_bytes({key: item for key, item in candidate.items() if key != "manifest_hash"})):
+        raise ValueError("analysis context transition intent candidate hash is invalid")
+    if _sha256_bytes(_manifest_bytes(candidate)) != value["after_manifest_hash"]:
+        raise ValueError("analysis context transition intent candidate bytes are invalid")
+    if value["intent_hash"] != _transition_digest(value):
+        raise ValueError("analysis context transition intent hash does not match content")
+    return value
+
+
+def _write_transition_state(path: Path, *, run_id: str, item_id: str, count: int, head: str | None, manifest_hash: str) -> dict[str, Any]:
+    value: dict[str, Any] = {
+        "record_kind": "analysis_context_implementation_transition_state",
+        "run_id": run_id,
+        "item_id": item_id,
+        "audit_path": f"work/{_TRANSITION_AUDIT_FILENAME}",
+        "audit_count": int(count),
+        "audit_head": head,
+        "manifest_file_hash": manifest_hash,
+    }
+    value["state_hash"] = _transition_digest(value)
+    _atomic_write_json_durable(path, value)
+    return value
+
+
+def _write_transition_intent(path: Path, value: Mapping[str, Any]) -> dict[str, Any]:
+    payload = dict(value)
+    payload["intent_hash"] = _transition_digest(payload)
+    _atomic_write_json_durable(path, payload)
+    return payload
+
+
+def _clear_transition_intent(path: Path) -> None:
+    if path.exists() or path.is_symlink():
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("analysis context transition intent is not a regular file")
+        path.unlink()
+        _fsync_directory(path.parent)
+
+
+def _reconcile_transition_journal(
+    manifest_path: Path,
+    *,
+    run_id: str,
+    item_id: str,
+    _locked: bool = False,
+) -> None:
+    """Converge one interrupted implementation rebind or fail closed."""
+
+    if not _locked:
+        with _transition_lock(manifest_path):
+            _reconcile_transition_journal(manifest_path, run_id=run_id, item_id=item_id, _locked=True)
+        return
+
+    audit_path, state_path, intent_path = _transition_paths(manifest_path)
+    audit = _read_transition_audit(audit_path, run_id=run_id, item_id=item_id)
+    state = _read_transition_state(state_path, run_id=run_id, item_id=item_id)
+    intent = _read_transition_intent(intent_path, run_id=run_id, item_id=item_id)
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        raise ValueError("analysis context manifest is not a regular file")
+    current_manifest_hash = _manifest_file_digest(manifest_path)
+    actual_count = len(audit)
+    actual_head = audit[-1]["record_hash"] if audit else None
+
+    if intent is None:
+        if state is None:
+            if audit:
+                raise ValueError("analysis context transition audit has no durable state anchor")
+            return
+        if state["audit_count"] != actual_count or state["audit_head"] != actual_head:
+            raise ValueError("analysis context transition audit does not match its durable state anchor")
+        if state["manifest_file_hash"] != current_manifest_hash:
+            raise ValueError("analysis context transition state does not match manifest")
+        return
+
+    expected = dict(intent["expected_audit"])
+    before_count = int(intent["before_audit_count"])
+    before_head = intent["before_audit_head"]
+    expected_count = before_count + 1
+    expected_head = expected["record_hash"]
+    if actual_count not in {before_count, expected_count}:
+        raise ValueError("analysis context transition intent audit count is not recoverable")
+    if actual_count == before_count:
+        if actual_head != before_head:
+            raise ValueError("analysis context transition intent audit prefix is invalid")
+    else:
+        if actual_head != expected_head or audit[-1] != expected:
+            raise ValueError("analysis context transition intent audit tail is invalid")
+    if state is not None:
+        if state["audit_count"] not in {before_count, expected_count}:
+            raise ValueError("analysis context transition intent state count is invalid")
+        if state["audit_count"] == before_count and state["audit_head"] != before_head:
+            raise ValueError("analysis context transition intent prior state head is invalid")
+        if state["audit_count"] == expected_count and state["audit_head"] != expected_head:
+            raise ValueError("analysis context transition intent final state head is invalid")
+        if state["audit_count"] == before_count and state["manifest_file_hash"] != intent["before_manifest_hash"]:
+            raise ValueError("analysis context transition intent prior manifest state is invalid")
+        if state["audit_count"] == expected_count and state["manifest_file_hash"] != intent["after_manifest_hash"]:
+            raise ValueError("analysis context transition intent final manifest state is invalid")
+    elif before_count:
+        raise ValueError("analysis context transition intent is missing its prior state anchor")
+
+    if current_manifest_hash not in {intent["before_manifest_hash"], intent["after_manifest_hash"]}:
+        raise ValueError("analysis context transition manifest is not recoverable")
+    if current_manifest_hash == intent["before_manifest_hash"]:
+        if actual_count == before_count:
+            _append_transition_record(audit_path, expected)
+            actual_count = expected_count
+            actual_head = expected_head
+        _atomic_write_json_durable(manifest_path, intent["candidate_manifest"])
+        current_manifest_hash = intent["after_manifest_hash"]
+    elif actual_count != expected_count:
+        raise ValueError("analysis context transition manifest advanced before its audit record")
+
+    _write_transition_state(
+        state_path,
+        run_id=run_id,
+        item_id=item_id,
+        count=expected_count,
+        head=expected_head,
+        manifest_hash=current_manifest_hash,
+    )
+    _clear_transition_intent(intent_path)
 
 
 def _assert_no_symlink_components(path: Path, *, root: Path) -> Path:
@@ -437,9 +830,15 @@ class BoundAnalysisContext:
             )
         return self._script_runner
 
-    def ensure_valid(self, *, final: bool = False) -> None:
+    def ensure_valid(self, *, final: bool = False, _transition_locked: bool = False) -> None:
         """Fail closed cheaply; use ``final=True`` at a freeze boundary."""
 
+        _reconcile_transition_journal(
+            self.manifest_path,
+            run_id=self.context.run_id,
+            item_id=self.item_workspace.item_id,
+            _locked=_transition_locked,
+        )
         if not self.manifest_path.is_file() or _sha256_file(self.manifest_path) != self._manifest_file_hash():
             raise ValueError("analysis context manifest changed")
         source_path = self.context.resolve_input(self.source_identity.uri)
@@ -449,7 +848,7 @@ class BoundAnalysisContext:
         if not isinstance(expected_stat, Mapping) or _source_stat_signature(source_path) != {
             str(key): int(value) for key, value in expected_stat.items()
         }:
-            raise ValueError("analysis source changed after binding (stat signature)")
+            raise ValueError("analysis source changed after binding (archive changed; stat signature)")
         if not self.source_catalog.path.is_file() or _sha256_file(self.source_catalog.path) != self.source_catalog.content_hash:
             raise ValueError("analysis catalog changed after binding")
         if self.source_catalog.source_hash != self.source_identity.content_hash:
@@ -462,6 +861,315 @@ class BoundAnalysisContext:
 
         self.ensure_valid(final=True)
 
+    def rebind_implementation(
+        self,
+        context: RunContext,
+        item_workspace: ItemWorkspace,
+        lifecycle: Any,
+    ) -> "BoundAnalysisContext":
+        """Serialize and publish one implementation transition.
+
+        Lock order is journal -> run lifecycle -> item state.  Lifecycle and
+        item mutators use their program-owned locks, so a terminal/attempt
+        writer is ordered before or after this transition rather than racing
+        its authoritative guard.
+        """
+
+        from .lifecycle import RunLifecycle
+
+        if not isinstance(context, RunContext):
+            raise TypeError("rebind_implementation requires one RunContext")
+        if not isinstance(item_workspace, ItemWorkspace):
+            raise TypeError("item_workspace must be an ItemWorkspace")
+        if not isinstance(lifecycle, RunLifecycle):
+            raise TypeError("lifecycle must be a RunLifecycle")
+        with _transition_lock(self.manifest_path):
+            with RunLifecycle._run_lock(context):
+                with item_workspace._state_transition_lock():
+                    return self._rebind_implementation_locked(
+                        context,
+                        item_workspace,
+                        lifecycle,
+                        _lifecycle_locked=True,
+                        _item_lock_held=True,
+                    )
+
+    def _rebind_implementation_locked(
+        self,
+        context: RunContext,
+        item_workspace: ItemWorkspace,
+        lifecycle: Any,
+        *,
+        _lifecycle_locked: bool = False,
+        _item_lock_held: bool = False,
+    ) -> "BoundAnalysisContext":
+        """Move this unaccepted context across an explicit implementation chain.
+
+        The operation is deliberately narrow: it changes only implementation
+        identity in the context manifest and keeps the already-bound source,
+        physical inventory, catalog, runner limits, and item artifacts intact.
+        A small intent/audit/state protocol makes each persistence boundary
+        recoverable on the next load while hash-chain tampering fails closed.
+        """
+
+        from .lifecycle import RunLifecycle
+
+        if not isinstance(context, RunContext):
+            raise TypeError("rebind_implementation requires one RunContext")
+        if not isinstance(item_workspace, ItemWorkspace):
+            raise TypeError("item_workspace must be an ItemWorkspace")
+        if not isinstance(lifecycle, RunLifecycle):
+            raise TypeError("lifecycle must be a RunLifecycle")
+        requested_item_id = item_workspace.item_id
+        requested_mode = item_workspace.mode
+        _reconcile_transition_journal(
+            self.manifest_path,
+            run_id=self.context.run_id,
+            item_id=requested_item_id,
+            _locked=True,
+        )
+        authoritative_lifecycle = (
+            RunLifecycle._load_unlocked(context)
+            if _lifecycle_locked
+            else RunLifecycle.load(context)
+        )
+        authoritative_item = ItemWorkspace.load(
+            context,
+            requested_item_id,
+            mode=requested_mode,
+            telemetry=self.telemetry,
+        )
+        lifecycle = authoritative_lifecycle
+        item_workspace = authoritative_item
+        if context.run_id != self.context.run_id or context.run_root != self.context.run_root:
+            raise ValueError("implementation rebind must stay within the same run")
+        if item_workspace.context is not context or item_workspace.item_id != self.item_workspace.item_id or item_workspace.mode != self.item_workspace.mode:
+            raise ValueError("implementation rebind item workspace identity does not match")
+        if item_workspace.item_id not in lifecycle.item_ids:
+            raise ValueError("implementation rebind item is not in the lifecycle")
+        if lifecycle.state in {"complete", "complete_with_limits"}:
+            raise ValueError("implementation rebind cannot run after terminal lifecycle")
+
+        try:
+            current_manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("analysis context manifest is unreadable") from exc
+        if not isinstance(current_manifest, Mapping):
+            raise ValueError("analysis context manifest must be an object")
+        current_manifest = dict(current_manifest)
+        current_unsigned = dict(current_manifest)
+        current_manifest_hash = current_unsigned.pop("manifest_hash", None)
+        if current_manifest_hash != _sha256_bytes(_json_bytes(current_unsigned)):
+            raise ValueError("analysis context manifest hash does not match")
+
+        target_core = context.core_version
+        target_skill = context.skill_version
+        current_core = str(current_unsigned.get("core_version", ""))
+        current_skill = current_unsigned.get("skill_version")
+        current_skill = str(current_skill) if current_skill is not None else None
+        if current_core == target_core and current_skill == target_skill:
+            # A prior successful call (or crash recovery) is an exact retry.
+            return load_bound_analysis_context(
+                context,
+                path=self.manifest_path,
+                item_workspace=item_workspace,
+                telemetry=self.telemetry,
+                _transition_locked=True,
+            )
+        if current_core != self.context.core_version or current_skill != self.context.skill_version:
+            raise ValueError("analysis context manifest implementation identity is not the caller's source")
+        self.ensure_valid(_transition_locked=True)
+
+        state = item_workspace.state
+        if state.get("active_attempt_id") is not None:
+            raise ValueError("implementation rebind requires no active attempt")
+        if item_workspace._read_business_review() is not None:
+            raise ValueError("implementation rebind requires no active business review")
+        if state.get("review", {}).get("status") != "pending":
+            raise ValueError("implementation rebind requires a pending review")
+        if state.get("terminal_intent") is not None or state.get("terminal_outcome") is not None:
+            raise ValueError("implementation rebind requires a nonterminal item")
+        if state.get("lifecycle_state") in {"accepted", "technical_failure"} or item_workspace.accepted_root.exists():
+            raise ValueError("implementation rebind cannot mutate an accepted item")
+        if state.get("integration_state") != "pending" or state.get("integration_manifest_hash") is not None or state.get("integration_manifest_ref") is not None:
+            raise ValueError("implementation rebind requires pending integration")
+
+        transitions = tuple(lifecycle.implementation_transitions)
+        if not transitions:
+            raise ValueError("implementation rebind requires an implementation transition chain")
+
+        def _version_pair(value: str) -> tuple[str, str]:
+            raw = str(value)
+            if "/" not in raw:
+                raise ValueError("implementation transition version must be skill/core")
+            skill, core = raw.split("/", 1)
+            if not skill.startswith("skill") or not core.startswith("core") or len(skill) == 5 or len(core) == 4:
+                raise ValueError("implementation transition version must be skill/core")
+            return skill, core
+
+        expected_old = (
+            str(self.context.skill_version) if str(self.context.skill_version).startswith("skill") else f"skill{self.context.skill_version}",
+            str(self.context.core_version) if str(self.context.core_version).startswith("core") else f"core{self.context.core_version}",
+        )
+        previous_new: tuple[str, str] | None = None
+        preserved: Mapping[str, str] | None = None
+        for index, transition in enumerate(transitions):
+            old_pair = _version_pair(transition.old_version)
+            new_pair = _version_pair(transition.new_version)
+            if index == 0:
+                if old_pair != expected_old:
+                    raise ValueError("implementation transition chain does not start at bound identity")
+                old_sha = current_unsigned.get("implementation_sha")
+                old_tree = current_unsigned.get("implementation_tree")
+                if old_sha is not None and old_sha != transition.old_sha:
+                    raise ValueError("implementation transition old SHA does not match manifest")
+                if old_tree is not None and old_tree != transition.old_tree:
+                    raise ValueError("implementation transition old tree does not match manifest")
+            elif old_pair != previous_new:
+                raise ValueError("implementation transition version chain has a gap")
+            if index and (transition.old_sha != transitions[index - 1].new_sha or transition.old_tree != transitions[index - 1].new_tree):
+                raise ValueError("implementation transition repository identity chain has a gap")
+            if transition.earliest_affected_item != item_workspace.item_id:
+                raise ValueError("implementation transition earliest affected item does not match")
+            candidate_preserved = dict(transition.preserved_accepted_hashes)
+            if preserved is None:
+                preserved = candidate_preserved
+            elif candidate_preserved != dict(preserved):
+                raise ValueError("implementation transition preserved accepted hashes changed")
+            previous_new = new_pair
+        expected_target = (
+            str(target_skill) if str(target_skill).startswith("skill") else f"skill{target_skill}",
+            str(target_core) if str(target_core).startswith("core") else f"core{target_core}",
+        )
+        if previous_new != expected_target:
+            raise ValueError("implementation transition chain does not reach target identity")
+        accepted_hashes = dict(preserved or {})
+        if item_workspace.item_id in accepted_hashes:
+            raise ValueError("implementation transition cannot preserve the active item")
+        for accepted_item, expected_hash in accepted_hashes.items():
+            accepted_path = context.resolve_run_path(Path("questions") / accepted_item / "accepted" / "manifest.json")
+            if not accepted_path.is_file() or _sha256_file(accepted_path) != expected_hash:
+                raise ValueError("implementation transition preserved accepted hash does not match disk")
+
+        # Reload both authorities immediately before preparing the durable
+        # intent.  A stale caller object (or a concurrent terminal/attempt
+        # writer) can never authorize this commit from an earlier snapshot.
+        latest_lifecycle = (
+            RunLifecycle._load_unlocked(context)
+            if _lifecycle_locked
+            else RunLifecycle.load(context)
+        )
+        latest_item = ItemWorkspace.load(
+            context,
+            item_workspace.item_id,
+            mode=item_workspace.mode,
+            telemetry=self.telemetry,
+        )
+        if latest_lifecycle.implementation_transitions != transitions:
+            raise ValueError("implementation transition ledger changed during rebind")
+        if latest_item.state != state:
+            raise ValueError("item workspace changed during implementation rebind")
+        if latest_item._read_business_review() is not None or latest_item.accepted_root.exists():
+            raise ValueError("item workspace became non-rebindable during implementation rebind")
+        item_workspace = latest_item
+        lifecycle = latest_lifecycle
+
+        candidate_unsigned = dict(current_unsigned)
+        candidate_unsigned["core_version"] = target_core
+        candidate_unsigned["skill_version"] = target_skill
+        candidate_unsigned["implementation_sha"] = transitions[-1].new_sha
+        candidate_unsigned["implementation_tree"] = transitions[-1].new_tree
+        candidate_manifest_hash = _sha256_bytes(_json_bytes(candidate_unsigned))
+        candidate_manifest = {**candidate_unsigned, "manifest_hash": candidate_manifest_hash}
+        before_manifest_hash = _manifest_file_digest(self.manifest_path)
+        after_manifest_hash = _sha256_bytes(_manifest_bytes(candidate_manifest))
+        audit_path, state_path, intent_path = _transition_paths(self.manifest_path)
+        audit = _read_transition_audit(audit_path, run_id=self.context.run_id, item_id=item_workspace.item_id)
+        anchor = _read_transition_state(state_path, run_id=self.context.run_id, item_id=item_workspace.item_id)
+        if anchor is None:
+            if audit:
+                raise ValueError("analysis context transition audit has no state anchor")
+            before_count, before_head = 0, None
+        else:
+            if anchor["audit_count"] != len(audit) or anchor["audit_head"] != (audit[-1]["record_hash"] if audit else None):
+                raise ValueError("analysis context transition state anchor is invalid")
+            if anchor["manifest_file_hash"] != before_manifest_hash:
+                raise ValueError("analysis context transition state manifest hash is stale")
+            before_count, before_head = anchor["audit_count"], anchor["audit_head"]
+        transition = transitions[-1]
+        record_unsigned = {
+            "record_kind": "analysis_context_implementation_transition",
+            "transition_id": transition.transition_id or f"{transition.old_version}->{transition.new_version}",
+            "run_id": self.context.run_id,
+            "item_id": item_workspace.item_id,
+            "before_manifest_hash": before_manifest_hash,
+            "after_manifest_hash": after_manifest_hash,
+            "old_core_version": self.context.core_version,
+            "new_core_version": target_core,
+            "old_skill_version": self.context.skill_version,
+            "new_skill_version": target_skill,
+            "old_sha": transitions[0].old_sha,
+            "new_sha": transition.new_sha,
+            "old_tree": transitions[0].old_tree,
+            "new_tree": transition.new_tree,
+            "previous_hash": before_head,
+        }
+        record = {**record_unsigned, "record_hash": _transition_digest(record_unsigned)}
+        operation_id = f"rebind-{record['record_hash'][:16]}"
+        intent = {
+            "record_kind": "analysis_context_implementation_transition_intent",
+            "operation_id": operation_id,
+            "run_id": self.context.run_id,
+            "item_id": item_workspace.item_id,
+            "audit_path": f"work/{_TRANSITION_AUDIT_FILENAME}",
+            "state_path": f"work/{_TRANSITION_STATE_FILENAME}",
+            "before_manifest_hash": before_manifest_hash,
+            "after_manifest_hash": after_manifest_hash,
+            "before_audit_count": before_count,
+            "before_audit_head": before_head,
+            "expected_audit": record,
+            "candidate_manifest": candidate_manifest,
+            "phase": "intent",
+        }
+        if intent_path.exists() or intent_path.is_symlink():
+            existing = _read_transition_intent(intent_path, run_id=self.context.run_id, item_id=item_workspace.item_id)
+            if existing != {**intent, "intent_hash": _transition_digest(intent)}:
+                raise ValueError("conflicting implementation rebind intent exists")
+        try:
+            _write_transition_intent(intent_path, intent)
+            _transition_failpoint("after_intent")
+            _append_transition_record(audit_path, record)
+            intent = {**intent, "phase": "audit_appended"}
+            _write_transition_intent(intent_path, intent)
+            _transition_failpoint("after_audit")
+            _atomic_write_json_durable(self.manifest_path, candidate_manifest)
+            intent = {**intent, "phase": "manifest_persisted"}
+            _write_transition_intent(intent_path, intent)
+            _transition_failpoint("after_manifest")
+            _write_transition_state(
+                state_path,
+                run_id=self.context.run_id,
+                item_id=item_workspace.item_id,
+                count=before_count + 1,
+                head=record["record_hash"],
+                manifest_hash=after_manifest_hash,
+            )
+            intent = {**intent, "phase": "state_persisted"}
+            _write_transition_intent(intent_path, intent)
+            _transition_failpoint("after_state")
+            _clear_transition_intent(intent_path)
+        except Exception:
+            # The intent remains for deterministic recovery on the next load;
+            # no broad rollback can safely erase an already-fsynced boundary.
+            raise
+        return load_bound_analysis_context(
+            context,
+            path=self.manifest_path,
+            item_workspace=item_workspace,
+            telemetry=self.telemetry,
+            _transition_locked=True,
+        )
+
     def save_prepared_candidate(
         self,
         prepared_asset_id: str,
@@ -470,6 +1178,7 @@ class BoundAnalysisContext:
     ) -> Any:
         """Materialize a mutable candidate below this item's work/prepared."""
 
+        self.ensure_valid()
         candidate_root = self.item_workspace.work_root / "prepared"
         return self._workbench._save_prepared_candidate(
             prepared_asset_id,
@@ -532,6 +1241,7 @@ def load_bound_analysis_context(
     path: str | Path | None = None,
     item_workspace: ItemWorkspace | None = None,
     telemetry: Any = None,
+    _transition_locked: bool = False,
 ) -> BoundAnalysisContext:
     """Load a hash-bound context from the environment or an explicit safe path."""
 
@@ -544,6 +1254,24 @@ def load_bound_analysis_context(
         raise ValueError("analysis context manifest is unreadable") from exc
     if not isinstance(manifest, Mapping):
         raise ValueError("analysis context manifest must be an object")
+    # Reconcile a crash-persisted rebind before interpreting implementation
+    # identity.  The hints are used only to select the already-bound journal;
+    # the full manifest hash and schema checks below remain authoritative.
+    hinted_run_id = manifest.get("run_id")
+    hinted_item_id = manifest.get("item_id")
+    if isinstance(hinted_run_id, str) and isinstance(hinted_item_id, str) and hinted_run_id and hinted_item_id:
+        _reconcile_transition_journal(
+            manifest_path,
+            run_id=hinted_run_id,
+            item_id=hinted_item_id,
+            _locked=_transition_locked,
+        )
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("analysis context manifest is unreadable") from exc
+        if not isinstance(manifest, Mapping):
+            raise ValueError("analysis context manifest must be an object")
     unsigned = dict(manifest)
     manifest_hash = unsigned.pop("manifest_hash", None)
     if not isinstance(manifest_hash, str) or manifest_hash != _sha256_bytes(_json_bytes(unsigned)):
@@ -567,7 +1295,11 @@ def load_bound_analysis_context(
             root=context.run_root,
             label="analysis context manifest",
         )
-    if unsigned.get("run_id") != context.run_id or unsigned.get("core_version") != context.core_version:
+    if (
+        unsigned.get("run_id") != context.run_id
+        or unsigned.get("core_version") != context.core_version
+        or unsigned.get("skill_version") != context.skill_version
+    ):
         raise ValueError("analysis context run/core identity does not match")
     item_id = unsigned.get("item_id")
     item_mode = unsigned.get("item_mode", "question")
@@ -628,6 +1360,61 @@ def load_bound_analysis_context(
         raise ValueError("analysis runner config is invalid") from exc
     if normalized_runner_config["default_timeout_seconds"] <= 0 or normalized_runner_config["default_output_bytes"] <= 0:
         raise ValueError("analysis runner config must be positive")
+    catalog_payload = unsigned.get("catalog")
+    if not isinstance(catalog_payload, Mapping):
+        raise ValueError("analysis catalog binding is missing")
+    catalog_core = str(catalog_payload.get("core_version", ""))
+    transition_audit = _transition_paths(manifest_path)[0]
+    transition_records = _read_transition_audit(
+        transition_audit,
+        run_id=context.run_id,
+        item_id=item_id,
+    )
+    rebound_catalog = bool(transition_records)
+    reused_entries: tuple[DataRoomCatalogEntry, ...] | None = None
+    reused_catalog_path: Path | None = None
+    reused_catalog_key: str | None = None
+    if rebound_catalog or catalog_core != context.core_version:
+        if (
+            not transition_records
+            or transition_records[0]["old_core_version"] != catalog_core
+            or transition_records[-1]["new_core_version"] != context.core_version
+            or transition_records[-1]["new_skill_version"] != str(context.skill_version)
+        ):
+            raise ValueError("analysis catalog implementation transition is not recorded")
+        raw_catalog_path = catalog_payload.get("path")
+        if not isinstance(raw_catalog_path, str) or not raw_catalog_path:
+            raise ValueError("analysis catalog path is invalid")
+        reused_catalog_path = _regular_file(
+            context.resolve_run_path(raw_catalog_path),
+            root=context.run_root,
+            label="analysis catalog",
+        )
+        if _sha256_file(reused_catalog_path) != catalog_payload.get("content_hash"):
+            raise ValueError("analysis catalog content hash does not match")
+        try:
+            persisted_catalog = json.loads(reused_catalog_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("analysis catalog is unreadable") from exc
+        if not isinstance(persisted_catalog, Mapping):
+            raise ValueError("analysis catalog must be an object")
+        if (
+            persisted_catalog.get("catalog_schema_version") != catalog_payload.get("catalog_schema_version")
+            or persisted_catalog.get("catalog_key") != catalog_payload.get("catalog_key")
+            or persisted_catalog.get("source_hash") != source_identity.content_hash
+            or persisted_catalog.get("core_version") != catalog_core
+        ):
+            raise ValueError("analysis catalog persisted identity does not match binding")
+        raw_entries = persisted_catalog.get("entries")
+        if not isinstance(raw_entries, list):
+            raise ValueError("analysis catalog entries are invalid")
+        try:
+            reused_entries = tuple(DataRoomCatalogEntry.from_dict(value) for value in raw_entries)
+        except (TypeError, KeyError, ValueError) as exc:
+            raise ValueError("analysis catalog entries are invalid") from exc
+        reused_catalog_key = str(catalog_payload.get("catalog_key", ""))
+        if not reused_catalog_key:
+            raise ValueError("analysis catalog key is invalid")
     workbench = DataRoomWorkbench(
         context,
         source_identity,
@@ -636,11 +1423,39 @@ def load_bound_analysis_context(
         _bound_archive_hash=source_identity.content_hash,
         _bound_source_stat=normalized_stat,
         _bound_central_directory_fingerprint=normalized_central_fingerprint,
+        _bound_catalog_entries=reused_entries,
+        _bound_catalog_path=reused_catalog_path,
+        _bound_catalog_key=reused_catalog_key,
     )
-    snapshot = CatalogSnapshot.from_workbench(workbench)
-    catalog_payload = unsigned.get("catalog")
-    if not isinstance(catalog_payload, Mapping):
-        raise ValueError("analysis catalog binding is missing")
+    if reused_entries is None:
+        snapshot = CatalogSnapshot.from_workbench(workbench)
+    else:
+        for entry in reused_entries:
+            workbench.data_room._resolve_member(entry.member)
+        raw_counts = persisted_catalog.get("counts")
+        if not isinstance(raw_counts, Mapping):
+            raise ValueError("analysis catalog counts are invalid")
+        try:
+            counts = CatalogCounts(
+                archive_members=raw_counts["archive_members"],
+                catalog_entries=raw_counts["catalog_entries"],
+                table_members=raw_counts["table_members"],
+                sheet_entries=raw_counts["sheet_entries"],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("analysis catalog counts are invalid") from exc
+        if counts != workbench.data_room.catalog_counts(reused_entries):
+            raise ValueError("analysis catalog counts do not match entries")
+        snapshot = CatalogSnapshot(
+            path=reused_catalog_path,
+            content_hash=str(catalog_payload["content_hash"]),
+            catalog_key=reused_catalog_key,
+            catalog_schema_version=str(catalog_payload.get("catalog_schema_version", "")),
+            source_hash=source_identity.content_hash or "",
+            core_version=catalog_core,
+            entries=reused_entries,
+            counts=counts,
+        )
     if (
         str(catalog_payload.get("path")) != str(snapshot.path)
         or catalog_payload.get("content_hash") != snapshot.content_hash
@@ -665,7 +1480,7 @@ def load_bound_analysis_context(
         default_timeout_seconds=normalized_runner_config["default_timeout_seconds"],
         default_output_bytes=normalized_runner_config["default_output_bytes"],
     )
-    bound.ensure_valid()
+    bound.ensure_valid(_transition_locked=_transition_locked)
     return bound
 
 
