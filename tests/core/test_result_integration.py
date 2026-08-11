@@ -69,8 +69,19 @@ def _session(context: RunContext, item_id: str = "Q-001", value: object | None =
     workspace = _accepted(context, item_id, value)
     lem = LivingEnterpriseModel(run_id=context.run_id)
     registry = PreparedAssetRegistry(context)
-    session = IntegrationSession.create(context, workspace, lem, registry, "integration-owner")
+    session = IntegrationSession.create(context, workspace, lem, registry, "integration-owner", invocation_id=f"inv-{item_id}")
     return workspace, lem, registry, session
+
+
+def _commit(session: IntegrationSession):
+    """Persist the required item-local fidelity acceptance before commit."""
+
+    if session.fidelity_result is None:
+        session.record_fidelity_review(
+            "accept",
+            checked_record_ids=tuple(record.record_id for record in session.records),
+        )
+    return session.commit()
 
 
 def test_accepted_bundle_is_opaque_and_evidence_short_ref_is_accepted(tmp_path: Path) -> None:
@@ -80,7 +91,7 @@ def test_accepted_bundle_is_opaque_and_evidence_short_ref_is_accepted(tmp_path: 
     assert AcceptedAnalysisBundle.load(workspace).answer_content == before
     record_id = session.add_claim("opaque claim", scope="question", evidence_refs=("answer_content.json",))
     assert session.records[0].evidence_hashes["answer_content.json"] == hashlib.sha256(before).hexdigest()
-    session.commit()
+    _commit(session)
     assert (workspace.accepted_root / "answer_content.json").read_bytes() == before
     assert session.records[0].record_id == record_id
     assert workspace.integration_state == "integrated"
@@ -130,12 +141,22 @@ def test_typed_records_corrections_and_lem_growth(tmp_path: Path) -> None:
     session.add_dashboard_fact({"fact": "orders_metric", "value": 3}, scope="question", evidence_refs=("work/plan.json",))
     session.link_evidence(metric_id, ("work/plan.json",), scope="question")
     before = session.records[0].record_hash
+    session.record_fidelity_review(
+        "repair_once",
+        findings=[{"message": "label correction", "record_id": source_id, "parts": ["payload"]}],
+        checked_record_ids=tuple(record.record_id for record in session.records),
+    )
     session.correct_record(source_id, {"item_id": "customer", "item_type": "entity", "label": "Customer corrected", "scope": "question"})
     assert session.records[0].record_hash != before
     assert session.validate().valid
-    manifest = session.commit()
+    session.record_fidelity_review(
+        "accept",
+        checked_record_ids=(source_id,),
+    )
+    manifest = _commit(session)
     assert manifest["records_count"] == 7
-    assert set(("customer", "order", "orders_metric")).issubset(lem.ontology)
+    assert {"customer", "order"}.issubset(lem.ontology)
+    assert "orders_metric" not in lem.ontology
     assert limitation_id in lem.knowledge
     assert workspace.integration_manifest_hash == manifest["manifest_hash"]
     assert "order" in {record.payload.get("item_id") for record in session.records if record.kind == "ontology_item"}
@@ -148,7 +169,7 @@ def test_relationship_refs_include_prior_staged_metrics_and_relationship_ontolog
         OntologyItem(item_id="customer", item_type="entity", label="Customer", scope="question"),
         evidence_refs=("work/plan.json",),
     )
-    session.add_metric({"item_id": "orders_metric", "label": "Orders"}, scope="question", evidence_refs=("work/plan.json",))
+    session.add_metric_definition({"item_id": "orders_metric", "label": "Orders", "properties": {"unit": "count"}}, scope="question", evidence_refs=("work/plan.json",))
     session.add_relationship(
         {"relationship_id": "customer_orders", "source_id": "customer", "target_id": "orders_metric"},
         scope="question",
@@ -160,7 +181,7 @@ def test_relationship_refs_include_prior_staged_metrics_and_relationship_ontolog
         evidence_refs=("work/plan.json",),
     )
     assert session.validate().valid
-    session.commit()
+    _commit(session)
     assert {"orders_metric", "customer_orders", "customer_orders_fact"}.issubset(lem.ontology)
 
 
@@ -179,16 +200,16 @@ def test_relationship_forward_or_unknown_refs_fail_closed(tmp_path: Path) -> Non
     session.add_metric({"item_id": "future_metric", "label": "Future"}, scope="question", evidence_refs=("work/plan.json",))
     assert not session.validate().valid
     with pytest.raises(ValueError, match="validation"):
-        session.commit()
+        _commit(session)
 
 
 def test_preflight_collision_has_no_intent_or_partial_lem_mutation(tmp_path: Path) -> None:
     context = RunContext("RUN", tmp_path / "run")
     workspace, lem, registry, session = _session(context)
-    lem.add_ontology_item(OntologyItem(item_id="m", item_type="metric", label="existing"))
-    session.add_metric({"item_id": "m", "label": "different"}, scope="question", evidence_refs=("work/plan.json",))
+    lem.add_metric_definition({"item_id": "m", "label": "existing"})
+    session.add_metric_definition({"item_id": "m", "label": "different"}, scope="question", evidence_refs=("work/plan.json",))
     with pytest.raises(ValueError, match="collision"):
-        session.commit()
+        _commit(session)
     assert not (session.staging_root / "commit_intent.json").exists()
     assert len(lem.ontology) == 1
     assert workspace.integration_state == "pending"
@@ -208,9 +229,9 @@ def test_staging_snapshot_reconciles_projection_crashes(tmp_path: Path, monkeypa
         original_json(path, value)
     monkeypatch.setattr(integration_module, "_atomic_write_json", fail_session)
     with pytest.raises(RuntimeError):
-        IntegrationSession.create(context, workspace, lem, registry, "integration-owner")
+        IntegrationSession.create(context, workspace, lem, registry, "integration-owner", invocation_id="inv-Q-001")
     monkeypatch.setattr(integration_module, "_atomic_write_json", original_json)
-    reloaded = IntegrationSession.create(context, workspace, lem, registry, "integration-owner")
+    reloaded = IntegrationSession.create(context, workspace, lem, registry, "integration-owner", invocation_id="inv-Q-001")
     assert reloaded.status == "open"
     assert (reloaded.staging_root / "session.json").is_file()
 
@@ -224,7 +245,7 @@ def test_staging_snapshot_reconciles_projection_crashes(tmp_path: Path, monkeypa
     with pytest.raises(RuntimeError):
         reloaded.add_limitation("later", scope="question", evidence_refs=("work/plan.json",))
     monkeypatch.setattr(integration_module, "_atomic_write_bytes", original_bytes)
-    recovered = IntegrationSession.load(context, workspace, lem, registry, "integration-owner")
+    recovered = IntegrationSession.load(context, workspace, lem, registry, "integration-owner", invocation_id="inv-Q-001")
     assert {record.record_id for record in recovered.records} == {rid, next(record.record_id for record in reloaded.records if record.kind == "limitation")}
 
 
@@ -235,22 +256,22 @@ def test_intent_before_apply_and_retry_after_publish_or_item_state_crash(tmp_pat
     original_apply = session._apply_records
     monkeypatch.setattr(session, "_apply_records", lambda: (_ for _ in ()).throw(RuntimeError("apply crash")))
     with pytest.raises(RuntimeError):
-        session.commit()
+        _commit(session)
     assert (session.staging_root / "commit_intent.json").is_file()
     assert workspace.integration_state == "pending"
     monkeypatch.setattr(session, "_apply_records", original_apply)
-    manifest = session.commit()
+    manifest = _commit(session)
     assert workspace.integration_state == "integrated"
-    assert session.commit()["manifest_hash"] == manifest["manifest_hash"]
+    assert _commit(session)["manifest_hash"] == manifest["manifest_hash"]
 
     workspace2, lem2, registry2, session2 = _session(context, "Q-002")
     session2.add_claim("claim", scope="question", evidence_refs=("work/plan.json",))
     original_publish = session2._write_committed
     monkeypatch.setattr(session2, "_write_committed", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("publish crash")))
     with pytest.raises(RuntimeError):
-        session2.commit()
+        _commit(session2)
     monkeypatch.setattr(session2, "_write_committed", original_publish)
-    assert session2.commit()["status"] == "committed"
+    assert _commit(session2)["status"] == "committed"
     assert workspace2.integration_state == "integrated"
 
 
@@ -271,11 +292,11 @@ def test_partial_external_apply_retries_without_duplicates(tmp_path: Path, monke
 
     monkeypatch.setattr(session, "_apply_lem_record", flaky)
     with pytest.raises(RuntimeError):
-        session.commit()
+        _commit(session)
     assert registry.search(prepared_asset_id="asset-first")
     assert workspace.integration_state == "pending"
     monkeypatch.setattr(session, "_apply_lem_record", original_apply)
-    manifest = session.commit()
+    manifest = _commit(session)
     assert manifest["status"] == "committed"
     assert len(registry.search(prepared_asset_id="asset-first")) == 1
 
@@ -295,11 +316,11 @@ def test_published_then_item_mark_crash_rebinds_on_retry(tmp_path: Path, monkeyp
 
     monkeypatch.setattr(workspace, "mark_integration_committed", flaky_mark)
     with pytest.raises(RuntimeError):
-        session.commit()
+        _commit(session)
     assert session.committed_manifest_path.is_file()
     assert workspace.integration_state == "pending"
     monkeypatch.setattr(workspace, "mark_integration_committed", original_mark)
-    manifest = session.commit()
+    manifest = _commit(session)
     assert workspace.integration_state == "integrated"
     assert workspace.integration_manifest_hash == manifest["manifest_hash"]
 
@@ -319,10 +340,10 @@ def test_integrated_then_staging_persistence_crash_converges(tmp_path: Path, mon
 
     monkeypatch.setattr(session, "_persist_state", flaky_persist)
     with pytest.raises(RuntimeError):
-        session.commit()
+        _commit(session)
     assert workspace.integration_state == "integrated"
     monkeypatch.setattr(session, "_persist_state", original_persist)
-    manifest = session.commit()
+    manifest = _commit(session)
     assert session.status == "committed"
     assert manifest["status"] == "committed"
 
@@ -378,16 +399,16 @@ def test_prepared_assets_all_scopes_register_and_reusable_loads_next_item(tmp_pa
     scoped = _asset(context, "asset-scoped", scope="requirement_scoped", workspace=workspace1)
     session1.register_prepared_asset(reusable)
     session1.register_prepared_asset(scoped)
-    session1.commit()
+    _commit(session1)
     assert registry.load("asset-reusable").rows == ({"asset": "asset-reusable"},)
     assert registry.search(reusable_only=True, prepared_asset_id="asset-reusable")
     assert not registry.search(reusable_only=True, prepared_asset_id="asset-scoped")
     assert registry.search(prepared_asset_id="asset-scoped")
 
     workspace2 = _accepted(context, "Q-002")
-    session2 = IntegrationSession.create(context, workspace2, lem, registry, "integration-owner")
+    session2 = IntegrationSession.create(context, workspace2, lem, registry, "integration-owner", invocation_id="inv-Q-002")
     session2.add_ontology_item(OntologyItem(item_id="item-2", item_type="entity", label="Second", scope="question"), evidence_refs=("work/plan.json",))
-    session2.commit()
+    _commit(session2)
     assert "item-2" in lem.ontology
     assert workspace1.accepted_root.joinpath("answer_content.json").read_bytes()
 
@@ -399,7 +420,7 @@ def test_prepared_candidate_is_staged_without_registry_mutation_until_commit(tmp
     session.register_prepared_asset(candidate)
     assert registry.search(prepared_asset_id=candidate.prepared_asset_id) == ()
     assert not registry.registry_path.exists()
-    session.commit()
+    _commit(session)
     assert registry.search(prepared_asset_id=candidate.prepared_asset_id) == (candidate,)
 
 
@@ -434,12 +455,12 @@ def test_registry_index_crash_repairs_on_exact_integration_retry(
 
     monkeypatch.setattr(prepared_module, "_atomic_write", fail_index_once)
     with pytest.raises(RuntimeError, match="index publication crash"):
-        session.commit()
+        _commit(session)
     assert registry.search(prepared_asset_id=candidate.prepared_asset_id) == (candidate,)
     assert workspace.integration_state == "pending"
     monkeypatch.setattr(prepared_module, "_atomic_write", original_atomic_write)
 
-    manifest = session.commit()
+    manifest = _commit(session)
     assert manifest["status"] == "committed"
     assert workspace.integration_state == "integrated"
     index = json.loads(registry.index_path.read_text(encoding="utf-8"))
@@ -460,7 +481,7 @@ def test_accepted_bundle_metadata_is_deeply_immutable(tmp_path: Path) -> None:
         bundle.manifest["artifact_progress"]["files"].append("tampered")  # type: ignore[union-attr]
 
     session.add_claim("still bound", scope="question", evidence_refs=("answer_content.json",))
-    session.commit()
+    _commit(session)
 
 
 def test_rejected_or_item_technical_failure_cannot_register_prepared_asset(tmp_path: Path) -> None:
@@ -480,7 +501,7 @@ def test_rejected_or_item_technical_failure_cannot_register_prepared_asset(tmp_p
     failed.technical_failure("unrecoverable", recovery_exhausted=True)
     assert registry.search() == ()
     with pytest.raises(ValueError):
-        IntegrationSession.create(context, failed, LivingEnterpriseModel(run_id=context.run_id), registry, "owner")
+        IntegrationSession.create(context, failed, LivingEnterpriseModel(run_id=context.run_id), registry, "owner", invocation_id="inv-failed")
     assert registry.search() == ()
 
 
@@ -489,11 +510,11 @@ def test_prepared_candidate_scope_and_same_id_conflict_fail_before_commit_intent
     workspace1, lem, registry, session1 = _session(context, "Q-001")
     first = _asset(context, "same-id", scope="exploratory", workspace=workspace1)
     session1.register_prepared_asset(first)
-    session1.commit()
+    _commit(session1)
     assert registry.search(prepared_asset_id="same-id", scope="exploratory") == (first,)
 
     workspace2 = _accepted(context, "Q-002")
-    session2 = IntegrationSession.create(context, workspace2, lem, registry, "integration-owner")
+    session2 = IntegrationSession.create(context, workspace2, lem, registry, "integration-owner", invocation_id="inv-Q-002")
     conflict = _asset(context, "same-id", scope="superseded", workspace=workspace2)
     with pytest.raises(ValueError, match="different descriptor"):
         session2.register_prepared_asset(conflict)
@@ -510,7 +531,7 @@ def test_prepared_candidate_mutation_after_staging_fails_without_registry_entry(
     path = Path(candidate.location)
     path.write_bytes(b'{"asset":"tampered"}\n')
     with pytest.raises(ValueError, match="changed|match|byte"):
-        session.commit()
+        _commit(session)
     assert registry.search(prepared_asset_id=candidate.prepared_asset_id) == ()
     assert workspace.integration_state == "pending"
 
@@ -522,7 +543,7 @@ def test_accepted_bundle_mutation_after_staging_is_rejected_before_external_appl
     accepted_path = workspace.accepted_root / "answer_content.json"
     accepted_path.write_bytes(b'{"answer":"tampered"}\n')
     with pytest.raises(ValueError, match="terminal|bundle|hash"):
-        session.commit()
+        _commit(session)
     assert workspace.integration_state == "pending"
     assert lem.ontology == {}
     assert registry.search() == ()
@@ -545,12 +566,12 @@ def test_record_shape_and_snapshot_tamper_rejected(tmp_path: Path) -> None:
     payload["state"]["records_count"] = 99
     snapshot.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="snapshot hash"):
-        IntegrationSession.load(context, workspace, lem, registry, "integration-owner")
+        IntegrationSession.load(context, workspace, lem, registry, "integration-owner", invocation_id="inv-Q-001")
 
 
 def test_owner_is_single_winner(tmp_path: Path) -> None:
     context = RunContext("RUN", tmp_path / "run")
     workspace = _accepted(context, "Q-001")
-    IntegrationSession.create(context, workspace, LivingEnterpriseModel(run_id="RUN"), PreparedAssetRegistry(context), "owner-a")
+    IntegrationSession.create(context, workspace, LivingEnterpriseModel(run_id="RUN"), PreparedAssetRegistry(context), "owner-a", invocation_id="inv-owner-a")
     with pytest.raises(ValueError, match="owned by another"):
-        IntegrationSession.create(context, workspace, LivingEnterpriseModel(run_id="RUN"), PreparedAssetRegistry(context), "owner-b")
+        IntegrationSession.create(context, workspace, LivingEnterpriseModel(run_id="RUN"), PreparedAssetRegistry(context), "owner-b", invocation_id="inv-owner-b")

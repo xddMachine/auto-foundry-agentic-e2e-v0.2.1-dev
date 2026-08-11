@@ -4,6 +4,10 @@ These instructions describe a local replacement. The package/validator smoke
 uses a temporary offline install target only; it never installs into this
 repository's Python environment or the Codex runtime automatically.
 
+The current contract is skill `0.2.4` with core `0.3.1`. Benchmark A remains
+prepared but unexecuted; this document does not authorize a run, installation,
+or remote operation.
+
 ## Normal runtime path
 
 The supported integration path is deliberately small:
@@ -65,8 +69,11 @@ The candidate descriptor and bytes remain under the current item's
 `work/prepared/` directory. Rejected items and technical-failure integrations
 do not create accepted registry entries. Registry registration validates exact
 path, hash, byte/row counts, scope, and provenance; these mechanical checks
-cannot prove semantic completeness, so a live Integration Agent and an
-external test-only fidelity audit remain required.
+cannot prove semantic completeness. After mechanical validation, exactly one
+fresh item-only Integration Fidelity Reviewer checks the current item before
+commit. The packet excludes sibling, cumulative, prior-memory, and
+broad-workspace context; the same Result Integration Agent may make one
+targeted repair and receives one targeted recheck.
 
 The run-level physical inventory is bound once and exposed through passive
 counter operations (`archive_full_hash`, `member_content_hash`,
@@ -81,7 +88,7 @@ active attempt and lane; unpersisted or mismatched references fail closed.
 
 ## Skill replacement (same name)
 
-1. Build/validate `dist/auto-foundry-agentic-e2e-v0.2.3.zip` locally.
+1. Build/validate `dist/auto-foundry-agentic-e2e-v0.2.4.zip` locally.
 2. Inspect that the ZIP has exactly one top-level directory named
    `auto-foundry-agentic-e2e/`.
 3. Back up the existing same-name directory, then replace it atomically in the
@@ -94,15 +101,15 @@ test -d "$SKILLS_DIR"
 test -d "${SKILLS_DIR}/auto-foundry-agentic-e2e"
 test ! -e "$BACKUP_DIR"
 mv "${SKILLS_DIR}/auto-foundry-agentic-e2e" "$BACKUP_DIR"
-unzip -q dist/auto-foundry-agentic-e2e-v0.2.3.zip -d "$SKILLS_DIR"
+unzip -q dist/auto-foundry-agentic-e2e-v0.2.4.zip -d "$SKILLS_DIR"
 ```
 
-4. Verify the installed `SKILL.md` frontmatter and markers are `0.2.3` with
-core version `0.3.0`, then
+4. Verify the installed `SKILL.md` frontmatter and markers are `0.2.4` with
+core version `0.3.1`, then
    start a **fresh Codex task**. Skill discovery is refreshed at task start;
    do not assume the current task sees a changed skill.
 
-Rollback is a replacement, not a merge. The active v0.2.3 tree must leave the
+Rollback is a replacement, not a merge. The active v0.2.4 tree must leave the
 skills discovery root before the previous entrypoint is restored; otherwise a
 recursive discovery scan can see two same-name skills. Keep the replacement
 tree in a timestamped retained directory outside `$CODEX_HOME/skills`:
@@ -110,18 +117,18 @@ tree in a timestamped retained directory outside `$CODEX_HOME/skills`:
 ```bash
 SKILLS_DIR="$(cd "${CODEX_HOME:-$HOME/.codex}/skills" && pwd -P)"
 ACTIVE="${SKILLS_DIR}/auto-foundry-agentic-e2e"
-BACKUP_DIR="${SKILLS_DIR}/auto-foundry-agentic-e2e-v0.2.1-backup-20260809T134600Z"
+BACKUP_DIR="${SKILLS_DIR}/auto-foundry-agentic-e2e.previous-backup"
 ROLLBACK_ROOT="${CODEX_HOME:-$HOME/.codex}/skill-rollback-replacements"
-REPLACEMENT="${ROLLBACK_ROOT}/auto-foundry-agentic-e2e-v0.2.3-$(date -u +%Y%m%dT%H%M%SZ)"
+REPLACEMENT="${ROLLBACK_ROOT}/auto-foundry-agentic-e2e-v0.2.4-$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$ROLLBACK_ROOT"
 test -d "$SKILLS_DIR"
 test -d "$ACTIVE"
 test -d "$BACKUP_DIR"
 test ! -e "$REPLACEMENT"
 test ! -e "$BACKUP_DIR/SKILL.md"
-test -f "$BACKUP_DIR/SKILL.md.rollback-v0.2.1"
+test -f "$BACKUP_DIR/SKILL.md.rollback-previous"
 mv "$ACTIVE" "$REPLACEMENT"
-mv "$BACKUP_DIR/SKILL.md.rollback-v0.2.1" "$BACKUP_DIR/SKILL.md"
+mv "$BACKUP_DIR/SKILL.md.rollback-previous" "$BACKUP_DIR/SKILL.md"
 mv "$BACKUP_DIR" "$ACTIVE"
 ```
 
@@ -132,13 +139,13 @@ succeeds, then remove only that explicitly named retained directory if desired.
 
 ## Core wheel replacement (same package name)
 
-The validated wheel is `dist/auto_foundry_core-0.3.0-*.whl`. Install into an
+The validated wheel is `dist/auto_foundry_core-0.3.1-*.whl`. Install into an
 explicit target or environment selected by the operator; do not install into
 the repository or a user runtime as part of this deliverable:
 
 ```bash
 TARGET="$(mktemp -d)"
-python3 -m pip install --no-index --no-deps --target "$TARGET" dist/auto_foundry_core-0.3.0-*.whl
+python3 -m pip install --no-index --no-deps --target "$TARGET" dist/auto_foundry_core-0.3.1-*.whl
 PYTHONPATH="$TARGET" python3 -c 'import auto_foundry_core; print(auto_foundry_core.__version__)'
 PYTHONPATH="$TARGET" python3 -m auto_foundry_core catalog list
 ```
@@ -156,7 +163,7 @@ do not fetch packages or use a remote index.
 ## Release candidate status
 
 After the complete offline vertical proofs and full suite pass, use the status
-label **v0.2.3 / core 0.3.0 — offline program validation complete for later
+label **v0.2.4 / core 0.3.1 — offline program validation complete for later
 Benchmark A**. Benchmark A is prepared but not run by this repository task. This remains an experimental
 release candidate, not a production-hardened sandbox.
 

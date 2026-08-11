@@ -201,9 +201,9 @@ The draft and accepted answer should separate:
 
 ## 11. Review and Knowledge Delta
 
-One Lead Analyst self-check precedes one routed Independent Reviewer. Route an
-independent fresh context first, an alternate independent route second, and a
-fresh same-family route third. If all are unavailable, disclose
+One Lead Analyst self-check precedes one routed Independent Business Reviewer.
+Route an independent fresh context first, an alternate independent route
+second, and a fresh same-family route third. If all are unavailable, disclose
 `review_status=unavailable` and `review_strength=none` and continue.
 
 The reviewer checks the materialized draft, exact-ID evidence, definitions,
@@ -227,10 +227,12 @@ semantic mapping; deterministic code validates types, paths, refs, hashes,
 stages, and commits. Every accepted prepared asset is registered in a
 canonical catalog immutable by source hash/core/schema; scope/reuse controls
 visibility only and sample/category views are derived. Mechanical validation
-cannot prove semantic completeness; the live Integration Agent and an
-external test-only fidelity audit remain required. There is no prose parser,
-semantic compiler, giant mandatory JSON, Integration Reviewer, or finalizer
-chain.
+cannot prove semantic completeness. Exactly one fresh item-only Integration
+Fidelity Reviewer checks the current item after mechanical validation and before
+commit; the same Result Integration Agent may make one targeted repair and
+receives one targeted recheck. The packet excludes siblings, cumulative state,
+prior memory, and broad workspace context. There is no prose parser, semantic
+compiler, giant mandatory JSON, or reviewer chain.
 
 ## 12. Queue continuation
 

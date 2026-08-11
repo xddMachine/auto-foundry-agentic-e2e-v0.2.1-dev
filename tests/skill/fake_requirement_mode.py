@@ -2,9 +2,10 @@
 
 The harness models the ownership boundaries that are easy to regress without
 calling a model, reading a source, or pretending that prose is lifecycle
-state.  One Lead Analyst owns the item, a controlled runner feeds code errors
-back to that same attempt, one independent reviewer may request one business
-repair, and exactly one Result Integration Agent consumes accepted bytes.
+state. One Lead Analyst owns the item, a controlled runner feeds code errors
+back to that same attempt, one Independent Business Reviewer may request one
+scoped business repair and targeted recheck, and exactly one Result Integration
+Agent plus one item-only Integration Fidelity Reviewer consume accepted bytes.
 """
 
 from __future__ import annotations
@@ -149,6 +150,37 @@ class ReviewResult:
     review_status: str
     review_strength: str
     verdict: str
+    finding_ids: tuple[str, ...] = ()
+    affected_paths: tuple[str, ...] = ()
+    dependent_outputs: tuple[str, ...] = ()
+    reviewed_draft_hash: str | None = None
+    targeted_recheck_scope: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class BusinessFinding:
+    """One stable, pointer-scoped business-review finding."""
+
+    finding_id: str
+    pointer: str
+    dependent_outputs: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class IntegrationFidelityResult:
+    """Exactly one fresh item-only fidelity review before commit."""
+
+    item_id: str
+    mechanical_validation_complete: bool
+    reviewer_calls: int = 1
+    targeted_repair_count: int = 0
+    targeted_recheck: bool = False
+    excluded_context: tuple[str, ...] = (
+        "siblings",
+        "cumulative",
+        "prior_memory",
+        "broad_workspace",
+    )
 
 
 @dataclass(frozen=True)
@@ -259,6 +291,7 @@ class RequirementResult:
     accepted_snapshot: AcceptedSnapshot
     acceptance_envelope: AcceptanceEnvelope
     integration: IntegrationReceipt
+    integration_fidelity: IntegrationFidelityResult
 
 
 class FakeRequirementRun:
@@ -270,6 +303,7 @@ class FakeRequirementRun:
         self.lead_attempts: list[str] = []
         self.reviewer_calls = 0
         self.business_repair_count = 0
+        self.integration_fidelity_reviewer_calls = 0
         self.integration_agent = ResultIntegrationAgent()
 
     def run(
@@ -295,13 +329,51 @@ class FakeRequirementRun:
         recovery = decide_recovery(invocation_receipt=invocation_receipt, materialized=True)
         self.reviewer_calls += 1
         verdict = self.reviewer_verdicts[0] if self.reviewer_verdicts else "accept"
-        review = ReviewResult("available", "independent", verdict)
+        draft_hash = hashlib.sha256(
+            f"draft:{requirement.requirement_id}".encode("utf-8")
+        ).hexdigest()
+        findings: tuple[BusinessFinding, ...] = ()
+        review = ReviewResult(
+            "available",
+            "independent",
+            verdict,
+            reviewed_draft_hash=draft_hash,
+        )
         if verdict == "repair_once":
             self.business_repair_count += 1
             if len(self.reviewer_verdicts) < 2:
                 raise ValueError("repair_once requires one re-review verdict")
+            findings = (
+                BusinessFinding(
+                    "finding-1",
+                    "/answer/findings/0/value",
+                    (f"claim:{requirement.requirement_id}",),
+                ),
+            )
+            review = ReviewResult(
+                "available",
+                "independent",
+                verdict,
+                finding_ids=tuple(item.finding_id for item in findings),
+                affected_paths=tuple(item.pointer for item in findings),
+                dependent_outputs=tuple(
+                    output
+                    for item in findings
+                    for output in item.dependent_outputs
+                ),
+                reviewed_draft_hash=draft_hash,
+            )
             self.reviewer_calls += 1
-            review = ReviewResult("available", "independent", self.reviewer_verdicts[1])
+            review = ReviewResult(
+                "available",
+                "independent",
+                self.reviewer_verdicts[1],
+                finding_ids=(),
+                affected_paths=(),
+                dependent_outputs=(),
+                reviewed_draft_hash=draft_hash,
+                targeted_recheck_scope=tuple(item.pointer for item in findings),
+            )
         if self.business_repair_count > 1:
             raise ValueError("at most one business repair is allowed")
 
@@ -312,9 +384,28 @@ class FakeRequirementRun:
             metrics=("metric:bounded",),
             limitations=("fixture-only",),
             evidence_refs=(f"evidence:{requirement.requirement_id}",),
-            prepared_assets=(PreparedAsset("asset-1", "a" * 64, "0.3.0", "fixture-v1", "source"),),
+            prepared_assets=(PreparedAsset("asset-1", "a" * 64, "0.3.1", "fixture-v1", "source"),),
             ontology_refs=("ontology:fixture",),
             relationship_refs=("relationship:fixture",),
             dashboard_facts=("dashboard:fixture",),
         )
-        return RequirementResult(requirement.requirement_id, script_receipt, code_feedback_count, review, self.business_repair_count, recovery, snapshot, envelope, integration)
+        self.integration_fidelity_reviewer_calls += 1
+        fidelity = IntegrationFidelityResult(
+            requirement.requirement_id,
+            mechanical_validation_complete=True,
+            reviewer_calls=self.integration_fidelity_reviewer_calls,
+            targeted_repair_count=0,
+            targeted_recheck=False,
+        )
+        return RequirementResult(
+            requirement.requirement_id,
+            script_receipt,
+            code_feedback_count,
+            review,
+            self.business_repair_count,
+            recovery,
+            snapshot,
+            envelope,
+            integration,
+            fidelity,
+        )

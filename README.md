@@ -1,7 +1,7 @@
-# Auto Foundry Agentic E2E v0.2.3 / core v0.3.0
+# Auto Foundry Agentic E2E v0.2.4 / core v0.3.1
 
-This repository contains the v0.2.3 reviewed-analysis skill and the
-source-agnostic, deterministic `auto_foundry_core` v0.3.0 substrate. The
+This repository contains the v0.2.4 reviewed-analysis skill and the
+source-agnostic, deterministic `auto_foundry_core` v0.3.1 substrate. The
 deliverable is offline-friendly: the skill keeps a run-local data room, durable
 item workspaces, Living Enterprise Model, and reviewed outputs, while the core
 provides typed local operations, bounded catalog access, and durable artifact
@@ -19,7 +19,7 @@ RunContext
   -> immutable BoundAnalysisContext -> controlled script receipts
   -> ItemWorkspace.create before the Lead Analyst attempt
   -> artifact progress -> execution recovery when needed
-  -> draft -> one review -> optional one business repair
+  -> draft -> one Independent Business Reviewer -> one scoped repair/recheck
   -> immutable accepted snapshot and reloadable state
   -> CoreRuntime.execute(OperationSpec) for deterministic mechanics
   -> reviewed fixture -> products dashboard
@@ -46,9 +46,18 @@ the accepted Result Integration commit validates the exact candidate path,
 content hash, byte/row counts, scope, and provenance. Registration is
 accepted-only, retains the recorded scope, is idempotent on exact retries, and
 leaves no accepted entry for a rejected item or an item with an integration
-technical failure. Mechanical validation cannot prove semantic completeness;
-the live Result Integration Agent and an external test-only fidelity audit are
-still required.
+technical failure. Mechanical validation cannot prove semantic completeness.
+Exactly one fresh, item-only Integration Fidelity Reviewer checks the staged
+candidate after mechanical validation and before commit; the same Result
+Integration Agent patches only affected records and receives one targeted
+recheck.
+
+The ontology is a compact enterprise map of stable objects, identities,
+aliases, sources, documents, processes, definitions, rules, relationships,
+limitations, and reusable metric definitions. Current counts, shares, amounts,
+values, rankings, top-N rows, and dimensional observations remain accepted
+results, claims, dashboard facts, evidence, or prepared assets; `add_metric`
+records an observation and never promotes it into ontology.
 
 The run binds one physical source inventory and records bounded counters for
 full archive binding, member hashes, selected-member reads, and catalog
@@ -100,9 +109,9 @@ The complete offline vertical proofs are
 `tests/integration/test_v023_normal_path.py`; together they use
 generic local fixtures, real workbench/durable/cache/telemetry/filesystem
 wiring, and no model or network call. When those proofs and the full offline
-suite pass, the candidate status is **v0.2.3 / core 0.3.0 — offline program
+suite pass, the candidate status is **v0.2.4 / core 0.3.1 — offline program
 validation complete for later Benchmark A**. Benchmark A remains prepared but
-unexecuted in this repository.
+unexecuted in this repository; no run is claimed here.
 
 The package script creates ignored local artifacts under `dist/`; no command
 in this repository pushes or publishes them. Start a fresh Codex task after

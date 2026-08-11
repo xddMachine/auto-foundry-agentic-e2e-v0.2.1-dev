@@ -1,4 +1,4 @@
-"""Offline contract checks for the v0.2.3 Agent Workbench skill tree.
+"""Offline contract checks for the v0.2.4 Agent Workbench skill tree.
 
 These tests intentionally inspect owned text and templates only. Core loading
 of the item-state template is covered by the offline integration vertical;
@@ -46,19 +46,19 @@ def _owned_text() -> str:
     return "\n".join(_read(path) for path in OWNED_MARKDOWN + OWNED_JSON)
 
 
-def test_frontmatter_and_run_markers_are_v023() -> None:
+def test_frontmatter_and_run_markers_are_v024() -> None:
     skill = _read(SKILL / "SKILL.md")
     assert skill.startswith("---\n")
     frontmatter = skill.split("---\n", 2)[1]
     assert "name: auto-foundry-agentic-e2e" in frontmatter
-    assert 'version: "0.2.3"' in frontmatter
+    assert 'version: "0.2.4"' in frontmatter
     assert "core_name: auto_foundry_core" in frontmatter
-    assert 'core_version: "0.3.0"' in frontmatter
+    assert 'core_version: "0.3.1"' in frontmatter
     for marker in (
         "skill_name: auto-foundry-agentic-e2e",
-        "skill_version: 0.2.3",
+        "skill_version: 0.2.4",
         "core_name: auto_foundry_core",
-        "core_version: 0.3.0",
+        "core_version: 0.3.1",
     ):
         assert marker in skill
     assert "Agent Workbench" in skill
@@ -168,6 +168,19 @@ def test_telemetry_template_observes_attempts_and_artifacts_only() -> None:
     assert event["invocation"]["model"] == "unavailable"
     assert event["terminal_reason_class"] == "same_attempt_feedback|business_repair|execution_recovery|abort_and_new_clean_run|null"
     assert event["recovery_decision"] == "continue|await_runtime|materialization_guidance|execution_recovery|null"
+    assert set(event["phase_timing"]["phase"].split("|")) >= {
+        "analyst_model",
+        "controlled_execution",
+        "business_review",
+        "business_repair",
+        "fidelity_integration_review",
+        "integration_commit",
+        "products",
+        "optimizer",
+        "reporting_finalization",
+        "genuine_recovery",
+    }
+    assert set(event["incident"]) >= {"incident_id", "category", "admissible", "disposition"}
 
 
 def test_requirement_and_dashboard_templates_use_program_owned_boundaries() -> None:
@@ -185,6 +198,11 @@ def test_requirement_and_dashboard_templates_use_program_owned_boundaries() -> N
     integration = requirement["result_integration"]
     assert integration["owner"] == "one_result_integration_agent"
     assert "integration_reviewer" not in integration
+    fidelity = integration["fidelity_review"]
+    assert fidelity["reviewer"] == "one_item_only_integration_fidelity_reviewer"
+    assert fidelity["after"] == "mechanical_validation"
+    assert fidelity["before"] == "commit"
+    assert fidelity["same_agent_targeted_repair"] is True
     assert set(integration["api_surfaces"]) == {
         "claims",
         "metrics",
@@ -279,6 +297,8 @@ def test_requirement_mode_is_analytics_only_and_priority_owned() -> None:
     assert "boundanalysiscontext" in normalized
     assert "same-attempt" in normalized
     assert "result integration agent" in normalized
+    assert "independent business reviewer" in normalized
+    assert "integration fidelity reviewer" in normalized
 
 
 def test_question_result_no_progress_decisions_exclude_recovery() -> None:
@@ -305,8 +325,8 @@ def test_workbench_sequence_and_recovery_are_progressive_and_separate() -> None:
         "Run Director checks artifact_progress after each response",
         "canonical persisted invocation receipt_ref/hash proves lane/provider/host/process loss",
         "materialized draft",
-        "one Independent Reviewer",
-        "at most one targeted business repair",
+        "one Independent Business Reviewer",
+        "at most one scoped business repair",
         "atomic immutable answer bytes + separate acceptance envelope",
         "one Result Integration Agent incremental API pass",
         "program validates and applies the reviewed Knowledge Delta",
@@ -345,7 +365,7 @@ def test_data_room_identity_review_and_prepared_asset_contract() -> None:
         "candidate",
         "accepted-only",
         "semantic completeness",
-        "external test-only fidelity audit",
+        "integration fidelity reviewer",
         "opaque",
         "inventory counters",
         "receipt_ref",
@@ -369,7 +389,7 @@ def test_catalog_is_optional_internal_and_custom_code_allowed() -> None:
 def test_reviewer_routing_completeness_identity_and_disclosure() -> None:
     text = _read(SKILL / "SKILL.md") + _read(SKILL / "references" / "REVIEW_PROTOCOL.md")
     normalized = " ".join(text.split()).lower()
-    assert "independent reviewer in a fresh context" in normalized
+    assert "independent business reviewer in a fresh context" in normalized
     assert "alternate independent route" in normalized
     assert "fresh same-family context" in normalized
     assert '"review_status":"unavailable"' in text

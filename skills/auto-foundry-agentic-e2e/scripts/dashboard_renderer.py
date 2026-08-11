@@ -566,7 +566,7 @@ def render_dashboard(fixture: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
         "internal_links_checked": True,
         "freeze_markers": freeze_markers.to_dict(),
         "run_id": _text(fixture.get("run_id")),
-        "skill_version": _text(fixture.get("skill_version"), "0.2.3"),
+        "skill_version": _text(fixture.get("skill_version"), "0.2.4"),
         "domain_order": [domain["id"] for domain in domains],
         "decision_flow_order": [
             {"domain_id": domain["id"], "flow_id": flow["id"]}

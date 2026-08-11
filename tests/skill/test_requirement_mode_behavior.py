@@ -89,11 +89,30 @@ def test_one_reviewer_one_business_repair_then_re_review() -> None:
     assert result.business_repair_count == 1
     assert result.review.verdict == "accept_with_limits"
     assert result.acceptance_envelope.terminal_reason_class == "business_repair"
+    assert result.review.targeted_recheck_scope == ("/answer/findings/0/value",)
+    assert result.review.finding_ids == ()
+    assert run.business_repair_count == 1
+
+
+def test_business_repair_finding_is_pointer_scoped_and_fidelity_review_is_item_only() -> None:
+    run = FakeRequirementRun(reviewer_verdicts=("repair_once", "accept"))
+    result = run.run(_requirement())
+
+    assert run.integration_fidelity_reviewer_calls == 1
+    assert result.integration_fidelity.mechanical_validation_complete is True
+    assert result.integration_fidelity.reviewer_calls == 1
+    assert result.integration_fidelity.targeted_repair_count == 0
+    assert result.integration_fidelity.excluded_context == (
+        "siblings",
+        "cumulative",
+        "prior_memory",
+        "broad_workspace",
+    )
 
 
 def test_result_integration_agent_is_single_owner_and_catalog_scope_is_visibility_only() -> None:
     agent = ResultIntegrationAgent()
-    asset = PreparedAsset("asset-1", "b" * 64, "0.3.0", "fixture-v1", "source")
+    asset = PreparedAsset("asset-1", "b" * 64, "0.3.1", "fixture-v1", "source")
     receipt = agent.integrate(
         claims=("claim",),
         metrics=("metric",),

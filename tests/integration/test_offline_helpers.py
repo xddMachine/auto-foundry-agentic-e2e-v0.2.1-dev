@@ -317,6 +317,6 @@ def test_benchmark_a_is_preparation_only_and_launch_has_no_extra_step() -> None:
     assert "explicit confirmation" not in commands.lower()
     assert "analysis_call" not in (BENCHMARK / "run_config.example.json").read_text(encoding="utf-8")
     assert expected_question_hash in commands
-    for marker in ("skill_name: auto-foundry-agentic-e2e", "skill_version: 0.2.1", "core_name: auto_foundry_core", "core_version: 0.1.0"):
+    for marker in ("skill_name: auto-foundry-agentic-e2e", "skill_version: 0.2.4", "core_name: auto_foundry_core", "core_version: 0.3.1"):
         assert marker in commands
     assert "82e9c913bf437ac9e361d6890467a9aed9b1c6db9d887cfcf0cd659035a71ec2" in commands

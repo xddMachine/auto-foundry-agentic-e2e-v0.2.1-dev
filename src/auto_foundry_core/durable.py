@@ -39,6 +39,7 @@ _FINDINGS_FILENAME = "findings.jsonl"
 _OPEN_ISSUES_FILENAME = "open_issues.json"
 _HANDOFF_FILENAME = "handoff.json"
 _DRAFT_FILENAME = "draft.json"
+_BUSINESS_REVIEW_FILENAME = "business_review.json"
 _ACCEPTED_FILENAME = "accepted"
 _BASE_STATE_FIELDS = frozenset(
     {
@@ -111,6 +112,7 @@ ITEM_STATE_SCHEMA = {
     "accepted_content": "accepted/answer_content.json",
     "acceptance_envelope": "accepted/acceptance_envelope.json",
     "accepted_manifest": "accepted/manifest.json",
+    "business_review_artifact": "work/business_review.json",
     "integration_fields": ("integration_state", "integration_manifest_hash", "integration_manifest_ref"),
     "terminal_intent_fields": ("outcome", "manifest_hash"),
 }
@@ -290,6 +292,67 @@ def _sha256_bytes(payload: bytes) -> str:
 
 def _is_sha256(value: Any) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+
+
+def _pointer_escape(value: Any) -> str:
+    return str(value).replace("~", "~0").replace("/", "~1")
+
+
+def _pointer_join(parent: str, component: Any) -> str:
+    return f"{parent}/{_pointer_escape(component)}" if parent else f"/{_pointer_escape(component)}"
+
+
+def _pointer_hashes(value: Any, path: str = "") -> dict[str, str]:
+    """Return canonical hashes for every structured JSON pointer node."""
+
+    hashes = {_path: _sha256_bytes(_json_bytes(node)) for _path, node in ((path, value),)}
+    if isinstance(value, Mapping):
+        for key in sorted(value, key=str):
+            child = _pointer_join(path, key)
+            hashes.update(_pointer_hashes(value[key], child))
+    elif isinstance(value, list):
+        for index, child_value in enumerate(value):
+            hashes.update(_pointer_hashes(child_value, _pointer_join(path, index)))
+    return hashes
+
+
+def _pointer_diff(before: Any, after: Any, path: str = "") -> list[str]:
+    """Return minimal changed JSON pointers without parsing prose."""
+
+    if before == after and type(before) is type(after):
+        return []
+    if isinstance(before, Mapping) and isinstance(after, Mapping):
+        changes: list[str] = []
+        keys = sorted(set(before) | set(after), key=str)
+        for key in keys:
+            child = _pointer_join(path, key)
+            if key not in before or key not in after:
+                changes.append(child)
+            else:
+                changes.extend(_pointer_diff(before[key], after[key], child))
+        return changes or [path]
+    if isinstance(before, list) and isinstance(after, list):
+        changes = []
+        if len(before) != len(after):
+            # The new/removed tail is represented at the exact array index;
+            # existing positions are still compared structurally.
+            for index in range(min(len(before), len(after))):
+                changes.extend(_pointer_diff(before[index], after[index], _pointer_join(path, index)))
+            for index in range(min(len(before), len(after)), max(len(before), len(after))):
+                changes.append(_pointer_join(path, index))
+            return changes or [path]
+        for index, (left, right) in enumerate(zip(before, after)):
+            changes.extend(_pointer_diff(left, right, _pointer_join(path, index)))
+        return changes or [path]
+    return [path]
+
+
+def _pointer_is_within(path: str, allowed: str) -> bool:
+    """Check JSON-pointer scope, where an allowed parent covers descendants."""
+
+    if allowed in {"", "/", "*"}:
+        return True
+    return path == allowed or path.startswith(allowed.rstrip("/") + "/")
 
 
 _INVOCATION_RECEIPT_REF_PREFIX = "telemetry/invocation_receipts.jsonl#"
@@ -1400,6 +1463,272 @@ class ItemWorkspace:
             raise FileNotFoundError(draft)
         return _sha256_file(draft)
 
+    @property
+    def business_review_path(self) -> Path:
+        """Path for the item-local structured business-review packet."""
+
+        return self._resolve_item_subpath(Path("work") / _BUSINESS_REVIEW_FILENAME)
+
+    @staticmethod
+    def _canonical_draft_value(payload: bytes) -> Any:
+        try:
+            value = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("draft must contain valid JSON for scoped business repair") from exc
+        # Drafts are JSON structures by contract.  Scalars are valid but still
+        # represented by the root pointer in the mechanical diff.
+        return value
+
+    @staticmethod
+    def _normalize_finding(value: Mapping[str, Any], index: int) -> dict[str, Any]:
+        if not isinstance(value, Mapping):
+            raise TypeError("business review findings must be mappings")
+        raw = dict(value)
+        finding_id = raw.pop("finding_id", raw.pop("id", None))
+        message = raw.pop("message", raw.pop("finding", raw.pop("reason", "")))
+        pointers = raw.pop("pointers", raw.pop("json_pointers", raw.pop("pointer", raw.pop("path", ()))))
+        artifact_paths = raw.pop(
+            "artifact_paths",
+            raw.pop("artifacts", raw.pop("artifact_path", ())),
+        )
+        dependent_outputs = raw.pop(
+            "dependent_outputs",
+            raw.pop("dependencies", raw.pop("dependent_output", ())),
+        )
+        if isinstance(pointers, str):
+            pointers = (pointers,)
+        if isinstance(artifact_paths, str):
+            artifact_paths = (artifact_paths,)
+        if isinstance(dependent_outputs, str):
+            dependent_outputs = (dependent_outputs,)
+        pointers = tuple(str(path).strip() for path in pointers or () if str(path).strip())
+        artifact_paths = tuple(str(path).strip() for path in artifact_paths or () if str(path).strip())
+        dependent_outputs = tuple(str(path).strip() for path in dependent_outputs or () if str(path).strip())
+        if any(path == "*" for path in (*pointers, *artifact_paths, *dependent_outputs)):
+            raise ValueError("business finding scope cannot use wildcard paths")
+        for pointer in pointers:
+            if not pointer.startswith("/") and pointer != "":
+                raise ValueError("business finding JSON pointers must use RFC 6901 paths")
+        canonical = {
+            "finding_id": str(finding_id).strip() if finding_id is not None else None,
+            "message": str(message),
+            "pointers": tuple(sorted(set(pointers))),
+            "artifact_paths": tuple(sorted(set(artifact_paths))),
+            "dependent_outputs": tuple(sorted(set(dependent_outputs))),
+            "material": bool(raw.pop("material", True)),
+        }
+        if not canonical["finding_id"]:
+            seed = _json_bytes({key: value for key, value in canonical.items() if key != "finding_id"})
+            canonical["finding_id"] = f"F-{_sha256_bytes(seed)[:12]}"
+        return canonical
+
+    @classmethod
+    def _normalize_findings(cls, findings: Any) -> list[dict[str, Any]]:
+        if findings is None:
+            return []
+        if isinstance(findings, Mapping):
+            findings = (findings,)
+        if isinstance(findings, (str, bytes)):
+            raise TypeError("business review findings must be mappings")
+        normalized = [cls._normalize_finding(value, index) for index, value in enumerate(findings)]
+        ids = [value["finding_id"] for value in normalized]
+        if len(ids) != len(set(ids)):
+            raise ValueError("business finding IDs must be unique")
+        return normalized
+
+    @staticmethod
+    def _require_repair_findings(findings: list[dict[str, Any]]) -> None:
+        """Require explicit material, pointer/artifact/dependency repair scope."""
+
+        if not findings or not any(finding.get("material", True) for finding in findings):
+            raise ValueError("repair_once requires at least one material finding")
+        for finding in findings:
+            if not (
+                finding.get("pointers")
+                or finding.get("artifact_paths")
+                or finding.get("dependent_outputs")
+            ):
+                raise ValueError("every repair finding must authorize an exact scope")
+
+    def _read_business_review(self) -> dict[str, Any] | None:
+        path = self.business_review_path
+        if not path.exists():
+            return None
+        _assert_regular_no_symlink(path, label="business review artifact")
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("business review artifact is invalid") from exc
+        if not isinstance(value, dict):
+            raise ValueError("business review artifact must be an object")
+        self._validate_business_review_payload(value)
+        return copy.deepcopy(value)
+
+    def _validate_business_review_payload(self, value: Mapping[str, Any]) -> None:
+        """Validate one complete review packet without mutating state."""
+
+        required = {
+            "item_id",
+            "review_scope",
+            "reviewed_draft_hash",
+            "before_hash",
+            "before_snapshot",
+            "before_pointer_hashes",
+            "before_artifact_hashes",
+            "after_pointer_hashes",
+            "after_artifact_hashes",
+            "findings",
+            "allowed_pointers",
+            "allowed_artifact_paths",
+            "allowed_dependencies",
+            "changed_pointers",
+            "unchanged_paths",
+            "unchanged_aggregate_hash",
+            "repair_active",
+            "targeted_recheck",
+        }
+        if set(value) != required:
+            raise ValueError("business review artifact fields are invalid")
+        if value.get("item_id") != self.item_id:
+            raise ValueError("business review artifact item_id is invalid")
+        if value.get("review_scope") not in {"full", "targeted"}:
+            raise ValueError("business review artifact review_scope is invalid")
+        for name in ("reviewed_draft_hash", "before_hash", "unchanged_aggregate_hash"):
+            if not _is_sha256(value.get(name)):
+                raise ValueError(f"business review artifact {name} is invalid")
+        for name in ("before_pointer_hashes", "after_pointer_hashes"):
+            if not isinstance(value.get(name), Mapping):
+                raise ValueError("business review artifact pointer hashes are invalid")
+        for name in ("before_artifact_hashes", "after_artifact_hashes"):
+            if not isinstance(value.get(name), Mapping):
+                raise ValueError("business review artifact artifact hashes are invalid")
+        if not isinstance(value.get("before_pointer_hashes"), Mapping):
+            raise ValueError("business review artifact pointer hashes are invalid")
+        if not isinstance(value.get("before_artifact_hashes"), Mapping):
+            raise ValueError("business review artifact artifact hashes are invalid")
+        for digest in (
+            list(value["before_pointer_hashes"].values())
+            + list(value["after_pointer_hashes"].values())
+            + list(value["before_artifact_hashes"].values())
+            + list(value["after_artifact_hashes"].values())
+        ):
+            if not _is_sha256(digest):
+                raise ValueError("business review artifact contains an invalid hash")
+        if _sha256_bytes(_json_bytes(value["before_snapshot"])) != value["before_hash"]:
+            raise ValueError("business review artifact before_hash does not match snapshot")
+        if dict(_pointer_hashes(value["before_snapshot"])) != dict(value["before_pointer_hashes"]):
+            raise ValueError("business review artifact before pointer hashes do not match snapshot")
+        if not isinstance(value.get("findings"), list):
+            raise ValueError("business review artifact findings are invalid")
+        self._normalize_findings(value["findings"])
+        for name in (
+            "allowed_pointers",
+            "allowed_artifact_paths",
+            "allowed_dependencies",
+            "changed_pointers",
+            "unchanged_paths",
+        ):
+            if not isinstance(value.get(name), list) or any(not isinstance(path, str) for path in value[name]):
+                raise ValueError(f"business review artifact {name} is invalid")
+        if any(
+            path == "*"
+            for name in ("allowed_pointers", "allowed_artifact_paths", "allowed_dependencies")
+            for path in value[name]
+        ):
+            raise ValueError("business review artifact cannot use wildcard scope")
+        if not isinstance(value.get("repair_active"), bool) or not isinstance(value.get("targeted_recheck"), bool):
+            raise ValueError("business review artifact flags are invalid")
+
+    def _write_business_review(
+        self,
+        value: Mapping[str, Any],
+        *,
+        touch_state: bool = True,
+        emit: bool = True,
+    ) -> None:
+        self._ensure_not_terminal()
+        self._validate_business_review_payload(value)
+        destination = self.business_review_path
+        _assert_regular_no_symlink(destination, label="business review artifact")
+        _atomic_write_json(destination, value)
+        if touch_state:
+            self._touch_state()
+        if emit:
+            self._emit("item_business_review_packet", artifact="work/business_review.json")
+
+    def _commit_business_review(self, packet: Mapping[str, Any], state: Mapping[str, Any]) -> None:
+        """Publish a validated packet and state together, rolling back on I/O failure."""
+
+        state_path = self._resolve_item_subpath(_STATE_FILENAME)
+        packet_path = self.business_review_path
+        prior_state_bytes = state_path.read_bytes()
+        prior_state = copy.deepcopy(self._state)
+        prior_packet_exists = packet_path.exists()
+        prior_packet_bytes = packet_path.read_bytes() if prior_packet_exists else None
+        try:
+            self._write_business_review(packet, touch_state=False, emit=False)
+            self._persist_state(state)
+        except Exception:
+            _atomic_write_bytes(state_path, prior_state_bytes)
+            self._state = prior_state
+            if prior_packet_exists and prior_packet_bytes is not None:
+                _atomic_write_bytes(packet_path, prior_packet_bytes)
+            else:
+                packet_path.unlink(missing_ok=True)
+            raise
+        self._emit("item_business_review_packet", artifact="work/business_review.json")
+
+    def _current_draft_value_and_hash(self) -> tuple[Any, str]:
+        draft = self.draft_root
+        _assert_regular_no_symlink(draft, label="draft artifact")
+        if not draft.is_file():
+            raise FileNotFoundError(draft)
+        payload = draft.read_bytes()
+        return self._canonical_draft_value(payload), _sha256_bytes(payload)
+
+    def _repair_scope_check(self, *, candidate_payload: bytes | None = None, artifact_path: str | None = None) -> dict[str, Any] | None:
+        """Fail closed when a repair mutates outside the reviewed scope."""
+
+        packet = self._read_business_review()
+        if packet is None or not packet.get("repair_active"):
+            return packet
+        before_value = packet["before_snapshot"]
+        current_value, _current_hash = self._current_draft_value_and_hash()
+        candidate_value = current_value if candidate_payload is None else self._canonical_draft_value(candidate_payload)
+        changed_current = _pointer_diff(before_value, current_value)
+        changed_candidate = _pointer_diff(before_value, candidate_value)
+        allowed_pointers = tuple(packet.get("allowed_pointers", ()))
+        allowed_artifacts = tuple(packet.get("allowed_artifact_paths", ()))
+        allowed_dependencies = tuple(packet.get("allowed_dependencies", ()))
+        if not (allowed_pointers or allowed_artifacts or allowed_dependencies):
+            raise ValueError("business repair packet has no authorized scope")
+        for pointer in (*changed_current, *changed_candidate):
+            if not any(_pointer_is_within(pointer, allowed) for allowed in allowed_pointers):
+                raise ValueError(f"business repair changed pointer outside reviewed scope: {pointer}")
+        if artifact_path is not None and str(artifact_path).replace("\\", "/") not in {_DRAFT_FILENAME, "work/" + _DRAFT_FILENAME}:
+            normalized = str(artifact_path).replace("\\", "/")
+            if allowed_artifacts and not any(
+                normalized == allowed or normalized.startswith(allowed.rstrip("/") + "/")
+                for allowed in allowed_artifacts
+            ):
+                raise ValueError(f"business repair changed artifact outside reviewed scope: {normalized}")
+        before_artifacts = dict(packet.get("before_artifact_hashes", {}))
+        current_progress = self._artifact_progress(candidate_payload if candidate_payload is not None else None)
+        for path, digest in current_progress.hashes.items():
+            if path == _DRAFT_FILENAME:
+                continue
+            if before_artifacts.get(path) != digest:
+                if not allowed_artifacts or not any(
+                    path == allowed or path.startswith(allowed.rstrip("/") + "/") for allowed in allowed_artifacts
+                ):
+                    raise ValueError(f"business repair changed artifact outside reviewed scope: {path}")
+        for path in set(before_artifacts) - set(current_progress.hashes):
+            if not allowed_artifacts or not any(
+                path == allowed or path.startswith(allowed.rstrip("/") + "/") for allowed in allowed_artifacts
+            ):
+                raise ValueError(f"business repair removed artifact outside reviewed scope: {path}")
+        return packet
+
     @staticmethod
     def _pending_review() -> dict[str, Any]:
         return {
@@ -1482,7 +1811,12 @@ class ItemWorkspace:
         self._ensure_not_terminal()
         destination = self._resolve_item_subpath(relative)
         _assert_regular_no_symlink(destination, label="item artifact")
-        _atomic_write_json(destination, value)
+        payload = _json_bytes(value)
+        if Path(relative).as_posix() == _DRAFT_FILENAME:
+            self._repair_scope_check(candidate_payload=payload, artifact_path=_DRAFT_FILENAME)
+        else:
+            self._repair_scope_check(artifact_path=Path(relative).as_posix())
+        _atomic_write_bytes(destination, payload)
         if Path(relative).as_posix() == _DRAFT_FILENAME:
             state = copy.deepcopy(self._state)
             if set(state) == _BASE_STATE_FIELDS:
@@ -1553,6 +1887,7 @@ class ItemWorkspace:
         self._ensure_not_terminal()
         destination = self._resolve_item_subpath(Path("work") / _SOURCE_MAP_FILENAME)
         _assert_regular_no_symlink(destination, label="source map artifact")
+        self._repair_scope_check(artifact_path="work/source_map.json")
         if destination.exists():
             try:
                 current = json.loads(destination.read_text(encoding="utf-8"))
@@ -1574,6 +1909,7 @@ class ItemWorkspace:
         self._ensure_not_terminal()
         destination = self._resolve_item_subpath(Path("work") / _FINDINGS_FILENAME)
         _assert_regular_no_symlink(destination, label="findings artifact")
+        self._repair_scope_check(artifact_path="work/findings.jsonl")
         _append_jsonl(destination, mapping)
         self._touch_state()
         self._emit("item_workspace_append", artifact="work/findings.jsonl")
@@ -1606,7 +1942,7 @@ class ItemWorkspace:
                     continue
                 relative_path = path.relative_to(item_root)
                 relative = relative_path.as_posix()
-                if relative == _STATE_FILENAME or "telemetry" in relative_path.parts:
+                if relative in {_STATE_FILENAME, str(Path("work") / _BUSINESS_REVIEW_FILENAME)} or "telemetry" in relative_path.parts:
                     continue
                 files.append(relative)
                 hashes[relative] = _sha256_file(path)
@@ -1892,15 +2228,37 @@ class ItemWorkspace:
         *,
         reviewer_ref: str | None = None,
         review_status: str = "reviewed",
+        findings: Any = None,
     ) -> dict[str, Any]:
-        """Persist a reviewer result, including explicit unavailability disclosure."""
+        """Persist a reviewer result and a structured, item-local review packet.
+
+        The ordinary review state remains the compact five-field lifecycle
+        contract.  Material findings and their exact scope live in the
+        ``work/business_review.json`` packet so older state templates remain
+        mechanically valid while repair authorization is still durable.
+        """
 
         self._ensure_execution_state()
         self._ensure_not_terminal()
         self._require_no_active_attempt()
-        draft_hash = self._draft_hash()
         status = str(review_status).strip()
         verdict = str(verdict).strip()
+        normalized_findings = self._normalize_findings(findings)
+        if verdict == "repair_once":
+            self._require_repair_findings(normalized_findings)
+
+        # Read and validate every input needed by the packet before touching
+        # item_state.json or the prior business-review artifact.
+        draft_value, draft_hash = self._current_draft_value_and_hash()
+        progress = self._artifact_progress()
+        pointer_hashes = _pointer_hashes(draft_value)
+        previous_packet = self._read_business_review()
+        targeted = previous_packet is not None and previous_packet.get("repair_active") is True
+        if targeted:
+            # A repair re-review is intentionally narrow.  It cannot silently
+            # become another full-answer review, and only one repair is ever
+            # permitted by the durable counter.
+            self._repair_scope_check()
         if status in {"unavailable", "not_reviewed"}:
             if reviewer_ref is not None:
                 raise ValueError("unavailable review cannot have reviewer_ref")
@@ -1927,10 +2285,81 @@ class ItemWorkspace:
             }
         else:
             raise ValueError("review_status is invalid")
+        if targeted and previous_packet is not None:
+            before_value = previous_packet["before_snapshot"]
+            changed_pointers = _pointer_diff(before_value, draft_value)
+            allowed = tuple(previous_packet.get("allowed_pointers", ()))
+            if not allowed and not previous_packet.get("allowed_artifact_paths") and not previous_packet.get("allowed_dependencies"):
+                raise ValueError("targeted business re-review has no authorized scope")
+            if any(
+                not any(_pointer_is_within(pointer, value) for value in allowed) for pointer in changed_pointers
+            ):
+                raise ValueError("targeted business re-review escaped the authorized scope")
+            packet = copy.deepcopy(previous_packet)
+            packet.update(
+                {
+                    "review_scope": "targeted",
+                    "reviewed_draft_hash": draft_hash,
+                    "after_pointer_hashes": pointer_hashes,
+                    "after_artifact_hashes": dict(progress.hashes),
+                    "changed_pointers": sorted(set(changed_pointers)),
+                    "unchanged_paths": sorted(
+                        path
+                        for path, digest in previous_packet["before_pointer_hashes"].items()
+                        if pointer_hashes.get(path) == digest
+                    ),
+                    "targeted_recheck": True,
+                    "repair_active": False,
+                }
+            )
+            unchanged_hashes = {
+                path: pointer_hashes[path]
+                for path in packet["unchanged_paths"]
+                if path in pointer_hashes
+            }
+            packet["unchanged_aggregate_hash"] = _sha256_bytes(_json_bytes(unchanged_hashes))
+            if normalized_findings:
+                packet["findings"] = normalized_findings
+        else:
+            allowed_pointers = sorted(
+                {
+                    pointer
+                    for finding in normalized_findings
+                    for pointer in (*finding["pointers"], *finding["dependent_outputs"])
+                    if pointer.startswith("/") or pointer == ""
+                }
+            )
+            allowed_artifacts = sorted(
+                {path for finding in normalized_findings for path in finding["artifact_paths"]}
+            )
+            allowed_dependencies = sorted(
+                {path for finding in normalized_findings for path in finding["dependent_outputs"] if not path.startswith("/")}
+            )
+            packet = {
+                "item_id": self.item_id,
+                "review_scope": "full",
+                "reviewed_draft_hash": draft_hash,
+                "before_hash": draft_hash,
+                "before_snapshot": draft_value,
+                "before_pointer_hashes": pointer_hashes,
+                "before_artifact_hashes": dict(progress.hashes),
+                "after_pointer_hashes": pointer_hashes,
+                "after_artifact_hashes": dict(progress.hashes),
+                "findings": normalized_findings,
+                "allowed_pointers": allowed_pointers,
+                "allowed_artifact_paths": allowed_artifacts,
+                "allowed_dependencies": allowed_dependencies,
+                "changed_pointers": [],
+                "unchanged_paths": sorted(pointer_hashes),
+                "unchanged_aggregate_hash": _sha256_bytes(_json_bytes(pointer_hashes)),
+                "repair_active": False,
+                "targeted_recheck": False,
+            }
+        self._validate_business_review_payload(packet)
         state = dict(self._state)
         state["review"] = review
         state["lifecycle_state"] = "review"
-        self._persist_state(state)
+        self._commit_business_review(packet, state)
         self._emit(
             "item_review_recorded",
             review_status=review["status"],
@@ -1938,11 +2367,24 @@ class ItemWorkspace:
             verdict=review["verdict"],
             reviewer_ref=review["reviewer_ref"],
             draft_hash=draft_hash,
+            review_scope=packet["review_scope"],
+            finding_count=len(packet["findings"]),
+            targeted_recheck=packet["targeted_recheck"],
         )
-        return dict(review)
+        result = dict(review)
+        result.update(
+            {
+                "review_scope": packet["review_scope"],
+                "finding_count": len(packet["findings"]),
+                "findings": _jsonable(packet["findings"]),
+                "changed_pointers": list(packet["changed_pointers"]),
+                "targeted_recheck": packet["targeted_recheck"],
+            }
+        )
+        return result
 
-    def use_business_repair(self) -> None:
-        """Consume the one bounded business repair and require a fresh review."""
+    def use_business_repair(self) -> dict[str, Any]:
+        """Consume the one bounded business repair and bind its exact scope."""
 
         self._ensure_execution_state()
         self._ensure_not_terminal()
@@ -1951,12 +2393,32 @@ class ItemWorkspace:
         review = self._state["review"]
         if review.get("verdict") != "repair_once":
             raise ValueError("business repair requires a repair_once review verdict")
+        packet = self._read_business_review()
+        if packet is None:
+            raise ValueError("business repair requires a structured finding packet")
+        self._require_repair_findings(self._normalize_findings(packet.get("findings")))
+        if packet.get("reviewed_draft_hash") != self._draft_hash():
+            raise ValueError("business repair requires the exact currently reviewed draft")
+        packet = copy.deepcopy(packet)
+        packet["repair_active"] = True
+        packet["targeted_recheck"] = False
+        packet["review_scope"] = "full"
+        packet["changed_pointers"] = []
         state = dict(self._state)
         state["business_repair_count"] = int(self._state["business_repair_count"]) + 1
         state["review"] = self._execution_defaults()["review"]
         state["lifecycle_state"] = "work"
-        self._persist_state(state)
-        self._emit("item_business_repair_used", repair_count=state["business_repair_count"])
+        self._commit_business_review(packet, state)
+        self._emit(
+            "item_business_repair_used",
+            repair_count=state["business_repair_count"],
+            allowed_pointers=packet["allowed_pointers"],
+            allowed_artifact_paths=packet["allowed_artifact_paths"],
+            allowed_dependencies=packet["allowed_dependencies"],
+            before_hash=packet["before_hash"],
+            unchanged_aggregate_hash=packet["unchanged_aggregate_hash"],
+        )
+        return copy.deepcopy(packet)
 
     def _publish_accepted_directory(self, files: Mapping[str, bytes], manifest: Mapping[str, Any]) -> Path:
         self._reject_existing_symlink_components(self.context, self.item_root)

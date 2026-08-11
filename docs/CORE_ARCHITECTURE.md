@@ -1,4 +1,4 @@
-# `auto_foundry_core` 0.3.0
+# `auto_foundry_core` 0.3.1
 
 `auto_foundry_core` is a small offline, source-agnostic deterministic substrate
 for local analytics and durable item execution. It is intentionally not an
@@ -54,12 +54,16 @@ adapters, or cross-run state.
   parsing analytical prose. Prepared candidates are preflighted without
   registry mutation and registered exactly once at accepted commit; the durable
   intent makes crash retries converge. Mechanical checks cannot prove semantic
-  completeness, so a live Integration Agent and an external test-only fidelity
-  audit remain required. There is no prose parser, semantic compiler, or
-  Integration Reviewer.
-- `lifecycle.py` owns run-level `RunLifecycle` transitions and durable
-  `AgentInvocationReceipt` ledgers; `product_contracts.py` owns exact nested
-  `freeze_markers` and singular `decision_flow` product validation.
+  completeness. Exactly one fresh item-only Integration Fidelity Reviewer runs
+  after mechanical validation and before commit; the same Result Integration
+  Agent may make one targeted repair and receives one targeted recheck. There
+  is no prose parser, semantic compiler, or reviewer chain.
+- `lifecycle.py` owns run-level `RunLifecycle` transitions, durable
+  `AgentInvocationReceipt` ledgers, and explicit implementation transitions;
+  `product_contracts.py` owns exact nested `freeze_markers` and singular
+  `decision_flow` product validation. `reporting.py` projects cumulative
+  outcomes, record-kind/registry/LEM/receipt/timing/incident totals and writes
+  an atomic report, manifest, and non-circular terminalization receipt.
 - `enterprise_model.py` stores a run-local extensible ontology and prepared-data
   registry.  Accepted `KnowledgeDelta` values are applied atomically and
   conflicts/supersession are retained.
@@ -134,7 +138,7 @@ candidate-to-accepted prepared registration, lifecycle barriers, strict
 product markers, physical-inventory counters, safe opaque materialization,
 and optimizer evidence. All fixtures use no model or network call.
 
-The candidate is labelled **v0.2.3 / core 0.3.0 — offline program validation
+The candidate is labelled **v0.2.4 / core 0.3.1 — offline program validation
 complete for later Benchmark A** only when these vertical proofs and the full
 offline suite pass. Benchmark A is not run here.
 This remains an experimental release candidate, not a production-hardened

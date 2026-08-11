@@ -9,8 +9,9 @@ mutable until the program writes the accepted snapshot.
 
 ## Reviewer routing
 
-Use one reviewer per active item. Prefer an independent reviewer in a fresh
-context. If that route is unavailable, try an alternate independent route;
+Use one Independent Business Reviewer per active item. Prefer an independent
+business reviewer in a fresh context. If that route is unavailable, try an
+alternate independent route;
 then try a fresh context from the same family. Do not hardcode model/provider
 names. Release sessions when the host supports it.
 
@@ -89,9 +90,12 @@ Mechanical checks may verify structured fields, file existence, script
 results, exact IDs, raw-source immutability, artifact progress, and internal-
 link integrity; business judgment remains with the Lead Analyst and reviewer.
 There is no reviewer-of-reviewer, business-repair finalizer, manual terminalizer,
-or Integration Reviewer. Result Integration mechanical validation cannot prove
-semantic completeness; a live Integration Agent and an external test-only
-fidelity audit remain required, with no prose parser or semantic compiler.
+or second integration reviewer. Result Integration mechanical validation cannot
+prove semantic completeness. Exactly one fresh item-only Integration Fidelity
+Reviewer checks the current item after mechanical validation and before commit;
+the same Result Integration Agent may make one targeted repair and receives one
+targeted recheck. The packet excludes siblings, cumulative state, prior memory,
+and broad workspace context; there is no prose parser or semantic compiler.
 
 ## Technical defects
 

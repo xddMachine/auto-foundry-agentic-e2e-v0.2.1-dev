@@ -6,6 +6,13 @@ dataset. The offline dashboard and optimizer helpers follow the same rule:
 dashboard rendering presents accepted values, while optimization is frozen,
 passive, and run-local.
 
+Keep the ontology compact: stable enterprise objects, identities, aliases,
+sources, documents, processes, definitions, rules, limitations, relationships,
+and reusable metric definitions only. Current counts, shares, amounts, values,
+rankings, top-N rows, and dimensional observations remain accepted results,
+claims, dashboard facts, evidence, or prepared assets; `add_metric` is an
+observation record, never ontology promotion.
+
 ## Question Mode: clean-room queue
 
 ```text
@@ -20,9 +27,9 @@ At run start, record these exact release markers in program run metadata and
 the final report (the lifecycle `run_state.json` remains the exact nine-field
 authority schema):
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.2.3
+skill_version: 0.2.4
 core_name: auto_foundry_core
-core_version: 0.3.0
+core_version: 0.3.1
 
 Build one program-owned data room/source catalog from the supplied archive and
 member metadata. Keep the archive read-only. Process the questions in exactly
@@ -49,16 +56,29 @@ persisted `receipt_ref`/hash matching the active attempt and lane; unpersisted
 or mismatched references fail closed. Do not use a workflow wall-time deadline
 or a terminalizer agent; the runner's explicit default 3600-second process
 guard is not an agent reasoning deadline. Preserve scratch during execution recovery; it does not
-consume the one business repair allowed only after a reviewer `repair_once`
-verdict. Materialize `draft`, then immutable accepted answer bytes plus a
+consume the one scoped business repair allowed only after an Independent
+Business Reviewer `repair_once` verdict. Materialize `draft`, then immutable accepted answer bytes plus a
 separate program-owned acceptance envelope only when their contents exist.
 
-Use one Lead Analyst and one reviewer per item. The reviewer should perform a
-targeted source-catalog completeness search for material absence claims and
-check any identity-escalation route without repeating the full analysis. Keep
+Use one Lead Analyst and one Independent Business Reviewer per item. The
+reviewer should return all material findings with exact JSON-pointer/artifact
+paths and dependent outputs, perform a targeted source-catalog completeness
+search for material absence claims, and check any identity-escalation route
+without repeating the full analysis. Keep
 telemetry passive: record invocation lane/role/route, status/errors,
 artifact-before/after/counts, recovery and repair counts, source/member reads,
 and core/cache facts, never raw rows or route control.
+
+Record separate observed phase timing for analyst/model work, controlled
+execution, business review, business repair, fidelity/integration review,
+integration commit, products, optimizer, reporting/finalization, and genuine
+recovery. Never infer missing start/finish/wall/provider/model facts: preserve
+`null` or `unavailable`. Normalize reviewer-scope, program, recovery, and
+metadata incidents so each appears once in cumulative reporting. Record every
+implementation transition with old/new SHA/tree/version, earliest affected
+item, preserved accepted hashes, revalidation reason, and exact resume point;
+resume at the earliest safely affected checkpoint, or restart only when the
+impact cannot be bounded.
 
 Record run-level physical-inventory operation names/counters (one initial full
 bind, child loads without re-inventory, selected-member verification, and an
@@ -71,8 +91,11 @@ claims, metrics, limitations, evidence refs, prepared assets, ontology,
 relationships, and dashboard facts through small program APIs; deterministic
 code validates types, paths, refs, hashes, stages, and commits. Build the final
 accepted-snapshot-only dashboard after the complete queue and whole-run freeze.
-Mechanical validation cannot prove semantic completeness; the live Integration
-Agent and an external test-only fidelity audit remain required.
+Mechanical validation cannot prove semantic completeness. After it, route
+exactly one fresh item-only Integration Fidelity Reviewer before commit; if it
+finds issues, the same Result Integration Agent patches only affected records
+and receives one targeted recheck. Its packet excludes siblings, cumulative
+state, prior memory, and broad workspace context.
 Do not run Benchmark A, call a model, access a network, or publish.
 ```
 
@@ -119,7 +142,7 @@ await_runtime/materialization guidance; recover execution separately from the
 one business repair only after a canonical persisted loss receipt reference.
 Preserve scratch and
 write technical_failure only after allowed recovery routes are exhausted. Have
-one reviewer check source-catalog completeness and identity escalation where
+  one Independent Business Reviewer check source-catalog completeness and identity escalation where
 material, with at most one business repair and re-review. Materialize draft and
 then immutable answer bytes plus a separate acceptance envelope. Apply reviewed
 Knowledge Delta in program code; a no_change delta has a concrete reason.
@@ -136,7 +159,7 @@ client-business automation.
 
 The offline tests should demonstrate:
 
-- v0.2.3 skill and v0.3.0 core markers in instructions and run metadata;
+- v0.2.4 skill and v0.3.1 core markers in instructions and run metadata;
 - one data room/source catalog, read-only raw archive, and bounded metadata;
 - one run-level physical inventory with passive operation counters, safe opaque
   materialization, and explicit final verification;
@@ -146,11 +169,11 @@ The offline tests should demonstrate:
 - artifact-based progress, two-strike execution recovery, no wall-time
   deadline, and recovery/repair separation;
 - exact Question Mode wording/order and Requirement Mode priority semantics;
-- one Lead Analyst, one independent reviewer, one business repair maximum plus
-  re-review, no terminalizer;
+- one Lead Analyst, one Independent Business Reviewer, one scoped business
+  repair maximum plus targeted recheck, no terminalizer;
 - no Portfolio Planner, Navigator, descriptor/typed-validation role,
   business-repair finalizer, reviewer-of-reviewer, manual terminalizer, or
-  Integration Reviewer;
+  second integration reviewer;
 - same-attempt code feedback through the controlled preflight/runtime receipt
   phases (`compile`/`dependency_check` only on failed preflight; `smoke`/`full`,
   with an optional second `full` for deterministic comparison, on a successful

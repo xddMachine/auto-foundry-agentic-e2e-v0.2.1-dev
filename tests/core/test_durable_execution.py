@@ -212,7 +212,11 @@ def test_review_guards_repair_once_and_acceptance_are_immutable(tmp_path: Path) 
     with pytest.raises(FileNotFoundError):
         workspace.record_review("accept")
     workspace.write_draft({"answer": "bounded", "limits": ["source-local"]})
-    workspace.record_review("repair_once", reviewer_ref="review-1")
+    workspace.record_review(
+        "repair_once",
+        reviewer_ref="review-1",
+        findings=[{"finding_id": "F-LIMITS", "pointers": ["/limits"]}],
+    )
     assert workspace.state["review"]["verdict"] == "repair_once"
     workspace.use_business_repair()
     assert workspace.state["business_repair_count"] == 1
@@ -240,6 +244,40 @@ def test_review_guards_repair_once_and_acceptance_are_immutable(tmp_path: Path) 
     assert workspace.state["lifecycle_state"] == "accepted"
     with pytest.raises(FileExistsError):
         workspace.accept()
+
+
+def test_repair_once_requires_structured_scope_and_targeted_review_failure_is_atomic(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    workspace.write_draft({"answer": {"value": 1}, "unrelated": "keep"})
+    with pytest.raises(ValueError, match="material finding"):
+        workspace.record_review("repair_once", reviewer_ref="review-1")
+    with pytest.raises(ValueError, match="wildcard"):
+        workspace.record_review(
+            "repair_once",
+            reviewer_ref="review-1",
+            findings=[{"finding_id": "F-WILDCARD", "pointers": ["*"]}],
+        )
+
+    workspace.record_review(
+        "repair_once",
+        reviewer_ref="review-1",
+        findings=[{"finding_id": "F-VALUE", "pointers": ["/answer/value"]}],
+    )
+    workspace.use_business_repair()
+    state_path = workspace.item_root / "item_state.json"
+    review_path = workspace.business_review_path
+    state_before = state_path.read_bytes()
+    review_before = review_path.read_bytes()
+    # Bypass the normal writer only to simulate an externally corrupted draft;
+    # the targeted re-review must fail before either authority is changed.
+    workspace.draft_root.write_text(
+        json.dumps({"answer": {"value": 2}, "unrelated": "changed"}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="outside reviewed scope"):
+        workspace.record_review("accept", reviewer_ref="review-2")
+    assert state_path.read_bytes() == state_before
+    assert review_path.read_bytes() == review_before
 
 
 def test_unavailable_review_disclosure_can_be_accepted_with_limits(tmp_path: Path) -> None:

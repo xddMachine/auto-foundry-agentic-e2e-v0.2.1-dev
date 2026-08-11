@@ -2,10 +2,10 @@
   "event_id": "TEL-...",
   "run_id": "RUN-...",
   "item_id": "Q-...|R-...|foundation-...|product|optimizer",
-  "event_type": "invocation|artifact_progress|source_read|recovery|review_routed|review_completed|item_completed|product_built|optimizer_observed",
+  "event_type": "invocation|phase_timing|incident|artifact_progress|source_read|recovery|review_routed|review_completed|item_completed|product_built|optimizer_observed",
   "invocation": {
     "lane": "lead|reviewer|specialist|program|collector|host",
-    "role": "Lead Analyst|Independent Reviewer|Result Integration Agent|Evidence Collector|program|host",
+    "role": "Lead Analyst|Independent Business Reviewer|Result Integration Agent|Integration Fidelity Reviewer|Evidence Collector|Optimization Agent|program|host",
     "route": "...",
     "provider": "unavailable",
     "model": "unavailable",
@@ -40,6 +40,20 @@
     "member_reads": 0
   },
   "recovery_decision": "continue|await_runtime|materialization_guidance|execution_recovery|null",
+  "phase_timing": {
+    "phase": "analyst_model|controlled_execution|business_review|business_repair|fidelity_integration_review|integration_commit|products|optimizer|reporting_finalization|genuine_recovery",
+    "start": null,
+    "finish": null,
+    "wall_time_ms": null,
+    "provider": "unavailable",
+    "model": "unavailable"
+  },
+  "incident": {
+    "incident_id": null,
+    "category": "reviewer_scope|program|recovery|metadata",
+    "admissible": null,
+    "disposition": null
+  },
   "source_reads": [],
   "member_reads": [],
   "core_cache": {

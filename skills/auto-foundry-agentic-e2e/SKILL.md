@@ -3,14 +3,14 @@ name: auto-foundry-agentic-e2e
 description: Runs a natural, reviewed, offline-friendly enterprise analysis workflow for supplied questions or analytics-only manager requirements using a program-owned data room, durable item workspaces, artifact progress, and run-local prepared assets.
 metadata:
   author: auto-foundry
-  version: "0.2.3"
+  version: "0.2.4"
   core_name: auto_foundry_core
-  core_version: "0.3.0"
+  core_version: "0.3.1"
   architecture: agent-workbench-durable-execution
   release: program-owned-data-room-and-durable-item-workspaces
 ---
 
-# Auto Foundry Agentic E2E — v0.2.3
+# Auto Foundry Agentic E2E — v0.2.4
 
 ## 0. Run identity and authority
 
@@ -19,9 +19,9 @@ program's run report/metadata and repeat them in the final run report:
 
 ```text
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.2.3
+skill_version: 0.2.4
 core_name: auto_foundry_core
-core_version: 0.3.0
+core_version: 0.3.1
 ```
 
 `run_state.json` is the lifecycle authority and contains exactly these nine
@@ -81,8 +81,8 @@ question wave. For every question:
    recovery;
 5. use structured artifact progress and completed invocation receipts to decide
    whether the lane is advancing or genuinely lost;
-6. route one reviewer, make at most one targeted business repair after a
-   `repair_once` verdict, and re-review that repair;
+6. route one Independent Business Reviewer, make at most one scoped business
+   repair after a `repair_once` verdict, and perform one targeted recheck;
 7. atomically materialize immutable accepted answer bytes plus a separate
    program-owned acceptance envelope, then continue to the next question.
 
@@ -242,22 +242,28 @@ freeze, and Knowledge Delta application.
   comparison adds a second `full` receipt. A failed preflight emits its
   `compile` or `dependency_check` receipt. It does not choose routes or
   recover lanes.
-- **Independent Reviewer** checks one materialized draft at the business-result
-  boundary and performs the focused source-completeness and identity checks
-  described below.
+- **Independent Business Reviewer** checks one materialized draft at the
+  business-result boundary, returns all material findings with exact
+  JSON-pointer/artifact paths and dependent outputs, and performs the focused
+  source-completeness and identity checks described below. One scoped repair
+  may change only those findings and dependencies before one targeted recheck.
 - **Result Integration Agent** is the one post-acceptance owner. It incrementally
   consumes program APIs for claims, metrics, limitations, evidence, prepared
   assets, ontology, relationships, and dashboard facts; deterministic program
   code validates types, paths, refs, hashes, stages, and commits. These
-  mechanical checks cannot prove semantic completeness; the live Integration
-  Agent and an external test-only fidelity audit remain required.
+  mechanical checks cannot prove semantic completeness.
+- **Integration Fidelity Reviewer** is exactly one fresh, item-only reviewer
+  after mechanical validation and before commit. Its packet excludes sibling,
+  cumulative, prior-memory, and broad-workspace context. It returns all
+  findings together; the same Result Integration Agent patches only affected
+  records and receives one targeted recheck.
 - **Evidence Collector** is a post-run deterministic observer of workflow and
-  substrate evidence. A separate fresh Optimization Agent may later reason
+  substrate evidence. A separate fresh **Optimization Agent** may later reason
   from its bounded bundle.
 
 There is no Portfolio Planner, Navigator, descriptor/typed-validation role,
 business-repair finalizer, reviewer-of-reviewer, manual terminalizer, or
-Integration Reviewer in the initial integration boundary. Specialists may
+second integration reviewer. Specialists may
 advise only when the program explicitly includes them; they never own a second
 item lifecycle or terminal transition.
 
@@ -279,10 +285,13 @@ program builds data room/source catalog
   → canonical persisted invocation receipt_ref/hash proves lane/provider/host/process loss
   → optional execution recovery only after the completed loss receipt
   → materialized draft
-  → one Independent Reviewer (source completeness and identity route included)
-  → at most one targeted business repair
+  → one Independent Business Reviewer (source completeness and identity route included)
+  → at most one scoped business repair + targeted recheck
   → atomic immutable answer bytes + separate acceptance envelope
   → one Result Integration Agent incremental API pass
+  → mechanical integration validation
+  → one item-only Integration Fidelity Reviewer
+  → same-agent targeted integration repair, if needed, then commit
   → program validates and applies the reviewed Knowledge Delta
 ```
 
@@ -299,10 +308,14 @@ claim about the data.
 The Living Enterprise Model (LEM) is run-local and progressive. It has two
 linked, separately addressable layers:
 
-1. **Enterprise Ontology** — an extensible map of business objects, fields,
-   grains, relationships, rules, processes, metrics, conflicts, and known
+1. **Enterprise Ontology** — an extensible map of stable business objects,
+   identities, aliases, sources, documents, grains, relationships, rules,
+   processes, definitions, reusable metric definitions, conflicts, and known
    limitations. It is reusable understanding, not a transaction copy or a
-   central ontology.
+   central ontology. Current counts, shares, amounts, values, rankings, top-N
+   rows, and dimensional observations remain accepted results, claims,
+   dashboard facts, evidence, or prepared assets; `add_metric` is an
+   observation record and never ontology promotion.
 2. **Prepared Data Registry** — reusable derived assets, profiles, mappings,
    normalized values, relationship measurements, and prepared views with exact
    source/evidence references. Entries may be source-scoped or
@@ -342,9 +355,11 @@ for claims, metrics, limitations, evidence references, prepared assets,
 ontology records, relationship facts, and dashboard facts. It performs
 semantic mapping only; deterministic code validates types, paths, refs,
 hashes, stages, and commits. Mechanical validation cannot prove semantic
-completeness; a live Integration Agent and an external test-only fidelity audit
-remain required. There is no prose parser, semantic compiler, giant mandatory
-JSON envelope, Integration Reviewer, or finalizer chain at this boundary.
+completeness. Exactly one item-only Integration Fidelity Reviewer checks the
+staged candidate after mechanical validation and before commit; the same
+Result Integration Agent makes at most one targeted repair and receives a
+targeted recheck. There is no prose parser, semantic compiler, giant mandatory
+JSON envelope, or reviewer/finalizer chain at this boundary.
 
 ## 6. Deterministic operations and custom work
 
@@ -367,8 +382,8 @@ context = RunContext(
     "RUN-example",
     run_root,
     (input_root,),
-    core_version="0.3.0",
-    skill_version="0.2.3",
+    core_version="0.3.1",
+    skill_version="0.2.4",
 )
 workbench = DataRoomWorkbench(context, archive_path)
 room = workbench.data_room
@@ -569,13 +584,15 @@ artifacts, or central/cross-run caches.
 
 - Keep supplied Question Mode wording/order, one-at-a-time execution, and
   queue continuation. Keep Requirement Mode explicit-priority semantics.
-- Use one Lead Analyst, one independent reviewer, and at most one targeted
-  business repair per item, followed by one re-review when repaired.
+- Use one Lead Analyst, one Independent Business Reviewer, and at most one
+  scoped business repair per item, followed by one targeted recheck when
+  repaired. Use one Result Integration Agent and exactly one item-only
+  Integration Fidelity Reviewer after mechanical validation and before commit.
   Execution recovery is a separate count and decision and requires a completed
   invocation loss receipt.
 - Do not add a Portfolio Planner, Navigator, descriptor/typed-validation role,
   business-repair finalizer, reviewer-of-reviewer, manual terminalizer,
-  Integration Reviewer, wall-time deadline, parallel question
+  second integration reviewer, wall-time deadline, parallel question
   wave, business-term dictionary, domain recipe, central ontology, cross-run
   cache, production app, external call, fallback wrapper, or a second
   repair.
@@ -589,7 +606,7 @@ artifacts, or central/cross-run caches.
 - Do not auto-promote custom code or confuse the development-only evidence
   collector and later Optimization Agent with client business automation.
 
-This v0.2.3 contract describes the minimal Agent Workbench + Durable
+This v0.2.4 contract describes the minimal Agent Workbench + Durable
 Execution path. It is an offline-friendly contract, not a claim of host-level
 sandboxing, benchmark completion, or production hardening.
 

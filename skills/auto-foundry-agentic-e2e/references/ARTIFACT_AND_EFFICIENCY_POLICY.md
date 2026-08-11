@@ -73,7 +73,7 @@ Optimization Agent report.
 - a folder for every capability that was not needed;
 - a Portfolio Planner, Navigator, descriptor/typed-validation role,
   business-repair finalizer, reviewer-of-reviewer, manual terminalizer,
-  Integration Reviewer, per-item catalog-compliance artifact, capability
+  second integration reviewer, per-item catalog-compliance artifact, capability
   approval tree, or finalizer artifact;
 - verifier scripts that inspect prose wording to decide state;
 - repeated copies of unchanged artifacts;

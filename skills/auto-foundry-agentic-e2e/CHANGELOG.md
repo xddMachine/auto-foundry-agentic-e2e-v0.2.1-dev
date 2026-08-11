@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.4 — Resumable development-run contract
+
+Added:
+
+- exact run markers for skill `0.2.4` and core `0.3.1`;
+- a compact enterprise ontology boundary: stable objects, identities, aliases,
+  sources, documents, processes, definitions, and reusable metric definitions;
+  current counts, shares, amounts, values, ranks, top-N rows, and dimensional
+  observations remain accepted results or evidence, and `add_metric` is an
+  observation record rather than ontology promotion;
+- one Independent Business Reviewer returning all material findings with stable
+  IDs, exact JSON-pointer/artifact paths, dependent outputs, and at most one
+  scoped business repair followed by a targeted recheck;
+- one fresh item-only Integration Fidelity Reviewer after mechanical validation
+  and before commit, with same-agent targeted repair/recheck and no sibling,
+  cumulative, prior-memory, or broad-workspace context;
+- phase-separated timing, normalized incidents, cumulative projection,
+  non-circular terminalization, and explicit implementation-transition/resume
+  proofs. Benchmark A question wording/order and hash remain unchanged and no
+  benchmark run is claimed.
+
 ## 0.2.3 — Program-owned integration and controlled analysis runtime
 
 Added:

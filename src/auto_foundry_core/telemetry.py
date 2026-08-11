@@ -5,17 +5,108 @@ from __future__ import annotations
 from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import time
 from typing import Any, Iterator, Mapping
 
-from .contracts import OperationReceipt, RunTelemetrySummary, TelemetryEvent
+from .contracts import IncidentRecord, OperationReceipt, PhaseTimingRecord, RunTelemetrySummary, TelemetryEvent
 from .workspace import RunContext
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_PHASES = frozenset(
+    {
+        "analyst_model",
+        "controlled_execution",
+        "business_review",
+        "business_repair",
+        "fidelity_integration_review",
+        "integration_commit",
+        "products",
+        "optimizer",
+        "reporting_finalization",
+        "genuine_recovery",
+    }
+)
+
+_PHASE_ALIASES = {
+    "analyst/model work": "analyst_model",
+    "analyst/model": "analyst_model",
+    "analyst_model_work": "analyst_model",
+    "controlled execution": "controlled_execution",
+    "business review": "business_review",
+    "business repair": "business_repair",
+    "fidelity/integration review": "fidelity_integration_review",
+    "fidelity integration review": "fidelity_integration_review",
+    "integration commit": "integration_commit",
+    "products": "products",
+    "optimizer": "optimizer",
+    "reporting/finalization": "reporting_finalization",
+    "reporting finalization": "reporting_finalization",
+    "genuine recovery": "genuine_recovery",
+    "recovery": "genuine_recovery",
+}
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _incident_digest(value: Mapping[str, Any]) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()[:16]
+
+
+def _normalize_incident(value: IncidentRecord | Mapping[str, Any]) -> IncidentRecord:
+    if isinstance(value, IncidentRecord):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("incident must be an IncidentRecord or mapping")
+    raw = dict(value)
+    category = raw.pop("category", raw.pop("kind", raw.pop("type", None)))
+    if category is None:
+        raise ValueError("incident category is required")
+    disposition = raw.pop("disposition", raw.pop("resolution", raw.pop("status", None)))
+    if disposition is None:
+        raise ValueError("incident disposition is required")
+    admissible = raw.pop("admissible", raw.pop("admissible_for_report", None))
+    if not isinstance(admissible, bool):
+        raise TypeError("incident admissible must be a bool")
+    incident_id = raw.pop("incident_id", raw.pop("id", None))
+    item_id = raw.pop("item_id", None)
+    scope = raw.pop("scope", raw.pop("affected_scope", ()))
+    if isinstance(scope, str):
+        scope = (scope,)
+    source = raw.pop("source", raw.pop("source_ref", None))
+    facts = raw.pop("facts", None)
+    if facts is None:
+        facts = raw
+    elif raw:
+        facts = {**dict(facts), **raw} if isinstance(facts, Mapping) else raw
+    canonical_without_id = {
+        "category": str(category).strip().lower(),
+        "disposition": str(disposition).strip(),
+        "admissible": admissible,
+        "item_id": item_id,
+        "scope": list(scope or ()),
+        "source": source,
+        "facts": dict(facts or {}) if isinstance(facts, Mapping) else {},
+    }
+    incident_id = str(incident_id).strip() if incident_id is not None else f"INC-{_incident_digest(canonical_without_id)}"
+    return IncidentRecord(
+        incident_id=incident_id,
+        category=canonical_without_id["category"],
+        disposition=canonical_without_id["disposition"],
+        admissible=admissible,
+        item_id=item_id,
+        scope=tuple(scope or ()),
+        source=source,
+        facts=canonical_without_id["facts"],
+    )
 
 
 class TelemetryRecorder:
@@ -43,6 +134,8 @@ class TelemetryRecorder:
         self.started_at = _now()
         self._started_clock = time.perf_counter()
         self.events: list[TelemetryEvent] = []
+        self.phase_timings: list[PhaseTimingRecord] = []
+        self.incidents: dict[str, IncidentRecord] = {}
         self._invocation_ledger = None
 
     @property
@@ -86,6 +179,75 @@ class TelemetryRecorder:
             error="; ".join(receipt.errors) if receipt.errors else None,
             facts={"backend": receipt.backend, "limitations": list(receipt.limitations)},
         )
+
+    def record_phase(
+        self,
+        phase: str,
+        *,
+        start: str | None = None,
+        finish: str | None = None,
+        wall_time_ms: float | None = None,
+        item_id: str | None = None,
+        attempt_id: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        receipt_ref: str | None = None,
+        facts: Mapping[str, Any] | None = None,
+    ) -> PhaseTimingRecord:
+        """Record one observed phase interval without inventing missing facts."""
+
+        phase_value = str(phase).strip().lower()
+        phase_value = _PHASE_ALIASES.get(phase_value, phase_value.replace("-", "_"))
+        if phase_value not in _PHASES:
+            raise ValueError(f"unsupported phase: {phase_value}")
+        observed_wall = wall_time_ms
+        if observed_wall is None and start is not None and finish is not None:
+            try:
+                started_at = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+                finished_at = datetime.fromisoformat(str(finish).replace("Z", "+00:00"))
+                elapsed_ms = (finished_at - started_at).total_seconds() * 1000
+                if elapsed_ms >= 0:
+                    observed_wall = elapsed_ms
+            except (TypeError, ValueError):
+                # The original timestamps remain authoritative; an
+                # unparseable pair simply leaves the derived duration
+                # unavailable rather than inventing one.
+                observed_wall = None
+        record = PhaseTimingRecord(
+            phase=phase_value,
+            start=start,
+            finish=finish,
+            wall_time_ms=observed_wall,
+            item_id=item_id,
+            attempt_id=attempt_id,
+            provider=provider,
+            model=model,
+            receipt_ref=receipt_ref,
+            facts=facts or {},
+        )
+        self.phase_timings.append(record)
+        self.record(
+            "phase_timing",
+            timestamp=record.start or record.finish,
+            facts=record.to_dict(),
+        )
+        return record
+
+    def record_incident(self, incident: IncidentRecord | Mapping[str, Any]) -> IncidentRecord:
+        """Normalize and de-duplicate a reportable incident by stable ID."""
+
+        normalized = _normalize_incident(incident)
+        existing = self.incidents.get(normalized.incident_id)
+        if existing is not None:
+            if existing != normalized:
+                raise ValueError(f"incident_id {normalized.incident_id!r} is already recorded with different facts")
+            return existing
+        self.incidents[normalized.incident_id] = normalized
+        self.record("incident", facts=normalized.to_dict())
+        return normalized
+
+    def record_incidents(self, incidents: Any) -> tuple[IncidentRecord, ...]:
+        return tuple(self.record_incident(value) for value in incidents or ())
 
     @property
     def invocation_ledger(self):
@@ -140,6 +302,27 @@ class TelemetryRecorder:
         bytes_read = sum(event.bytes_processed or 0 for event in self.events if event.event_type in {"source_read", "operation"})
         files_read = sum(event.event_type == "source_read" for event in self.events)
         facts = dict(extra or {})
+        phase_payload = [record.to_dict() for record in self.phase_timings]
+        phase_totals: dict[str, dict[str, Any]] = {}
+        for record in self.phase_timings:
+            aggregate = phase_totals.setdefault(
+                record.phase,
+                {"count": 0, "wall_time_ms": None, "start": None, "finish": None},
+            )
+            aggregate["count"] += 1
+            if record.wall_time_ms is not None:
+                aggregate["wall_time_ms"] = (aggregate["wall_time_ms"] or 0.0) + record.wall_time_ms
+            if aggregate["start"] is None and record.start is not None:
+                aggregate["start"] = record.start
+            if record.finish is not None:
+                aggregate["finish"] = record.finish
+        incident_payload = [incident.to_dict() for incident in self.incidents.values()]
+        incident_totals = Counter(incident.category for incident in self.incidents.values())
+        facts.setdefault("phase_timings", phase_payload)
+        facts.setdefault("phase_timing_totals", phase_totals)
+        facts.setdefault("incidents", incident_payload)
+        facts.setdefault("incident_totals", dict(incident_totals))
+        facts.setdefault("incident_count", len(incident_payload))
         facts.setdefault("telemetry_storage", "available" if self.storage_available else ("disabled" if self.root is None else "unavailable"))
         facts.setdefault("telemetry_write_errors", len(self.write_errors))
         facts.setdefault("telemetry_dropped_events", self.dropped_events)

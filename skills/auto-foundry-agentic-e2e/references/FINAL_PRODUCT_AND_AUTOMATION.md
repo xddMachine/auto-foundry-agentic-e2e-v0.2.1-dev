@@ -69,8 +69,8 @@ The program checks values, labels, periods, populations, units/currencies,
 claim strength, visible limitations, offline rendering, internal links, and
 traceability while integrating products. A presentation defect is fixed in the
 product. A genuine analytical defect returns to the originating item for its
-single permitted repair; do not create a second review pipeline or an
-Integration Reviewer.
+single permitted repair; do not create a second review pipeline or a second
+integration reviewer.
 
 ## Post-run evidence and optimization
 
@@ -113,8 +113,10 @@ rejected or technical-failure items leave no accepted entry. Exactly one Result
 Integration Agent incrementally uses small program APIs for claims, metrics,
 limitations, evidence references, prepared assets, ontology, relationships,
 and dashboard facts. It performs semantic mapping; deterministic code
-validates types, paths, refs, hashes, stages, and commits. Mechanical
-validation cannot prove semantic completeness; the live Integration Agent and
-an external test-only fidelity audit remain required. There is no prose parser,
-semantic compiler, giant mandatory JSON, Integration Reviewer, or finalizer
-chain.
+validates types, paths, refs, hashes, stages, and commits. Mechanical validation
+cannot prove semantic completeness. Exactly one fresh item-only Integration
+Fidelity Reviewer checks the staged current item after mechanical validation and
+before commit; the same Result Integration Agent may make one targeted repair
+and receives one targeted recheck. The packet excludes siblings, cumulative
+state, prior memory, and broad workspace context. There is no prose parser,
+semantic compiler, giant mandatory JSON, or reviewer chain.

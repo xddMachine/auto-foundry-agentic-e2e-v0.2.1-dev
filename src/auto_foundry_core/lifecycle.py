@@ -24,11 +24,13 @@ except ImportError:  # pragma: no cover - defensive fallback
     fcntl = None  # type: ignore[assignment]
 
 from .workspace import AllowedRootError, RunContext
+from .contracts import ImplementationTransition
 
 
 RUN_STATE_FILENAME = "run_state.json"
 _RUN_LOCK_FILENAME = ".run_state.lock"
 INVOCATION_LEDGER_FILENAME = "invocation_receipts.jsonl"
+IMPLEMENTATION_TRANSITIONS_FILENAME = "implementation_transitions.jsonl"
 _INVOCATION_LEDGER_LOCK_FILENAME = ".invocation_receipts.lock"
 RUN_STATES = (
     "initialized",
@@ -128,6 +130,13 @@ def _sha256_bytes(value: bytes) -> str:
 def _manifest_hash(value: Mapping[str, Any]) -> str:
     unsigned = {key: item for key, item in value.items() if key != "manifest_hash"}
     return _sha256_bytes(_json_bytes(unsigned))
+
+
+def _implementation_transition_path(context: RunContext) -> Path:
+    path = context.resolve_run_path(IMPLEMENTATION_TRANSITIONS_FILENAME)
+    if path.is_symlink():
+        raise AllowedRootError("implementation transition ledger cannot be a symlink")
+    return path
 
 
 def _atomic_write_bytes(path: Path, payload: bytes) -> None:
@@ -686,6 +695,107 @@ class RunLifecycle:
     def to_dict(self) -> dict[str, Any]:
         return copy.deepcopy(self._state)
 
+    @property
+    def implementation_transitions(self) -> tuple[ImplementationTransition, ...]:
+        """Load the append-only implementation/resume checkpoint ledger."""
+
+        path = _implementation_transition_path(self.context)
+        if not path.exists():
+            return ()
+        if not path.is_file() or path.is_symlink():
+            raise AllowedRootError("implementation transition ledger is not a regular file")
+        records: list[ImplementationTransition] = []
+        seen: set[str] = set()
+        for line_number, line in enumerate(path.read_bytes().splitlines(), 1):
+            try:
+                payload = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError(f"implementation transition line {line_number} is invalid") from exc
+            if not isinstance(payload, Mapping) or set(payload) != {
+                "transition_id",
+                "old_sha",
+                "new_sha",
+                "old_tree",
+                "new_tree",
+                "old_version",
+                "new_version",
+                "earliest_affected_item",
+                "preserved_accepted_hashes",
+                "unaffected_reason",
+                "resume_point",
+                "record_hash",
+            }:
+                raise ValueError(f"implementation transition line {line_number} fields are invalid")
+            unsigned = {key: payload[key] for key in payload if key != "record_hash"}
+            expected = _sha256_bytes(_json_bytes(unsigned))
+            if payload.get("record_hash") != expected:
+                raise ValueError(f"implementation transition line {line_number} hash does not match content")
+            transition = ImplementationTransition(**dict(unsigned))
+            transition_id = transition.transition_id
+            if not transition_id or transition_id in seen:
+                raise ValueError("implementation transition IDs must be unique")
+            seen.add(transition_id)
+            records.append(transition)
+        return tuple(records)
+
+    def record_implementation_transition(
+        self,
+        transition: ImplementationTransition | Mapping[str, Any] | None = None,
+        **fields: Any,
+    ) -> ImplementationTransition:
+        """Persist an explicit program patch and safe resumable checkpoint.
+
+        The transition is independent of ``run_state.json`` so adding a
+        checkpoint cannot silently alter lifecycle status or reinterpret old
+        item state.  Re-recording an identical transition is idempotent;
+        conflicting reuse of its identity fails closed.
+        """
+
+        if transition is None:
+            transition = fields
+        elif fields:
+            raise TypeError("transition mapping and keyword fields cannot both be supplied")
+        if isinstance(transition, ImplementationTransition):
+            candidate = transition
+        elif isinstance(transition, Mapping):
+            raw = dict(transition)
+            unsigned = {key: value for key, value in raw.items() if key != "transition_id"}
+            transition_id = raw.get("transition_id")
+            if transition_id is None:
+                transition_id = "T-" + _sha256_bytes(_json_bytes(unsigned))[:16]
+            candidate = ImplementationTransition(transition_id=str(transition_id), **unsigned)
+        else:
+            raise TypeError("transition must be ImplementationTransition or mapping")
+        if candidate.transition_id is None:
+            unsigned = {key: value for key, value in candidate.to_dict().items() if key != "transition_id"}
+            candidate = ImplementationTransition(
+                transition_id="T-" + _sha256_bytes(_json_bytes(unsigned))[:16],
+                **unsigned,
+            )
+        existing = {value.transition_id: value for value in self.implementation_transitions}
+        if candidate.transition_id in existing:
+            if existing[candidate.transition_id] != candidate:
+                raise ValueError("implementation transition ID is already recorded with different facts")
+            return existing[candidate.transition_id]
+        payload = candidate.to_dict()
+        payload["record_hash"] = _sha256_bytes(_json_bytes(payload))
+        path = _implementation_transition_path(self.context)
+        with self._run_lock(self.context):
+            # Re-read under the lifecycle lock to close duplicate-writer races.
+            existing = {value.transition_id: value for value in self.implementation_transitions}
+            if candidate.transition_id in existing:
+                if existing[candidate.transition_id] != candidate:
+                    raise ValueError("implementation transition ID is already recorded with different facts")
+                return existing[candidate.transition_id]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.is_symlink():
+                raise AllowedRootError("implementation transition ledger cannot be a symlink")
+            with path.open("ab") as stream:
+                stream.write(_json_bytes(payload))
+                stream.flush()
+                os.fsync(stream.fileno())
+        return candidate
+
     def _write_state_unlocked(self, state: Mapping[str, Any]) -> None:
         # Compare the authoritative on-disk generation/hash immediately before
         # publication.  A stale in-memory lifecycle can never overwrite a
@@ -839,6 +949,8 @@ class RunLifecycle:
 __all__ = [
     "AgentInvocationReceipt",
     "INVOCATION_LEDGER_FILENAME",
+    "IMPLEMENTATION_TRANSITIONS_FILENAME",
+    "ImplementationTransition",
     "InvocationReceiptLedger",
     "classify_invocation_terminal_reason",
     "RUN_STATE_FILENAME",

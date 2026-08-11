@@ -187,11 +187,26 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
     assert ledger.get(unavailable_ref).provider == "unavailable"
     item.write_draft({"answer": "bounded corrected result", "evidence": "work/analysis.json"})
     item.finish_attempt(attempt.attempt_id, status="completed")
-    item.record_review("repair_once", reviewer_ref="synthetic-reviewer")
+    repair_review = item.record_review(
+        "repair_once",
+        reviewer_ref="synthetic-reviewer",
+        findings=[
+            {
+                "finding_id": "F-V023-ANSWER",
+                "message": "The bounded answer wording needs one targeted correction.",
+                "pointers": ["/answer"],
+            }
+        ],
+    )
+    assert repair_review["findings"][0]["pointers"] == ["/answer"]
+    assert repair_review["targeted_recheck"] is False
     item.use_business_repair()
     assert item.state["business_repair_count"] == 1
     item.write_draft({"answer": "bounded corrected result after one repair", "evidence": "work/analysis.json"})
-    item.record_review("accept", reviewer_ref="synthetic-reviewer-rereview")
+    targeted_review = item.record_review("accept", reviewer_ref="synthetic-reviewer-rereview")
+    assert targeted_review["targeted_recheck"] is True
+    assert targeted_review["changed_pointers"] == ["/answer"]
+    assert json.loads(item.draft_root.read_text(encoding="utf-8"))["evidence"] == "work/analysis.json"
     item.accept(accepted_refs=("work/analysis.json",))
     accepted_bundle = AcceptedAnalysisBundle.load(item)
     answer_before = accepted_bundle.answer_content
@@ -202,11 +217,40 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
 
     # Exactly one owner stages all integration kinds through the program API.
     lem = LivingEnterpriseModel(run_id=context.run_id)
+    # The fidelity packet is an item-local boundary.  Populate nearby
+    # cumulative/sibling surfaces with unmistakable sentinels so the vertical
+    # proof catches accidental traversal of those stores.
+    lem.add_ontology_item(
+        OntologyItem(
+            item_id="cumulative-secret",
+            item_type="entity",
+            label="CUMULATIVE LEM SENTINEL",
+        )
+    )
+    telemetry.record("sentinel", facts={"secret": "CUMULATIVE TELEMETRY SENTINEL"})
+    (run_root / "report-sentinel.json").write_text(
+        json.dumps({"secret": "CUMULATIVE REPORT SENTINEL"}, sort_keys=True),
+        encoding="utf-8",
+    )
     registry = workbench.prepared_registry
     assert registry.search() == ()
-    session = IntegrationSession.create(context, item, lem, registry, "result-integration")
+    session = IntegrationSession.create(
+        context,
+        item,
+        lem,
+        registry,
+        "result-integration",
+        invocation_id="inv-Q-001",
+    )
     with pytest.raises(ValueError, match="owned by another"):
-        IntegrationSession.create(context, item, lem, registry, "other-owner")
+        IntegrationSession.create(
+            context,
+            item,
+            lem,
+            registry,
+            "result-integration",
+            invocation_id="inv-Q-001-other",
+        )
     entity_a = session.add_ontology_item(
         OntologyItem(item_id="generic-record", item_type="entity", label="Generic record", scope="question"),
         evidence_refs=("work/plan.json",),
@@ -231,6 +275,25 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
     )
     session.add_dashboard_fact({"fact": "generic-total", "value": 8}, scope="question", evidence_refs=("work/analysis.json",))
     assert session.validate().valid
+    packet = session.build_fidelity_packet()
+    packet_text = session.fidelity_packet_path.read_text(encoding="utf-8")
+    assert packet.answer_content == json.loads(accepted_bundle.answer_content.decode("utf-8"))
+    assert packet.answer_content_bytes == accepted_bundle.answer_content
+    assert packet.acceptance_envelope == json.loads(envelope_before.decode("utf-8"))
+    assert packet.manifest == json.loads((item.accepted_root / "manifest.json").read_text(encoding="utf-8"))
+    assert packet.accepted_content_hash == accepted_bundle.content_hash
+    assert packet.accepted_manifest_hash == accepted_bundle.manifest_hash
+    for sentinel in (
+        "second bounded item",
+        "CUMULATIVE LEM SENTINEL",
+        "CUMULATIVE TELEMETRY SENTINEL",
+        "CUMULATIVE REPORT SENTINEL",
+    ):
+        assert sentinel not in packet_text
+    session.record_fidelity_review(
+        "accept",
+        checked_record_ids=tuple(record.record_id for record in session.records),
+    )
     manifest = session.commit()
     assert manifest["status"] == "committed"
     assert item.integration_state == "integrated"
@@ -241,7 +304,14 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
         "prepared_asset", "relationship", "dashboard_fact",
     }
 
-    session2 = IntegrationSession.create(context, item2, lem, registry, "result-integration")
+    session2 = IntegrationSession.create(
+        context,
+        item2,
+        lem,
+        registry,
+        "result-integration",
+        invocation_id="inv-Q-002",
+    )
     bound2 = BoundAnalysisContext.create(
         context,
         DataAssetRef.from_path(archive),
@@ -261,6 +331,20 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
         OntologyItem(item_id="second-item", item_type="entity", label="Second item", scope="question"),
         evidence_refs=("work/plan.json",),
     )
+    accepted_bundle2 = AcceptedAnalysisBundle.load(item2)
+    packet2 = session2.build_fidelity_packet()
+    assert packet2.answer_content == json.loads(accepted_bundle2.answer_content.decode("utf-8"))
+    assert packet2.answer_content_bytes == accepted_bundle2.answer_content
+    assert packet2.acceptance_envelope == json.loads(
+        (item2.accepted_root / "acceptance_envelope.json").read_text(encoding="utf-8")
+    )
+    assert packet2.manifest == json.loads(
+        (item2.accepted_root / "manifest.json").read_text(encoding="utf-8")
+    )
+    session2.record_fidelity_review(
+        "accept",
+        checked_record_ids=tuple(record.record_id for record in session2.records),
+    )
     session2.commit()
     assert len(lem.ontology) > 2
     assert registry.search(reusable_only=True, prepared_asset_id="generic-reusable")
@@ -272,7 +356,7 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
     fixture = {
         "title": "Generic reviewed product",
         "run_id": context.run_id,
-        "skill_version": "0.2.3",
+        "skill_version": "0.2.4",
         "freeze_markers": FreezeMarkers(True, True, True, True, True).to_dict(),
         "limitations": ["Synthetic fixture only; no new analytics."],
         "domains": [{

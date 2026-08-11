@@ -26,10 +26,13 @@ Keep these run-local layers separate but link them with evidence references:
 ### Enterprise Ontology
 
 An extensible, non-transaction representation of business objects, fields,
-grains, relationships, metric meanings, applicable rules, process definitions,
-conflicts, effective periods, and known limits. It captures reusable
-understanding; it does not copy rows from a source and is never a central
-ontology.
+grains, relationships, aliases, sources, documents, metric meanings, reusable
+metric definitions, applicable rules, process definitions, conflicts, effective
+periods, and known limits. It captures reusable understanding; it does not copy
+rows from a source and is never a central ontology. Current counts, shares,
+amounts, values, ranks, top-N rows, and dimensional observations remain
+accepted results, claims, dashboard facts, evidence, or prepared assets;
+`add_metric` records an observation and never promotes it into ontology.
 
 ### Prepared Data Registry
 
@@ -72,10 +75,13 @@ After acceptance, exactly one Result Integration Agent incrementally consumes
 claims, metrics, limitations, evidence refs, prepared assets, ontology,
 relationships, and dashboard facts through small program APIs. It performs
 semantic mapping; deterministic code validates types, paths, refs, hashes,
-stages, and commits. Mechanical validation cannot prove semantic completeness;
-the live Integration Agent and an external test-only fidelity audit remain
-required. There is no prose parser, semantic compiler, giant mandatory JSON,
-Integration Reviewer, or finalizer chain.
+  stages, and commits. Mechanical validation cannot prove semantic completeness.
+  Exactly one fresh item-only Integration Fidelity Reviewer checks the staged
+  current item after mechanical validation and before commit; the same Result
+  Integration Agent may make one targeted repair and receives one targeted
+  recheck. The packet excludes siblings, cumulative state, prior memory, and
+  broad workspace context. There is no prose parser, semantic compiler, giant
+  mandatory JSON, or reviewer chain.
 
 ## Knowledge item shape
 

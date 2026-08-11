@@ -14,15 +14,18 @@ from .contracts import (
     DocumentRef,
     FieldRef,
     FoundationTask,
+    IncidentRecord,
     IdentityCandidate,
     IdentityDecision,
     IdentityEvidence,
+    ImplementationTransition,
     KnowledgeDelta,
     LEMRef,
     OntologyItem,
     OperationReceipt,
     OperationResultRef,
     OperationSpec,
+    PhaseTimingRecord,
     PreparedAssetDescriptor,
     PreparedAssetRef,
     RequirementPortfolioPlan,
@@ -65,9 +68,30 @@ from .analysis import (
 )
 from .integration import (
     AcceptedAnalysisBundle,
+    collision_safe_record_id,
+    deterministic_record_id,
     IntegrationRecord,
     IntegrationSession,
     IntegrationValidation,
+    make_record_id,
+    validate_record_id,
+)
+from .integration_review import (
+    FidelityFinding,
+    FidelityPacket,
+    FidelityRepairAuthorization,
+    FidelityRepairProgress,
+    FidelityResult,
+    FidelityReviewResult,
+    IntegrationFidelityPacket,
+    write_packet,
+    write_result,
+)
+from .reporting import (
+    RunReportFinalizer,
+    RunReportProjector,
+    finalize_run_report,
+    project_run_report,
 )
 from .lifecycle import (
     AgentInvocationReceipt,
@@ -105,7 +129,7 @@ from .references import (
     is_explicit_reference_mapping,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     "AggregationSpec", "AllowedRootError", "CanonicalMapping",
@@ -114,8 +138,9 @@ __all__ = [
     "PreparedAsset", "PreparedAssetRegistry", "AcceptedSnapshot", "ArtifactProgress", "ExecutionAttempt", "ITEM_STATE_FIELDS",
     "ITEM_STATE_SCHEMA", "ItemWorkspace", "ProgressDecision",
     "FoundationTask", "IdentityCandidate", "IdentityDecision",
-    "IdentityEvidence", "KnowledgeDelta", "LEMRef", "LivingEnterpriseModel",
+    "IdentityEvidence", "IncidentRecord", "ImplementationTransition", "KnowledgeDelta", "LEMRef", "LivingEnterpriseModel",
     "OntologyItem", "OperationReceipt", "OperationResultRef", "OperationSpec",
+    "PhaseTimingRecord",
     "PopulationLedger", "PreparedAssetDescriptor", "PreparedAssetRef",
     "RequirementPortfolioPlan", "RequirementRecord", "RunCache",
     "RunTelemetrySummary", "TableRef", "TelemetryEvent", "TelemetryRecorder",
@@ -131,6 +156,9 @@ __all__ = [
     "BoundAnalysisContext", "CatalogSnapshot", "ControlledScriptRunner",
     "ScriptExecutionReceipt", "ScriptRunReport", "load_bound_analysis_context",
     "AcceptedAnalysisBundle", "IntegrationRecord", "IntegrationSession", "IntegrationValidation",
+    "IntegrationFidelityPacket", "FidelityPacket", "FidelityFinding", "FidelityResult", "FidelityReviewResult", "FidelityRepairAuthorization", "FidelityRepairProgress", "deterministic_record_id",
+    "collision_safe_record_id", "make_record_id", "validate_record_id", "write_packet", "write_result",
+    "RunReportFinalizer", "RunReportProjector", "finalize_run_report", "project_run_report",
     "AgentInvocationReceipt", "InvocationReceiptLedger", "RunLifecycle", "RunLifecycleSnapshot",
     "classify_invocation_terminal_reason", "classify_terminal_reason", "recovery_classification",
     "FREEZE_MARKER_FIELDS", "FreezeMarkers", "ProductContractError", "decode_freeze_markers",

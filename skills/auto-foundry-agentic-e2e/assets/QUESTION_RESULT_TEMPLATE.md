@@ -55,7 +55,7 @@
 ## Review and outcome
 
 - Lead Analyst self-check:
-- Reviewer route:
+- Independent Business Reviewer route:
 - `review_status`:
 - `review_strength`:
 - Reviewer verdict:
@@ -71,7 +71,10 @@
 - Raw terminal reason (specific fact, for example `syntax_error` or
   `core_defect`):
 - Provider/model/host/process identity (literal `unavailable` when unknown):
-- Business repair used: `none` | `one_targeted_repair`
+- Business repair used: `none` | `one_scoped_repair`
+- Business findings (all returned together): finding IDs, exact JSON-pointer/
+  artifact paths, dependent outputs, reviewed draft hash, and targeted recheck
+  scope:
 - Final outcome:
 - Accepted answer bytes (immutable ref/hash):
 - Acceptance envelope (program-owned ref/hash/lifecycle):
@@ -95,5 +98,9 @@
 - Integration state/receipt:
 - Accepted registry publication (exactly once at accepted commit; scope retained;
   rejected/technical-failure leaves no entry):
-- Mechanical validation limitation: semantic completeness requires the live
-  Integration Agent and an external test-only fidelity audit:
+- Integration Fidelity Reviewer: exactly one fresh item-only reviewer after
+  mechanical validation and before commit; packet excludes siblings,
+  cumulative state, prior memory, and broad workspace context:
+- Integration fidelity findings, affected record/dependency paths, preserved
+  hashes, same-agent targeted repair and one targeted recheck:
+- Mechanical validation limitation and reviewer disposition:

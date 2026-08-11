@@ -887,6 +887,133 @@ class RunTelemetrySummary(ContractMixin):
 
 
 @dataclass(frozen=True)
+class PhaseTimingRecord(ContractMixin):
+    """Observed timing for one program phase.
+
+    Timing is deliberately facts-only.  ``start``, ``finish`` and
+    ``wall_time_ms`` remain ``None`` when the host did not supply that fact;
+    constructors never fill missing observations with a clock reading or a
+    zero duration.
+    """
+
+    phase: str
+    start: str | None = None
+    finish: str | None = None
+    wall_time_ms: float | None = None
+    item_id: str | None = None
+    attempt_id: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    receipt_ref: str | None = None
+    facts: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        phase = _require(self.phase, "phase")
+        object.__setattr__(self, "phase", phase)
+        for name in ("start", "finish", "item_id", "attempt_id", "provider", "model", "receipt_ref"):
+            value = getattr(self, name)
+            if value is not None:
+                value = str(value).strip()
+                object.__setattr__(self, name, value or None)
+        if self.wall_time_ms is not None:
+            if isinstance(self.wall_time_ms, bool) or not isinstance(self.wall_time_ms, (int, float)):
+                raise TypeError("wall_time_ms must be a number or None")
+            if self.wall_time_ms < 0:
+                raise ValueError("wall_time_ms cannot be negative")
+            object.__setattr__(self, "wall_time_ms", float(self.wall_time_ms))
+        object.__setattr__(self, "facts", _freeze(self.facts))
+
+    @property
+    def wall_ms(self) -> float | None:
+        """Short alias used by report consumers."""
+
+        return self.wall_time_ms
+
+
+@dataclass(frozen=True)
+class IncidentRecord(ContractMixin):
+    """Normalized reviewer/program/recovery/metadata incident metadata."""
+
+    incident_id: str
+    category: str
+    disposition: str
+    admissible: bool
+    item_id: str | None = None
+    scope: tuple[str, ...] = ()
+    source: str | None = None
+    facts: Mapping[str, Any] = field(default_factory=dict)
+
+    CATEGORIES: ClassVar[frozenset[str]] = frozenset(
+        {"reviewer_scope", "program", "recovery", "metadata"}
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "incident_id", _require(self.incident_id, "incident_id"))
+        category = _require(self.category, "category").lower().replace("-", "_").replace(" ", "_")
+        category = {
+            "review": "reviewer_scope",
+            "reviewer": "reviewer_scope",
+            "execution_recovery": "recovery",
+            "program_defect": "program",
+            "metadata_defect": "metadata",
+        }.get(category, category)
+        if category not in self.CATEGORIES:
+            raise ValueError(f"unsupported incident category: {category}")
+        object.__setattr__(self, "category", category)
+        object.__setattr__(self, "disposition", _require(self.disposition, "disposition"))
+        if not isinstance(self.admissible, bool):
+            raise TypeError("admissible must be a bool")
+        if self.item_id is not None:
+            object.__setattr__(self, "item_id", _require(self.item_id, "item_id"))
+        object.__setattr__(self, "scope", tuple(_require(value, "scope") for value in self.scope))
+        if self.source is not None:
+            object.__setattr__(self, "source", _require(self.source, "source"))
+        object.__setattr__(self, "facts", _freeze(self.facts))
+
+
+@dataclass(frozen=True)
+class ImplementationTransition(ContractMixin):
+    """Explicit implementation patch and resumable-run checkpoint facts."""
+
+    old_sha: str
+    new_sha: str
+    old_tree: str
+    new_tree: str
+    old_version: str
+    new_version: str
+    earliest_affected_item: str
+    preserved_accepted_hashes: Mapping[str, str]
+    unaffected_reason: str
+    resume_point: str
+    transition_id: str | None = None
+
+    def __post_init__(self) -> None:
+        sha_fields = ("old_sha", "new_sha", "old_tree", "new_tree")
+        for name in sha_fields:
+            value = _require(getattr(self, name), name).lower()
+            if len(value) != 40 or any(char not in "0123456789abcdef" for char in value):
+                raise ValueError(f"{name} must be exactly 40 lowercase hexadecimal characters")
+            object.__setattr__(self, name, value)
+        for name in ("old_version", "new_version", "earliest_affected_item", "unaffected_reason", "resume_point"):
+            object.__setattr__(self, name, _require(getattr(self, name), name))
+        preserved = dict(self.preserved_accepted_hashes or {})
+        for item_id, digest in preserved.items():
+            item_id = _require(item_id, "preserved accepted item_id")
+            digest = _require(digest, "preserved accepted hash").lower()
+            if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+                raise ValueError("preserved accepted hashes must be SHA-256 digests")
+        object.__setattr__(self, "preserved_accepted_hashes", MappingProxyType(dict(sorted(preserved.items()))))
+        if self.transition_id is not None:
+            object.__setattr__(self, "transition_id", _require(self.transition_id, "transition_id"))
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ImplementationTransition":
+        if not isinstance(data, Mapping):
+            raise TypeError("ImplementationTransition.from_dict expects a mapping")
+        return cls(**dict(data))
+
+
+@dataclass(frozen=True)
 class AggregationSpec(ContractMixin):
     operation: str
     value_field: str | None = None

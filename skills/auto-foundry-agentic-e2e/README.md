@@ -1,8 +1,8 @@
-# Auto Foundry Agentic E2E Skill v0.2.3
+# Auto Foundry Agentic E2E Skill v0.2.4
 
 `auto-foundry-agentic-e2e` is a natural, reviewed, offline-friendly workflow
 for turning supplied enterprise evidence into bounded answers and a traceable
-management dashboard prototype. The v0.2.3 contract is **Agent Workbench +
+management dashboard prototype. The v0.2.4 contract is **Agent Workbench +
 Durable Execution**: the program owns one data room/source catalog and one
 durable item workspace before analysis, while the Lead Analyst remains free to
 choose the useful analytical route.
@@ -13,9 +13,9 @@ Every run records:
 
 ```text
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.2.3
+skill_version: 0.2.4
 core_name: auto_foundry_core
-core_version: 0.3.0
+core_version: 0.3.1
 ```
 
 The normal program path is `RunContext` + `DataRoomWorkbench` +
@@ -23,6 +23,13 @@ The normal program path is `RunContext` + `DataRoomWorkbench` +
 available for deterministic operations. The program owns lifecycle,
 integration/product/optimizer transitions, strict freeze markers, and terminal
 state. Agents never hand-edit terminal state.
+
+The ontology remains a compact enterprise map of stable objects, identities,
+aliases, sources, documents, processes, definitions, rules, relationships,
+limitations, and reusable metric definitions. Current counts, shares,
+amounts, values, rankings, top-N rows, and dimensional observations remain
+accepted results, claims, dashboard facts, evidence, or prepared assets;
+`add_metric` records an observation and never promotes it into ontology.
 
 The run binds one physical source inventory. Initial archive/member hashes are
 counted once; bound child contexts reuse that inventory, selected-member reads
@@ -43,7 +50,8 @@ safe materialization and are never semantically parsed.
   return to the same attempt, while execution recovery requires a canonical
   persisted receipt reference/hash proving lane/provider/host/process loss and
   matching the active attempt and lane. The program then routes one
-  reviewer, allows at most one targeted business repair plus re-review, and
+  Independent Business Reviewer, allows at most one scoped business repair
+  plus targeted recheck, and
   writes immutable accepted answer bytes beside a separate acceptance envelope
   before continuing. It builds the dashboard after the complete queue and
   whole-run freeze.
@@ -87,7 +95,7 @@ Compact source/LEM/prepared indexes remain searchable and the Lead Analyst
 selects relevant IDs directly. Catalog capabilities may be recommended or
 used internally; custom reproducible code is allowed. There is no Portfolio
 Planner, Navigator, descriptor/typed-validation role, business-repair
-finalizer, reviewer-of-reviewer, manual terminalizer, or per-item
+  finalizer, reviewer-of-reviewer, manual terminalizer, or per-item
 catalog-compliance artifact.
 
 Prepared data is first a candidate written atomically below the current item's
@@ -97,9 +105,12 @@ from `PreparedAssetRegistry`. After acceptance, exactly one Result Integration
 Agent stages it and the commit validates exact path, hash, byte/row counts,
 scope, and provenance before registering it once. Scope is retained, exact
 retries are idempotent, and rejected or technical-failure items leave no
-accepted entry. Mechanical validation cannot prove semantic completeness;
-the live Integration Agent and an external test-only fidelity audit remain
-required.
+accepted entry. Mechanical validation cannot prove semantic completeness.
+Exactly one fresh, item-only Integration Fidelity Reviewer checks the staged
+candidate after mechanical validation and before commit; the same Result
+Integration Agent patches only affected records and receives one targeted
+recheck. Its packet excludes siblings, cumulative state, prior memory, and
+broad workspace context.
 
 When exact identity overlap is absent but same-object representations are
 materially plausible, the run records candidates, evidence/coverage, a
@@ -121,7 +132,7 @@ small program APIs for claims, metrics, limitations, evidence, prepared
 assets, ontology, relationships, and dashboard facts. It performs semantic
 mapping; deterministic code validates types, paths, refs, hashes, stages, and
 commits. There is no prose parser, semantic compiler, giant mandatory JSON,
-Integration Reviewer, or finalizer chain. The runner's explicit configurable
+second integration reviewer, or finalizer chain. The runner's explicit configurable
 default is a 3600-second process guard, not an agent reasoning or workflow
 wall-time deadline. Recovery accepts only a canonical persisted receipt
 reference/hash with the active attempt and lane; unpersisted or mismatched
@@ -135,6 +146,19 @@ reason classifier output is exactly `same_attempt_feedback`,
 `business_repair`, `execution_recovery`, `abort_and_new_clean_run`, or `null`;
 raw terminal reasons remain specific facts. It contains no raw rows and never
 controls routing.
+
+Phase timing is passive and separated for analyst/model work, controlled
+execution, business review, business repair, fidelity/integration review,
+integration commit, products, optimizer, reporting/finalization, and genuine
+recovery. Start, finish, and wall time come only from observed events; missing
+times and provider/model identities remain literal `null`/`unavailable`.
+Incident records are normalized and deduplicated so reviewer-scope, program,
+recovery, and metadata incidents enter cumulative reporting exactly once.
+Implementation transitions bind old/new SHA, tree, and version, earliest
+affected item, preserved accepted hashes, revalidation reason, and exact resume
+point. Finalization recomputes item outcomes/counts and atomically binds a
+report hash to a manifest and non-circular terminalization receipt; identical
+re-finalization is idempotent and stale/tampered inputs fail closed.
 
 ## Install and verify
 

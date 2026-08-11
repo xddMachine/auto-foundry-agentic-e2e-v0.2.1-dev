@@ -26,6 +26,80 @@ _FORBIDDEN_ONTOLOGY_KEYS = frozenset({
     "lifecycle_state", "run_state", "parser", "parser_metadata", "queue_state",
 })
 
+# Current analytical observations belong to the accepted answer/integration
+# records, never to the run-local ontology.  Keep this validator deliberately
+# mechanical: it rejects observation-shaped field names, but does not infer a
+# semantic meaning for otherwise valid definition fields.
+_OBSERVATION_KEY_FRAGMENTS = frozenset({
+    "value", "values", "count", "counts", "share", "shares", "percent",
+    "percentage", "amount", "amounts", "rank", "ranking", "top_n", "topn",
+    "dimension_values", "dimensional_values", "current_value", "current_count",
+    "current_amount", "current_share", "current_percent", "observation",
+    "observations", "row_values", "value_rows", "value_row", "dimensional_value_rows",
+    "current_observation", "amount_value", "percent_value", "rank_value",
+})
+_EXPORT_FIELDS = frozenset({
+    "run_id", "ontology", "ontology_index", "prepared_assets",
+    "canonical_mappings", "identity_decisions", "relationships", "knowledge",
+    "conflicts", "conflict_links", "supersession_links", "conflict_state",
+    "revisions",
+})
+
+
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(char in "0123456789abcdef" for char in value.lower())
+
+
+def _reject_observation_shape(value: Any, *, path: str = "ontology") -> None:
+    """Reject obvious current-observation payloads without semantic inference."""
+
+    if isinstance(value, Mapping):
+        if "evidence_hashes" in value:
+            evidence_hashes = value.get("evidence_hashes")
+            evidence_refs = value.get("evidence_refs")
+            if not isinstance(evidence_hashes, Mapping) or (evidence_refs is not None and set(evidence_hashes) != set(evidence_refs)):
+                raise ValueError(f"LEM export evidence refs/hashes do not match: {path}")
+        for raw_key, nested in value.items():
+            key = str(raw_key).strip().lower().replace("-", "_").replace(" ", "_")
+            if key in _OBSERVATION_KEY_FRAGMENTS or key.startswith("current_"):
+                raise ValueError(f"observation-shaped ontology field is not allowed: {path}.{raw_key}")
+            _reject_observation_shape(nested, path=f"{path}.{raw_key}")
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        for index, nested in enumerate(value):
+            _reject_observation_shape(nested, path=f"{path}[{index}]")
+
+
+def _validate_export_payload(value: Any, *, path: str = "export") -> None:
+    """Validate JSON-shaped export metadata before contract coercion.
+
+    Hash and evidence structures are checked at the boundary so a tampered
+    export cannot be silently normalized by a contract constructor.
+    """
+
+    if isinstance(value, Mapping):
+        for raw_key, nested in value.items():
+            if not isinstance(raw_key, str):
+                raise ValueError(f"LEM export keys must be strings: {path}")
+            key = raw_key.lower()
+            if "hash" in key and nested is not None:
+                if isinstance(nested, Mapping):
+                    for hash_key, hash_value in nested.items():
+                        if not _is_sha256(hash_value):
+                            raise ValueError(f"LEM export hash is invalid: {path}.{raw_key}.{hash_key}")
+                elif isinstance(nested, (list, tuple)):
+                    if any(not _is_sha256(item) for item in nested):
+                        raise ValueError(f"LEM export hash list is invalid: {path}.{raw_key}")
+                elif not _is_sha256(nested):
+                    raise ValueError(f"LEM export hash is invalid: {path}.{raw_key}")
+            if key in {"evidence_refs", "source_refs"} and not isinstance(nested, (list, tuple)):
+                raise ValueError(f"LEM export {raw_key} must be a list: {path}.{raw_key}")
+            _validate_export_payload(nested, path=f"{path}.{raw_key}")
+    elif isinstance(value, (list, tuple)):
+        for index, nested in enumerate(value):
+            _validate_export_payload(nested, path=f"{path}[{index}]")
+    elif isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"LEM export contains non-finite float: {path}")
+
 # Relevant bundles are bounded even when callers omit optional limits.  These
 # are deliberately conservative run-local defaults, not tunable policy.
 _DEFAULT_BUNDLE_LAYER_LIMIT = 256
@@ -217,6 +291,10 @@ class LivingEnterpriseModel:
         ]
 
     def add_ontology_item(self, item: OntologyItem | Mapping[str, Any]) -> OntologyItem:
+        if isinstance(item, OntologyItem):
+            _reject_observation_shape(item.to_dict())
+        else:
+            _reject_observation_shape(item)
         item = item if isinstance(item, OntologyItem) else OntologyItem.from_dict(_clean(item))
         if item.item_id in self.ontology:
             raise ValueError(f"ontology item already exists: {item.item_id}")
@@ -312,7 +390,15 @@ class LivingEnterpriseModel:
         return self.add_ontology_item(ontology_item)
 
     def add_metric(self, item: OntologyItem | Mapping[str, Any] | None = None, **values: Any) -> OntologyItem:
+        # ``add_metric`` remains the historical semantic helper.  Integration
+        # observations do not call it; stable reusable definitions should use
+        # ``add_metric_definition`` so their explicit ontology type is clear.
         return self._add_semantic_item("metric", item, **values)
+
+    def add_metric_definition(self, item: OntologyItem | Mapping[str, Any] | None = None, **values: Any) -> OntologyItem:
+        """Register one stable, reusable metric meaning in the ontology."""
+
+        return self._add_semantic_item("metric_definition", item, **values)
 
     def add_definition(self, item: OntologyItem | Mapping[str, Any] | None = None, **values: Any) -> OntologyItem:
         return self._add_semantic_item("definition", item, **values)
@@ -757,6 +843,202 @@ class LivingEnterpriseModel:
             "conflict_state": _export_value(self.conflict_state),
             "revisions": _export_value(self.revisions),
         }
+
+    @classmethod
+    def from_export(cls, exported: Mapping[str, Any]) -> "LivingEnterpriseModel":
+        """Strictly rehydrate an exported run-local model.
+
+        Rehydration is deliberately performed into a fresh model and compared
+        with its canonical export before the new instance is returned.  Any
+        shape, reference, hash, duplicate, or evidence tampering therefore
+        fails atomically without mutating an existing model.
+        """
+
+        if not isinstance(exported, Mapping) or set(exported) != _EXPORT_FIELDS:
+            raise ValueError("LEM export fields are invalid")
+        _validate_export_payload(exported)
+        run_id = exported.get("run_id")
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("LEM export run_id is invalid")
+
+        def require_list(name: str) -> list[Any]:
+            value = exported.get(name)
+            if not isinstance(value, list):
+                raise ValueError(f"LEM export {name} must be a list")
+            return value
+
+        candidate = cls(run_id=run_id)
+        try:
+            ontology_values = require_list("ontology")
+            for raw in ontology_values:
+                if not isinstance(raw, Mapping):
+                    raise ValueError("LEM export ontology item is invalid")
+                item = OntologyItem.from_dict(raw)
+                if item.item_id in candidate.ontology:
+                    raise ValueError(f"LEM export contains duplicate ontology item: {item.item_id}")
+                candidate.add_ontology_item(item)
+
+            prepared_values = require_list("prepared_assets")
+            for raw in prepared_values:
+                if not isinstance(raw, Mapping):
+                    raise ValueError("LEM export prepared asset is invalid")
+                asset = PreparedAssetDescriptor.from_dict(raw)
+                candidate.register_prepared_asset(asset)
+
+            decisions = require_list("identity_decisions")
+            for raw in decisions:
+                if not isinstance(raw, Mapping):
+                    raise ValueError("LEM export identity decision is invalid")
+                candidate.register_identity_decision(IdentityDecision.from_dict(raw))
+
+            mappings = require_list("canonical_mappings")
+            for raw in mappings:
+                if not isinstance(raw, Mapping):
+                    raise ValueError("LEM export canonical mapping is invalid")
+                candidate.add_mapping(CanonicalMapping.from_dict(raw))
+
+            relationships = exported.get("relationships")
+            if not isinstance(relationships, Mapping):
+                raise ValueError("LEM export relationships must be an object")
+            for raw_id, raw in relationships.items():
+                if not isinstance(raw, Mapping):
+                    raise ValueError("LEM export relationship is invalid")
+                relationship_id = str(raw.get("relationship_id", ""))
+                if relationship_id != str(raw_id):
+                    raise ValueError("LEM export relationship key does not match relationship_id")
+                source = raw.get("source_id", raw.get("source_item_id"))
+                target = raw.get("target_id", raw.get("target_item_id"))
+                if source is None or target is None or str(source) not in candidate.ontology or str(target) not in candidate.ontology:
+                    raise ValueError("LEM export relationship reference is invalid")
+                # ``export()`` contains both the relationship registry record
+                # and the generated relationship ontology item.  Ontology was
+                # loaded above, so reusing the public add operation here would
+                # falsely report a duplicate.  Reconstruct both layers
+                # explicitly while retaining collision checks.
+                relationship_item = candidate._semantic_payload(raw, "relationship")
+                existing_item = candidate.ontology.get(relationship_item.item_id)
+                if existing_item is None:
+                    candidate.add_ontology_item(relationship_item)
+                elif existing_item != relationship_item:
+                    raise ValueError(f"LEM export relationship ontology collision: {relationship_item.item_id}")
+                relationship_record = _clean(dict(raw))
+                relationship_record["relationship_id"] = relationship_id
+                existing_record = candidate.relationships.get(relationship_id)
+                if existing_record is not None and existing_record != relationship_record:
+                    raise ValueError(f"LEM export relationship collision: {relationship_id}")
+                candidate.relationships[relationship_id] = relationship_record
+
+            knowledge = exported.get("knowledge")
+            if not isinstance(knowledge, Mapping):
+                raise ValueError("LEM export knowledge must be an object")
+
+            def parse_knowledge_ref(raw_ref: Any, *, label: str) -> LEMRef:
+                if not isinstance(raw_ref, Mapping) or set(raw_ref) != {"namespace", "object_id"}:
+                    raise ValueError(f"LEM export {label} reference is invalid")
+                ref = LEMRef.from_dict(raw_ref)
+                if ref.to_dict() != dict(raw_ref):
+                    raise ValueError(f"LEM export {label} reference is invalid")
+                return ref
+
+            parsed_supersedes: dict[str, tuple[LEMRef, ...]] = {}
+            for raw_id, raw in knowledge.items():
+                if not isinstance(raw, Mapping) or str(raw_id) != str(raw.get("ref", {}).get("object_id", raw_id)):
+                    raise ValueError("LEM export knowledge record is invalid")
+                ref = raw.get("ref")
+                if not isinstance(ref, Mapping) or ref.get("namespace") != "knowledge_delta" or ref.get("object_id") != str(raw_id):
+                    raise ValueError("LEM export knowledge reference is invalid")
+                parse_knowledge_ref(ref, label="knowledge")
+                raw_supersedes = raw.get("supersedes", ())
+                if not isinstance(raw_supersedes, list):
+                    raise ValueError("LEM export knowledge supersedes links are invalid")
+                supersedes = tuple(parse_knowledge_ref(value, label="knowledge supersedes") for value in raw_supersedes)
+                if len({ref.to_dict()["namespace"] + "\0" + ref.object_id for ref in supersedes}) != len(supersedes):
+                    raise ValueError("LEM export knowledge supersedes links contain duplicates")
+                raw_superseded_by = raw.get("superseded_by", [])
+                if not isinstance(raw_superseded_by, list):
+                    raise ValueError("LEM export knowledge superseded_by links are invalid")
+                for value in raw_superseded_by:
+                    parse_knowledge_ref(value, label="knowledge superseded_by")
+                parsed_supersedes[str(raw_id)] = supersedes
+                candidate.knowledge[str(raw_id)] = _snapshot_value(dict(raw))
+
+            for name, target in (("conflicts", candidate.conflicts), ("revisions", candidate.revisions)):
+                values = require_list(name)
+                target.extend(_snapshot_value(value) for value in values)
+
+            for name in ("conflict_links", "supersession_links", "conflict_state"):
+                raw = exported.get(name)
+                if not isinstance(raw, Mapping):
+                    raise ValueError(f"LEM export {name} must be an object")
+                if name == "conflict_links":
+                    candidate.conflict_links = {str(key): set(value) if isinstance(value, (list, tuple, set, frozenset)) else set() for key, value in raw.items()}
+                elif name == "supersession_links":
+                    converted: dict[str, set[LEMRef]] = {}
+                    for key, values in raw.items():
+                        source_id = str(key)
+                        if source_id not in candidate.knowledge:
+                            raise ValueError("LEM export supersession link source is dangling")
+                        if not isinstance(values, (list, tuple, set, frozenset)):
+                            raise ValueError("LEM export supersession links are invalid")
+                        refs = tuple(parse_knowledge_ref(value, label="supersession") for value in values)
+                        if len({ref.to_dict()["namespace"] + "\0" + ref.object_id for ref in refs}) != len(refs):
+                            raise ValueError("LEM export supersession links contain duplicates")
+                        parsed = parsed_supersedes.get(source_id, ())
+                        if {
+                            (ref.namespace, ref.object_id) for ref in refs
+                        } != {
+                            (ref.namespace, ref.object_id) for ref in parsed
+                        }:
+                            raise ValueError("LEM export supersession link does not match knowledge record")
+                        converted[source_id] = set(refs)
+                    for source_id, refs in parsed_supersedes.items():
+                        if refs and source_id not in converted:
+                            raise ValueError("LEM export knowledge supersedes link is missing")
+                        registries = {
+                            "ontology": candidate.ontology,
+                            "prepared_asset": candidate.prepared_assets,
+                            "canonical_mapping": candidate.canonical_mappings,
+                            "knowledge_delta": candidate.knowledge,
+                        }
+                        for ref in refs:
+                            if ref.object_id not in registries[ref.namespace]:
+                                raise ValueError("LEM export supersession link target is dangling")
+                    for source_id, refs in converted.items():
+                        for ref in refs:
+                            if ref.object_id not in {
+                                "ontology": candidate.ontology,
+                                "prepared_asset": candidate.prepared_assets,
+                                "canonical_mapping": candidate.canonical_mappings,
+                                "knowledge_delta": candidate.knowledge,
+                            }[ref.namespace]:
+                                raise ValueError("LEM export supersession link target is dangling")
+                    for target_id, target_record in candidate.knowledge.items():
+                        reverse = {
+                            ("knowledge_delta", source_id)
+                            for source_id, refs in converted.items()
+                            if any(ref.namespace == "knowledge_delta" and ref.object_id == target_id for ref in refs)
+                        }
+                        raw_reverse = target_record.get("superseded_by", ())
+                        parsed_reverse = {
+                            (ref.namespace, ref.object_id)
+                            for ref in (parse_knowledge_ref(value, label="knowledge superseded_by") for value in raw_reverse)
+                        }
+                        if parsed_reverse != reverse:
+                            raise ValueError("LEM export superseded_by links do not match supersession links")
+                    candidate.supersession_links = converted
+                else:
+                    candidate.conflict_state = _snapshot_value(dict(raw))
+
+            if candidate.export() != dict(exported):
+                raise ValueError("LEM export does not round-trip canonically")
+        except Exception:
+            # ``candidate`` is private to this call; retaining this explicit
+            # atomic boundary documents that no caller-owned model is touched.
+            raise
+        return candidate
+
+    rehydrate = from_export
+    load_export = from_export
 
 
 __all__ = ["LivingEnterpriseModel"]

@@ -16,6 +16,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from auto_foundry_core import (
+    AcceptedAnalysisBundle,
     AcceptedSnapshot,
     BoundAnalysisContext,
     DataAssetRef,
@@ -26,6 +27,7 @@ from auto_foundry_core import (
     ITEM_STATE_SCHEMA,
     ItemWorkspace,
     LivingEnterpriseModel,
+    OntologyItem,
     RunContext,
 )
 from auto_foundry_core.telemetry import TelemetryRecorder
@@ -68,8 +70,8 @@ def test_complete_offline_workbench_and_durable_vertical_path(
         "RUN-WORKBENCH-VERTICAL",
         run_root,
         (input_root,),
-        core_version="0.3.0",
-        skill_version="0.2.3",
+        core_version="0.3.1",
+        skill_version="0.2.4",
     )
     telemetry = TelemetryRecorder(context=context)
 
@@ -205,13 +207,28 @@ def test_complete_offline_workbench_and_durable_vertical_path(
     item.write_draft({"answer": "bounded fixture summary", "refs": ["orders-prepared"]})
     assert item.observe_attempt(recovery.attempt_id).action == "continue"
     item.finish_attempt(recovery.attempt_id, status="completed")
-    item.record_review("repair_once", reviewer_ref="reviewer-1")
+    repair_review = item.record_review(
+        "repair_once",
+        reviewer_ref="reviewer-1",
+        findings=[
+            {
+                "finding_id": "F-WORKBENCH-ANSWER",
+                "message": "The bounded answer wording needs one targeted correction.",
+                "pointers": ["/answer"],
+            }
+        ],
+    )
+    assert repair_review["findings"][0]["pointers"] == ["/answer"]
+    assert repair_review["targeted_recheck"] is False
     item.use_business_repair()
     assert item.state["execution_recovery_count"] == 1
     assert item.state["business_repair_count"] == 1
 
     item.write_draft({"answer": "bounded fixture summary after repair", "refs": ["orders-prepared"]})
     review = item.record_review("accept", reviewer_ref="reviewer-2")
+    assert review["targeted_recheck"] is True
+    assert review["changed_pointers"] == ["/answer"]
+    assert json.loads(item.draft_root.read_text(encoding="utf-8"))["refs"] == ["orders-prepared"]
     reviewed_draft = item.draft_root.read_bytes()
     reviewed_draft_hash = hashlib.sha256(reviewed_draft).hexdigest()
     assert review["draft_hash"] == reviewed_draft_hash
@@ -263,10 +280,49 @@ def test_complete_offline_workbench_and_durable_vertical_path(
     # converges without mutating immutable accepted answer/envelope bytes.
     registry = bound.prepared_assets
     lem = LivingEnterpriseModel(run_id=context.run_id)
-    integration = IntegrationSession.create(context, item, lem, registry, "result-integration")
+    lem.add_ontology_item(
+        OntologyItem(
+            item_id="cumulative-secret",
+            item_type="entity",
+            label="CUMULATIVE LEM SENTINEL",
+        )
+    )
+    telemetry.record("sentinel", facts={"secret": "CUMULATIVE TELEMETRY SENTINEL"})
+    (run_root / "report-sentinel.json").write_text(
+        json.dumps({"secret": "CUMULATIVE REPORT SENTINEL"}, sort_keys=True),
+        encoding="utf-8",
+    )
+    integration = IntegrationSession.create(
+        context,
+        item,
+        lem,
+        registry,
+        "result-integration",
+        invocation_id="inv-Q-001",
+    )
     integration.register_prepared_asset(prepared_descriptor)
+    accepted_bundle = AcceptedAnalysisBundle.load(item)
     answer_before = (item.accepted_root / "answer_content.json").read_bytes()
     envelope_before = (item.accepted_root / "acceptance_envelope.json").read_bytes()
+    packet = integration.build_fidelity_packet()
+    packet_text = integration.fidelity_packet_path.read_text(encoding="utf-8")
+    assert packet.answer_content == json.loads(accepted_bundle.answer_content.decode("utf-8"))
+    assert packet.answer_content_bytes == accepted_bundle.answer_content
+    assert packet.acceptance_envelope == json.loads(envelope_before.decode("utf-8"))
+    assert packet.manifest == json.loads((item.accepted_root / "manifest.json").read_text(encoding="utf-8"))
+    assert packet.accepted_content_hash == accepted_bundle.content_hash
+    assert packet.accepted_manifest_hash == accepted_bundle.manifest_hash
+    for sentinel in (
+        "outside",
+        "CUMULATIVE LEM SENTINEL",
+        "CUMULATIVE TELEMETRY SENTINEL",
+        "CUMULATIVE REPORT SENTINEL",
+    ):
+        assert sentinel not in packet_text
+    integration.record_fidelity_review(
+        "accept",
+        checked_record_ids=tuple(record.record_id for record in integration.records),
+    )
     original_apply = integration._apply_lem_record
     raised = {"value": False}
 
@@ -290,9 +346,10 @@ def test_complete_offline_workbench_and_durable_vertical_path(
     assert (item.accepted_root / "acceptance_envelope.json").read_bytes() == envelope_before
 
 
-def test_run_context_defaults_to_core_v030(tmp_path: Path) -> None:
+def test_run_context_defaults_to_current_versions(tmp_path: Path) -> None:
     context = RunContext("RUN-DEFAULT-VERSION", tmp_path / "run")
-    assert context.core_version == "0.3.0"
+    assert context.core_version == "0.3.1"
+    assert context.skill_version == "0.2.4"
 
 
 def test_item_state_template_loads_through_durable_core(tmp_path: Path) -> None:
@@ -305,7 +362,7 @@ def test_item_state_template_loads_through_durable_core(tmp_path: Path) -> None:
     assert tuple(template) == tuple(ITEM_STATE_FIELDS)
     assert set(template) <= set(ITEM_STATE_SCHEMA["fields"])
 
-    context = RunContext("RUN-TEMPLATE", tmp_path / "run", core_version="0.3.0")
+    context = RunContext("RUN-TEMPLATE", tmp_path / "run", core_version="0.3.1", skill_version="0.2.4")
     item_root = context.resolve_run_path(Path("questions") / template["item_id"])
     (item_root / "work").mkdir(parents=True)
     state_path = item_root / "item_state.json"
