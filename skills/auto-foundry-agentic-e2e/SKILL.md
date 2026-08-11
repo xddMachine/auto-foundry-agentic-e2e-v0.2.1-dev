@@ -3,14 +3,14 @@ name: auto-foundry-agentic-e2e
 description: Runs a natural, reviewed, offline-friendly enterprise analysis workflow for supplied questions or analytics-only manager requirements using a program-owned data room, durable item workspaces, artifact progress, and run-local prepared assets.
 metadata:
   author: auto-foundry
-  version: "0.2.4"
+  version: "0.2.5"
   core_name: auto_foundry_core
-  core_version: "0.3.1"
+  core_version: "0.3.2"
   architecture: agent-workbench-durable-execution
   release: program-owned-data-room-and-durable-item-workspaces
 ---
 
-# Auto Foundry Agentic E2E — v0.2.4
+# Auto Foundry Agentic E2E — v0.2.5
 
 ## 0. Run identity and authority
 
@@ -19,9 +19,9 @@ program's run report/metadata and repeat them in the final run report:
 
 ```text
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.2.4
+skill_version: 0.2.5
 core_name: auto_foundry_core
-core_version: 0.3.1
+core_version: 0.3.2
 ```
 
 `run_state.json` is the lifecycle authority and contains exactly these nine
@@ -246,7 +246,9 @@ freeze, and Knowledge Delta application.
   business-result boundary, returns all material findings with exact
   JSON-pointer/artifact paths and dependent outputs, and performs the focused
   source-completeness and identity checks described below. One scoped repair
-  may change only those findings and dependencies before one targeted recheck.
+  may change only those findings and dependencies before one targeted recheck;
+  explicit dependent artifact roots and JSON fragments authorize their owning
+  artifact paths, while unrelated artifacts remain fail-closed.
 - **Result Integration Agent** is the one post-acceptance owner. It incrementally
   consumes program APIs for claims, metrics, limitations, evidence, prepared
   assets, ontology, relationships, and dashboard facts; deterministic program
@@ -382,8 +384,8 @@ context = RunContext(
     "RUN-example",
     run_root,
     (input_root,),
-    core_version="0.3.1",
-    skill_version="0.2.4",
+    core_version="0.3.2",
+    skill_version="0.2.5",
 )
 workbench = DataRoomWorkbench(context, archive_path)
 room = workbench.data_room
@@ -606,7 +608,7 @@ artifacts, or central/cross-run caches.
 - Do not auto-promote custom code or confuse the development-only evidence
   collector and later Optimization Agent with client business automation.
 
-This v0.2.4 contract describes the minimal Agent Workbench + Durable
+This v0.2.5 contract describes the minimal Agent Workbench + Durable
 Execution path. It is an offline-friendly contract, not a claim of host-level
 sandboxing, benchmark completion, or production hardening.
 

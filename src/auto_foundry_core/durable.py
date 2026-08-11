@@ -355,6 +355,43 @@ def _pointer_is_within(path: str, allowed: str) -> bool:
     return path == allowed or path.startswith(allowed.rstrip("/") + "/")
 
 
+def _artifact_scope_roots(packet: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return exact/descendant artifact roots from the reviewed scope.
+
+    ``allowed_dependencies`` may carry a JSON-fragment reference (for
+    example ``work/result.json#/metrics``), but artifact authorization is
+    path-based.  Pointer scopes remain handled separately by
+    ``_pointer_is_within``; only non-pointer dependencies contribute roots.
+    """
+
+    roots: set[str] = set()
+    for raw in (
+        *tuple(packet.get("allowed_artifact_paths", ())),
+        *tuple(packet.get("allowed_dependencies", ())),
+    ):
+        normalized = str(raw).replace("\\", "/")
+        if normalized.startswith("/"):
+            continue
+        root = normalized.split("#", 1)[0]
+        while root.startswith("./"):
+            root = root[2:]
+        root = root.rstrip("/")
+        if not root:
+            continue
+        if "*" in root:
+            raise ValueError("business repair artifact scope cannot use wildcard")
+        roots.add(root)
+    return tuple(sorted(roots))
+
+
+def _artifact_is_within(path: str, root: str) -> bool:
+    """Check exact/descendant run-relative artifact scope."""
+
+    normalized_path = str(path).replace("\\", "/")
+    normalized_root = str(root).replace("\\", "/").rstrip("/")
+    return normalized_path == normalized_root or normalized_path.startswith(normalized_root + "/")
+
+
 _INVOCATION_RECEIPT_REF_PREFIX = "telemetry/invocation_receipts.jsonl#"
 
 
@@ -1702,15 +1739,13 @@ class ItemWorkspace:
         allowed_dependencies = tuple(packet.get("allowed_dependencies", ()))
         if not (allowed_pointers or allowed_artifacts or allowed_dependencies):
             raise ValueError("business repair packet has no authorized scope")
+        artifact_roots = _artifact_scope_roots(packet)
         for pointer in (*changed_current, *changed_candidate):
             if not any(_pointer_is_within(pointer, allowed) for allowed in allowed_pointers):
                 raise ValueError(f"business repair changed pointer outside reviewed scope: {pointer}")
         if artifact_path is not None and str(artifact_path).replace("\\", "/") not in {_DRAFT_FILENAME, "work/" + _DRAFT_FILENAME}:
             normalized = str(artifact_path).replace("\\", "/")
-            if allowed_artifacts and not any(
-                normalized == allowed or normalized.startswith(allowed.rstrip("/") + "/")
-                for allowed in allowed_artifacts
-            ):
+            if not any(_artifact_is_within(normalized, root) for root in artifact_roots):
                 raise ValueError(f"business repair changed artifact outside reviewed scope: {normalized}")
         before_artifacts = dict(packet.get("before_artifact_hashes", {}))
         current_progress = self._artifact_progress(candidate_payload if candidate_payload is not None else None)
@@ -1718,14 +1753,10 @@ class ItemWorkspace:
             if path == _DRAFT_FILENAME:
                 continue
             if before_artifacts.get(path) != digest:
-                if not allowed_artifacts or not any(
-                    path == allowed or path.startswith(allowed.rstrip("/") + "/") for allowed in allowed_artifacts
-                ):
+                if not any(_artifact_is_within(path, root) for root in artifact_roots):
                     raise ValueError(f"business repair changed artifact outside reviewed scope: {path}")
         for path in set(before_artifacts) - set(current_progress.hashes):
-            if not allowed_artifacts or not any(
-                path == allowed or path.startswith(allowed.rstrip("/") + "/") for allowed in allowed_artifacts
-            ):
+            if not any(_artifact_is_within(path, root) for root in artifact_roots):
                 raise ValueError(f"business repair removed artifact outside reviewed scope: {path}")
         return packet
 

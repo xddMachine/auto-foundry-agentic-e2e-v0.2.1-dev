@@ -280,6 +280,60 @@ def test_repair_once_requires_structured_scope_and_targeted_review_failure_is_at
     assert review_path.read_bytes() == review_before
 
 
+def test_repair_scope_allows_dependency_mutation_removal_and_targeted_recheck(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    workspace.write_draft({"answer": "initial", "unrelated": "keep"})
+    workspace.write_handoff({"result": "initial"})
+    workspace.record_review(
+        "repair_once",
+        reviewer_ref="review-1",
+        findings=[
+            {
+                "finding_id": "F-DEPENDENCY",
+                "pointers": ["/answer"],
+                "dependent_outputs": ["work/handoff.json#/result", "work/findings.jsonl"],
+            }
+        ],
+    )
+    workspace.use_business_repair()
+
+    # A separate dependency remains available for mutation coverage.  Both
+    # public writers are explicitly dependency-scoped, even though the paths
+    # arrived through dependent_outputs rather than artifact_paths.
+    workspace.append_finding({"finding_id": "F-DEPENDENCY-REPAIRED", "support": "bounded"})
+
+    # Removal of an authorized dependency that existed at review time is also
+    # in scope.  The next draft write runs the scope check and must not reject
+    # the missing handoff.
+    (workspace.work_root / "handoff.json").unlink()
+    workspace.write_draft({"answer": "repaired", "unrelated": "keep"})
+
+    review = workspace.record_review("accept", reviewer_ref="review-2")
+    assert review["targeted_recheck"] is True
+    assert workspace.state["review"]["verdict"] == "accept"
+    assert json.loads(workspace.business_review_path.read_text(encoding="utf-8"))["targeted_recheck"] is True
+
+
+def test_repair_scope_rejects_unrelated_artifact_with_dependency_only_scope(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    workspace.write_draft({"answer": "initial"})
+    workspace.record_review(
+        "repair_once",
+        reviewer_ref="review-1",
+        findings=[
+            {
+                "finding_id": "F-DEPENDENCY",
+                "pointers": ["/answer"],
+                "dependent_outputs": ["work/handoff.json#/result"],
+            }
+        ],
+    )
+    workspace.use_business_repair()
+    with pytest.raises(ValueError, match="outside reviewed scope"):
+        workspace.write_open_issues({"unrelated": True})
+    assert not (workspace.work_root / "open_issues.json").exists()
+
+
 def test_unavailable_review_disclosure_can_be_accepted_with_limits(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     workspace.write_draft({"answer": "useful partial"})

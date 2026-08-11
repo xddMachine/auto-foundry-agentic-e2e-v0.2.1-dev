@@ -1,7 +1,7 @@
-# Auto Foundry Agentic E2E v0.2.4 / core v0.3.1
+# Auto Foundry Agentic E2E v0.2.5 / core v0.3.2
 
-This repository contains the v0.2.4 reviewed-analysis skill and the
-source-agnostic, deterministic `auto_foundry_core` v0.3.1 substrate. The
+This repository contains the v0.2.5 reviewed-analysis skill and the
+source-agnostic, deterministic `auto_foundry_core` v0.3.2 substrate. The
 deliverable is offline-friendly: the skill keeps a run-local data room, durable
 item workspaces, Living Enterprise Model, and reviewed outputs, while the core
 provides typed local operations, bounded catalog access, and durable artifact
@@ -51,6 +51,10 @@ Exactly one fresh, item-only Integration Fidelity Reviewer checks the staged
 candidate after mechanical validation and before commit; the same Result
 Integration Agent patches only affected records and receives one targeted
 recheck.
+
+Business repair scope honors explicit dependent artifact roots and JSON
+fragments by authorizing their owning artifact paths; unrelated artifact
+changes remain fail-closed.
 
 The ontology is a compact enterprise map of stable objects, identities,
 aliases, sources, documents, processes, definitions, rules, relationships,
@@ -109,7 +113,7 @@ The complete offline vertical proofs are
 `tests/integration/test_v023_normal_path.py`; together they use
 generic local fixtures, real workbench/durable/cache/telemetry/filesystem
 wiring, and no model or network call. When those proofs and the full offline
-suite pass, the candidate status is **v0.2.4 / core 0.3.1 — offline program
+suite pass, the candidate status is **v0.2.5 / core 0.3.2 — offline program
 validation complete for later Benchmark A**. Benchmark A remains prepared but
 unexecuted in this repository; no run is claimed here.
 

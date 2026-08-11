@@ -74,6 +74,10 @@ lane/provider/host/process loss and matching the active attempt/lane.
 Unpersisted or mismatched references fail closed. Filesystem no-progress alone yields `await_runtime` or
 `materialization_guidance`. Provider/model identity may be literal
 `unavailable`.
+
+The repair packet may authorize explicit dependent artifact roots and JSON
+fragments; these resolve to their owning artifact paths. Any unrelated artifact
+mutation remains fail-closed.
 If the issue remains, record the supported outcome and disclose the unresolved
 component. The program then validates and atomically applies the reviewed
 Knowledge Delta; custom question code does not apply it.

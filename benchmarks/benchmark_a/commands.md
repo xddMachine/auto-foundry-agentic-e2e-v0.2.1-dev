@@ -1,7 +1,7 @@
 # Benchmark A commands (PREPARE / LAUNCH LATER only)
 
 These commands document a later run. They were **not executed** while
-preparing v0.2.4/core v0.3.1, and no Benchmark A run root was created here.
+preparing v0.2.5/core v0.3.2, and no Benchmark A run root was created here.
 
 ## PREPARE (later)
 
@@ -36,9 +36,9 @@ read, reuse, copy, or import any prior run root, cache, script, prompt, answer,
 LEM, prepared registry, dashboard, or telemetry. Use exactly these markers in
 structured state and the final report:
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.2.4
+skill_version: 0.2.5
 core_name: auto_foundry_core
-core_version: 0.3.1
+core_version: 0.3.2
 
 Use the same immutable source ZIP and SHA-256 as the baseline:
 82e9c913bf437ac9e361d6890467a9aed9b1c6db9d887cfcf0cd659035a71ec2

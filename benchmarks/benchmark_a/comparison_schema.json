@@ -105,5 +105,5 @@
   },
   "question_order_hash_definition": "SHA-256 of UTF-8 bytes for canonical Q-###|<exact question> lines from questions.md joined by one newline and terminated by one newline.",
   "wall_time_contract": "Record only an observed end-to-end measurement from the run harness; otherwise use {status: unknown, observed: false}.",
-  "comparison_rule": "Do not compare runs unless source hash, question order, clean-room state, and v0.2.4/core0.3.1 markers match."
+  "comparison_rule": "Do not compare runs unless source hash, question order, clean-room state, and v0.2.5/core0.3.2 markers match."
 }

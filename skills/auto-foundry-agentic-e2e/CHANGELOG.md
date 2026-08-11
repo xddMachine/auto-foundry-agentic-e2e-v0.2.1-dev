@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.5 — Explicit dependent artifact repair scope
+
+Changed:
+
+- business repair scope now honors explicit dependent artifact roots and JSON
+  fragments while unrelated artifact changes remain fail-closed;
+- no compatibility layer was added; the current contract and package markers
+  move directly to skill `0.2.5` and core `0.3.2`.
+
 ## 0.2.4 — Resumable development-run contract
 
 Added:

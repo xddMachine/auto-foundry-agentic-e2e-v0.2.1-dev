@@ -27,9 +27,9 @@ At run start, record these exact release markers in program run metadata and
 the final report (the lifecycle `run_state.json` remains the exact nine-field
 authority schema):
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.2.4
+skill_version: 0.2.5
 core_name: auto_foundry_core
-core_version: 0.3.1
+core_version: 0.3.2
 
 Build one program-owned data room/source catalog from the supplied archive and
 member metadata. Keep the archive read-only. Process the questions in exactly
@@ -159,7 +159,7 @@ client-business automation.
 
 The offline tests should demonstrate:
 
-- v0.2.4 skill and v0.3.1 core markers in instructions and run metadata;
+- v0.2.5 skill and v0.3.2 core markers in instructions and run metadata;
 - one data room/source catalog, read-only raw archive, and bounded metadata;
 - one run-level physical inventory with passive operation counters, safe opaque
   materialization, and explicit final verification;

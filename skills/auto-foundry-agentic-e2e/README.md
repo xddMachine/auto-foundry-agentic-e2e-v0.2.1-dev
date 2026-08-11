@@ -1,8 +1,8 @@
-# Auto Foundry Agentic E2E Skill v0.2.4
+# Auto Foundry Agentic E2E Skill v0.2.5
 
 `auto-foundry-agentic-e2e` is a natural, reviewed, offline-friendly workflow
 for turning supplied enterprise evidence into bounded answers and a traceable
-management dashboard prototype. The v0.2.4 contract is **Agent Workbench +
+management dashboard prototype. The v0.2.5 contract is **Agent Workbench +
 Durable Execution**: the program owns one data room/source catalog and one
 durable item workspace before analysis, while the Lead Analyst remains free to
 choose the useful analytical route.
@@ -13,9 +13,9 @@ Every run records:
 
 ```text
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.2.4
+skill_version: 0.2.5
 core_name: auto_foundry_core
-core_version: 0.3.1
+core_version: 0.3.2
 ```
 
 The normal program path is `RunContext` + `DataRoomWorkbench` +
@@ -55,6 +55,10 @@ safe materialization and are never semantically parsed.
   writes immutable accepted answer bytes beside a separate acceptance envelope
   before continuing. It builds the dashboard after the complete queue and
   whole-run freeze.
+
+Repair scope honors explicit dependent artifact roots and JSON fragments by
+authorizing their owning artifact paths; changes to unrelated artifacts remain
+fail-closed.
 - **Requirement Mode** is analytics-only and keeps user-owned records and
   explicit priority semantics. It records original text, objective, expected
   analytical/visual outputs, internal and foundation dependencies, data/
