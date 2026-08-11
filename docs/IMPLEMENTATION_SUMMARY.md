@@ -2,7 +2,7 @@
 
 ## Architecture
 
-- `auto_foundry_core` v0.3.4 is a small, source-agnostic deterministic
+- `auto_foundry_core` v0.3.5 is a small, source-agnostic deterministic
   substrate with typed contracts, local source/profile/normalization,
   identity/relationship/population/aggregation operations, artifact and cache
   boundaries, telemetry, a Living Enterprise Model, a capability catalog, a
@@ -17,7 +17,7 @@
   capability, records an `OperationReceipt`, and emits passive telemetry. Its
   `CoreExecutionResult` carries the value, receipt, and cache status. The
   deprecated mutable `Workspace` facade is removed.
-- `auto-foundry-agentic-e2e` v0.2.7 is a natural reviewed workflow with
+- `auto-foundry-agentic-e2e` v0.2.8 is a natural reviewed workflow with
   Question and analytics-only Requirement modes, progressive run-local LEM
   layers, exact-ID evidence selection, review routing, clean-room controls,
   passive telemetry, and reviewed-output-only products.
@@ -40,7 +40,7 @@
   automation is rejected. A separate fresh Optimization Agent is described
   but is not invoked by this helper; collection failure is non-blocking.
 - `analysis.py`, `integration.py`, `lifecycle.py`, `prepared.py`, and
-  `product_contracts.py` provide the current v0.3.4 public runtime,
+  `product_contracts.py` provide the current v0.3.5 public runtime,
   integration, registry, receipt, and strict product contracts. Accepted
   answer bytes remain immutable and separate from `acceptance_envelope.json`;
   integration commits are under each item's `integration/committed/` path.
@@ -49,7 +49,7 @@
 
 `tests/integration/test_vertical_acceptance.py` remains the broader closure
 proof for source/runtime/LEM/product behavior. The companion
-`tests/integration/test_workbench_durable_vertical.py` proves the normal v0.2.7
+`tests/integration/test_workbench_durable_vertical.py` proves the normal v0.2.8
 program path with a safe generic ZIP: catalog/search/read, item-local
 candidate staging before acceptance, accepted-only Result Integration commit,
 workspace creation before an attempt, exact-receipt execution recovery, a
@@ -87,6 +87,16 @@ audit, and anchored heads recover process loss under journal → run → item lo
 order without ZIP/member reads, catalog rebuilds, counter changes, false
 telemetry, new analysis, or raw reads. Active attempt/review/terminal/accepted
 state is rejected, and invalid reviewer packets must be discarded first.
+
+For later or multi-hop items, `BoundAnalysisContext.create_from_transitioned_catalog(...)`
+creates immutable source inheritance rather than a synthetic transition. It
+reuses the original source/catalog/stat/inventory identity with no ZIP/member
+discovery, catalog rebuild, inventory-counter change, or raw read. Recursive
+upstream provenance is validated under inherited journals oldest first → target
+inheritance journal → run → lexical source/target item locks. Target
+intent/manifest/record/state phases recover idempotently after a crash and no
+synthetic target transition audit is written. `earliest_affected_item` is a
+lower bound that covers later items only.
 
 Two concrete integration defects found by this proof are fixed: contract
 hashing now uses `to_dict()` before `dataclasses.asdict()` (mapping proxies are
@@ -128,7 +138,7 @@ tampering or stale counts.
 ## Release candidate boundary
 
 When the vertical proofs and full offline suite pass, the status is
-**v0.2.7 / core 0.3.4 — offline program validation complete for later Benchmark A**. Benchmark A
+**v0.2.8 / core 0.3.5 — offline program validation complete for later Benchmark A**. Benchmark A
 remains prepared and unexecuted. This is an experimental release candidate, not
 a production-hardened sandbox. A Coding Agent with unrestricted host
 shell/filesystem access cannot

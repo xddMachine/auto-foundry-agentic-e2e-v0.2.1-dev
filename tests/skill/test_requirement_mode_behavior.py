@@ -112,7 +112,7 @@ def test_business_repair_finding_is_pointer_scoped_and_fidelity_review_is_item_o
 
 def test_result_integration_agent_is_single_owner_and_catalog_scope_is_visibility_only() -> None:
     agent = ResultIntegrationAgent()
-    asset = PreparedAsset("asset-1", "b" * 64, "0.3.4", "fixture-v1", "source")
+    asset = PreparedAsset("asset-1", "b" * 64, "0.3.5", "fixture-v1", "source")
     receipt = agent.integrate(
         claims=("claim",),
         metrics=("metric",),

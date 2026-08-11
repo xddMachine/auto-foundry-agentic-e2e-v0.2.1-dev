@@ -89,6 +89,14 @@
   of no ZIP/member reads, catalog rebuild, counters, false telemetry, new
   analysis, or raw reads. Reject active review/attempt/terminal/accepted
   state; discard an invalid reviewer packet first.
+- Later-item catalog inheritance (when applicable):
+  `BoundAnalysisContext.create_from_transitioned_catalog(...)`, immutable
+  source inheritance rather than a synthetic transition, original
+  source/catalog/stat/inventory identity, recursive upstream provenance,
+  inherited-journal → target-journal → run → lexical item lock order, durable
+  target intent/manifest/record/state recovery, no ZIP/member reads, catalog
+  rebuild, counters, raw reads, or synthetic target transition audit, and the
+  `earliest_affected_item` lower-bound check.
 - Final outcome:
 - Accepted answer bytes (immutable ref/hash):
 - Acceptance envelope (program-owned ref/hash/lifecycle):

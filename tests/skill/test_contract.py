@@ -1,4 +1,4 @@
-"""Offline contract checks for the v0.2.7 Agent Workbench skill tree.
+"""Offline contract checks for the v0.2.8 Agent Workbench skill tree.
 
 These tests intentionally inspect owned text and templates only. Core loading
 of the item-state template is covered by the offline integration vertical;
@@ -46,19 +46,19 @@ def _owned_text() -> str:
     return "\n".join(_read(path) for path in OWNED_MARKDOWN + OWNED_JSON)
 
 
-def test_frontmatter_and_run_markers_are_v027() -> None:
+def test_frontmatter_and_run_markers_are_v028() -> None:
     skill = _read(SKILL / "SKILL.md")
     assert skill.startswith("---\n")
     frontmatter = skill.split("---\n", 2)[1]
     assert "name: auto-foundry-agentic-e2e" in frontmatter
-    assert 'version: "0.2.7"' in frontmatter
+    assert 'version: "0.2.8"' in frontmatter
     assert "core_name: auto_foundry_core" in frontmatter
-    assert 'core_version: "0.3.4"' in frontmatter
+    assert 'core_version: "0.3.5"' in frontmatter
     for marker in (
         "skill_name: auto-foundry-agentic-e2e",
-        "skill_version: 0.2.7",
+        "skill_version: 0.2.8",
         "core_name: auto_foundry_core",
-        "core_version: 0.3.4",
+        "core_version: 0.3.5",
     ):
         assert marker in skill
     assert "Agent Workbench" in skill

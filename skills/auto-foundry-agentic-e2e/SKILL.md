@@ -3,14 +3,14 @@ name: auto-foundry-agentic-e2e
 description: Runs a natural, reviewed, offline-friendly enterprise analysis workflow for supplied questions or analytics-only manager requirements using a program-owned data room, durable item workspaces, artifact progress, and run-local prepared assets.
 metadata:
   author: auto-foundry
-  version: "0.2.7"
+  version: "0.2.8"
   core_name: auto_foundry_core
-  core_version: "0.3.4"
+  core_version: "0.3.5"
   architecture: agent-workbench-durable-execution
   release: program-owned-data-room-and-durable-item-workspaces
 ---
 
-# Auto Foundry Agentic E2E — v0.2.7
+# Auto Foundry Agentic E2E — v0.2.8
 
 ## 0. Run identity and authority
 
@@ -19,9 +19,9 @@ program's run report/metadata and repeat them in the final run report:
 
 ```text
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.2.7
+skill_version: 0.2.8
 core_name: auto_foundry_core
-core_version: 0.3.4
+core_version: 0.3.5
 ```
 
 `run_state.json` is the lifecycle authority and contains exactly these nine
@@ -384,8 +384,8 @@ context = RunContext(
     "RUN-example",
     run_root,
     (input_root,),
-    core_version="0.3.4",
-    skill_version="0.2.7",
+    core_version="0.3.5",
+    skill_version="0.2.8",
 )
 workbench = DataRoomWorkbench(context, archive_path)
 room = workbench.data_room
@@ -491,6 +491,30 @@ review boundary. Rebind requires no active attempt, review packet or reviewed
 state, terminal intent/outcome, accepted snapshot, or terminal lifecycle;
 discard an invalid reviewer packet first. It never creates a new item,
 analysis, catalog, raw read, or compatibility fallback.
+
+### Later-item catalog inheritance
+
+For a later item, call only
+`BoundAnalysisContext.create_from_transitioned_catalog(context,
+item_workspace, source_context, lifecycle)`. This creates immutable source
+inheritance, not a synthetic implementation transition: the target manifest
+records the source manifest, catalog, source-stat signature, physical
+inventory, and recursive provenance while retaining the original catalog
+implementation identity. The target gets the requested current context
+identity, but no ZIP/member discovery, catalog rebuild, inventory-counter
+increment, or source read is allowed. A target must be a clean work item and
+the source must be terminal or context-stable; the source must precede the
+target in the authoritative lifecycle.
+
+For multi-hop Q2/Q3 inheritance, validate every upstream source recursively
+before touching target bytes. Acquire inherited source journals oldest first,
+then the target inheritance journal, the run lifecycle lock, and source/target
+item state locks in lexical order. The target intent, manifest, inheritance
+record, and anchored state are durable publication phases; a crash reconciles
+the same intent idempotently and an exact retry preserves bytes. No synthetic
+target transition audit is written. `earliest_affected_item` is a lower bound:
+a transition affecting an earlier item covers later items, but an item before
+that lower bound is rejected.
 
 ## 9. Final products and dashboard prototype
 
@@ -646,7 +670,7 @@ artifacts, or central/cross-run caches.
 - Do not auto-promote custom code or confuse the development-only evidence
   collector and later Optimization Agent with client business automation.
 
-This v0.2.7 contract describes the minimal Agent Workbench + Durable
+This v0.2.8 contract describes the minimal Agent Workbench + Durable
 Execution path. It is an offline-friendly contract, not a claim of host-level
 sandboxing, benchmark completion, or production hardening.
 

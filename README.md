@@ -1,7 +1,7 @@
-# Auto Foundry Agentic E2E v0.2.7 / core v0.3.4
+# Auto Foundry Agentic E2E v0.2.8 / core v0.3.5
 
-This repository contains the v0.2.7 reviewed-analysis skill and the
-source-agnostic, deterministic `auto_foundry_core` v0.3.4 substrate. The
+This repository contains the v0.2.8 reviewed-analysis skill and the
+source-agnostic, deterministic `auto_foundry_core` v0.3.5 substrate. The
 deliverable is offline-friendly: the skill keeps a run-local data room, durable
 item workspaces, Living Enterprise Model, and reviewed outputs, while the core
 provides typed local operations, bounded catalog access, and durable artifact
@@ -71,6 +71,17 @@ changes identity only, rejects active review/attempt/terminal/accepted state,
 requires invalid review discard first, and performs no ZIP/raw reads, catalog
 rebuild, inventory-counter change, false telemetry, or new analysis.
 
+Later or multi-hop items use only
+`BoundAnalysisContext.create_from_transitioned_catalog(...)`. This is immutable
+source inheritance, not a synthetic transition: the original source/catalog/
+stat/inventory identity is reused without ZIP/member discovery, catalog
+rebuild, inventory counters, or source reads. Recursive upstream provenance is
+validated under inherited journals oldest first → target inheritance journal →
+run → lexical source/target item locks; target intent/manifest/record/state
+reconcile idempotently after a crash. No synthetic target transition audit is
+created. `earliest_affected_item` is a lower bound, so later items are covered
+and an earlier target is rejected.
+
 The ontology is a compact enterprise map of stable objects, identities,
 aliases, sources, documents, processes, definitions, rules, relationships,
 limitations, and reusable metric definitions. Current counts, shares, amounts,
@@ -128,7 +139,7 @@ The complete offline vertical proofs are
 `tests/integration/test_v023_normal_path.py`; together they use
 generic local fixtures, real workbench/durable/cache/telemetry/filesystem
 wiring, and no model or network call. When those proofs and the full offline
-suite pass, the candidate status is **v0.2.7 / core 0.3.4 — offline program
+suite pass, the candidate status is **v0.2.8 / core 0.3.5 — offline program
 validation complete for later Benchmark A**. Benchmark A remains prepared but
 unexecuted in this repository; no run is claimed here.
 

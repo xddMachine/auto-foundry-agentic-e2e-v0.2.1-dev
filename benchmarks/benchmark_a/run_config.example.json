@@ -1,9 +1,9 @@
 {
   "benchmark_id": "benchmark-a",
   "skill_name": "auto-foundry-agentic-e2e",
-  "skill_version": "0.2.7",
+  "skill_version": "0.2.8",
   "core_name": "auto_foundry_core",
-  "core_version": "0.3.4",
+  "core_version": "0.3.5",
   "run_root": "REPLACE_WITH_NEW_EMPTY_RUN_ROOT",
   "source_zip": "/Users/fedorlebedev/Desktop/gen/08_final_release/01_ai_input_levels/level_4_full_dirty_dataset_with_pdfs_policies 2.zip",
   "source_sha256": "82e9c913bf437ac9e361d6890467a9aed9b1c6db9d887cfcf0cd659035a71ec2",

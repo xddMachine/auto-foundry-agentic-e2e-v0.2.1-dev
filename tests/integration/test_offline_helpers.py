@@ -318,7 +318,7 @@ def test_benchmark_a_is_preparation_only_and_launch_has_no_extra_step() -> None:
     assert "explicit confirmation" not in commands.lower()
     assert "analysis_call" not in (BENCHMARK / "run_config.example.json").read_text(encoding="utf-8")
     assert expected_question_hash in commands
-    for marker in ("skill_name: auto-foundry-agentic-e2e", "skill_version: 0.2.7", "core_name: auto_foundry_core", "core_version: 0.3.4"):
+    for marker in ("skill_name: auto-foundry-agentic-e2e", "skill_version: 0.2.8", "core_name: auto_foundry_core", "core_version: 0.3.5"):
         assert marker in commands
     assert "82e9c913bf437ac9e361d6890467a9aed9b1c6db9d887cfcf0cd659035a71ec2" in commands
 
@@ -331,8 +331,8 @@ def test_release_validator_rejects_stale_core_source_bytes(tmp_path: Path) -> No
         for name, payload in source_files.items():
             archive.writestr(name, payload + (b"\n" if name.endswith("/durable.py") else b""))
         archive.writestr(
-            "auto_foundry_core-0.3.4.dist-info/METADATA",
-            "Metadata-Version: 2.1\nName: auto_foundry_core\nVersion: 0.3.4\n",
+            "auto_foundry_core-0.3.5.dist-info/METADATA",
+            "Metadata-Version: 2.1\nName: auto_foundry_core\nVersion: 0.3.5\n",
         )
     with pytest.raises(ValueError, match="wheel source byte mismatch"):
         release_validator._validate_wheel(wheel_path, source_root)

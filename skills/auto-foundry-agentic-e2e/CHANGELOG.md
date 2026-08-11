@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.8 — Later-item catalog inheritance
+
+Changed:
+
+- current package markers move directly to skill `0.2.8` and core `0.3.5`;
+- public `BoundAnalysisContext.create_from_transitioned_catalog(...)` now
+  documents immutable source inheritance for later and multi-hop items rather
+  than synthetic transitions, preserving original source/catalog/stat/
+  inventory identity without ZIP/member reads, catalog rebuilds, counters, or
+  raw-source reads;
+- recursive upstream provenance uses inherited journals oldest first, then the
+  target journal, run lifecycle, and lexical source/target item locks;
+- target intent/manifest/inheritance-record/state phases recover idempotently
+  after a crash, exact retries emit no synthetic target transition audit, and
+  `earliest_affected_item` remains a lower bound for later items.
+
 ## 0.2.7 — Resumable implementation-context transitions
 
 Changed:

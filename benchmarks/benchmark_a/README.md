@@ -1,7 +1,7 @@
-# Benchmark A — v0.2.7/core v0.3.4 preparation package
+# Benchmark A — v0.2.8/core v0.3.5 preparation package
 
-Benchmark A is prepared for a later, controlled comparison of the v0.2.7
-skill and `auto_foundry_core` v0.3.4 against the recorded v0.2.0 baseline. It
+Benchmark A is prepared for a later, controlled comparison of the v0.2.8
+skill and `auto_foundry_core` v0.3.5 against the recorded v0.2.0 baseline. It
 is not an analytical result and it was not executed in this deliverable.
 
 This directory intentionally contains only the preparation contract:

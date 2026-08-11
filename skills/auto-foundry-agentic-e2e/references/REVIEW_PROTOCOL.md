@@ -105,6 +105,20 @@ commit/discard as well, so rebind cannot cross a half-written review packet.
 Reject any active attempt/review/terminal/accepted state; discard an invalid
 review packet before rebinding.
 
+### Later-item catalog inheritance
+
+Use only `BoundAnalysisContext.create_from_transitioned_catalog(...)` for a
+later or multi-hop item. This is immutable source inheritance, not a synthetic
+transition: preserve the original source/catalog/source-stat/inventory
+identity and perform no ZIP/member discovery, catalog rebuild, inventory
+counter update, or raw-source read. Validate recursive upstream provenance
+before target bytes are touched. Acquire inherited journals oldest first, then
+the target inheritance journal, run lifecycle, and source/target item locks in
+lexical order. Target intent, manifest, inheritance record, and anchored state
+form durable phases that reconcile idempotently after a crash; an exact retry
+must not emit a synthetic target transition audit. `earliest_affected_item` is
+a lower bound, covering later items while rejecting an earlier target.
+
 The repair packet may authorize explicit dependent artifact roots and JSON
 fragments; these resolve to their owning artifact paths. Any unrelated artifact
 mutation remains fail-closed.

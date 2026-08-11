@@ -27,9 +27,9 @@ At run start, record these exact release markers in program run metadata and
 the final report (the lifecycle `run_state.json` remains the exact nine-field
 authority schema):
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.2.7
+skill_version: 0.2.8
 core_name: auto_foundry_core
-core_version: 0.3.4
+core_version: 0.3.5
 
 Build one program-owned data room/source catalog from the supplied archive and
 member metadata. Keep the archive read-only. Process the questions in exactly
@@ -88,6 +88,16 @@ lock order. Rebind is invalid while an attempt, review packet/reviewed state,
 terminal intent/outcome, accepted snapshot, or terminal lifecycle exists;
 discard an invalid reviewer packet first. The shared item state-transition
 lock must serialize reviewer packet atomicity with rebind.
+
+For a later item, call `BoundAnalysisContext.create_from_transitioned_catalog`
+from the current source context. Verify immutable source inheritance rather
+than a synthetic transition: the original catalog/source/stat/inventory is
+reused with no ZIP/member reads, catalog rebuild, inventory counters, or raw
+source reads. Exercise recursive Q2/Q3 provenance, oldest-upstream journal →
+target journal → run → lexical source/target item lock order, and target
+intent/manifest/record/state crash recovery. Retries must be byte-identical
+and emit no synthetic target transition audit. Treat
+`earliest_affected_item` as a lower bound; reject a target before it.
 
 Record separate observed phase timing for analyst/model work, controlled
 execution, business review, business repair, fidelity/integration review,
@@ -179,7 +189,7 @@ client-business automation.
 
 The offline tests should demonstrate:
 
-- v0.2.7 skill and v0.3.4 core markers in instructions and run metadata;
+- v0.2.8 skill and v0.3.5 core markers in instructions and run metadata;
 - one data room/source catalog, read-only raw archive, and bounded metadata;
 - one run-level physical inventory with passive operation counters, safe opaque
   materialization, and explicit final verification;

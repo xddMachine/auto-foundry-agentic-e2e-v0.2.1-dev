@@ -1,4 +1,4 @@
-# `auto_foundry_core` 0.3.4
+# `auto_foundry_core` 0.3.5
 
 `auto_foundry_core` is a small offline, source-agnostic deterministic substrate
 for local analytics and durable item execution. It is intentionally not an
@@ -75,6 +75,14 @@ adapters, or cross-run state.
   → item lock order; active attempt/review/terminal/accepted state is rejected
   (discard an invalid review first), and no ZIP/raw reads, catalog rebuild,
   inventory counters, false telemetry, or new analysis occur.
+- `BoundAnalysisContext.create_from_transitioned_catalog(...)` creates a later
+  or multi-hop item by immutable source inheritance, not a synthetic
+  transition. It reuses the original source/catalog/stat/inventory identity
+  without ZIP/member discovery, catalog rebuild, inventory counters, or raw
+  reads. Recursive upstream provenance is checked under inherited journals
+  oldest first → target inheritance journal → run → lexical source/target item
+  locks; target intent/manifest/record/state recovery is idempotent and emits
+  no synthetic transition audit. `earliest_affected_item` is a lower bound.
 - `lifecycle.py` owns run-level `RunLifecycle` transitions, durable
   `AgentInvocationReceipt` ledgers, and explicit implementation transitions;
   `product_contracts.py` owns exact nested `freeze_markers` and singular
@@ -155,7 +163,7 @@ candidate-to-accepted prepared registration, lifecycle barriers, strict
 product markers, physical-inventory counters, safe opaque materialization,
 and optimizer evidence. All fixtures use no model or network call.
 
-The candidate is labelled **v0.2.7 / core 0.3.4 — offline program validation
+The candidate is labelled **v0.2.8 / core 0.3.5 — offline program validation
 complete for later Benchmark A** only when these vertical proofs and the full
 offline suite pass. Benchmark A is not run here.
 This remains an experimental release candidate, not a production-hardened

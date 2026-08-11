@@ -6,7 +6,7 @@ preparing this package.
 - [ ] Confirm a new, empty run root exists and no sibling run/cache/artifact is
       readable or reused.
 - [ ] Confirm the exact skill/core markers are present in structured state and
-      final report: skill `0.2.7`, core `0.3.4`.
+      final report: skill `0.2.8`, core `0.3.5`.
 - [ ] Confirm the source ZIP path and SHA-256 exactly match the baseline and
       the source remains read-only.
 - [ ] Confirm the canonical question-order SHA-256 is

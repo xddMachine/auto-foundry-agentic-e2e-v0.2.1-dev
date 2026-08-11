@@ -1,8 +1,8 @@
-# Auto Foundry Agentic E2E Skill v0.2.7
+# Auto Foundry Agentic E2E Skill v0.2.8
 
 `auto-foundry-agentic-e2e` is a natural, reviewed, offline-friendly workflow
 for turning supplied enterprise evidence into bounded answers and a traceable
-management dashboard prototype. The v0.2.7 contract is **Agent Workbench +
+management dashboard prototype. The v0.2.8 contract is **Agent Workbench +
 Durable Execution**: the program owns one data room/source catalog and one
 durable item workspace before analysis, while the Lead Analyst remains free to
 choose the useful analytical route.
@@ -13,9 +13,9 @@ Every run records:
 
 ```text
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.2.7
+skill_version: 0.2.8
 core_name: auto_foundry_core
-core_version: 0.3.4
+core_version: 0.3.5
 ```
 
 The normal program path is `RunContext` + `DataRoomWorkbench` +
@@ -79,6 +79,18 @@ packet commit/discard. Rebind requires no active attempt/review, terminal or
 accepted state; discard an invalid review first. It performs no ZIP/member or
 raw-source reads, catalog rebuild, inventory-counter increment, or new
 analysis.
+
+For a later or multi-hop item, use only
+`BoundAnalysisContext.create_from_transitioned_catalog(...)`. This is
+immutable source inheritance, not a synthetic transition: the target reuses
+the original source/catalog/stat/inventory identity and performs no ZIP/member
+discovery, catalog rebuild, inventory-counter increment, or source read.
+Recursive upstream provenance is checked before target publication. Locks are
+ordered as inherited journals oldest first → target inheritance journal → run
+lifecycle → source/target item state (lexical item order). Target intent,
+manifest, inheritance record, and state recover idempotently after a crash;
+retry writes no synthetic transition audit. `earliest_affected_item` is a
+lower bound, so later items are covered while an earlier target is rejected.
 - **Requirement Mode** is analytics-only and keeps user-owned records and
   explicit priority semantics. It records original text, objective, expected
   analytical/visual outputs, internal and foundation dependencies, data/

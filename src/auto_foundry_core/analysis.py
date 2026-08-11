@@ -14,7 +14,8 @@ isolation outside this package.
 from __future__ import annotations
 
 import ast
-from contextlib import contextmanager
+import base64
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
@@ -54,6 +55,9 @@ _TRANSITION_AUDIT_FILENAME = "analysis_context_transitions.jsonl"
 _TRANSITION_STATE_FILENAME = "analysis_context_transition_state.json"
 _TRANSITION_INTENT_FILENAME = "analysis_context_transition_intent.json"
 _TRANSITION_LOCK_FILENAME = "analysis_context_transition.lock"
+_INHERITANCE_FILENAME = "analysis_context_inheritance.json"
+_INHERITANCE_STATE_FILENAME = "analysis_context_inheritance_state.json"
+_INHERITANCE_INTENT_FILENAME = "analysis_context_inheritance_intent.json"
 _TRANSITION_AUDIT_FIELDS = frozenset(
     {
         "record_kind",
@@ -99,6 +103,69 @@ _TRANSITION_INTENT_FIELDS = frozenset(
         "before_audit_count",
         "before_audit_head",
         "expected_audit",
+        "candidate_manifest",
+        "phase",
+        "intent_hash",
+    }
+)
+_INHERITANCE_RECORD_FIELDS = frozenset(
+    {
+        "record_kind",
+        "schema_version",
+        "run_id",
+        "target_item_id",
+        "source_item_id",
+        "source_manifest_path",
+        "source_manifest_bytes",
+        "source_manifest_hash",
+        "source_core_version",
+        "source_skill_version",
+        "source_implementation_sha",
+        "source_implementation_tree",
+        "source_state_mode",
+        "source_transition_audit_count",
+        "source_transition_audit_head",
+        "source_transition_audit_hash",
+        "source_transition_state_hash",
+        "source_transition_state_file_hash",
+        "source_transition_intent_path",
+        "source_transition_intent_bytes",
+        "source_transition_intent_hash",
+        "catalog_origin",
+        "physical_inventory",
+        "expected_old_pair",
+        "expected_current_pair",
+        "expected_current_sha",
+        "expected_current_tree",
+        "lifecycle_transition_ids",
+        "lifecycle_transition_hashes",
+        "lifecycle_transition_head",
+        "lifecycle_transition_chain_hash",
+        "record_hash",
+    }
+)
+_INHERITANCE_STATE_FIELDS = frozenset(
+    {
+        "record_kind",
+        "run_id",
+        "item_id",
+        "record_path",
+        "inheritance_count",
+        "inheritance_head",
+        "manifest_file_hash",
+        "state_hash",
+    }
+)
+_INHERITANCE_INTENT_FIELDS = frozenset(
+    {
+        "record_kind",
+        "operation_id",
+        "run_id",
+        "item_id",
+        "record_path",
+        "state_path",
+        "after_manifest_hash",
+        "expected_record",
         "candidate_manifest",
         "phase",
         "intent_hash",
@@ -258,6 +325,15 @@ def _transition_paths(manifest_path: Path) -> tuple[Path, Path, Path]:
     )
 
 
+def _inheritance_paths(manifest_path: Path) -> tuple[Path, Path, Path]:
+    root = manifest_path.parent
+    return (
+        root / _INHERITANCE_FILENAME,
+        root / _INHERITANCE_STATE_FILENAME,
+        root / _INHERITANCE_INTENT_FILENAME,
+    )
+
+
 @contextmanager
 def _transition_lock(manifest_path: Path):
     """Serialize context transition reconciliation and publication."""
@@ -335,6 +411,758 @@ def _read_transition_audit(path: Path, *, run_id: str, item_id: str) -> list[dic
     return records
 
 
+def _implementation_version_pair(value: str) -> tuple[str, str]:
+    """Normalize one persisted ``skillX/coreY`` implementation version."""
+
+    raw = str(value)
+    if "/" not in raw:
+        raise ValueError("implementation transition version must be skill/core")
+    skill, core = raw.split("/", 1)
+    if not skill.startswith("skill") or not core.startswith("core") or len(skill) == 5 or len(core) == 4:
+        raise ValueError("implementation transition version must be skill/core")
+    return skill, core
+
+
+def _version_component(value: Any, prefix: str) -> str:
+    raw = str(value)
+    return raw[len(prefix) :] if raw.startswith(prefix) else raw
+
+
+def _implementation_transition_chain(
+    transitions: Sequence[Any],
+    lifecycle: Any,
+    *,
+    catalog_core: str,
+    target_core: str,
+    target_skill: str | None,
+    target_item_id: str,
+    expected_old_pair: tuple[str, str] | None = None,
+) -> Mapping[str, str]:
+    """Validate one contiguous implementation chain for an item position.
+
+    ``earliest_affected_item`` is a lower bound, not an exact item identity:
+    a transition affecting Q-001 also covers later Q-002/Q-003 workspaces.
+    """
+
+    item_ids = tuple(str(value) for value in getattr(lifecycle, "item_ids", ()))
+    if target_item_id not in item_ids:
+        raise ValueError("implementation transition item is not in the lifecycle")
+    target_position = item_ids.index(target_item_id)
+    if not transitions:
+        normalized_catalog_core = str(catalog_core)
+        if normalized_catalog_core.startswith("core"):
+            normalized_catalog_core = normalized_catalog_core[4:]
+        if normalized_catalog_core != str(target_core).removeprefix("core"):
+            raise ValueError("implementation transition chain is required for the catalog core")
+        return {}
+
+    expected_catalog_core = str(catalog_core)
+    if not expected_catalog_core.startswith("core"):
+        expected_catalog_core = f"core{expected_catalog_core}"
+    expected_target = (
+        str(target_skill) if str(target_skill).startswith("skill") else f"skill{target_skill}",
+        str(target_core) if str(target_core).startswith("core") else f"core{target_core}",
+    )
+    previous_new: tuple[str, str] | None = None
+    preserved: Mapping[str, str] | None = None
+    for index, transition in enumerate(transitions):
+        old_pair = _implementation_version_pair(transition.old_version)
+        new_pair = _implementation_version_pair(transition.new_version)
+        if index == 0:
+            if old_pair[1] != expected_catalog_core:
+                raise ValueError("implementation transition chain does not start at the persisted catalog core")
+            if expected_old_pair is not None and old_pair != expected_old_pair:
+                raise ValueError("implementation transition chain does not start at bound identity")
+        else:
+            if old_pair != previous_new:
+                raise ValueError("implementation transition version chain has a gap")
+            prior = transitions[index - 1]
+            if transition.old_sha != prior.new_sha or transition.old_tree != prior.new_tree:
+                raise ValueError("implementation transition repository identity chain has a gap")
+        earliest_item = str(transition.earliest_affected_item)
+        if earliest_item not in item_ids:
+            raise ValueError("implementation transition earliest item is not in the lifecycle")
+        if item_ids.index(earliest_item) > target_position:
+            raise ValueError("implementation transition earliest item is after the target item")
+        candidate_preserved = dict(transition.preserved_accepted_hashes)
+        if preserved is None:
+            preserved = candidate_preserved
+        elif candidate_preserved != dict(preserved):
+            raise ValueError("implementation transition preserved accepted hashes changed")
+        previous_new = new_pair
+    if previous_new != expected_target:
+        raise ValueError("implementation transition chain does not reach target identity")
+    return dict(preserved or {})
+
+
+def _implementation_ledger_fingerprint(context: RunContext, lifecycle: Any) -> dict[str, Any]:
+    """Return the exact authoritative lifecycle transition IDs and hashes."""
+
+    path = context.resolve_run_path("implementation_transitions.jsonl")
+    transitions = tuple(lifecycle.implementation_transitions)
+    if not path.exists():
+        if transitions:
+            raise ValueError("implementation transition ledger is missing")
+        records: list[dict[str, str]] = []
+    else:
+        _transition_regular(path, label="implementation transition ledger")
+        records = []
+        for line_number, line in enumerate(path.read_bytes().splitlines(), 1):
+            try:
+                payload = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError(f"implementation transition ledger line {line_number} is invalid") from exc
+            if not isinstance(payload, Mapping) or not isinstance(payload.get("transition_id"), str) or not isinstance(payload.get("record_hash"), str):
+                raise ValueError("implementation transition ledger record is invalid")
+            records.append({"transition_id": str(payload["transition_id"]), "record_hash": str(payload["record_hash"])})
+    if len(records) != len(transitions):
+        raise ValueError("implementation transition ledger changed during catalog inheritance")
+    ids = [record["transition_id"] for record in records]
+    hashes = [record["record_hash"] for record in records]
+    for index, transition in enumerate(transitions):
+        if transition.transition_id != ids[index] or _sha256_bytes(_json_bytes(transition.to_dict()) + b"\n") != hashes[index]:
+            raise ValueError("implementation transition ledger hash does not match lifecycle")
+    head = hashes[-1] if hashes else "0" * 64
+    chain_hash = _sha256_bytes(_json_bytes({"transition_ids": ids, "record_hashes": hashes}))
+    return {
+        "transition_ids": ids,
+        "record_hashes": hashes,
+        "head": head,
+        "chain_hash": chain_hash,
+    }
+
+
+def _source_transition_preflight(
+    context: RunContext,
+    *,
+    source_manifest: Path,
+    lifecycle: Any,
+    target_item_id: str,
+    _locked: bool = False,
+) -> dict[str, Any]:
+    """Validate source transition provenance before target publication.
+
+    This helper deliberately runs before ``DataRoomWorkbench`` is opened.  A
+    source transition journal is an implementation identity authority, not a
+    catalog hint: skill-only transitions, missing anchors, an incomplete
+    intent, or a false current repository identity must fail before any target
+    manifest/record is written or any archive instrumentation can occur.
+    """
+
+    if not _locked:
+        with _transition_lock(source_manifest):
+            return _source_transition_preflight(
+                context,
+                source_manifest=source_manifest,
+                lifecycle=lifecycle,
+                target_item_id=target_item_id,
+                _locked=True,
+            )
+
+    source_manifest = _regular_file(source_manifest, root=context.run_root, label="source analysis context manifest")
+    _reconcile_transition_journal(
+        source_manifest,
+        run_id=context.run_id,
+        item_id=source_manifest.parent.parent.name,
+        _locked=True,
+    )
+    source_item_id = source_manifest.parent.parent.name
+    source_manifest_bytes = source_manifest.read_bytes()
+    try:
+        source_manifest_value = json.loads(source_manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("source analysis context manifest is invalid") from exc
+    if not isinstance(source_manifest_value, Mapping):
+        raise ValueError("source analysis context manifest is invalid")
+    source_unsigned = dict(source_manifest_value)
+    manifest_hash = source_unsigned.pop("manifest_hash", None)
+    if manifest_hash != _sha256_bytes(_json_bytes(source_unsigned)):
+        raise ValueError("source analysis context manifest hash does not match")
+    if (
+        source_unsigned.get("run_id") != context.run_id
+        or source_unsigned.get("run_root") != str(context.run_root)
+        or source_unsigned.get("item_id") != source_item_id
+    ):
+        raise ValueError("source analysis context identity does not match target run")
+    source_core = str(source_unsigned.get("core_version", ""))
+    source_skill_raw = source_unsigned.get("skill_version")
+    source_skill = str(source_skill_raw) if source_skill_raw is not None else None
+    target_core = str(context.core_version)
+    target_skill_raw = context.skill_version
+    target_skill = str(target_skill_raw) if target_skill_raw is not None else None
+    if source_core != target_core or source_skill != target_skill:
+        raise ValueError("source analysis context is not bound to the current implementation")
+    source_sha = str(source_unsigned.get("implementation_sha", ""))
+    source_tree = str(source_unsigned.get("implementation_tree", ""))
+    for field_name, value in (("implementation_sha", source_sha), ("implementation_tree", source_tree)):
+        if len(value) != 40 or any(char not in "0123456789abcdef" for char in value):
+            raise ValueError(f"source {field_name} is invalid")
+    source_catalog = source_unsigned.get("catalog")
+    source_inventory = source_unsigned.get("physical_inventory")
+    if not isinstance(source_catalog, Mapping) or not isinstance(source_inventory, Mapping):
+        raise ValueError("source context catalog/inventory binding is missing")
+    source_inheritance = source_unsigned.get("catalog_inheritance")
+    inherited_source_provenance = source_inheritance is not None
+    if inherited_source_provenance:
+        # An inherited source item has no synthetic local transition audit;
+        # its immutable nested inheritance record is the provenance authority.
+        # Validate it while the complete source chain is already locked by the
+        # caller, then permit the local audit/state pair to remain empty.
+        if not isinstance(source_inheritance, Mapping):
+            raise ValueError("source context catalog inheritance binding is invalid")
+        source_workspace = ItemWorkspace.load(context, source_item_id)
+        _validate_catalog_inheritance(
+            context,
+            manifest_path=source_manifest,
+            manifest=source_manifest_value,
+            item_workspace=source_workspace,
+            lifecycle=lifecycle,
+            source_transition_locked=True,
+        )
+    catalog_core_raw = str(source_catalog.get("core_version", ""))
+    catalog_core = catalog_core_raw if catalog_core_raw.startswith("core") else f"core{catalog_core_raw}"
+    source_audit_path, source_state_path, source_intent_path = _transition_paths(source_manifest)
+    source_records = _read_transition_audit(source_audit_path, run_id=context.run_id, item_id=source_item_id)
+    source_state_value = _read_transition_state(source_state_path, run_id=context.run_id, item_id=source_item_id)
+    source_intent_bytes = source_intent_path.read_bytes() if source_intent_path.exists() else b""
+    if source_intent_path.is_symlink() or (source_intent_path.exists() and not source_intent_path.is_file()):
+        raise ValueError("source transition intent is not a regular file")
+    transitions = tuple(lifecycle.implementation_transitions)
+    ledger = _implementation_ledger_fingerprint(context, lifecycle)
+    if transitions:
+        _implementation_transition_chain(
+            transitions,
+            lifecycle,
+            catalog_core=catalog_core,
+            target_core=target_core,
+            target_skill=target_skill,
+            target_item_id=target_item_id,
+        )
+    if source_records and not transitions:
+        raise ValueError("source context transition audit has no authoritative lifecycle chain")
+    if source_state_value is not None and not source_records:
+        raise ValueError("source context transition state has no audit provenance")
+    if transitions and (not source_records or source_state_value is None) and not inherited_source_provenance:
+        raise ValueError("source context transition provenance is incomplete")
+
+    if source_records:
+        first = transitions[0]
+        last = transitions[-1]
+        audit_first = source_records[0]
+        audit_last = source_records[-1]
+        if (
+            _version_component(audit_first["old_skill_version"], "skill")
+            != _version_component(first.old_version.split("/", 1)[0], "skill")
+            or _version_component(audit_first["old_core_version"], "core")
+            != _version_component(first.old_version.split("/", 1)[1], "core")
+            or audit_first["old_sha"] != first.old_sha
+            or audit_first["old_tree"] != first.old_tree
+            or _version_component(audit_last["new_skill_version"], "skill")
+            != _version_component(last.new_version.split("/", 1)[0], "skill")
+            or _version_component(audit_last["new_core_version"], "core")
+            != _version_component(last.new_version.split("/", 1)[1], "core")
+            or audit_last["new_sha"] != last.new_sha
+            or audit_last["new_tree"] != last.new_tree
+        ):
+            raise ValueError("source context transition audit does not match authoritative lifecycle")
+        if source_sha != last.new_sha or source_tree != last.new_tree:
+            raise ValueError("source analysis context current repository identity is not authoritative")
+        if source_state_value["audit_count"] != len(source_records):
+            raise ValueError("source context transition state count does not match audit")
+        if source_state_value["audit_head"] != source_records[-1]["record_hash"]:
+            raise ValueError("source context transition state head does not match audit")
+        if source_state_value["manifest_file_hash"] != _sha256_bytes(source_manifest_bytes):
+            raise ValueError("source context transition state does not match source manifest")
+
+    origin_skill, origin_core = _implementation_version_pair(transitions[0].old_version) if transitions else (
+        source_skill or "",
+        catalog_core,
+    )
+    source_pair = (source_skill or "", source_core if source_core.startswith("core") else f"core{source_core}")
+    target_pair = (target_skill or "", target_core if target_core.startswith("core") else f"core{target_core}")
+    origin_pair = (origin_skill, origin_core)
+    applicable = bool(transitions) or origin_pair != source_pair or origin_pair != target_pair
+    if applicable and (not source_records or source_state_value is None) and not inherited_source_provenance:
+        raise ValueError("source context transition provenance is incomplete")
+    if not applicable and (source_records or source_state_value is not None):
+        raise ValueError("source context transition provenance is unexpected")
+    try:
+        source_manifest_path = source_manifest.relative_to(context.run_root).as_posix()
+        source_intent_relpath = source_intent_path.relative_to(context.run_root).as_posix()
+    except ValueError as exc:
+        raise ValueError("source transition provenance escapes the run root") from exc
+    source_audit_bytes = source_audit_path.read_bytes() if source_audit_path.exists() else b""
+    source_state_bytes = source_state_path.read_bytes() if source_state_path.exists() else b""
+    return {
+        "source_manifest_value": source_manifest_value,
+        "source_manifest_bytes": source_manifest_bytes,
+        "source_manifest_hash": _sha256_bytes(source_manifest_bytes),
+        "source_manifest_path": source_manifest_path,
+        "source_catalog": source_catalog,
+        "source_inventory": source_inventory,
+        "source_records": source_records,
+        "source_state": source_state_value,
+        "source_audit_bytes": source_audit_bytes,
+        "source_state_bytes": source_state_bytes,
+        "source_intent_path": source_intent_relpath,
+        "source_intent_bytes": source_intent_bytes,
+        "source_intent_hash": _sha256_bytes(source_intent_bytes),
+        "source_sha": source_sha,
+        "source_tree": source_tree,
+        "origin_skill": origin_skill,
+        "origin_core": origin_core,
+        "ledger": ledger,
+    }
+
+
+def _inherited_source_preflight(
+    context: RunContext,
+    *,
+    source_manifest: Path,
+    source_manifest_value: Mapping[str, Any],
+    source_item: ItemWorkspace,
+    lifecycle: Any,
+) -> dict[str, Any]:
+    """Build source provenance for a source item that already inherited.
+
+    An inherited item intentionally has no local implementation-transition
+    audit.  Its nested catalog-inheritance record and the recursively locked
+    source chain are the authority.  Keep this path separate from
+    ``_source_transition_preflight`` so creating Q3 from inherited Q2 never
+    interprets Q2's absent local transition journal as an incomplete direct
+    rebind.
+    """
+
+    source_manifest = _regular_file(
+        source_manifest,
+        root=context.run_root,
+        label="source analysis context manifest",
+    )
+    if not isinstance(source_manifest_value, Mapping) or source_manifest_value.get("catalog_inheritance") is None:
+        raise ValueError("inherited source context catalog provenance is missing")
+    record = _validate_catalog_inheritance(
+        context,
+        manifest_path=source_manifest,
+        manifest=source_manifest_value,
+        item_workspace=source_item,
+        lifecycle=lifecycle,
+        source_transition_locked=True,
+    )
+    if record is None:
+        raise ValueError("inherited source context catalog provenance is missing")
+    source_manifest_bytes = source_manifest.read_bytes()
+    source_catalog = source_manifest_value.get("catalog")
+    source_inventory = source_manifest_value.get("physical_inventory")
+    if not isinstance(source_catalog, Mapping) or not isinstance(source_inventory, Mapping):
+        raise ValueError("source context catalog/inventory binding is missing")
+    audit_path, state_path, intent_path = _transition_paths(source_manifest)
+    # _validate_catalog_inheritance rejects all transition audit/state/intent
+    # residue for an inherited target.  Keep the empty hashes explicit in the
+    # child record so the same fact is immutable and checked on every load.
+    if any(path.exists() or path.is_symlink() for path in (audit_path, state_path, intent_path)):
+        raise ValueError("inherited source context has unexpected transition provenance")
+    try:
+        manifest_relpath = source_manifest.relative_to(context.run_root).as_posix()
+        intent_relpath = intent_path.relative_to(context.run_root).as_posix()
+    except ValueError as exc:
+        raise ValueError("source transition provenance escapes the run root") from exc
+    ledger = _implementation_ledger_fingerprint(context, lifecycle)
+    old_pair = record.get("expected_old_pair")
+    if not isinstance(old_pair, Mapping):
+        raise ValueError("inherited source context transition origin is invalid")
+    origin_skill = str(old_pair.get("skill_version", ""))
+    origin_core = str(old_pair.get("core_version", ""))
+    source_sha = str(source_manifest_value.get("implementation_sha", ""))
+    source_tree = str(source_manifest_value.get("implementation_tree", ""))
+    if not source_sha or not source_tree:
+        raise ValueError("inherited source context repository identity is missing")
+    empty = b""
+    return {
+        "source_manifest_value": source_manifest_value,
+        "source_manifest_bytes": source_manifest_bytes,
+        "source_manifest_hash": _sha256_bytes(source_manifest_bytes),
+        "source_manifest_path": manifest_relpath,
+        "source_catalog": source_catalog,
+        "source_inventory": source_inventory,
+        "source_records": [],
+        "source_state": None,
+        "source_audit_bytes": empty,
+        "source_state_bytes": empty,
+        "source_intent_path": intent_relpath,
+        "source_intent_bytes": empty,
+        "source_intent_hash": _sha256_bytes(empty),
+        "source_sha": source_sha,
+        "source_tree": source_tree,
+        "origin_skill": origin_skill,
+        "origin_core": origin_core,
+        "ledger": ledger,
+    }
+
+
+def _catalog_inheritance_record(
+    context: RunContext,
+    *,
+    source_manifest: Path,
+    source_manifest_value: Mapping[str, Any],
+    source_item: ItemWorkspace,
+    source_catalog: Mapping[str, Any],
+    source_inventory: Mapping[str, Any],
+    lifecycle: Any,
+    target_item_id: str,
+    source_preflight: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build immutable provenance for inheriting a rebound physical catalog."""
+
+    preflight = source_preflight or _source_transition_preflight(
+        context,
+        source_manifest=source_manifest,
+        lifecycle=lifecycle,
+        target_item_id=target_item_id,
+        _locked=True,
+    )
+    source_manifest_bytes = bytes(preflight["source_manifest_bytes"])
+    source_manifest_hash = str(preflight["source_manifest_hash"])
+    source_unsigned = dict(source_manifest_value)
+    manifest_hash = source_unsigned.pop("manifest_hash", None)
+    if manifest_hash != _sha256_bytes(_json_bytes(source_unsigned)):
+        raise ValueError("source analysis context manifest hash does not match")
+    source_manifest_path = str(preflight["source_manifest_path"])
+    source_state = source_item.state
+    source_terminal = source_state.get("lifecycle_state") in {"accepted", "technical_failure"}
+    source_stable = (
+        source_state.get("lifecycle_state") == "work"
+        and source_state.get("active_attempt_id") is None
+        and source_state.get("terminal_intent") is None
+        and source_state.get("terminal_outcome") is None
+        and source_state.get("review", {}).get("status") == "pending"
+        and not source_item.business_review_path.exists()
+    )
+    if not source_terminal and not source_stable:
+        raise ValueError("source item is not terminal or context-stable")
+    source_state_mode = "terminal" if source_terminal else "stable"
+
+    transitions = tuple(lifecycle.implementation_transitions)
+    target_core = str(context.core_version)
+    target_skill = str(context.skill_version) if context.skill_version is not None else None
+    old_skill = str(preflight["origin_skill"])
+    old_core = str(preflight["origin_core"])
+    source_sha = str(preflight["source_sha"])
+    source_tree = str(preflight["source_tree"])
+    source_records = list(preflight["source_records"])
+    source_state_value = preflight["source_state"]
+    source_audit_bytes = bytes(preflight["source_audit_bytes"])
+    source_state_bytes = bytes(preflight["source_state_bytes"])
+    ledger = dict(preflight["ledger"])
+    source_audit_head = source_records[-1]["record_hash"] if source_records else "0" * 64
+    source_state_hash = source_state_value["state_hash"] if source_state_value is not None else "0" * 64
+    source_audit_hash = _sha256_bytes(source_audit_bytes)
+    source_state_file_hash = _sha256_bytes(source_state_bytes)
+    catalog_origin = dict(_jsonable(source_catalog))
+    catalog_origin["origin_core_version"] = str(source_catalog.get("core_version", ""))
+    catalog_origin["origin_skill_version"] = old_skill
+    record_unsigned: dict[str, Any] = {
+        "record_kind": "analysis_context_catalog_inheritance",
+        "schema_version": "1",
+        "run_id": context.run_id,
+        "target_item_id": target_item_id,
+        "source_item_id": source_item.item_id,
+        "source_manifest_path": source_manifest_path,
+        "source_manifest_bytes": base64.b64encode(source_manifest_bytes).decode("ascii"),
+        "source_manifest_hash": source_manifest_hash,
+        "source_core_version": str(source_manifest_value.get("core_version", "")),
+        "source_skill_version": str(source_manifest_value.get("skill_version", "")),
+        "source_implementation_sha": source_sha,
+        "source_implementation_tree": source_tree,
+        "source_state_mode": source_state_mode,
+        "source_transition_audit_count": len(source_records),
+        "source_transition_audit_head": source_audit_head,
+        "source_transition_audit_hash": source_audit_hash,
+        "source_transition_state_hash": source_state_hash,
+        "source_transition_state_file_hash": source_state_file_hash,
+        "source_transition_intent_path": str(preflight["source_intent_path"]),
+        "source_transition_intent_bytes": base64.b64encode(bytes(preflight["source_intent_bytes"])).decode("ascii"),
+        "source_transition_intent_hash": str(preflight["source_intent_hash"]),
+        "catalog_origin": catalog_origin,
+        "physical_inventory": _jsonable(source_inventory),
+        "expected_old_pair": {"skill_version": old_skill, "core_version": old_core},
+        "expected_current_pair": {"skill_version": target_skill, "core_version": target_core},
+        "expected_current_sha": source_sha,
+        "expected_current_tree": source_tree,
+        "lifecycle_transition_ids": list(ledger["transition_ids"]),
+        "lifecycle_transition_hashes": list(ledger["record_hashes"]),
+        "lifecycle_transition_head": ledger["head"],
+        "lifecycle_transition_chain_hash": ledger["chain_hash"],
+    }
+    record = {**record_unsigned, "record_hash": _transition_digest(record_unsigned)}
+    return record
+
+
+def _validate_catalog_inheritance(
+    context: RunContext,
+    *,
+    manifest_path: Path,
+    manifest: Mapping[str, Any],
+    item_workspace: ItemWorkspace,
+    lifecycle: Any | None = None,
+    source_item: ItemWorkspace | None = None,
+    source_transition_locked: bool = False,
+) -> dict[str, Any] | None:
+    """Validate target inheritance provenance and all of its authorities."""
+
+    raw_ref = manifest.get("catalog_inheritance")
+    inheritance_path, inheritance_state_path, inheritance_intent_path = _inheritance_paths(manifest_path)
+    if raw_ref is None:
+        if any(path.exists() or path.is_symlink() for path in (inheritance_path, inheritance_state_path, inheritance_intent_path)):
+            raise ValueError("analysis context inheritance artifacts are not bound by the manifest")
+        return None
+    if (
+        not isinstance(raw_ref, Mapping)
+        or raw_ref.get("path") != f"work/{_INHERITANCE_FILENAME}"
+        or not isinstance(raw_ref.get("record_hash"), str)
+    ):
+        raise ValueError("analysis context catalog inheritance binding is invalid")
+    target_transition_paths = _transition_paths(manifest_path)
+    if any(path.exists() or path.is_symlink() for path in target_transition_paths):
+        raise ValueError("target catalog inheritance must not contain synthetic transition audit artifacts")
+    record = _read_inheritance_record(inheritance_path, run_id=context.run_id, item_id=item_workspace.item_id)
+    state = _read_inheritance_state(inheritance_state_path, run_id=context.run_id, item_id=item_workspace.item_id)
+    if record is None or state is None or record["record_hash"] != raw_ref["record_hash"]:
+        raise ValueError("analysis context catalog inheritance record/state is incomplete")
+    manifest_file_hash = _manifest_file_digest(manifest_path)
+    if state["inheritance_head"] != record["record_hash"] or state["manifest_file_hash"] != manifest_file_hash:
+        raise ValueError("analysis context catalog inheritance state does not match manifest")
+
+    source_manifest_path = context.resolve_run_path(record["source_manifest_path"])
+    if not source_transition_locked:
+        # Inherited target validation must use the same source-first lock order
+        # as target creation.  Re-entering this function under the source lock
+        # keeps the target transition lock (held by the caller, when any) from
+        # becoming the first lock in a source/target cycle.
+        with _transition_lock(source_manifest_path):
+            return _validate_catalog_inheritance(
+                context,
+                manifest_path=manifest_path,
+                manifest=manifest,
+                item_workspace=item_workspace,
+                lifecycle=lifecycle,
+                source_item=source_item,
+                source_transition_locked=True,
+            )
+    try:
+        _reconcile_transition_journal(
+            source_manifest_path,
+            run_id=context.run_id,
+            item_id=str(record["source_item_id"]),
+            _locked=True,
+        )
+    except ValueError as exc:
+        if "state does not match manifest" in str(exc):
+            raise ValueError("source analysis context manifest provenance changed") from exc
+        raise
+    source_manifest_path = _regular_file(source_manifest_path, root=context.run_root, label="source analysis context manifest")
+    source_manifest_bytes = source_manifest_path.read_bytes()
+    expected_source_bytes = base64.b64decode(record["source_manifest_bytes"].encode("ascii"), validate=True)
+    if source_manifest_bytes != expected_source_bytes or _sha256_bytes(source_manifest_bytes) != record["source_manifest_hash"]:
+        raise ValueError("source analysis context manifest provenance changed")
+    try:
+        source_manifest = json.loads(source_manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("source analysis context manifest provenance is invalid") from exc
+    if not isinstance(source_manifest, Mapping):
+        raise ValueError("source analysis context manifest provenance is invalid")
+    source_unsigned = dict(source_manifest)
+    source_manifest_hash = source_unsigned.pop("manifest_hash", None)
+    if source_manifest_hash != _sha256_bytes(_json_bytes(source_unsigned)):
+        raise ValueError("source analysis context manifest provenance hash is invalid")
+    if (
+        source_unsigned.get("run_id") != context.run_id
+        or source_unsigned.get("run_root") != str(context.run_root)
+        or source_unsigned.get("item_id") != record["source_item_id"]
+        or source_unsigned.get("core_version") != record["source_core_version"]
+        or source_unsigned.get("skill_version") != record["source_skill_version"]
+        or source_unsigned.get("implementation_sha") != record["source_implementation_sha"]
+        or source_unsigned.get("implementation_tree") != record["source_implementation_tree"]
+    ):
+        raise ValueError("source analysis context implementation provenance changed")
+    expected_source_path = context.resolve_run_path(
+        Path("questions" if source_unsigned.get("item_mode", "question") == "question" else "requirements")
+        / str(record["source_item_id"])
+        / "work"
+        / _MANIFEST_FILENAME
+    )
+    if source_manifest_path != expected_source_path:
+        raise ValueError("source analysis context manifest path provenance changed")
+    if manifest.get("source_identity") != source_unsigned.get("source_identity"):
+        raise ValueError("source analysis context source identity provenance changed")
+    if manifest.get("physical_inventory") != source_unsigned.get("physical_inventory") or manifest.get("physical_inventory") != record["physical_inventory"]:
+        raise ValueError("source physical inventory provenance changed")
+    source_catalog = source_unsigned.get("catalog")
+    target_catalog = manifest.get("catalog")
+    if not isinstance(source_catalog, Mapping) or not isinstance(target_catalog, Mapping):
+        raise ValueError("catalog inheritance catalog binding is invalid")
+    origin_catalog = dict(record["catalog_origin"])
+    origin_catalog.pop("origin_core_version", None)
+    origin_catalog.pop("origin_skill_version", None)
+    if dict(source_catalog) != origin_catalog or dict(target_catalog) != origin_catalog:
+        raise ValueError("catalog inheritance origin binding changed")
+    from .lifecycle import RunLifecycle
+
+    lifecycle = lifecycle if lifecycle is not None else RunLifecycle.load(context)
+    ledger = _implementation_ledger_fingerprint(context, lifecycle)
+    if (
+        ledger["transition_ids"] != record["lifecycle_transition_ids"]
+        or ledger["record_hashes"] != record["lifecycle_transition_hashes"]
+        or ledger["head"] != record["lifecycle_transition_head"]
+        or ledger["chain_hash"] != record["lifecycle_transition_chain_hash"]
+    ):
+        raise ValueError("catalog inheritance lifecycle provenance changed")
+    old_pair = (
+        str(record["expected_old_pair"]["skill_version"]),
+        str(record["expected_old_pair"]["core_version"]),
+    )
+    _implementation_transition_chain(
+        lifecycle.implementation_transitions,
+        lifecycle,
+        catalog_core=str(source_catalog.get("core_version", "")),
+        target_core=context.core_version,
+        target_skill=context.skill_version,
+        target_item_id=item_workspace.item_id,
+        expected_old_pair=old_pair,
+    )
+    expected_current_pair = record["expected_current_pair"]
+    if (
+        expected_current_pair.get("core_version") != context.core_version
+        or expected_current_pair.get("skill_version") != context.skill_version
+        or record["expected_current_sha"] != record["source_implementation_sha"]
+        or record["expected_current_tree"] != record["source_implementation_tree"]
+    ):
+        raise ValueError("catalog inheritance current implementation provenance changed")
+    if source_item is None:
+        source_item = ItemWorkspace.load(
+            context,
+            str(record["source_item_id"]),
+            mode=str(source_unsigned.get("item_mode", "question")),
+        )
+    source_state = source_item.state
+    source_terminal = source_state.get("lifecycle_state") in {"accepted", "technical_failure"}
+    source_stable = (
+        source_state.get("lifecycle_state") == "work"
+        and source_state.get("active_attempt_id") is None
+        and source_state.get("terminal_intent") is None
+        and source_state.get("terminal_outcome") is None
+        and source_state.get("review", {}).get("status") == "pending"
+        and not source_item.business_review_path.exists()
+    )
+    if not source_terminal and not source_stable:
+        raise ValueError("source item is no longer terminal or context-stable")
+    if record["source_state_mode"] != ("terminal" if source_terminal else "stable"):
+        raise ValueError("source item state provenance changed")
+    if source_item.item_id not in lifecycle.item_ids or item_workspace.item_id not in lifecycle.item_ids:
+        raise ValueError("catalog inheritance items are not in the lifecycle")
+    if lifecycle.item_ids.index(source_item.item_id) >= lifecycle.item_ids.index(item_workspace.item_id):
+        raise ValueError("source item must precede inherited target item")
+    inherited_source_provenance = source_unsigned.get("catalog_inheritance") is not None
+    if inherited_source_provenance:
+        if not isinstance(source_unsigned.get("catalog_inheritance"), Mapping):
+            raise ValueError("source context catalog inheritance binding is invalid")
+        source_workspace = ItemWorkspace.load(
+            context,
+            str(source_unsigned.get("item_id", "")),
+            mode=str(source_unsigned.get("item_mode", "question")),
+        )
+        _validate_catalog_inheritance(
+            context,
+            manifest_path=source_manifest_path,
+            manifest=source_manifest,
+            item_workspace=source_workspace,
+            source_item=None,
+            lifecycle=lifecycle,
+            source_transition_locked=True,
+        )
+
+    source_audit_path, source_state_path, source_intent_path = _transition_paths(source_manifest_path)
+    source_records = _read_transition_audit(source_audit_path, run_id=context.run_id, item_id=source_item.item_id)
+    source_audit_bytes = source_audit_path.read_bytes() if source_audit_path.is_file() else b""
+    if len(source_records) != record["source_transition_audit_count"]:
+        raise ValueError("source transition audit provenance changed")
+    source_head = source_records[-1]["record_hash"] if source_records else "0" * 64
+    if source_head != record["source_transition_audit_head"] or _sha256_bytes(source_audit_bytes) != record["source_transition_audit_hash"]:
+        raise ValueError("source transition audit provenance changed")
+    source_state_value = _read_transition_state(source_state_path, run_id=context.run_id, item_id=source_item.item_id)
+    source_state_bytes = source_state_path.read_bytes() if source_state_path.is_file() else b""
+    source_state_hash = source_state_value["state_hash"] if source_state_value is not None else "0" * 64
+    if source_state_hash != record["source_transition_state_hash"] or _sha256_bytes(source_state_bytes) != record["source_transition_state_file_hash"]:
+        raise ValueError("source transition state provenance changed")
+    source_intent_bytes = source_intent_path.read_bytes() if source_intent_path.exists() else b""
+    try:
+        source_intent_relpath = source_intent_path.relative_to(context.run_root).as_posix()
+    except ValueError as exc:
+        raise ValueError("source transition intent path escapes the run root") from exc
+    if (
+        source_intent_relpath != f"{Path(record['source_manifest_path']).parent.as_posix()}/{_TRANSITION_INTENT_FILENAME}"
+        or
+        record["source_transition_intent_path"] != source_intent_relpath
+        or _sha256_bytes(source_intent_bytes) != record["source_transition_intent_hash"]
+    ):
+        raise ValueError("source transition intent provenance changed")
+    try:
+        expected_intent_bytes = base64.b64decode(record["source_transition_intent_bytes"].encode("ascii"), validate=True)
+    except (UnicodeEncodeError, ValueError) as exc:
+        raise ValueError("source transition intent provenance is invalid") from exc
+    if source_intent_bytes != expected_intent_bytes:
+        raise ValueError("source transition intent provenance changed")
+    origin_pair = (
+        str(record["expected_old_pair"]["skill_version"]),
+        str(record["expected_old_pair"]["core_version"]),
+    )
+    source_pair = (
+        str(record["source_skill_version"]),
+        str(record["source_core_version"]),
+    )
+    current_pair = (
+        str(record["expected_current_pair"]["skill_version"]),
+        str(record["expected_current_pair"]["core_version"]),
+    )
+    applicable = bool(lifecycle.implementation_transitions) or origin_pair != source_pair or origin_pair != current_pair
+    if applicable and (not source_records or source_state_value is None) and not inherited_source_provenance:
+        raise ValueError("source transition provenance is incomplete")
+    if not applicable and (source_records or source_state_value is not None):
+        raise ValueError("source transition provenance is unexpected")
+    if source_state_value is not None and (
+        source_state_value["audit_count"] != len(source_records)
+        or source_state_value["audit_head"] != source_head
+        or source_state_value["manifest_file_hash"] != _sha256_bytes(source_manifest_bytes)
+    ):
+        raise ValueError("source transition state provenance changed")
+    if lifecycle.implementation_transitions:
+        first = lifecycle.implementation_transitions[0]
+        last = lifecycle.implementation_transitions[-1]
+        if (
+            record["source_implementation_sha"] != last.new_sha
+            or record["source_implementation_tree"] != last.new_tree
+        ):
+            raise ValueError("source analysis context current repository identity is not authoritative")
+        if source_records:
+            audit_first = source_records[0]
+            audit_last = source_records[-1]
+            if (
+                _version_component(audit_first["old_skill_version"], "skill")
+                != _version_component(record["expected_old_pair"]["skill_version"], "skill")
+                or _version_component(audit_first["old_core_version"], "core")
+                != _version_component(record["expected_old_pair"]["core_version"], "core")
+                or audit_first["old_sha"] != first.old_sha
+                or audit_first["old_tree"] != first.old_tree
+                or _version_component(audit_last["new_skill_version"], "skill")
+                != _version_component(record["expected_current_pair"]["skill_version"], "skill")
+                or _version_component(audit_last["new_core_version"], "core")
+                != _version_component(record["expected_current_pair"]["core_version"], "core")
+                or audit_last["new_sha"] != last.new_sha
+                or audit_last["new_tree"] != last.new_tree
+            ):
+                raise ValueError("source transition audit does not match lifecycle provenance")
+    return record
+
+
 def _read_transition_state(path: Path, *, run_id: str, item_id: str) -> dict[str, Any] | None:
     if not path.exists() and not path.is_symlink():
         return None
@@ -410,6 +1238,252 @@ def _read_transition_intent(path: Path, *, run_id: str, item_id: str) -> dict[st
     if value["intent_hash"] != _transition_digest(value):
         raise ValueError("analysis context transition intent hash does not match content")
     return value
+
+
+def _write_inheritance_record(path: Path, record: Mapping[str, Any]) -> None:
+    """Durably publish one immutable catalog-inheritance provenance record."""
+
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise ValueError("analysis context inheritance record is not a regular file")
+    _atomic_write_json_durable(path, record)
+
+
+def _read_inheritance_record(path: Path, *, run_id: str, item_id: str) -> dict[str, Any] | None:
+    if not path.exists() and not path.is_symlink():
+        return None
+    _transition_regular(path, label="analysis context inheritance record")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("analysis context inheritance record is invalid") from exc
+    if not isinstance(value, Mapping) or set(value) != _INHERITANCE_RECORD_FIELDS:
+        raise ValueError("analysis context inheritance record fields are invalid")
+    value = dict(value)
+    if value["record_kind"] != "analysis_context_catalog_inheritance" or value["schema_version"] != "1":
+        raise ValueError("analysis context inheritance record kind is invalid")
+    if value["run_id"] != run_id or value["target_item_id"] != item_id:
+        raise ValueError("analysis context inheritance record identity does not match")
+    for field_name in (
+        "source_manifest_hash",
+        "source_transition_audit_hash",
+        "source_transition_state_hash",
+        "source_transition_state_file_hash",
+        "source_transition_intent_hash",
+        "lifecycle_transition_head",
+        "lifecycle_transition_chain_hash",
+        "record_hash",
+    ):
+        raw = value[field_name]
+        if not isinstance(raw, str) or len(raw) != 64 or any(char not in "0123456789abcdef" for char in raw):
+            raise ValueError(f"analysis context inheritance {field_name} is invalid")
+    for field_name in ("source_item_id", "source_manifest_path", "source_manifest_bytes"):
+        if not isinstance(value[field_name], str) or not value[field_name]:
+            raise ValueError(f"analysis context inheritance {field_name} is invalid")
+    if not isinstance(value["source_transition_intent_path"], str) or not value["source_transition_intent_path"]:
+        raise ValueError("analysis context inheritance source transition intent path is invalid")
+    if not isinstance(value["source_transition_intent_bytes"], str):
+        raise ValueError("analysis context inheritance source transition intent bytes are invalid")
+    try:
+        intent_bytes = base64.b64decode(value["source_transition_intent_bytes"].encode("ascii"), validate=True)
+    except (UnicodeEncodeError, ValueError) as exc:
+        raise ValueError("analysis context inheritance source transition intent bytes are invalid") from exc
+    if _sha256_bytes(intent_bytes) != value["source_transition_intent_hash"]:
+        raise ValueError("analysis context inheritance source transition intent hash is invalid")
+    for field_name in (
+        "source_core_version",
+        "source_skill_version",
+        "source_implementation_sha",
+        "source_implementation_tree",
+        "source_state_mode",
+        "expected_old_pair",
+        "expected_current_pair",
+        "catalog_origin",
+        "physical_inventory",
+    ):
+        if field_name in {"expected_old_pair", "expected_current_pair", "catalog_origin", "physical_inventory"}:
+            if not isinstance(value[field_name], Mapping):
+                raise ValueError(f"analysis context inheritance {field_name} is invalid")
+        elif not isinstance(value[field_name], str) or not value[field_name]:
+            raise ValueError(f"analysis context inheritance {field_name} is invalid")
+    for field_name in ("source_transition_audit_count",):
+        count = value[field_name]
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("analysis context inheritance audit count is invalid")
+    for field_name in ("lifecycle_transition_ids", "lifecycle_transition_hashes"):
+        if not isinstance(value[field_name], list) or any(not isinstance(item, str) or not item for item in value[field_name]):
+            raise ValueError("analysis context inheritance lifecycle ledger is invalid")
+    if len(value["lifecycle_transition_ids"]) != len(value["lifecycle_transition_hashes"]):
+        raise ValueError("analysis context inheritance lifecycle ledger lengths differ")
+    if value["record_hash"] != _transition_digest(value):
+        raise ValueError("analysis context inheritance record hash does not match content")
+    return value
+
+
+def _write_inheritance_state(
+    path: Path,
+    *,
+    run_id: str,
+    item_id: str,
+    record_hash: str,
+    manifest_hash: str,
+) -> dict[str, Any]:
+    value: dict[str, Any] = {
+        "record_kind": "analysis_context_catalog_inheritance_state",
+        "run_id": run_id,
+        "item_id": item_id,
+        "record_path": f"work/{_INHERITANCE_FILENAME}",
+        "inheritance_count": 1,
+        "inheritance_head": record_hash,
+        "manifest_file_hash": manifest_hash,
+    }
+    value["state_hash"] = _transition_digest(value)
+    _atomic_write_json_durable(path, value)
+    return value
+
+
+def _read_inheritance_state(path: Path, *, run_id: str, item_id: str) -> dict[str, Any] | None:
+    if not path.exists() and not path.is_symlink():
+        return None
+    _transition_regular(path, label="analysis context inheritance state")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("analysis context inheritance state is invalid") from exc
+    if not isinstance(value, Mapping) or set(value) != _INHERITANCE_STATE_FIELDS:
+        raise ValueError("analysis context inheritance state fields are invalid")
+    value = dict(value)
+    if value["record_kind"] != "analysis_context_catalog_inheritance_state":
+        raise ValueError("analysis context inheritance state kind is invalid")
+    if value["run_id"] != run_id or value["item_id"] != item_id:
+        raise ValueError("analysis context inheritance state identity does not match")
+    if value["record_path"] != f"work/{_INHERITANCE_FILENAME}" or value["inheritance_count"] != 1:
+        raise ValueError("analysis context inheritance state anchor is invalid")
+    for field_name in ("inheritance_head", "manifest_file_hash", "state_hash"):
+        raw = value[field_name]
+        if not isinstance(raw, str) or len(raw) != 64 or any(char not in "0123456789abcdef" for char in raw):
+            raise ValueError(f"analysis context inheritance {field_name} is invalid")
+    if value["state_hash"] != _transition_digest(value):
+        raise ValueError("analysis context inheritance state hash does not match content")
+    return value
+
+
+def _write_inheritance_intent(path: Path, value: Mapping[str, Any]) -> dict[str, Any]:
+    payload = dict(value)
+    payload["intent_hash"] = _transition_digest(payload)
+    _atomic_write_json_durable(path, payload)
+    return payload
+
+
+def _read_inheritance_intent(path: Path, *, run_id: str, item_id: str) -> dict[str, Any] | None:
+    if not path.exists() and not path.is_symlink():
+        return None
+    _transition_regular(path, label="analysis context inheritance intent")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("analysis context inheritance intent is invalid") from exc
+    if not isinstance(value, Mapping) or set(value) != _INHERITANCE_INTENT_FIELDS:
+        raise ValueError("analysis context inheritance intent fields are invalid")
+    value = dict(value)
+    if value["record_kind"] != "analysis_context_catalog_inheritance_intent":
+        raise ValueError("analysis context inheritance intent kind is invalid")
+    if value["run_id"] != run_id or value["item_id"] != item_id:
+        raise ValueError("analysis context inheritance intent identity does not match")
+    if value["record_path"] != f"work/{_INHERITANCE_FILENAME}" or value["state_path"] != f"work/{_INHERITANCE_STATE_FILENAME}":
+        raise ValueError("analysis context inheritance intent paths are invalid")
+    if value["phase"] not in {"intent", "manifest_persisted", "inheritance_persisted", "state_persisted"}:
+        raise ValueError("analysis context inheritance intent phase is invalid")
+    for field_name in ("after_manifest_hash", "intent_hash"):
+        raw = value[field_name]
+        if not isinstance(raw, str) or len(raw) != 64 or any(char not in "0123456789abcdef" for char in raw):
+            raise ValueError(f"analysis context inheritance {field_name} is invalid")
+    expected = value["expected_record"]
+    if not isinstance(expected, Mapping) or set(expected) != _INHERITANCE_RECORD_FIELDS:
+        raise ValueError("analysis context inheritance intent record is invalid")
+    if expected.get("record_hash") != _transition_digest(expected):
+        raise ValueError("analysis context inheritance intent record hash is invalid")
+    candidate = value["candidate_manifest"]
+    if not isinstance(candidate, Mapping) or candidate.get("manifest_hash") != _sha256_bytes(
+        _json_bytes({key: item for key, item in candidate.items() if key != "manifest_hash"})
+    ):
+        raise ValueError("analysis context inheritance intent candidate hash is invalid")
+    if _sha256_bytes(_manifest_bytes(candidate)) != value["after_manifest_hash"]:
+        raise ValueError("analysis context inheritance intent candidate bytes are invalid")
+    if value["intent_hash"] != _transition_digest(value):
+        raise ValueError("analysis context inheritance intent hash does not match content")
+    return value
+
+
+def _clear_inheritance_intent(path: Path) -> None:
+    if path.exists() or path.is_symlink():
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("analysis context inheritance intent is not a regular file")
+        path.unlink()
+        _fsync_directory(path.parent)
+
+
+def _reconcile_inheritance_journal(
+    manifest_path: Path,
+    *,
+    run_id: str,
+    item_id: str,
+    _locked: bool = False,
+) -> None:
+    """Recover or validate a target catalog-inheritance publication."""
+
+    if not _locked:
+        with _transition_lock(manifest_path):
+            _reconcile_inheritance_journal(manifest_path, run_id=run_id, item_id=item_id, _locked=True)
+        return
+
+    record_path, state_path, intent_path = _inheritance_paths(manifest_path)
+    record = _read_inheritance_record(record_path, run_id=run_id, item_id=item_id)
+    state = _read_inheritance_state(state_path, run_id=run_id, item_id=item_id)
+    intent = _read_inheritance_intent(intent_path, run_id=run_id, item_id=item_id)
+    manifest_exists = manifest_path.exists() or manifest_path.is_symlink()
+    if manifest_exists and (manifest_path.is_symlink() or not manifest_path.is_file()):
+        raise ValueError("analysis context manifest is not a regular file")
+
+    if intent is None:
+        if not manifest_exists:
+            if record is not None or state is not None:
+                raise ValueError("analysis context inheritance residue has no manifest")
+            return
+        if record is None and state is None:
+            return
+        if record is None or state is None:
+            raise ValueError("analysis context inheritance record/state is incomplete")
+        current_manifest_hash = _manifest_file_digest(manifest_path)
+        if state["inheritance_head"] != record["record_hash"] or state["manifest_file_hash"] != current_manifest_hash:
+            raise ValueError("analysis context inheritance state does not match durable publication")
+        return
+
+    expected = dict(intent["expected_record"])
+    candidate = dict(intent["candidate_manifest"])
+    expected_record_hash = str(expected["record_hash"])
+    expected_manifest_hash = str(intent["after_manifest_hash"])
+    if manifest_exists:
+        current_manifest_hash = _manifest_file_digest(manifest_path)
+        if current_manifest_hash != expected_manifest_hash:
+            raise ValueError("analysis context inheritance manifest is not recoverable")
+    else:
+        _atomic_write_json_durable(manifest_path, candidate)
+        current_manifest_hash = expected_manifest_hash
+    if record is not None and record != expected:
+        raise ValueError("analysis context inheritance record conflicts with intent")
+    if record is None:
+        _write_inheritance_record(record_path, expected)
+    if state is not None:
+        if state["inheritance_head"] != expected_record_hash or state["manifest_file_hash"] != current_manifest_hash:
+            raise ValueError("analysis context inheritance state conflicts with intent")
+    _write_inheritance_state(
+        state_path,
+        run_id=run_id,
+        item_id=item_id,
+        record_hash=expected_record_hash,
+        manifest_hash=current_manifest_hash,
+    )
+    _clear_inheritance_intent(intent_path)
 
 
 def _write_transition_state(path: Path, *, run_id: str, item_id: str, count: int, head: str | None, manifest_hash: str) -> dict[str, Any]:
@@ -792,6 +1866,378 @@ class BoundAnalysisContext:
         )
         return bound
 
+    @classmethod
+    def create_from_transitioned_catalog(
+        cls,
+        context: RunContext,
+        item_workspace: ItemWorkspace,
+        source_context: "BoundAnalysisContext",
+        lifecycle: Any,
+        *,
+        telemetry: Any = None,
+    ) -> "BoundAnalysisContext":
+        """Create a later item context from an already rebound catalog.
+
+        The source context is the authority for the immutable source identity,
+        physical inventory, canonical catalog and runner limits.  A target item
+        receives a current implementation manifest while its catalog retains
+        the persisted catalog's original implementation identity.  No
+        workbench discovery is performed: the identity-only ``DataRoom`` path
+        receives the source context's bound members and catalog entries.
+        """
+
+        from .lifecycle import RunLifecycle
+
+        if not isinstance(context, RunContext):
+            raise TypeError("create_from_transitioned_catalog requires one RunContext")
+        if not isinstance(item_workspace, ItemWorkspace):
+            raise TypeError("item_workspace must be an ItemWorkspace")
+        if not isinstance(source_context, BoundAnalysisContext):
+            raise TypeError("source_context must be a BoundAnalysisContext")
+        if not isinstance(lifecycle, RunLifecycle):
+            raise TypeError("lifecycle must be a RunLifecycle")
+        if item_workspace.context.run_id != context.run_id or item_workspace.context.run_root != context.run_root:
+            raise ValueError("target item must use the same run as the target context")
+        if (
+            source_context.context.run_id != context.run_id
+            or source_context.context.run_root != context.run_root
+            or source_context.context.core_version != context.core_version
+            or source_context.context.skill_version != context.skill_version
+        ):
+            raise ValueError("source context must already use the target implementation")
+        source_item_id = source_context.item_workspace.item_id
+        target_item_id = item_workspace.item_id
+        if source_item_id == target_item_id:
+            raise ValueError("source and target items must be distinct")
+        target_manifest = item_workspace.work_root / _MANIFEST_FILENAME
+        source_manifest = source_context.manifest_path
+        telemetry = telemetry or source_context.telemetry
+
+        # Global lock order is inherited source journals (oldest first) ->
+        # target inheritance journal -> run lifecycle -> source/target item
+        # state.  The complete source chain is needed when this source item is
+        # itself inherited; otherwise a Q2/Q3 writer could form a lock cycle.
+        source_lock_paths, source_hint_snapshot = _inheritance_lock_plan(context, source_manifest)
+        target_lock_paths, target_hint_snapshot = _inheritance_lock_plan(context, target_manifest)
+        lock_paths = list(source_lock_paths)
+        for lock_path in target_lock_paths:
+            if lock_path not in lock_paths:
+                lock_paths.append(lock_path)
+        with ExitStack() as stack:
+            for lock_path in lock_paths:
+                stack.enter_context(_transition_lock(lock_path))
+            if source_hint_snapshot:
+                _assert_inheritance_lock_plan_unchanged(context, source_manifest, source_hint_snapshot)
+            if target_hint_snapshot:
+                _assert_inheritance_lock_plan_unchanged(context, target_manifest, target_hint_snapshot)
+            with RunLifecycle._run_lock(context):
+                # Reload lifecycle and both workspaces under the authoritative
+                # run lock; caller-held objects are never authorization tokens.
+                authoritative_lifecycle = RunLifecycle._load_unlocked(context)
+                if authoritative_lifecycle.item_ids != lifecycle.item_ids:
+                    raise ValueError("implementation lifecycle changed during context creation")
+                source_item = ItemWorkspace.load(context, source_item_id, telemetry=telemetry)
+                target_item = ItemWorkspace.load(context, target_item_id, telemetry=telemetry)
+                # Lock both source and target item state files in lexical order,
+                # then reload them authoritatively.  A source attempt/review
+                # writer cannot race the stability guard between its read and
+                # target publication.
+                with ExitStack() as item_stack:
+                    for workspace in sorted((source_item, target_item), key=lambda value: str(value.item_root)):
+                        item_stack.enter_context(workspace._state_transition_lock())
+                    source_item = ItemWorkspace.load(context, source_item_id, telemetry=telemetry)
+                    target_item = ItemWorkspace.load(context, target_item_id, telemetry=telemetry)
+                    if source_item_id not in authoritative_lifecycle.item_ids or target_item_id not in authoritative_lifecycle.item_ids:
+                        raise ValueError("source and target items must be in the lifecycle")
+                    if authoritative_lifecycle.item_ids.index(source_item_id) >= authoritative_lifecycle.item_ids.index(target_item_id):
+                        raise ValueError("source item must precede target item")
+                    # Validate complete source provenance before opening the
+                    # identity-only workbench or touching target bytes.  A
+                    # direct rebound source is checked against its local
+                    # transition audit; an inherited source is checked by
+                    # the recursively locked catalog-inheritance chain and
+                    # must not be treated as a missing local audit.
+                    source_manifest = _regular_file(
+                        source_manifest,
+                        root=context.run_root,
+                        label="source analysis context manifest",
+                    )
+                    source_manifest_bytes = source_manifest.read_bytes()
+                    try:
+                        source_manifest_value = json.loads(source_manifest_bytes.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        raise ValueError("source analysis context manifest is invalid") from exc
+                    if not isinstance(source_manifest_value, Mapping):
+                        raise ValueError("source analysis context manifest is invalid")
+                    if source_manifest_value.get("catalog_inheritance") is not None:
+                        source_preflight = _inherited_source_preflight(
+                            context,
+                            source_manifest=source_manifest,
+                            source_manifest_value=source_manifest_value,
+                            source_item=source_item,
+                            lifecycle=authoritative_lifecycle,
+                        )
+                    else:
+                        source_preflight = _source_transition_preflight(
+                            context,
+                            source_manifest=source_manifest,
+                            lifecycle=authoritative_lifecycle,
+                            target_item_id=target_item_id,
+                            _locked=True,
+                        )
+                    source_manifest_value = source_preflight["source_manifest_value"]
+                    source_catalog_payload = source_preflight["source_catalog"]
+                    source_inventory = source_preflight["source_inventory"]
+                    source_bound = load_bound_analysis_context(
+                        context,
+                        path=source_manifest,
+                        item_workspace=source_item,
+                        telemetry=telemetry,
+                        _transition_locked=True,
+                        _source_transition_locked=True,
+                        _lifecycle=authoritative_lifecycle,
+                    )
+                    source_state = source_item.state
+                    source_terminal = source_state.get("lifecycle_state") in {"accepted", "technical_failure"}
+                    source_stable = (
+                        source_state.get("lifecycle_state") == "work"
+                        and source_state.get("active_attempt_id") is None
+                        and source_state.get("terminal_intent") is None
+                        and source_state.get("terminal_outcome") is None
+                        and source_state.get("review", {}).get("status") == "pending"
+                        and not source_item.business_review_path.exists()
+                    )
+                    if not (source_terminal or source_stable):
+                        raise ValueError("source item is not terminal or context-stable")
+                    if source_item_id not in authoritative_lifecycle.item_ids or target_item_id not in authoritative_lifecycle.item_ids:
+                        raise ValueError("source and target items must be in the lifecycle")
+                    if authoritative_lifecycle.item_ids.index(source_item_id) >= authoritative_lifecycle.item_ids.index(target_item_id):
+                        raise ValueError("source item must precede target item")
+                    target_state = target_item.state
+                    if (
+                        target_state.get("lifecycle_state") != "work"
+                        or target_state.get("active_attempt_id") is not None
+                        or target_state.get("terminal_intent") is not None
+                        or target_state.get("terminal_outcome") is not None
+                        or target_state.get("review", {}).get("status") != "pending"
+                        or target_item.accepted_root.exists()
+                        or target_item.business_review_path.exists()
+                    ):
+                        raise ValueError("target item is not a clean work item")
+
+                    # Recover an interrupted inheritance publication before
+                    # interpreting any target bytes.  The transition lock is
+                    # a normal program artifact and is deliberately ignored
+                    # as residue.
+                    _reconcile_inheritance_journal(
+                        target_manifest,
+                        run_id=context.run_id,
+                        item_id=target_item_id,
+                        _locked=True,
+                    )
+                    target_transition_paths = _transition_paths(target_manifest)
+                    target_inheritance_paths = _inheritance_paths(target_manifest)
+                    if (
+                        target_manifest.is_symlink()
+                        or (target_manifest.exists() and not target_manifest.is_file())
+                        or any(path.is_symlink() for path in target_transition_paths + target_inheritance_paths)
+                    ):
+                        raise ValueError("target context creation residue is not regular")
+                    if any(path.exists() for path in target_transition_paths):
+                        raise ValueError("target catalog inheritance must not contain synthetic transition audit artifacts")
+                    existing_manifest_bytes = target_manifest.read_bytes() if target_manifest.is_file() else None
+                    if not target_manifest.is_file() and any(path.exists() for path in target_inheritance_paths):
+                        raise ValueError("target context inheritance residue is incomplete")
+
+                    source_unsigned = dict(source_manifest_value)
+                    source_unsigned.pop("manifest_hash", None)
+                    if not isinstance(source_catalog_payload, Mapping) or not isinstance(source_inventory, Mapping):
+                        raise ValueError("source context catalog/inventory binding is missing")
+                    catalog_path_value = source_catalog_payload.get("path")
+                    if not isinstance(catalog_path_value, str) or not catalog_path_value:
+                        raise ValueError("source context catalog path is invalid")
+                    catalog_path = _regular_file(
+                        context.resolve_run_path(catalog_path_value),
+                        root=context.run_root,
+                        label="analysis catalog",
+                    )
+                    catalog_hash = source_catalog_payload.get("content_hash")
+                    if not isinstance(catalog_hash, str) or _sha256_file(catalog_path) != catalog_hash:
+                        raise ValueError("analysis catalog content hash does not match source context")
+                    try:
+                        persisted_catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+                    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        raise ValueError("analysis catalog is unreadable") from exc
+                    if not isinstance(persisted_catalog, Mapping):
+                        raise ValueError("analysis catalog must be an object")
+                    if (
+                        persisted_catalog.get("catalog_key") != source_catalog_payload.get("catalog_key")
+                        or persisted_catalog.get("source_hash") != source_bound.source_identity.content_hash
+                        or persisted_catalog.get("core_version") != source_catalog_payload.get("core_version")
+                    ):
+                        raise ValueError("analysis catalog persisted identity does not match source binding")
+                    raw_entries = persisted_catalog.get("entries")
+                    raw_counts = persisted_catalog.get("counts")
+                    if not isinstance(raw_entries, list) or not isinstance(raw_counts, Mapping):
+                        raise ValueError("analysis catalog entries/counts are invalid")
+                    try:
+                        entries = tuple(DataRoomCatalogEntry.from_dict(value) for value in raw_entries)
+                        counts = CatalogCounts(
+                            archive_members=raw_counts["archive_members"],
+                            catalog_entries=raw_counts["catalog_entries"],
+                            table_members=raw_counts["table_members"],
+                            sheet_entries=raw_counts["sheet_entries"],
+                        )
+                    except (TypeError, KeyError, ValueError) as exc:
+                        raise ValueError("analysis catalog entries/counts are invalid") from exc
+                    if entries != source_bound.source_catalog.entries or counts != source_bound.source_catalog.counts:
+                        raise ValueError("analysis catalog differs from source context")
+                    raw_members = source_inventory.get("members")
+                    if not isinstance(raw_members, list):
+                        raise ValueError("source physical inventory is invalid")
+                    try:
+                        bound_members = tuple(DataRoomMember.from_dict(value) for value in raw_members)
+                    except (TypeError, KeyError, ValueError) as exc:
+                        raise ValueError("source physical inventory is invalid") from exc
+                    if source_inventory.get("inventory_hash") != _sha256_bytes(_json_bytes(raw_members)):
+                        raise ValueError("source physical inventory hash does not match")
+
+                    transitions = tuple(authoritative_lifecycle.implementation_transitions)
+                    _implementation_transition_chain(
+                        transitions,
+                        authoritative_lifecycle,
+                        catalog_core=str(source_catalog_payload.get("core_version", "")),
+                        target_core=context.core_version,
+                        target_skill=context.skill_version,
+                        target_item_id=target_item_id,
+                    )
+                    inheritance_record = _catalog_inheritance_record(
+                        context,
+                        source_manifest=source_manifest,
+                        source_manifest_value=source_manifest_value,
+                        source_item=source_item,
+                        source_catalog=source_catalog_payload,
+                        source_inventory=source_inventory,
+                        lifecycle=authoritative_lifecycle,
+                        target_item_id=target_item_id,
+                        source_preflight=source_preflight,
+                    )
+
+                    source_identity = source_bound.source_identity
+                    target_workbench = DataRoomWorkbench(
+                        context,
+                        source_identity,
+                        telemetry=telemetry,
+                        _bound_members=bound_members,
+                        _bound_archive_hash=source_identity.content_hash,
+                        _bound_source_stat=source_inventory.get("source_stat"),
+                        _bound_central_directory_fingerprint=source_inventory.get("central_directory_fingerprint"),
+                        _bound_catalog_entries=entries,
+                        _bound_catalog_path=catalog_path,
+                        _bound_catalog_key=str(source_catalog_payload.get("catalog_key", "")),
+                    )
+                    snapshot = CatalogSnapshot(
+                        path=catalog_path,
+                        content_hash=str(source_catalog_payload["content_hash"]),
+                        catalog_key=str(source_catalog_payload["catalog_key"]),
+                        catalog_schema_version=str(source_catalog_payload.get("catalog_schema_version", "")),
+                        source_hash=source_identity.content_hash or "",
+                        core_version=str(source_catalog_payload.get("core_version", "")),
+                        entries=entries,
+                        counts=counts,
+                    )
+                    candidate_unsigned = {
+                        "schema_version": ANALYSIS_CONTEXT_SCHEMA_VERSION,
+                        "kind": "bound_analysis_context",
+                        "run_id": context.run_id,
+                        "run_root": str(context.run_root),
+                        "input_roots": [str(root) for root in context.input_roots],
+                        "core_version": context.core_version,
+                        "skill_version": context.skill_version,
+                        "item_id": target_item_id,
+                        "item_mode": target_item.mode,
+                        "source_identity": source_identity.to_dict(),
+                        "catalog": snapshot.to_dict(),
+                        "physical_inventory": _jsonable(source_inventory),
+                        "runner_config": dict(source_bound.runner_config),
+                        "ontology_bundle": _jsonable(source_bound.ontology_bundle),
+                        "manifest_path": str(target_manifest),
+                        "catalog_inheritance": {
+                            "path": f"work/{_INHERITANCE_FILENAME}",
+                            "record_hash": inheritance_record["record_hash"],
+                        },
+                    }
+                    for field_name in ("implementation_sha", "implementation_tree"):
+                        if field_name in source_unsigned:
+                            candidate_unsigned[field_name] = source_unsigned[field_name]
+                    candidate_manifest_hash = _sha256_bytes(_json_bytes(candidate_unsigned))
+                    candidate_manifest = {**candidate_unsigned, "manifest_hash": candidate_manifest_hash}
+                    if existing_manifest_bytes is not None:
+                        if existing_manifest_bytes != _manifest_bytes(candidate_manifest):
+                            raise ValueError("target context already exists with conflicting identity")
+                        return load_bound_analysis_context(
+                            context,
+                            path=target_manifest,
+                            item_workspace=target_item,
+                            telemetry=telemetry,
+                            _transition_locked=True,
+                            _source_transition_locked=True,
+                            _lifecycle=authoritative_lifecycle,
+                            _source_item=source_item,
+                        )
+                    inheritance_path, inheritance_state_path, inheritance_intent_path = _inheritance_paths(target_manifest)
+                    intent_unsigned = {
+                        "record_kind": "analysis_context_catalog_inheritance_intent",
+                        "operation_id": f"inherit-{inheritance_record['record_hash'][:16]}",
+                        "run_id": context.run_id,
+                        "item_id": target_item_id,
+                        "record_path": f"work/{_INHERITANCE_FILENAME}",
+                        "state_path": f"work/{_INHERITANCE_STATE_FILENAME}",
+                        "after_manifest_hash": _sha256_bytes(_manifest_bytes(candidate_manifest)),
+                        "expected_record": inheritance_record,
+                        "candidate_manifest": candidate_manifest,
+                        "phase": "intent",
+                    }
+                    if inheritance_intent_path.exists() or inheritance_intent_path.is_symlink():
+                        existing_intent = _read_inheritance_intent(
+                            inheritance_intent_path,
+                            run_id=context.run_id,
+                            item_id=target_item_id,
+                        )
+                        if existing_intent != {**intent_unsigned, "intent_hash": _transition_digest(intent_unsigned)}:
+                            raise ValueError("conflicting catalog inheritance intent exists")
+                    _write_inheritance_intent(inheritance_intent_path, intent_unsigned)
+                    _transition_failpoint("inheritance_after_intent")
+                    _atomic_write_json_durable(target_manifest, candidate_manifest)
+                    intent_unsigned["phase"] = "manifest_persisted"
+                    _write_inheritance_intent(inheritance_intent_path, intent_unsigned)
+                    _transition_failpoint("inheritance_after_manifest")
+                    _write_inheritance_record(inheritance_path, inheritance_record)
+                    intent_unsigned["phase"] = "inheritance_persisted"
+                    _write_inheritance_intent(inheritance_intent_path, intent_unsigned)
+                    _transition_failpoint("inheritance_after_record")
+                    _write_inheritance_state(
+                        inheritance_state_path,
+                        run_id=context.run_id,
+                        item_id=target_item_id,
+                        record_hash=inheritance_record["record_hash"],
+                        manifest_hash=_manifest_file_digest(target_manifest),
+                    )
+                    intent_unsigned["phase"] = "state_persisted"
+                    _write_inheritance_intent(inheritance_intent_path, intent_unsigned)
+                    _transition_failpoint("inheritance_after_state")
+                    _clear_inheritance_intent(inheritance_intent_path)
+                    return load_bound_analysis_context(
+                        context,
+                        path=target_manifest,
+                        item_workspace=target_item,
+                        telemetry=telemetry,
+                        _transition_locked=True,
+                        _source_transition_locked=True,
+                        _lifecycle=authoritative_lifecycle,
+                        _source_item=source_item,
+                    )
+
     @property
     def data_room(self):
         return self._workbench.data_room
@@ -830,7 +2276,15 @@ class BoundAnalysisContext:
             )
         return self._script_runner
 
-    def ensure_valid(self, *, final: bool = False, _transition_locked: bool = False) -> None:
+    def ensure_valid(
+        self,
+        *,
+        final: bool = False,
+        _transition_locked: bool = False,
+        _source_transition_locked: bool = False,
+        _lifecycle: Any | None = None,
+        _source_item: ItemWorkspace | None = None,
+    ) -> None:
         """Fail closed cheaply; use ``final=True`` at a freeze boundary."""
 
         _reconcile_transition_journal(
@@ -839,8 +2293,29 @@ class BoundAnalysisContext:
             item_id=self.item_workspace.item_id,
             _locked=_transition_locked,
         )
+        _reconcile_inheritance_journal(
+            self.manifest_path,
+            run_id=self.context.run_id,
+            item_id=self.item_workspace.item_id,
+            _locked=_transition_locked,
+        )
         if not self.manifest_path.is_file() or _sha256_file(self.manifest_path) != self._manifest_file_hash():
             raise ValueError("analysis context manifest changed")
+        try:
+            current_manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("analysis context manifest is unreadable") from exc
+        if not isinstance(current_manifest, Mapping):
+            raise ValueError("analysis context manifest must be an object")
+        _validate_catalog_inheritance(
+            self.context,
+            manifest_path=self.manifest_path,
+            manifest=current_manifest,
+            item_workspace=self.item_workspace,
+            lifecycle=_lifecycle,
+            source_item=_source_item,
+            source_transition_locked=_source_transition_locked,
+        )
         source_path = self.context.resolve_input(self.source_identity.uri)
         if not source_path.is_file():
             raise ValueError("analysis source changed after binding")
@@ -869,8 +2344,9 @@ class BoundAnalysisContext:
     ) -> "BoundAnalysisContext":
         """Serialize and publish one implementation transition.
 
-        Lock order is journal -> run lifecycle -> item state.  Lifecycle and
-        item mutators use their program-owned locks, so a terminal/attempt
+        Lock order is source transition journal (for inherited contexts) ->
+        target transition journal -> run lifecycle -> item state.  Lifecycle
+        and item mutators use their program-owned locks, so a terminal/attempt
         writer is ordered before or after this transition rather than racing
         its authoritative guard.
         """
@@ -883,7 +2359,16 @@ class BoundAnalysisContext:
             raise TypeError("item_workspace must be an ItemWorkspace")
         if not isinstance(lifecycle, RunLifecycle):
             raise TypeError("lifecycle must be a RunLifecycle")
-        with _transition_lock(self.manifest_path):
+        lock_paths, hint_snapshot = _inheritance_lock_plan(self.context, self.manifest_path)
+        inherited = bool(hint_snapshot)
+        with ExitStack() as stack:
+            if inherited:
+                for lock_path in lock_paths:
+                    stack.enter_context(_transition_lock(lock_path))
+            else:
+                stack.enter_context(_transition_lock(self.manifest_path))
+            if inherited:
+                _assert_inheritance_lock_plan_unchanged(self.context, self.manifest_path, hint_snapshot)
             with RunLifecycle._run_lock(context):
                 with item_workspace._state_transition_lock():
                     return self._rebind_implementation_locked(
@@ -892,6 +2377,7 @@ class BoundAnalysisContext:
                         lifecycle,
                         _lifecycle_locked=True,
                         _item_lock_held=True,
+                        _source_transition_locked=inherited,
                     )
 
     def _rebind_implementation_locked(
@@ -902,6 +2388,7 @@ class BoundAnalysisContext:
         *,
         _lifecycle_locked: bool = False,
         _item_lock_held: bool = False,
+        _source_transition_locked: bool = False,
     ) -> "BoundAnalysisContext":
         """Move this unaccepted context across an explicit implementation chain.
 
@@ -975,10 +2462,16 @@ class BoundAnalysisContext:
                 item_workspace=item_workspace,
                 telemetry=self.telemetry,
                 _transition_locked=True,
+                _source_transition_locked=_source_transition_locked,
+                _lifecycle=authoritative_lifecycle,
             )
         if current_core != self.context.core_version or current_skill != self.context.skill_version:
             raise ValueError("analysis context manifest implementation identity is not the caller's source")
-        self.ensure_valid(_transition_locked=True)
+        self.ensure_valid(
+            _transition_locked=True,
+            _source_transition_locked=_source_transition_locked,
+            _lifecycle=authoritative_lifecycle,
+        )
 
         state = item_workspace.state
         if state.get("active_attempt_id") is not None:
@@ -998,52 +2491,31 @@ class BoundAnalysisContext:
         if not transitions:
             raise ValueError("implementation rebind requires an implementation transition chain")
 
-        def _version_pair(value: str) -> tuple[str, str]:
-            raw = str(value)
-            if "/" not in raw:
-                raise ValueError("implementation transition version must be skill/core")
-            skill, core = raw.split("/", 1)
-            if not skill.startswith("skill") or not core.startswith("core") or len(skill) == 5 or len(core) == 4:
-                raise ValueError("implementation transition version must be skill/core")
-            return skill, core
-
         expected_old = (
             str(self.context.skill_version) if str(self.context.skill_version).startswith("skill") else f"skill{self.context.skill_version}",
             str(self.context.core_version) if str(self.context.core_version).startswith("core") else f"core{self.context.core_version}",
         )
-        previous_new: tuple[str, str] | None = None
-        preserved: Mapping[str, str] | None = None
-        for index, transition in enumerate(transitions):
-            old_pair = _version_pair(transition.old_version)
-            new_pair = _version_pair(transition.new_version)
-            if index == 0:
-                if old_pair != expected_old:
-                    raise ValueError("implementation transition chain does not start at bound identity")
-                old_sha = current_unsigned.get("implementation_sha")
-                old_tree = current_unsigned.get("implementation_tree")
-                if old_sha is not None and old_sha != transition.old_sha:
-                    raise ValueError("implementation transition old SHA does not match manifest")
-                if old_tree is not None and old_tree != transition.old_tree:
-                    raise ValueError("implementation transition old tree does not match manifest")
-            elif old_pair != previous_new:
-                raise ValueError("implementation transition version chain has a gap")
-            if index and (transition.old_sha != transitions[index - 1].new_sha or transition.old_tree != transitions[index - 1].new_tree):
-                raise ValueError("implementation transition repository identity chain has a gap")
-            if transition.earliest_affected_item != item_workspace.item_id:
-                raise ValueError("implementation transition earliest affected item does not match")
-            candidate_preserved = dict(transition.preserved_accepted_hashes)
-            if preserved is None:
-                preserved = candidate_preserved
-            elif candidate_preserved != dict(preserved):
-                raise ValueError("implementation transition preserved accepted hashes changed")
-            previous_new = new_pair
-        expected_target = (
-            str(target_skill) if str(target_skill).startswith("skill") else f"skill{target_skill}",
-            str(target_core) if str(target_core).startswith("core") else f"core{target_core}",
+        first_transition = transitions[0]
+        old_sha = current_unsigned.get("implementation_sha")
+        old_tree = current_unsigned.get("implementation_tree")
+        if old_sha is not None and old_sha != first_transition.old_sha:
+            raise ValueError("implementation transition old SHA does not match manifest")
+        if old_tree is not None and old_tree != first_transition.old_tree:
+            raise ValueError("implementation transition old tree does not match manifest")
+        catalog_payload = current_unsigned.get("catalog")
+        if not isinstance(catalog_payload, Mapping):
+            raise ValueError("analysis catalog binding is missing")
+        accepted_hashes = dict(
+            _implementation_transition_chain(
+                transitions,
+                lifecycle,
+                catalog_core=str(catalog_payload.get("core_version", "")),
+                target_core=target_core,
+                target_skill=target_skill,
+                target_item_id=item_workspace.item_id,
+                expected_old_pair=expected_old,
+            )
         )
-        if previous_new != expected_target:
-            raise ValueError("implementation transition chain does not reach target identity")
-        accepted_hashes = dict(preserved or {})
         if item_workspace.item_id in accepted_hashes:
             raise ValueError("implementation transition cannot preserve the active item")
         for accepted_item, expected_hash in accepted_hashes.items():
@@ -1168,6 +2640,8 @@ class BoundAnalysisContext:
             item_workspace=item_workspace,
             telemetry=self.telemetry,
             _transition_locked=True,
+            _source_transition_locked=_source_transition_locked,
+            _lifecycle=lifecycle,
         )
 
     def save_prepared_candidate(
@@ -1232,7 +2706,140 @@ def _manifest_path_for(
             raise ValueError("analysis context manifest must be a regular file")
         return raw
     resolved = context.resolve_run_path(selected)
+    if (
+        item_workspace is not None
+        and resolved == item_workspace.work_root / _MANIFEST_FILENAME
+        and _inheritance_paths(resolved)[2].is_file()
+    ):
+        # A crash may leave only the durable inheritance intent.  The loader
+        # lets its reconciliation step publish the candidate manifest before
+        # requiring a regular file below.
+        return resolved
     return _regular_file(resolved, root=context.run_root, label="analysis context manifest")
+
+
+def _inheritance_source_manifest_hint(context: RunContext, manifest_path: Path) -> dict[str, Any] | None:
+    """Read and fingerprint the contained source hint before taking locks.
+
+    The hint is intentionally lexical and bounded: it must be a relative,
+    run-contained ``questions|requirements/<item>/work/analysis_context.json``
+    path.  The returned bytes are re-read after source+target locks are held so
+    a concurrent source/target writer cannot change the lock ownership proof.
+    """
+
+    record_path, state_path, intent_path = _inheritance_paths(manifest_path)
+    manifest_bytes: bytes | None = None
+    manifest_value: Mapping[str, Any] | None = None
+    if manifest_path.exists() or manifest_path.is_symlink():
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise ValueError("inherited analysis context manifest is not a regular file")
+        manifest_bytes = manifest_path.read_bytes()
+        try:
+            parsed = json.loads(manifest_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("inherited analysis context manifest is invalid") from exc
+        if not isinstance(parsed, Mapping):
+            raise ValueError("inherited analysis context manifest is invalid")
+        manifest_value = parsed
+        binding = parsed.get("catalog_inheritance")
+        if binding is None:
+            if any(path.exists() or path.is_symlink() for path in (record_path, state_path, intent_path)):
+                raise ValueError("analysis context inheritance artifacts are not bound by the manifest")
+            return None
+        if not isinstance(binding, Mapping) or binding.get("path") != f"work/{_INHERITANCE_FILENAME}":
+            raise ValueError("analysis context catalog inheritance binding is invalid")
+    target_item_id = str(
+        manifest_value.get("item_id") if manifest_value is not None else manifest_path.parent.parent.name
+    )
+    if not target_item_id or "/" in target_item_id or target_item_id in {".", ".."}:
+        raise ValueError("inherited target item identity is invalid")
+
+    record: dict[str, Any] | None = None
+    state: dict[str, Any] | None = None
+    intent: dict[str, Any] | None = None
+    if record_path.exists() or record_path.is_symlink():
+        record = _read_inheritance_record(record_path, run_id=context.run_id, item_id=target_item_id)
+    if state_path.exists() or state_path.is_symlink():
+        state = _read_inheritance_state(state_path, run_id=context.run_id, item_id=target_item_id)
+    if intent_path.exists() or intent_path.is_symlink():
+        intent = _read_inheritance_intent(intent_path, run_id=context.run_id, item_id=target_item_id)
+    if record is None and intent is None:
+        if manifest_value is not None and manifest_value.get("catalog_inheritance") is not None:
+            raise ValueError("analysis context inheritance record is incomplete")
+        return None
+    if record is not None and manifest_value is not None:
+        binding = manifest_value.get("catalog_inheritance")
+        if not isinstance(binding, Mapping) or binding.get("record_hash") != record["record_hash"]:
+            raise ValueError("analysis context inheritance binding changed")
+    expected_record = record or dict(intent["expected_record"])
+    raw = expected_record.get("source_manifest_path")
+    if not isinstance(raw, str) or not raw or Path(raw).is_absolute():
+        raise ValueError("inherited source manifest hint must be run-relative")
+    raw_path = Path(raw)
+    if any(part in {"", ".", ".."} for part in raw_path.parts):
+        raise ValueError("inherited source manifest hint is not lexical")
+    if len(raw_path.parts) < 4 or raw_path.parts[0] not in {"questions", "requirements"} or raw_path.parts[-2:] != ("work", _MANIFEST_FILENAME):
+        raise ValueError("inherited source manifest hint path is invalid")
+    source_item_id = raw_path.parts[-3]
+    if not source_item_id or source_item_id in {".", ".."} or "/" in source_item_id:
+        raise ValueError("inherited source item hint is invalid")
+    source_manifest = context.resolve_run_path(raw)
+    if source_manifest == manifest_path or source_manifest.is_symlink() or not source_manifest.is_file():
+        raise ValueError("inherited source analysis context manifest is not a regular file")
+    if state is not None and record is not None:
+        if state["inheritance_head"] != record["record_hash"]:
+            raise ValueError("analysis context inheritance state head changed")
+        if manifest_path.is_file() and state["manifest_file_hash"] != _sha256_file(manifest_path):
+            raise ValueError("analysis context inheritance state manifest anchor changed")
+    return {
+        "source_manifest": source_manifest,
+        "source_manifest_path": raw,
+        "source_item_id": source_item_id,
+        "target_item_id": target_item_id,
+        "manifest_bytes": manifest_bytes,
+        "record_bytes": record_path.read_bytes() if record_path.is_file() else None,
+        "state_bytes": state_path.read_bytes() if state_path.is_file() else None,
+        "intent_bytes": intent_path.read_bytes() if intent_path.is_file() else None,
+    }
+
+
+def _inheritance_lock_plan(
+    context: RunContext,
+    manifest_path: Path,
+) -> tuple[tuple[Path, ...], tuple[tuple[Path, dict[str, Any]], ...]]:
+    """Return all inherited source locks in root-to-target order.
+
+    A later item may inherit from an item that itself inherited from an older
+    item.  Locking that complete chain avoids a Q2/Q3 cycle while preserving
+    the documented source-before-target order.  The second tuple is the
+    byte-level hint snapshot revalidated after all locks are held.
+    """
+
+    nodes: list[Path] = [manifest_path]
+    hints: list[tuple[Path, dict[str, Any]]] = []
+    current = manifest_path
+    seen: set[Path] = set()
+    while True:
+        if current in seen:
+            raise ValueError("analysis context inheritance source chain cycles")
+        seen.add(current)
+        hint = _inheritance_source_manifest_hint(context, current)
+        if hint is None:
+            break
+        hints.append((current, hint))
+        current = hint["source_manifest"]
+        nodes.append(current)
+    return tuple(reversed(nodes)), tuple(reversed(hints))
+
+
+def _assert_inheritance_lock_plan_unchanged(
+    context: RunContext,
+    manifest_path: Path,
+    expected: tuple[tuple[Path, dict[str, Any]], ...],
+) -> None:
+    _paths, actual = _inheritance_lock_plan(context, manifest_path)
+    if actual != expected:
+        raise ValueError("analysis context inheritance source hint changed during lock acquisition")
 
 
 def load_bound_analysis_context(
@@ -1242,12 +2849,95 @@ def load_bound_analysis_context(
     item_workspace: ItemWorkspace | None = None,
     telemetry: Any = None,
     _transition_locked: bool = False,
+    _source_transition_locked: bool = False,
+    _lifecycle: Any | None = None,
+    _source_item: ItemWorkspace | None = None,
+) -> BoundAnalysisContext:
+    """Load a bound context under source-first transition lock ordering."""
+
+    if context is None or _source_transition_locked:
+        return _load_bound_analysis_context_impl(
+            context,
+            path=path,
+            item_workspace=item_workspace,
+            telemetry=telemetry,
+            _transition_locked=_transition_locked,
+            _source_transition_locked=_source_transition_locked,
+            _lifecycle=_lifecycle,
+            _source_item=_source_item,
+        )
+    manifest_path = _manifest_path_for(context, path=path, item_workspace=item_workspace)
+    lock_paths, hint_snapshot = _inheritance_lock_plan(context, manifest_path)
+    if not hint_snapshot:
+        return _load_bound_analysis_context_impl(
+            context,
+            path=path,
+            item_workspace=item_workspace,
+            telemetry=telemetry,
+            _transition_locked=_transition_locked,
+            _source_transition_locked=False,
+            _lifecycle=_lifecycle,
+            _source_item=_source_item,
+        )
+    if _transition_locked:
+        # Callers that already hold the ordered source+target locks (the
+        # inheritance creator) pass both private flags explicitly.
+        if hint_snapshot:
+            _assert_inheritance_lock_plan_unchanged(context, manifest_path, hint_snapshot)
+        return _load_bound_analysis_context_impl(
+            context,
+            path=path,
+            item_workspace=item_workspace,
+            telemetry=telemetry,
+            _transition_locked=True,
+            _source_transition_locked=True,
+            _lifecycle=_lifecycle,
+            _source_item=_source_item,
+        )
+    with ExitStack() as stack:
+        for lock_path in lock_paths:
+            stack.enter_context(_transition_lock(lock_path))
+        _assert_inheritance_lock_plan_unchanged(context, manifest_path, hint_snapshot)
+        return _load_bound_analysis_context_impl(
+            context,
+            path=path,
+            item_workspace=item_workspace,
+            telemetry=telemetry,
+            _transition_locked=True,
+            _source_transition_locked=True,
+            _lifecycle=_lifecycle,
+            _source_item=_source_item,
+        )
+
+
+def _load_bound_analysis_context_impl(
+    context: RunContext | None = None,
+    *,
+    path: str | Path | None = None,
+    item_workspace: ItemWorkspace | None = None,
+    telemetry: Any = None,
+    _transition_locked: bool = False,
+    _source_transition_locked: bool = False,
+    _lifecycle: Any | None = None,
+    _source_item: ItemWorkspace | None = None,
 ) -> BoundAnalysisContext:
     """Load a hash-bound context from the environment or an explicit safe path."""
 
     if context is not None and not isinstance(context, RunContext):
         raise TypeError("load_bound_analysis_context requires one RunContext")
     manifest_path = _manifest_path_for(context, path=path, item_workspace=item_workspace)
+    if (
+        context is not None
+        and item_workspace is not None
+        and not manifest_path.is_file()
+        and _inheritance_paths(manifest_path)[2].is_file()
+    ):
+        _reconcile_inheritance_journal(
+            manifest_path,
+            run_id=context.run_id,
+            item_id=item_workspace.item_id,
+            _locked=_transition_locked,
+        )
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1261,6 +2951,12 @@ def load_bound_analysis_context(
     hinted_item_id = manifest.get("item_id")
     if isinstance(hinted_run_id, str) and isinstance(hinted_item_id, str) and hinted_run_id and hinted_item_id:
         _reconcile_transition_journal(
+            manifest_path,
+            run_id=hinted_run_id,
+            item_id=hinted_item_id,
+            _locked=_transition_locked,
+        )
+        _reconcile_inheritance_journal(
             manifest_path,
             run_id=hinted_run_id,
             item_id=hinted_item_id,
@@ -1312,6 +3008,15 @@ def load_bound_analysis_context(
     expected_manifest = item_workspace.work_root / _MANIFEST_FILENAME
     if manifest_path != expected_manifest:
         raise ValueError("analysis context manifest is not inside the bound item workspace")
+    _validate_catalog_inheritance(
+        context,
+        manifest_path=manifest_path,
+        manifest=manifest,
+        item_workspace=item_workspace,
+        lifecycle=_lifecycle,
+        source_item=_source_item,
+        source_transition_locked=_source_transition_locked,
+    )
     source_payload = unsigned.get("source_identity")
     if not isinstance(source_payload, Mapping):
         raise ValueError("analysis source identity is missing")
@@ -1370,18 +3075,34 @@ def load_bound_analysis_context(
         run_id=context.run_id,
         item_id=item_id,
     )
+    inheritance_record = _read_inheritance_record(
+        _inheritance_paths(manifest_path)[0],
+        run_id=context.run_id,
+        item_id=item_id,
+    )
     rebound_catalog = bool(transition_records)
     reused_entries: tuple[DataRoomCatalogEntry, ...] | None = None
     reused_catalog_path: Path | None = None
     reused_catalog_key: str | None = None
-    if rebound_catalog or catalog_core != context.core_version:
+    if inheritance_record is not None or rebound_catalog or catalog_core != context.core_version:
         if (
             not transition_records
-            or transition_records[0]["old_core_version"] != catalog_core
+            and inheritance_record is None
+        ):
+            raise ValueError("analysis catalog implementation transition is not recorded")
+        if transition_records and (
+            transition_records[0]["old_core_version"] != catalog_core
             or transition_records[-1]["new_core_version"] != context.core_version
             or transition_records[-1]["new_skill_version"] != str(context.skill_version)
         ):
             raise ValueError("analysis catalog implementation transition is not recorded")
+        if inheritance_record is not None and transition_records:
+            raise ValueError("analysis catalog cannot mix transition audit and inheritance provenance")
+        if inheritance_record is not None and (
+            inheritance_record["expected_current_pair"]["core_version"] != context.core_version
+            or inheritance_record["expected_current_pair"]["skill_version"] != str(context.skill_version)
+        ):
+            raise ValueError("analysis catalog inheritance current implementation is not recorded")
         raw_catalog_path = catalog_payload.get("path")
         if not isinstance(raw_catalog_path, str) or not raw_catalog_path:
             raise ValueError("analysis catalog path is invalid")
@@ -1480,7 +3201,12 @@ def load_bound_analysis_context(
         default_timeout_seconds=normalized_runner_config["default_timeout_seconds"],
         default_output_bytes=normalized_runner_config["default_output_bytes"],
     )
-    bound.ensure_valid(_transition_locked=_transition_locked)
+    bound.ensure_valid(
+        _transition_locked=_transition_locked,
+        _source_transition_locked=_source_transition_locked,
+        _lifecycle=_lifecycle,
+        _source_item=_source_item,
+    )
     return bound
 
 

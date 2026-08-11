@@ -37,7 +37,7 @@ def _fixture(tmp_path: Path) -> tuple[RunContext, RunContext, ItemWorkspace, Bou
             old_tree="c" * 40,
             new_tree="d" * 40,
             old_version="skill0.2.5/core0.3.1",
-            new_version="skill0.2.7/core0.3.2",
+            new_version="skill0.2.8/core0.3.2",
             earliest_affected_item="Q-001",
             preserved_accepted_hashes={},
             unaffected_reason="implementation transition",
@@ -51,15 +51,15 @@ def _fixture(tmp_path: Path) -> tuple[RunContext, RunContext, ItemWorkspace, Bou
             new_sha="e" * 40,
             old_tree="d" * 40,
             new_tree="f" * 40,
-            old_version="skill0.2.7/core0.3.2",
-            new_version="skill0.2.7/core0.3.4",
+            old_version="skill0.2.8/core0.3.2",
+            new_version="skill0.2.8/core0.3.5",
             earliest_affected_item="Q-001",
             preserved_accepted_hashes={},
             unaffected_reason="implementation transition",
             resume_point="analysis_context_rebind",
         )
     )
-    new = RunContext("RUN-REBIND", run, (inputs,), core_version="0.3.4", skill_version="0.2.7")
+    new = RunContext("RUN-REBIND", run, (inputs,), core_version="0.3.5", skill_version="0.2.8")
     return old, new, item, bound, lifecycle
 
 
@@ -77,14 +77,14 @@ def _skill_only_fixture(tmp_path: Path) -> tuple[RunContext, RunContext, ItemWor
             old_tree="c" * 40,
             new_tree="f" * 40,
             old_version="skill0.2.5/core0.3.1",
-            new_version="skill0.2.7/core0.3.1",
+            new_version="skill0.2.8/core0.3.1",
             earliest_affected_item="Q-001",
             preserved_accepted_hashes={},
             unaffected_reason="skill transition",
             resume_point="analysis_context_rebind",
         )
     )
-    new = RunContext("RUN-REBIND", run, (inputs,), core_version="0.3.1", skill_version="0.2.7")
+    new = RunContext("RUN-REBIND", run, (inputs,), core_version="0.3.1", skill_version="0.2.8")
     return old, new, item, bound, lifecycle
 
 
@@ -99,8 +99,8 @@ def test_rebind_reuses_catalog_and_old_identity_fails_closed(tmp_path: Path) -> 
 
     rebound = bound.rebind_implementation(new, new_item, lifecycle)
 
-    assert rebound.context.core_version == "0.3.4"
-    assert rebound.context.skill_version == "0.2.7"
+    assert rebound.context.core_version == "0.3.5"
+    assert rebound.context.skill_version == "0.2.8"
     assert rebound.source_catalog.path == catalog_path
     assert rebound.source_catalog.catalog_key == catalog_key
     assert rebound.source_catalog.content_hash == catalog_hash
@@ -175,7 +175,7 @@ def test_concurrent_rebind_is_one_idempotent_audit_record(tmp_path: Path) -> Non
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(bound.rebind_implementation, new, new_item, lifecycle) for _ in range(2)]
         results = [future.result() for future in futures]
-    assert all(result.context.core_version == "0.3.4" for result in results)
+    assert all(result.context.core_version == "0.3.5" for result in results)
     audit_path = bound.manifest_path.parent / "analysis_context_transitions.jsonl"
     assert len(audit_path.read_text(encoding="utf-8").splitlines()) == 1
 
@@ -205,7 +205,7 @@ def test_active_attempt_race_is_ordered_by_item_state_lock(tmp_path: Path) -> No
     final_item = ItemWorkspace.load(new, "Q-001")
     if "rebind" in results:
         assert final_item.state["active_attempt_id"] is not None
-        assert json.loads(bound.manifest_path.read_text(encoding="utf-8"))["core_version"] == "0.3.4"
+        assert json.loads(bound.manifest_path.read_text(encoding="utf-8"))["core_version"] == "0.3.5"
     else:
         assert final_item.state["active_attempt_id"] is not None
         assert not (bound.manifest_path.parent / "analysis_context_transition_intent.json").exists()
@@ -310,7 +310,7 @@ def test_rebind_crash_boundaries_converge_on_load(tmp_path: Path, monkeypatch: p
         bound.rebind_implementation(new, new_item, lifecycle)
     monkeypatch.setattr(analysis_module, "_transition_failpoint", lambda _actual: None)
     loaded = load_bound_analysis_context(new, path=bound.manifest_path, item_workspace=new_item)
-    assert loaded.context.core_version == "0.3.4"
+    assert loaded.context.core_version == "0.3.5"
     assert not (bound.manifest_path.parent / "analysis_context_transition_intent.json").exists()
     assert loaded.source_catalog.path == bound.source_catalog.path
 
