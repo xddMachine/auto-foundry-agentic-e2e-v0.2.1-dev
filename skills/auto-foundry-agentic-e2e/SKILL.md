@@ -3,14 +3,14 @@ name: auto-foundry-agentic-e2e
 description: Runs a natural, reviewed, offline-friendly enterprise analysis workflow for supplied questions or analytics-only manager requirements using a program-owned data room, durable item workspaces, artifact progress, and run-local prepared assets.
 metadata:
   author: auto-foundry
-  version: "0.2.5"
+  version: "0.2.6"
   core_name: auto_foundry_core
-  core_version: "0.3.2"
+  core_version: "0.3.3"
   architecture: agent-workbench-durable-execution
   release: program-owned-data-room-and-durable-item-workspaces
 ---
 
-# Auto Foundry Agentic E2E — v0.2.5
+# Auto Foundry Agentic E2E — v0.2.6
 
 ## 0. Run identity and authority
 
@@ -19,9 +19,9 @@ program's run report/metadata and repeat them in the final run report:
 
 ```text
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.2.5
+skill_version: 0.2.6
 core_name: auto_foundry_core
-core_version: 0.3.2
+core_version: 0.3.3
 ```
 
 `run_state.json` is the lifecycle authority and contains exactly these nine
@@ -384,8 +384,8 @@ context = RunContext(
     "RUN-example",
     run_root,
     (input_root,),
-    core_version="0.3.2",
-    skill_version="0.2.5",
+    core_version="0.3.3",
+    skill_version="0.2.6",
 )
 workbench = DataRoomWorkbench(context, archive_path)
 room = workbench.data_room
@@ -453,6 +453,18 @@ If no reviewer can be obtained, continue with:
 Disclose this limitation in the item result and final report. An available
 reviewer may return `accept`, `accept_with_limits`, `repair_once`, or
 `block_specific_claims`; only the single permitted business repair may follow.
+
+If the persisted reviewer packet itself is invalid because of reviewer scope,
+the program may call the strict `ItemWorkspace.discard_business_review(...)`
+recovery path. The incident must be an inadmissible, item-bound
+`reviewer_scope` incident with a non-empty source. The method appends an
+append-only, hash-bound record to
+`work/business_review_discard_audit.jsonl`, then atomically removes the packet
+and resets `review` to pending, `business_repair_count` to zero, and lifecycle
+state to `work`; existing work and draft bytes are preserved. The next review
+must be a new full review. This path never reinterprets findings, changes
+semantic or draft content, or supplies a compatibility fallback, and it is not
+a general-purpose review reset.
 
 ## 9. Final products and dashboard prototype
 
@@ -608,7 +620,7 @@ artifacts, or central/cross-run caches.
 - Do not auto-promote custom code or confuse the development-only evidence
   collector and later Optimization Agent with client business automation.
 
-This v0.2.5 contract describes the minimal Agent Workbench + Durable
+This v0.2.6 contract describes the minimal Agent Workbench + Durable
 Execution path. It is an offline-friendly contract, not a claim of host-level
 sandboxing, benchmark completion, or production hardening.
 

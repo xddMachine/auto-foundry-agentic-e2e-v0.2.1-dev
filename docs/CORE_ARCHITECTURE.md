@@ -1,4 +1,4 @@
-# `auto_foundry_core` 0.3.2
+# `auto_foundry_core` 0.3.3
 
 `auto_foundry_core` is a small offline, source-agnostic deterministic substrate
 for local analytics and durable item execution. It is intentionally not an
@@ -61,6 +61,12 @@ adapters, or cross-run state.
 - Business repair authorization accepts explicit dependent artifact roots and
   JSON fragments as owning artifact paths; unrelated artifact mutations fail
   closed.
+- `ItemWorkspace.discard_business_review(...)` is a strict recovery path for
+  an inadmissible item-bound `reviewer_scope` packet only. It appends a
+  hash-bound record to the append-only discard audit, atomically removes the
+  packet while preserving work/draft bytes, resets pending review and business
+  repair, and requires a new full review. It never reinterprets semantic
+  content and has no compatibility fallback.
 - `lifecycle.py` owns run-level `RunLifecycle` transitions, durable
   `AgentInvocationReceipt` ledgers, and explicit implementation transitions;
   `product_contracts.py` owns exact nested `freeze_markers` and singular
@@ -141,7 +147,7 @@ candidate-to-accepted prepared registration, lifecycle barriers, strict
 product markers, physical-inventory counters, safe opaque materialization,
 and optimizer evidence. All fixtures use no model or network call.
 
-The candidate is labelled **v0.2.5 / core 0.3.2 — offline program validation
+The candidate is labelled **v0.2.6 / core 0.3.3 — offline program validation
 complete for later Benchmark A** only when these vertical proofs and the full
 offline suite pass. Benchmark A is not run here.
 This remains an experimental release candidate, not a production-hardened

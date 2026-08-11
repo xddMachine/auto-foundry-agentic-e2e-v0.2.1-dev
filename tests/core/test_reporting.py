@@ -87,7 +87,7 @@ def test_report_projector_rejects_bad_sha_and_finalizer_is_idempotent_and_tamper
                 "record_kind_totals": {"claim": 1},
                 "implementation_sha": "a" * 40,
                 "implementation_tree": "b" * 40,
-                "implementation_version": "0.3.2",
+                "implementation_version": "0.3.3",
             }
         ],
         receipts=[
@@ -184,7 +184,7 @@ def test_report_projector_rejects_bad_sha_and_finalizer_is_idempotent_and_tamper
                     "outcome": "accepted",
                     "implementation_sha": "a" * 41,
                     "implementation_tree": "b" * 40,
-                "implementation_version": "0.3.2",
+                "implementation_version": "0.3.3",
                 }
             ]
         )
@@ -201,7 +201,7 @@ def test_report_projector_roundtrips_authoritative_reviews_receipts_timings_and_
         "record_kind_totals": {"claim": 2},
         "implementation_sha": "a" * 40,
         "implementation_tree": "b" * 40,
-        "implementation_version": "0.3.2",
+        "implementation_version": "0.3.3",
     }
     receipts = [
         {

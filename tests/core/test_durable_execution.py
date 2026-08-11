@@ -4,9 +4,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from typing import Mapping
 
 import pytest
 
+import auto_foundry_core.durable as durable_module
+from auto_foundry_core.contracts import IncidentRecord
 from auto_foundry_core.durable import (
     AcceptedSnapshot,
     ArtifactProgress,
@@ -21,6 +24,10 @@ from auto_foundry_core.telemetry import TelemetryRecorder
 from auto_foundry_core.workspace import AllowedRootError, RunContext
 
 
+class _DiscardCrash(BaseException):
+    """Simulated process loss that bypasses ordinary exception rollback."""
+
+
 def _workspace(tmp_path: Path, *, telemetry=None) -> ItemWorkspace:
     context = RunContext("RUN-EXECUTION", tmp_path / "run")
     return ItemWorkspace.create(context, "Q-001", original_text="Analyze the supplied evidence", telemetry=telemetry)
@@ -32,6 +39,24 @@ def _accepted_workspace(tmp_path: Path) -> ItemWorkspace:
     workspace.record_review("accept", reviewer_ref="review-1")
     workspace.accept(accepted_refs=("work/plan.json",))
     return workspace
+
+
+def _discard_incident(
+    *,
+    item_id: str = "Q-001",
+    admissible: bool = False,
+    category: str = "reviewer_scope",
+    source: str | None = "reviewer-scope-fixture",
+) -> IncidentRecord:
+    return IncidentRecord(
+        incident_id="INC-REVIEW-SCOPE-001",
+        category=category,
+        disposition="discarded_invalid_scope",
+        admissible=admissible,
+        item_id=item_id,
+        scope=("work/q001_result.json", "/answer"),
+        source=source,
+    )
 
 
 def test_attempt_progress_decisions_are_deterministic_and_reloadable(tmp_path: Path) -> None:
@@ -332,6 +357,367 @@ def test_repair_scope_rejects_unrelated_artifact_with_dependency_only_scope(tmp_
     with pytest.raises(ValueError, match="outside reviewed scope"):
         workspace.write_open_issues({"unrelated": True})
     assert not (workspace.work_root / "open_issues.json").exists()
+
+
+def test_discard_business_review_preserves_repair_bytes_and_allows_clean_full_review(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    workspace.write_draft({"answer": "initial", "limits": []})
+    workspace.record_review(
+        "repair_once",
+        reviewer_ref="review-1",
+        findings=[{"finding_id": "F-SCOPE", "pointers": ["/answer"]}],
+    )
+    workspace.use_business_repair()
+    workspace.write_draft({"answer": "repaired", "limits": []})
+    draft_before = workspace.draft_root.read_bytes()
+    packet_before = workspace.business_review_path.read_bytes()
+
+    audit = workspace.discard_business_review(_discard_incident().to_dict())
+
+    assert workspace.draft_root.read_bytes() == draft_before
+    assert not workspace.business_review_path.exists()
+    assert workspace.state["business_repair_count"] == 0
+    assert workspace.state["review"] == workspace._pending_review()
+    assert workspace.state["lifecycle_state"] == "work"
+    audit_lines = workspace.business_review_discard_audit_path.read_text(encoding="utf-8").splitlines()
+    assert len(audit_lines) == 1
+    assert json.loads(audit_lines[0]) == audit
+    assert audit["discarded_packet_hash"] == hashlib.sha256(packet_before).hexdigest()
+
+    clean = workspace.record_review(
+        "repair_once",
+        reviewer_ref="review-2",
+        findings=[{"finding_id": "F-CLEAN", "pointers": ["/answer"]}],
+    )
+    assert clean["review_scope"] == "full"
+    assert clean["targeted_recheck"] is False
+    assert workspace.state["business_repair_count"] == 0
+    workspace.use_business_repair()
+    assert workspace.state["business_repair_count"] == 1
+
+    with pytest.raises(ValueError, match="already recorded"):
+        workspace.discard_business_review(_discard_incident())
+
+
+@pytest.mark.parametrize(
+    ("incident", "message"),
+    (
+        (_discard_incident(admissible=True), "inadmissible"),
+        (_discard_incident(category="program"), "reviewer_scope"),
+        (_discard_incident(item_id="Q-OTHER"), "item_id"),
+    ),
+)
+def test_discard_business_review_rejects_invalid_incidents(tmp_path: Path, incident: IncidentRecord, message: str) -> None:
+    workspace = _workspace(tmp_path)
+    workspace.write_draft({"answer": "initial"})
+    workspace.record_review(
+        "repair_once",
+        reviewer_ref="review-1",
+        findings=[{"finding_id": "F-SCOPE", "pointers": ["/answer"]}],
+    )
+    packet_before = workspace.business_review_path.read_bytes()
+    with pytest.raises(ValueError, match=message):
+        workspace.discard_business_review(incident)
+    assert workspace.business_review_path.read_bytes() == packet_before
+    assert workspace.state["business_repair_count"] == 0
+    assert not workspace.business_review_discard_audit_path.exists()
+
+
+def _review_packet_workspace(tmp_path: Path) -> ItemWorkspace:
+    workspace = _workspace(tmp_path)
+    workspace.write_draft({"answer": "initial"})
+    workspace.record_review(
+        "repair_once",
+        reviewer_ref="review-1",
+        findings=[{"finding_id": "F-SCOPE", "pointers": ["/answer"]}],
+    )
+    return workspace
+
+
+def _repair_packet_workspace(tmp_path: Path) -> ItemWorkspace:
+    workspace = _review_packet_workspace(tmp_path)
+    workspace.use_business_repair()
+    workspace.write_draft({"answer": "repaired"})
+    return workspace
+
+
+def test_discard_business_review_requires_typed_source(tmp_path: Path) -> None:
+    workspace = _review_packet_workspace(tmp_path)
+    with pytest.raises(ValueError, match="source must be a non-empty string"):
+        workspace.discard_business_review(_discard_incident(source=None))
+    assert workspace.business_review_path.exists()
+    assert not workspace.business_review_discard_audit_path.exists()
+
+
+@pytest.mark.parametrize("source", (None, "", "   "))
+def test_discard_business_review_requires_nonblank_mapping_source(tmp_path: Path, source: str | None) -> None:
+    workspace = _review_packet_workspace(tmp_path)
+    value = _discard_incident().to_dict()
+    value["source"] = source
+    with pytest.raises(ValueError, match="source must be a non-empty string"):
+        workspace.discard_business_review(value)
+    assert workspace.business_review_path.exists()
+    assert not workspace.business_review_discard_audit_path.exists()
+
+
+def test_discard_business_review_requires_mapping_source_field(tmp_path: Path) -> None:
+    workspace = _review_packet_workspace(tmp_path)
+    value = _discard_incident().to_dict()
+    del value["source"]
+    with pytest.raises(ValueError, match="missing fields"):
+        workspace.discard_business_review(value)
+    assert workspace.business_review_path.exists()
+    assert not workspace.business_review_discard_audit_path.exists()
+
+
+def test_discard_business_review_rejects_missing_packet(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    workspace.write_draft({"answer": "initial"})
+    with pytest.raises(ValueError, match="structured review packet"):
+        workspace.discard_business_review(_discard_incident())
+    assert not workspace.business_review_discard_audit_path.exists()
+
+
+def test_discard_business_review_rolls_back_on_state_persist_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace = _workspace(tmp_path)
+    workspace.write_draft({"answer": "initial"})
+    workspace.record_review(
+        "repair_once",
+        reviewer_ref="review-1",
+        findings=[{"finding_id": "F-SCOPE", "pointers": ["/answer"]}],
+    )
+    workspace.use_business_repair()
+    workspace.write_draft({"answer": "repaired"})
+    state_path = workspace.item_root / "item_state.json"
+    state_before = state_path.read_bytes()
+    packet_before = workspace.business_review_path.read_bytes()
+    draft_before = workspace.draft_root.read_bytes()
+
+    def fail_persist(_state: Mapping[str, object], **_kwargs: object) -> None:
+        raise RuntimeError("injected discard persistence failure")
+
+    monkeypatch.setattr(workspace, "_persist_state", fail_persist)
+    with pytest.raises(RuntimeError, match="injected discard persistence failure"):
+        workspace.discard_business_review(_discard_incident())
+
+    assert state_path.read_bytes() == state_before
+    assert workspace.business_review_path.read_bytes() == packet_before
+    assert workspace.draft_root.read_bytes() == draft_before
+    assert not workspace.business_review_discard_audit_path.exists()
+    assert workspace.state["business_repair_count"] == 1
+
+
+def test_discard_reload_recovers_crash_after_intent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace = _repair_packet_workspace(tmp_path)
+    incident = _discard_incident()
+
+    def crash_before_audit(_path: Path, _value: Mapping[str, object]) -> None:
+        raise _DiscardCrash("after intent")
+
+    monkeypatch.setattr(durable_module, "_append_jsonl", crash_before_audit)
+    with pytest.raises(_DiscardCrash):
+        workspace.discard_business_review(incident)
+
+    assert workspace.business_review_discard_state_path.exists()
+    assert not workspace.business_review_discard_audit_path.exists()
+    reloaded = ItemWorkspace.load(workspace.context, workspace.item_id)
+    assert reloaded.state["business_repair_count"] == 1
+    assert reloaded.business_review_path.exists()
+    assert json.loads(reloaded.business_review_discard_state_path.read_text(encoding="utf-8"))["intent"] is None
+
+
+def test_discard_reload_recovers_crash_after_audit_append(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace = _repair_packet_workspace(tmp_path)
+    incident = _discard_incident()
+    original_append = durable_module._append_jsonl
+
+    def append_then_crash(path: Path, value: Mapping[str, object]) -> None:
+        original_append(path, value)
+        raise _DiscardCrash("after audit")
+
+    monkeypatch.setattr(durable_module, "_append_jsonl", append_then_crash)
+    with pytest.raises(_DiscardCrash):
+        workspace.discard_business_review(incident)
+
+    assert workspace.business_review_path.exists()
+    assert workspace.business_review_discard_audit_path.exists()
+    reloaded = ItemWorkspace.load(workspace.context, workspace.item_id)
+    assert reloaded.state["business_repair_count"] == 0
+    assert not reloaded.business_review_path.exists()
+    assert reloaded.business_review_discard_audit_path.read_text(encoding="utf-8").count("\n") == 1
+    assert reloaded.business_review_discard_state_path.read_text(encoding="utf-8").find('"intent":null') >= 0
+
+
+def test_discard_reload_recovers_crash_after_packet_unlink_before_state_persist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _repair_packet_workspace(tmp_path)
+    incident = _discard_incident()
+
+    def crash_before_state(_state: Mapping[str, object], **_kwargs: object) -> None:
+        raise _DiscardCrash("after packet unlink")
+
+    monkeypatch.setattr(workspace, "_persist_state", crash_before_state)
+    with pytest.raises(_DiscardCrash):
+        workspace.discard_business_review(incident)
+
+    assert not workspace.business_review_path.exists()
+    assert workspace.state["business_repair_count"] == 1
+    reloaded = ItemWorkspace.load(workspace.context, workspace.item_id)
+    assert reloaded.state["business_repair_count"] == 0
+    assert not reloaded.business_review_path.exists()
+
+
+def test_discard_reload_rejects_draft_mutation_after_packet_unlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _repair_packet_workspace(tmp_path)
+
+    def crash_before_state(_state: Mapping[str, object], **_kwargs: object) -> None:
+        raise _DiscardCrash("after packet unlink")
+
+    monkeypatch.setattr(workspace, "_persist_state", crash_before_state)
+    with pytest.raises(_DiscardCrash):
+        workspace.discard_business_review(_discard_incident())
+
+    # Simulate an unrelated writer changing the draft while the process is
+    # down.  The persisted intent must reject recovery rather than silently
+    # accepting a hash it did not authorize.
+    workspace.draft_root.write_bytes(b'{"answer":"tampered"}\n')
+    with pytest.raises(ValueError, match="discard intent draft is invalid"):
+        ItemWorkspace.load(workspace.context, workspace.item_id)
+
+
+def test_discard_reload_recovers_crash_after_state_persist_before_commit_anchor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _repair_packet_workspace(tmp_path)
+    incident = _discard_incident()
+    original_write = workspace._write_business_review_discard_state
+    calls = 0
+
+    def write_then_crash(*, audit_count: int, audit_head: str | None, intent: Mapping[str, object] | None) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 4:
+            raise _DiscardCrash("after state persist")
+        return original_write(audit_count=audit_count, audit_head=audit_head, intent=intent)
+
+    monkeypatch.setattr(workspace, "_write_business_review_discard_state", write_then_crash)
+    with pytest.raises(_DiscardCrash):
+        workspace.discard_business_review(incident)
+
+    assert workspace.state["business_repair_count"] == 0
+    assert not workspace.business_review_path.exists()
+    reloaded = ItemWorkspace.load(workspace.context, workspace.item_id)
+    assert reloaded.state["business_repair_count"] == 0
+    assert not reloaded.business_review_path.exists()
+    assert reloaded.business_review_discard_state_path.read_text(encoding="utf-8").find('"intent":null') >= 0
+
+
+def test_discard_audit_anchor_rejects_delete_rewrite_and_valid_prefix_truncation(tmp_path: Path) -> None:
+    workspace = _repair_packet_workspace(tmp_path)
+    workspace.discard_business_review(_discard_incident())
+    audit_path = workspace.business_review_discard_audit_path
+
+    audit_path.unlink()
+    with pytest.raises(ValueError, match="missing its durable state anchor|does not match"):
+        ItemWorkspace.load(workspace.context, workspace.item_id)
+
+    workspace = _repair_packet_workspace(tmp_path / "rewrite")
+    workspace.discard_business_review(_discard_incident())
+    audit_path = workspace.business_review_discard_audit_path
+    tampered = json.loads(audit_path.read_text(encoding="utf-8"))
+    tampered["disposition"] = "rewritten"
+    audit_path.write_text(json.dumps(tampered) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="audit hash|discard audit"):
+        ItemWorkspace.load(workspace.context, workspace.item_id)
+
+    workspace = _repair_packet_workspace(tmp_path / "truncate")
+    workspace.discard_business_review(_discard_incident())
+    prefix_line = workspace.business_review_discard_audit_path.read_text(encoding="utf-8")
+    workspace.record_review(
+        "repair_once",
+        reviewer_ref="review-2",
+        findings=[{"finding_id": "F-SCOPE-2", "pointers": ["/answer"]}],
+    )
+    workspace.use_business_repair()
+    workspace.discard_business_review(
+        IncidentRecord(
+            incident_id="INC-REVIEW-SCOPE-002",
+            category="reviewer_scope",
+            disposition="discarded_invalid_scope",
+            admissible=False,
+            item_id="Q-001",
+            scope=("work/q001_result.json", "/answer"),
+            source="reviewer-scope-fixture",
+        )
+    )
+    audit_path = workspace.business_review_discard_audit_path
+    audit_path.write_text(prefix_line, encoding="utf-8")
+    with pytest.raises(ValueError, match="does not match|audit count"):
+        ItemWorkspace.load(workspace.context, workspace.item_id)
+
+
+def _tamper_discard_audit(workspace: ItemWorkspace, kind: str) -> None:
+    audit_path = workspace.business_review_discard_audit_path
+    if kind == "delete":
+        audit_path.unlink()
+    elif kind == "truncate":
+        audit_path.write_bytes(b"")
+    elif kind == "rewrite":
+        record = json.loads(audit_path.read_text(encoding="utf-8"))
+        record["incident"]["disposition"] = "tampered"
+        audit_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    else:
+        raise AssertionError(f"unknown audit tamper: {kind}")
+
+
+def test_discard_live_workspace_allows_stable_review_and_accept(tmp_path: Path) -> None:
+    workspace = _repair_packet_workspace(tmp_path)
+    workspace.discard_business_review(_discard_incident())
+    workspace.record_review("accept", reviewer_ref="review-2")
+
+    snapshot = workspace.accept()
+
+    assert snapshot.outcome == "accepted"
+    assert workspace.accepted_root.is_dir()
+
+
+@pytest.mark.parametrize("kind", ("delete", "truncate", "rewrite"))
+def test_discard_live_workspace_rejects_audit_tamper_before_record_review(tmp_path: Path, kind: str) -> None:
+    workspace = _repair_packet_workspace(tmp_path)
+    workspace.discard_business_review(_discard_incident())
+    state_before = (workspace.item_root / "item_state.json").read_bytes()
+    sidecar_before = workspace.business_review_discard_state_path.read_bytes()
+    _tamper_discard_audit(workspace, kind)
+
+    with pytest.raises(ValueError, match="business review discard|audit"):
+        workspace.record_review("accept", reviewer_ref="review-2")
+
+    assert (workspace.item_root / "item_state.json").read_bytes() == state_before
+    assert workspace.business_review_discard_state_path.read_bytes() == sidecar_before
+    assert not workspace.business_review_path.exists()
+
+
+@pytest.mark.parametrize("kind", ("delete", "truncate", "rewrite"))
+def test_discard_live_workspace_rejects_audit_tamper_before_accept(tmp_path: Path, kind: str) -> None:
+    workspace = _repair_packet_workspace(tmp_path)
+    workspace.discard_business_review(_discard_incident())
+    workspace.record_review("accept", reviewer_ref="review-2")
+    state_before = (workspace.item_root / "item_state.json").read_bytes()
+    packet_before = workspace.business_review_path.read_bytes()
+    _tamper_discard_audit(workspace, kind)
+
+    with pytest.raises(ValueError, match="business review discard|audit"):
+        workspace.accept()
+
+    assert (workspace.item_root / "item_state.json").read_bytes() == state_before
+    assert workspace.business_review_path.read_bytes() == packet_before
+    assert not workspace.accepted_root.exists()
 
 
 def test_unavailable_review_disclosure_can_be_accepted_with_limits(tmp_path: Path) -> None:

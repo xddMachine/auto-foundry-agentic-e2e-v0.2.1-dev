@@ -27,9 +27,9 @@ At run start, record these exact release markers in program run metadata and
 the final report (the lifecycle `run_state.json` remains the exact nine-field
 authority schema):
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.2.5
+skill_version: 0.2.6
 core_name: auto_foundry_core
-core_version: 0.3.2
+core_version: 0.3.3
 
 Build one program-owned data room/source catalog from the supplied archive and
 member metadata. Keep the archive read-only. Process the questions in exactly
@@ -68,6 +68,14 @@ without repeating the full analysis. Keep
 telemetry passive: record invocation lane/role/route, status/errors,
 artifact-before/after/counts, recovery and repair counts, source/member reads,
 and core/cache facts, never raw rows or route control.
+
+If a reviewer packet is itself out of scope, recover it only through
+`ItemWorkspace.discard_business_review(...)` with an inadmissible, item-bound
+`reviewer_scope` incident. Verify the append-only hash-bound
+`work/business_review_discard_audit.jsonl` record, atomic packet removal,
+unchanged work/draft bytes, pending review, and zero business-repair count;
+then require a new full review. Do not reinterpret findings or add a
+compatibility fallback.
 
 Record separate observed phase timing for analyst/model work, controlled
 execution, business review, business repair, fidelity/integration review,
@@ -159,7 +167,7 @@ client-business automation.
 
 The offline tests should demonstrate:
 
-- v0.2.5 skill and v0.3.2 core markers in instructions and run metadata;
+- v0.2.6 skill and v0.3.3 core markers in instructions and run metadata;
 - one data room/source catalog, read-only raw archive, and bounded metadata;
 - one run-level physical inventory with passive operation counters, safe opaque
   materialization, and explicit final verification;

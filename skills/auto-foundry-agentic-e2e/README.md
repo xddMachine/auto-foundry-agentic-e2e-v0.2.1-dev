@@ -1,8 +1,8 @@
-# Auto Foundry Agentic E2E Skill v0.2.5
+# Auto Foundry Agentic E2E Skill v0.2.6
 
 `auto-foundry-agentic-e2e` is a natural, reviewed, offline-friendly workflow
 for turning supplied enterprise evidence into bounded answers and a traceable
-management dashboard prototype. The v0.2.5 contract is **Agent Workbench +
+management dashboard prototype. The v0.2.6 contract is **Agent Workbench +
 Durable Execution**: the program owns one data room/source catalog and one
 durable item workspace before analysis, while the Lead Analyst remains free to
 choose the useful analytical route.
@@ -13,9 +13,9 @@ Every run records:
 
 ```text
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.2.5
+skill_version: 0.2.6
 core_name: auto_foundry_core
-core_version: 0.3.2
+core_version: 0.3.3
 ```
 
 The normal program path is `RunContext` + `DataRoomWorkbench` +
@@ -59,6 +59,14 @@ safe materialization and are never semantically parsed.
 Repair scope honors explicit dependent artifact roots and JSON fragments by
 authorizing their owning artifact paths; changes to unrelated artifacts remain
 fail-closed.
+
+When a reviewer packet is inadmissible because its scope is invalid, the
+program-only `ItemWorkspace.discard_business_review(...)` recovery path accepts
+only an item-bound, inadmissible `reviewer_scope` incident. It appends an
+append-only hash-bound audit record, atomically removes the packet while
+preserving all existing work and draft bytes, resets pending review and the
+business-repair count, and requires a new full review. It does not reinterpret
+findings or provide a compatibility fallback.
 - **Requirement Mode** is analytics-only and keeps user-owned records and
   explicit priority semantics. It records original text, objective, expected
   analytical/visual outputs, internal and foundation dependencies, data/

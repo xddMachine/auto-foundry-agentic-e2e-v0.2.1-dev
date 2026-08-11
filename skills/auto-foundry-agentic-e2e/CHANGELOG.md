@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.6 — Reviewer-scope packet recovery
+
+Changed:
+
+- the current package markers move directly to skill `0.2.6` and core `0.3.3`;
+- `ItemWorkspace.discard_business_review(...)` is a strict recovery path for
+  an inadmissible `reviewer_scope` packet only: it appends a hash-bound,
+  append-only audit record, removes the invalid packet atomically, preserves
+  the existing work and draft bytes, resets review and business-repair
+  authority, and requires a new full review;
+- discard recovery never reinterprets findings, mutates semantic content, or
+  supplies a compatibility fallback.
+
 ## 0.2.5 — Explicit dependent artifact repair scope
 
 Changed:

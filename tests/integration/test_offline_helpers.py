@@ -30,6 +30,7 @@ def _load(name: str, path: Path):
 
 dashboard_renderer = _load("dashboard_renderer_integration", SCRIPTS / "dashboard_renderer.py")
 evidence_collector = _load("optimizer_evidence_collector_integration", SCRIPTS / "optimizer_evidence_collector.py")
+release_validator = _load("validate_release_integration", ROOT / "scripts" / "validate_release.py")
 
 from auto_foundry_core.product_contracts import FORBIDDEN_FREEZE_SIBLINGS  # noqa: E402
 from auto_foundry_core.workspace import AllowedRootError, RunContext  # noqa: E402
@@ -317,6 +318,21 @@ def test_benchmark_a_is_preparation_only_and_launch_has_no_extra_step() -> None:
     assert "explicit confirmation" not in commands.lower()
     assert "analysis_call" not in (BENCHMARK / "run_config.example.json").read_text(encoding="utf-8")
     assert expected_question_hash in commands
-    for marker in ("skill_name: auto-foundry-agentic-e2e", "skill_version: 0.2.5", "core_name: auto_foundry_core", "core_version: 0.3.2"):
+    for marker in ("skill_name: auto-foundry-agentic-e2e", "skill_version: 0.2.6", "core_name: auto_foundry_core", "core_version: 0.3.3"):
         assert marker in commands
     assert "82e9c913bf437ac9e361d6890467a9aed9b1c6db9d887cfcf0cd659035a71ec2" in commands
+
+
+def test_release_validator_rejects_stale_core_source_bytes(tmp_path: Path) -> None:
+    source_root = ROOT / "src" / "auto_foundry_core"
+    source_files = release_validator._core_source_files(source_root)
+    wheel_path = tmp_path / "stale.whl"
+    with release_validator.zipfile.ZipFile(wheel_path, "w", compression=release_validator.zipfile.ZIP_DEFLATED) as archive:
+        for name, payload in source_files.items():
+            archive.writestr(name, payload + (b"\n" if name.endswith("/durable.py") else b""))
+        archive.writestr(
+            "auto_foundry_core-0.3.3.dist-info/METADATA",
+            "Metadata-Version: 2.1\nName: auto_foundry_core\nVersion: 0.3.3\n",
+        )
+    with pytest.raises(ValueError, match="wheel source byte mismatch"):
+        release_validator._validate_wheel(wheel_path, source_root)

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-ZIP_NAME = "auto-foundry-agentic-e2e-v0.2.5.zip"
+ZIP_NAME = "auto-foundry-agentic-e2e-v0.2.6.zip"
 
 # The release deliberately replaces the old deterministic optimizer report
 # helper with the evidence collector.  Keep this check explicit so a stale
@@ -122,10 +122,10 @@ def _validate_zip(zip_path: Path, skill_root: Path) -> dict[str, object]:
         if not skill_text.startswith("---\n"):
             raise ValueError("SKILL.md frontmatter missing")
         frontmatter = skill_text.split("---\n", 2)[1]
-        required = ('name: auto-foundry-agentic-e2e', 'version: "0.2.5"', 'core_name: auto_foundry_core', 'core_version: "0.3.2"')
+        required = ('name: auto-foundry-agentic-e2e', 'version: "0.2.6"', 'core_name: auto_foundry_core', 'core_version: "0.3.3"')
         if any(marker not in frontmatter for marker in required):
             raise ValueError("SKILL.md frontmatter/version markers invalid")
-        for marker in ("skill_version: 0.2.5", "core_version: 0.3.2"):
+        for marker in ("skill_version: 0.2.6", "core_version: 0.3.3"):
             if marker not in skill_text:
                 raise ValueError(f"SKILL.md run marker missing: {marker}")
         return {
@@ -147,18 +147,55 @@ def _metadata(text: str) -> dict[str, str]:
     return values
 
 
-def _validate_wheel(wheel_path: Path) -> dict[str, object]:
+def _core_source_files(source_root: Path) -> dict[str, bytes]:
+    """Return the complete source-file map expected in the core wheel."""
+
+    source_root = source_root.resolve()
+    if not source_root.is_dir():
+        raise ValueError(f"core source root is missing: {source_root}")
+    result: dict[str, bytes] = {}
+    for path in source_root.rglob("*"):
+        if not path.is_file() or path.is_symlink():
+            continue
+        if "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}:
+            continue
+        relative = path.relative_to(source_root).as_posix()
+        result[f"auto_foundry_core/{relative}"] = path.read_bytes()
+    if not result:
+        raise ValueError(f"core source root has no package files: {source_root}")
+    return result
+
+
+def _validate_wheel(wheel_path: Path, source_root: Path) -> dict[str, object]:
+    expected_source = _core_source_files(source_root)
     with zipfile.ZipFile(wheel_path) as archive:
         if archive.testzip() is not None:
             raise ValueError("wheel CRC failure")
         names = archive.namelist()
         if any(not _safe_member(name) for name in names):
             raise ValueError("wheel contains unsafe path")
+        actual_source = {
+            name: archive.read(name)
+            for name in names
+            if name.startswith("auto_foundry_core/")
+        }
+        missing_source = sorted(set(expected_source) - set(actual_source))
+        extra_source = sorted(set(actual_source) - set(expected_source))
+        if missing_source or extra_source:
+            raise ValueError(
+                "wheel source mapping mismatch: "
+                f"missing={missing_source}, extra={extra_source}"
+            )
+        mismatched_source = sorted(
+            name for name, expected in expected_source.items() if actual_source[name] != expected
+        )
+        if mismatched_source:
+            raise ValueError(f"wheel source byte mismatch: {mismatched_source}")
         metadata_name = next((name for name in names if name.endswith(".dist-info/METADATA")), None)
         if metadata_name is None:
             raise ValueError("wheel METADATA missing")
         metadata = _metadata(archive.read(metadata_name).decode("utf-8"))
-        if metadata.get("Name") != "auto_foundry_core" or metadata.get("Version") != "0.3.2":
+        if metadata.get("Name") != "auto_foundry_core" or metadata.get("Version") != "0.3.3":
             raise ValueError(f"wheel metadata mismatch: {metadata.get('Name')} {metadata.get('Version')}")
         missing = sorted(REQUIRED_CORE_MODULES - set(names))
         if missing:
@@ -168,6 +205,8 @@ def _validate_wheel(wheel_path: Path) -> dict[str, object]:
             "metadata_name": metadata["Name"],
             "metadata_version": metadata["Version"],
             "package_files": "PASS",
+            "source_mapping": "PASS",
+            "source_file_count": len(expected_source),
             "wheel_sha256": _sha256(wheel_path),
         }
 
@@ -207,7 +246,7 @@ def _offline_install_smoke(wheel_path: Path) -> dict[str, object]:
         )
         import_result = subprocess.run([sys.executable, "-c", import_script], check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         cli_result = subprocess.run([sys.executable, "-m", "auto_foundry_core", "catalog", "list"], check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if import_result.stdout.strip() != "0.3.2":
+        if import_result.stdout.strip() != "0.3.3":
             raise ValueError(f"installed import version mismatch: {import_result.stdout!r}")
         if not cli_result.stdout.strip().startswith("["):
             raise ValueError("installed catalog CLI did not return JSON list")
@@ -217,12 +256,12 @@ def _offline_install_smoke(wheel_path: Path) -> dict[str, object]:
 def validate_release(root: Path, dist: Path, zip_path: Path | None = None, wheel_path: Path | None = None) -> dict[str, object]:
     zip_path = zip_path or dist / ZIP_NAME
     if wheel_path is None:
-        wheels = sorted(dist.glob("auto_foundry_core-0.3.2-*.whl"))
+        wheels = sorted(dist.glob("auto_foundry_core-0.3.3-*.whl"))
         if len(wheels) != 1:
             raise ValueError(f"expected one core wheel in {dist}, found {wheels}")
         wheel_path = wheels[0]
     zip_result = _validate_zip(zip_path, root / "skills" / "auto-foundry-agentic-e2e")
-    wheel_result = _validate_wheel(wheel_path)
+    wheel_result = _validate_wheel(wheel_path, root / "src" / "auto_foundry_core")
     install_result = _offline_install_smoke(wheel_path)
     return {"zip": zip_result, "wheel": wheel_result, "install": install_result, "network": False}
 

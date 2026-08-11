@@ -75,6 +75,20 @@ Unpersisted or mismatched references fail closed. Filesystem no-progress alone y
 `materialization_guidance`. Provider/model identity may be literal
 `unavailable`.
 
+### Reviewer-scope packet recovery
+
+If the persisted review packet is invalid because the reviewer supplied an
+out-of-scope packet, the program may use only
+`ItemWorkspace.discard_business_review(...)`. Its incident must be
+inadmissible, item-bound, and categorized `reviewer_scope`; other categories or
+admissible incidents are rejected. The method binds the discarded packet hash
+and draft hash in an append-only hash chain at
+`work/business_review_discard_audit.jsonl`, removes the packet and resets
+pending review/business-repair state atomically, and preserves every existing
+work and draft byte. The next review is a new full review, not a targeted
+recheck. Recovery never reinterprets findings or semantic content and has no
+compatibility fallback; it is not a general reset or a second repair route.
+
 The repair packet may authorize explicit dependent artifact roots and JSON
 fragments; these resolve to their owning artifact paths. Any unrelated artifact
 mutation remains fail-closed.

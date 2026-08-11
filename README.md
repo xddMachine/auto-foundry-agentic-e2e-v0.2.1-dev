@@ -1,7 +1,7 @@
-# Auto Foundry Agentic E2E v0.2.5 / core v0.3.2
+# Auto Foundry Agentic E2E v0.2.6 / core v0.3.3
 
-This repository contains the v0.2.5 reviewed-analysis skill and the
-source-agnostic, deterministic `auto_foundry_core` v0.3.2 substrate. The
+This repository contains the v0.2.6 reviewed-analysis skill and the
+source-agnostic, deterministic `auto_foundry_core` v0.3.3 substrate. The
 deliverable is offline-friendly: the skill keeps a run-local data room, durable
 item workspaces, Living Enterprise Model, and reviewed outputs, while the core
 provides typed local operations, bounded catalog access, and durable artifact
@@ -55,6 +55,13 @@ recheck.
 Business repair scope honors explicit dependent artifact roots and JSON
 fragments by authorizing their owning artifact paths; unrelated artifact
 changes remain fail-closed.
+
+An inadmissible reviewer-scope packet may be recovered only through
+`ItemWorkspace.discard_business_review(...)`: the item-bound incident is
+append-only and hash-bound, packet removal is atomic, existing work/draft bytes
+are preserved, review and repair state reset, and a new full review is
+required. Findings are never reinterpreted and no compatibility fallback is
+provided.
 
 The ontology is a compact enterprise map of stable objects, identities,
 aliases, sources, documents, processes, definitions, rules, relationships,
@@ -113,7 +120,7 @@ The complete offline vertical proofs are
 `tests/integration/test_v023_normal_path.py`; together they use
 generic local fixtures, real workbench/durable/cache/telemetry/filesystem
 wiring, and no model or network call. When those proofs and the full offline
-suite pass, the candidate status is **v0.2.5 / core 0.3.2 — offline program
+suite pass, the candidate status is **v0.2.6 / core 0.3.3 — offline program
 validation complete for later Benchmark A**. Benchmark A remains prepared but
 unexecuted in this repository; no run is claimed here.
 

@@ -4,7 +4,7 @@ This ledger covers the product-under-test and Benchmark A preparation only.
 
 | Scope | Analytical/model calls | Network/external calls | Status |
 |---|---:|---:|---|
-| v0.2.5/core v0.3.2 workbench, runtime, integration, and durable helpers | 0 | 0 | complete offline |
+| v0.2.6/core v0.3.3 workbench, runtime, integration, and durable helpers | 0 | 0 | complete offline |
 | Benchmark A preparation | 0 | 0 | prepared, not executed |
 | Generic offline vertical acceptance | 0 | 0 | complete fixture proof |
 | Baseline run reference | not re-executed here | not re-executed here | read-only evidence |
@@ -38,6 +38,6 @@ and hash only; it never records raw data. The script runner's explicit default
 deadline.
 
 The candidate status after passing the vertical proofs and full offline suites
-is **v0.2.5 / core 0.3.2 — offline program validation complete for later Benchmark A**. This is not a production-hardened
+is **v0.2.6 / core 0.3.3 — offline program validation complete for later Benchmark A**. This is not a production-hardened
 host sandbox; true isolation requires a separate workspace/container or host
 allowlist.

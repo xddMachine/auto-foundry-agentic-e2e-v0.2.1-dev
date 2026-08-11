@@ -28,6 +28,7 @@ import tempfile
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from .contracts import IncidentRecord
 from .workspace import AllowedRootError, RunContext
 
 
@@ -40,6 +41,53 @@ _OPEN_ISSUES_FILENAME = "open_issues.json"
 _HANDOFF_FILENAME = "handoff.json"
 _DRAFT_FILENAME = "draft.json"
 _BUSINESS_REVIEW_FILENAME = "business_review.json"
+_BUSINESS_REVIEW_DISCARD_AUDIT_FILENAME = "business_review_discard_audit.jsonl"
+_BUSINESS_REVIEW_DISCARD_STATE_FILENAME = "business_review_discard_state.json"
+_BUSINESS_REVIEW_DISCARD_AUDIT_FIELDS = frozenset(
+    {
+        "record_kind",
+        "audit_id",
+        "audit_path",
+        "item_id",
+        "incident",
+        "discarded_packet_hash",
+        "draft_hash",
+        "previous_audit_hash",
+        "audit_hash",
+    }
+)
+_BUSINESS_REVIEW_DISCARD_STATE_FIELDS = frozenset(
+    {
+        "record_kind",
+        "item_id",
+        "audit_path",
+        "audit_count",
+        "audit_head",
+        "intent",
+        "state_hash",
+    }
+)
+_BUSINESS_REVIEW_DISCARD_INTENT_FIELDS = frozenset(
+    {
+        "operation_id",
+        "target",
+        "packet_path",
+        "audit_path",
+        "incident",
+        "discarded_packet_hash",
+        "draft_hash",
+        "prior_audit_count",
+        "prior_audit_head",
+        "expected_audit_count",
+        "expected_audit_head",
+        "expected_audit",
+        "before_state_hash",
+        "after_state_hash",
+        "after_state",
+        "phase",
+        "intent_hash",
+    }
+)
 _ACCEPTED_FILENAME = "accepted"
 _BASE_STATE_FIELDS = frozenset(
     {
@@ -276,6 +324,7 @@ def _append_jsonl(path: Path, value: Mapping[str, Any]) -> None:
         stream.write(payload)
         stream.flush()
         os.fsync(stream.fileno())
+    _fsync_directory(path.parent)
 
 
 def _sha256_file(path: Path) -> str:
@@ -684,8 +733,17 @@ class ItemWorkspace:
             # directory.  Reconcile it before recreating/allowing work; keep
             # the original eight-field create shape untouched when no layer-2
             # state or terminal directory exists.
-            if set(state) == _EXECUTION_STATE_FIELDS or workspace.accepted_root.exists() or workspace.accepted_root.is_symlink():
+            if (
+                set(state) == _EXECUTION_STATE_FIELDS
+                or workspace.accepted_root.exists()
+                or workspace.accepted_root.is_symlink()
+                or workspace.business_review_discard_state_path.exists()
+                or workspace.business_review_discard_state_path.is_symlink()
+                or workspace.business_review_discard_audit_path.exists()
+                or workspace.business_review_discard_audit_path.is_symlink()
+            ):
                 workspace._ensure_execution_state()
+                workspace._reconcile_business_review_discard()
                 workspace._validate_recovery_authorizations()
                 workspace._reconcile_review_draft()
                 workspace._reconcile_terminal_snapshot()
@@ -771,6 +829,7 @@ class ItemWorkspace:
             state=state,
         )
         workspace._ensure_execution_state()
+        workspace._reconcile_business_review_discard()
         workspace._validate_recovery_authorizations()
         workspace._reconcile_review_draft()
         workspace._reconcile_terminal_snapshot()
@@ -1506,6 +1565,462 @@ class ItemWorkspace:
 
         return self._resolve_item_subpath(Path("work") / _BUSINESS_REVIEW_FILENAME)
 
+    @property
+    def business_review_discard_audit_path(self) -> Path:
+        """Append-only audit path for discarded reviewer-scope packets."""
+
+        return self._resolve_item_subpath(Path("work") / _BUSINESS_REVIEW_DISCARD_AUDIT_FILENAME)
+
+    @property
+    def business_review_discard_state_path(self) -> Path:
+        """Durable anchor and in-flight intent for reviewer-scope discard."""
+
+        return self._resolve_item_subpath(Path("work") / _BUSINESS_REVIEW_DISCARD_STATE_FILENAME)
+
+    def _normalize_discard_incident(self, value: IncidentRecord | Mapping[str, Any]) -> IncidentRecord:
+        if isinstance(value, IncidentRecord):
+            incident = value
+        elif isinstance(value, Mapping):
+            raw = dict(value)
+            required = {"incident_id", "category", "disposition", "admissible", "item_id", "scope", "source"}
+            missing = sorted(required - set(raw))
+            if missing:
+                raise ValueError(f"discard incident is missing fields: {missing}")
+            unknown = sorted(set(raw) - (required | {"facts"}))
+            if unknown:
+                raise ValueError(f"discard incident has unknown fields: {unknown}")
+            if str(raw["category"]).strip() != "reviewer_scope":
+                raise ValueError("discard incident category must be reviewer_scope")
+            if not isinstance(raw["source"], str) or not raw["source"].strip():
+                raise ValueError("discard incident source must be a non-empty string")
+            scope = raw["scope"]
+            if isinstance(scope, str) or not isinstance(scope, (list, tuple)):
+                raise TypeError("discard incident scope must be a sequence of strings")
+            incident = IncidentRecord(
+                incident_id=raw["incident_id"],
+                category=raw["category"],
+                disposition=raw["disposition"],
+                admissible=raw["admissible"],
+                item_id=raw["item_id"],
+                scope=tuple(scope),
+                source=raw.get("source"),
+                facts=raw.get("facts", {}),
+            )
+        else:
+            raise TypeError("discard incident must be an IncidentRecord or mapping")
+        if incident.category != "reviewer_scope":
+            raise ValueError("discard incident category must be reviewer_scope")
+        if incident.admissible:
+            raise ValueError("discard incident must be inadmissible")
+        if incident.item_id != self.item_id:
+            raise ValueError("discard incident item_id does not match workspace")
+        if not incident.incident_id or not incident.disposition:
+            raise ValueError("discard incident requires non-empty incident_id and disposition")
+        if not isinstance(incident.source, str) or not incident.source.strip():
+            raise ValueError("discard incident source must be a non-empty string")
+        if not incident.scope or len(incident.scope) != len(set(incident.scope)):
+            raise ValueError("discard incident requires a non-empty unique scope")
+        return incident
+
+    def _validate_business_review_discard_record(
+        self,
+        raw: Any,
+        *,
+        line_number: int,
+        previous_hash: str | None,
+        seen_ids: set[str],
+    ) -> dict[str, Any]:
+        if not isinstance(raw, dict) or set(raw) != _BUSINESS_REVIEW_DISCARD_AUDIT_FIELDS:
+            raise ValueError(f"business review discard audit line {line_number} fields are invalid")
+        if raw["record_kind"] != "business_review_discard":
+            raise ValueError(f"business review discard audit line {line_number} kind is invalid")
+        if raw["audit_path"] != f"work/{_BUSINESS_REVIEW_DISCARD_AUDIT_FILENAME}":
+            raise ValueError(f"business review discard audit line {line_number} path is invalid")
+        if raw["item_id"] != self.item_id:
+            raise ValueError(f"business review discard audit line {line_number} item_id is invalid")
+        incident = self._normalize_discard_incident(raw["incident"])
+        if raw["audit_id"] != incident.incident_id or raw["audit_id"] in seen_ids:
+            raise ValueError("business review discard audit incident_id is duplicate or inconsistent")
+        for name in ("discarded_packet_hash", "draft_hash", "audit_hash"):
+            if not _is_sha256(raw[name]):
+                raise ValueError(f"business review discard audit {name} is invalid")
+        if raw["previous_audit_hash"] != previous_hash:
+            raise ValueError("business review discard audit hash chain is invalid")
+        unsigned = {key: raw[key] for key in _BUSINESS_REVIEW_DISCARD_AUDIT_FIELDS if key != "audit_hash"}
+        if _sha256_bytes(_json_bytes(unsigned)) != raw["audit_hash"]:
+            raise ValueError("business review discard audit hash is invalid")
+        return copy.deepcopy(raw)
+
+    def _read_business_review_discard_audit(self) -> list[dict[str, Any]]:
+        path = self.business_review_discard_audit_path
+        if not path.exists() and not path.is_symlink():
+            return []
+        _assert_regular_no_symlink(path, label="business review discard audit")
+        if not path.is_file():
+            raise ValueError("business review discard audit is not a file")
+        if path.stat().st_size == 0:
+            raise ValueError("business review discard audit is empty")
+        records: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        previous_hash: str | None = None
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ValueError("business review discard audit is unreadable") from exc
+        for line_number, line in enumerate(lines, 1):
+            if not line.strip():
+                raise ValueError(f"business review discard audit has a blank line at {line_number}")
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"business review discard audit line {line_number} is invalid") from exc
+            record = self._validate_business_review_discard_record(
+                raw,
+                line_number=line_number,
+                previous_hash=previous_hash,
+                seen_ids=seen_ids,
+            )
+            records.append(record)
+            seen_ids.add(record["audit_id"])
+            previous_hash = record["audit_hash"]
+        return records
+
+    def _validate_business_review_discard_intent(self, value: Any) -> dict[str, Any]:
+        if not isinstance(value, Mapping) or set(value) != _BUSINESS_REVIEW_DISCARD_INTENT_FIELDS:
+            raise ValueError("business review discard intent fields are invalid")
+        if not isinstance(value["operation_id"], str) or not value["operation_id"]:
+            raise ValueError("business review discard intent operation_id is invalid")
+        if value["target"] != "discard_business_review":
+            raise ValueError("business review discard intent target is invalid")
+        if value["packet_path"] != f"work/{_BUSINESS_REVIEW_FILENAME}" or value["audit_path"] != f"work/{_BUSINESS_REVIEW_DISCARD_AUDIT_FILENAME}":
+            raise ValueError("business review discard intent paths are invalid")
+        incident = self._normalize_discard_incident(value["incident"])
+        if incident.incident_id != value["operation_id"]:
+            raise ValueError("business review discard intent incident identity is invalid")
+        for name in ("discarded_packet_hash", "draft_hash", "before_state_hash", "after_state_hash", "expected_audit_head"):
+            if not _is_sha256(value[name]):
+                raise ValueError(f"business review discard intent {name} is invalid")
+        for name in ("prior_audit_head",):
+            if value[name] is not None and not _is_sha256(value[name]):
+                raise ValueError(f"business review discard intent {name} is invalid")
+        for name in ("prior_audit_count", "expected_audit_count"):
+            count = value[name]
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise ValueError(f"business review discard intent {name} is invalid")
+        if value["expected_audit_count"] != value["prior_audit_count"] + 1:
+            raise ValueError("business review discard intent audit counts are invalid")
+        expected_audit = self._validate_business_review_discard_record(
+            value["expected_audit"],
+            line_number=0,
+            previous_hash=value["prior_audit_head"],
+            seen_ids=set(),
+        )
+        if (
+            expected_audit["audit_id"] != incident.incident_id
+            or expected_audit["audit_hash"] != value["expected_audit_head"]
+            or expected_audit["incident"] != incident.to_dict()
+            or expected_audit["discarded_packet_hash"] != value["discarded_packet_hash"]
+            or expected_audit["draft_hash"] != value["draft_hash"]
+        ):
+            raise ValueError("business review discard intent expected audit is invalid")
+        after_state = value["after_state"]
+        if not isinstance(after_state, Mapping):
+            raise ValueError("business review discard intent after_state is invalid")
+        self._validate_state_shape(after_state)
+        if _sha256_bytes(_json_bytes(after_state)) != value["after_state_hash"]:
+            raise ValueError("business review discard intent after_state hash is invalid")
+        if value["phase"] not in {"intent", "audit_appended", "packet_removed", "state_persisted"}:
+            raise ValueError("business review discard intent phase is invalid")
+        unsigned = {key: value[key] for key in _BUSINESS_REVIEW_DISCARD_INTENT_FIELDS if key != "intent_hash"}
+        if not _is_sha256(value["intent_hash"]) or _sha256_bytes(_json_bytes(unsigned)) != value["intent_hash"]:
+            raise ValueError("business review discard intent hash is invalid")
+        return copy.deepcopy(dict(value))
+
+    def _read_business_review_discard_state(self) -> dict[str, Any] | None:
+        state_path = self.business_review_discard_state_path
+        audit_path = self.business_review_discard_audit_path
+        if not state_path.exists() and not state_path.is_symlink():
+            if audit_path.exists() or audit_path.is_symlink():
+                raise ValueError("business review discard audit is missing its durable state anchor")
+            return None
+        _assert_regular_no_symlink(state_path, label="business review discard state")
+        try:
+            value = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("business review discard state is invalid") from exc
+        if not isinstance(value, Mapping) or set(value) != _BUSINESS_REVIEW_DISCARD_STATE_FIELDS:
+            raise ValueError("business review discard state fields are invalid")
+        if value["record_kind"] != "business_review_discard_state" or value["item_id"] != self.item_id:
+            raise ValueError("business review discard state identity is invalid")
+        if value["audit_path"] != f"work/{_BUSINESS_REVIEW_DISCARD_AUDIT_FILENAME}":
+            raise ValueError("business review discard state audit path is invalid")
+        count = value["audit_count"]
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("business review discard state audit_count is invalid")
+        head = value["audit_head"]
+        if (count == 0 and head is not None) or (count > 0 and not _is_sha256(head)):
+            raise ValueError("business review discard state audit_head is invalid")
+        if value["intent"] is not None:
+            self._validate_business_review_discard_intent(value["intent"])
+        unsigned = {key: value[key] for key in _BUSINESS_REVIEW_DISCARD_STATE_FIELDS if key != "state_hash"}
+        if not _is_sha256(value["state_hash"]) or _sha256_bytes(_json_bytes(unsigned)) != value["state_hash"]:
+            raise ValueError("business review discard state hash is invalid")
+        return copy.deepcopy(dict(value))
+
+    def _write_business_review_discard_state(
+        self,
+        *,
+        audit_count: int,
+        audit_head: str | None,
+        intent: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        value = {
+            "record_kind": "business_review_discard_state",
+            "item_id": self.item_id,
+            "audit_path": f"work/{_BUSINESS_REVIEW_DISCARD_AUDIT_FILENAME}",
+            "audit_count": audit_count,
+            "audit_head": audit_head,
+            "intent": copy.deepcopy(dict(intent)) if intent is not None else None,
+        }
+        value["state_hash"] = _sha256_bytes(_json_bytes(value))
+        _atomic_write_json(self.business_review_discard_state_path, value)
+        return value
+
+    @staticmethod
+    def _discard_intent_with_phase(intent: Mapping[str, Any], phase: str) -> dict[str, Any]:
+        updated = copy.deepcopy(dict(intent))
+        updated["phase"] = phase
+        unsigned = {key: updated[key] for key in _BUSINESS_REVIEW_DISCARD_INTENT_FIELDS if key != "intent_hash"}
+        updated["intent_hash"] = _sha256_bytes(_json_bytes(unsigned))
+        return updated
+
+    def _reconcile_business_review_discard(self) -> None:
+        anchor = self._read_business_review_discard_state()
+        audit = self._read_business_review_discard_audit()
+        if anchor is None:
+            return
+        actual_count = len(audit)
+        actual_head = audit[-1]["audit_hash"] if audit else None
+        intent = anchor["intent"]
+        if intent is None:
+            if anchor["audit_count"] != actual_count or anchor["audit_head"] != actual_head:
+                raise ValueError("business review discard audit does not match its durable state anchor")
+            return
+
+        prior_count = intent["prior_audit_count"]
+        prior_head = intent["prior_audit_head"]
+        expected_count = intent["expected_audit_count"]
+        expected_head = intent["expected_audit_head"]
+        if actual_count not in {prior_count, expected_count}:
+            raise ValueError("business review discard intent audit count is not recoverable")
+        if actual_count == prior_count:
+            if anchor["audit_count"] != prior_count or anchor["audit_head"] != prior_head:
+                raise ValueError("business review discard intent anchor is inconsistent")
+        else:
+            if actual_head != expected_head or audit[-1] != intent["expected_audit"]:
+                raise ValueError("business review discard intent audit tail is invalid")
+            if anchor["audit_count"] not in {prior_count, expected_count} or anchor["audit_head"] not in {prior_head, expected_head}:
+                raise ValueError("business review discard intent anchor is inconsistent")
+
+        state_path = self._resolve_item_subpath(_STATE_FILENAME)
+        state_bytes = state_path.read_bytes()
+        state_hash = _sha256_bytes(state_bytes)
+        before_hash = intent["before_state_hash"]
+        after_hash = intent["after_state_hash"]
+        packet_path = self.business_review_path
+        packet_present = packet_path.exists() or packet_path.is_symlink()
+        # The discard protocol never mutates the draft.  Bind it on every
+        # recovery path, including after the packet unlink boundary, so an
+        # external draft edit cannot be mistaken for a completed operation.
+        if self._draft_hash() != intent["draft_hash"]:
+            raise ValueError("business review discard intent draft is invalid")
+        if packet_present:
+            _assert_regular_no_symlink(packet_path, label="business review artifact")
+            if not packet_path.is_file() or _sha256_file(packet_path) != intent["discarded_packet_hash"]:
+                raise ValueError("business review discard intent packet is invalid")
+
+        if state_hash == after_hash:
+            if packet_present or actual_count != expected_count:
+                raise ValueError("business review discard intent completed state is inconsistent")
+            self._write_business_review_discard_state(
+                audit_count=expected_count,
+                audit_head=expected_head,
+                intent=None,
+            )
+            return
+        if state_hash != before_hash:
+            raise ValueError("business review discard intent state is not recoverable")
+        if actual_count == prior_count:
+            if not packet_present:
+                raise ValueError("business review discard intent lost its packet before audit append")
+            self._write_business_review_discard_state(
+                audit_count=prior_count,
+                audit_head=prior_head,
+                intent=None,
+            )
+            return
+        if packet_present:
+            packet_path.unlink()
+            _fsync_directory(packet_path.parent)
+        after_state = copy.deepcopy(intent["after_state"])
+        self._persist_state(after_state, touch=False)
+        self._write_business_review_discard_state(
+            audit_count=expected_count,
+            audit_head=expected_head,
+            intent=None,
+        )
+
+    def discard_business_review(self, incident: IncidentRecord | Mapping[str, Any]) -> dict[str, Any]:
+        """Discard an invalid reviewer-scope packet and reset repair authority.
+
+        A durable intent and audit head make the operation converge after a
+        process loss at any persistence boundary.  Ordinary exceptions still
+        roll back every touched byte before returning control to the caller.
+        """
+
+        self._ensure_not_terminal()
+        self._require_no_active_attempt()
+        if self._state.get("terminal_intent") is not None:
+            raise ValueError("business review discard cannot run with terminal intent")
+        self._reconcile_business_review_discard()
+        packet_path = self.business_review_path
+        if not packet_path.exists():
+            raise ValueError("business review discard requires a structured review packet")
+        self._ensure_execution_state()
+        normalized_incident = self._normalize_discard_incident(incident)
+        packet = self._read_business_review()
+        if packet is None:
+            raise ValueError("business review discard requires a structured review packet")
+        _assert_regular_no_symlink(packet_path, label="business review artifact")
+        packet_bytes = packet_path.read_bytes()
+        prior_audit = self._read_business_review_discard_audit()
+        if any(record["audit_id"] == normalized_incident.incident_id for record in prior_audit):
+            raise ValueError("business review discard incident_id was already recorded")
+        draft_hash = self._draft_hash()
+        previous_audit_hash = prior_audit[-1]["audit_hash"] if prior_audit else None
+        unsigned_audit = {
+            "record_kind": "business_review_discard",
+            "audit_id": normalized_incident.incident_id,
+            "audit_path": f"work/{_BUSINESS_REVIEW_DISCARD_AUDIT_FILENAME}",
+            "item_id": self.item_id,
+            "incident": normalized_incident.to_dict(),
+            "discarded_packet_hash": _sha256_bytes(packet_bytes),
+            "draft_hash": draft_hash,
+            "previous_audit_hash": previous_audit_hash,
+        }
+        audit = {
+            **unsigned_audit,
+            "audit_hash": _sha256_bytes(_json_bytes(unsigned_audit)),
+        }
+        state_path = self._resolve_item_subpath(_STATE_FILENAME)
+        _assert_regular_no_symlink(state_path, label="item state")
+        prior_state_bytes = state_path.read_bytes()
+        prior_state = copy.deepcopy(self._state)
+        before_state_hash = _sha256_bytes(prior_state_bytes)
+        after_state = copy.deepcopy(self._state)
+        after_state["business_repair_count"] = 0
+        after_state["review"] = self._pending_review()
+        after_state["lifecycle_state"] = "work"
+        after_state["updated_at"] = _now()
+        self._validate_state_shape(after_state)
+        after_state_hash = _sha256_bytes(_json_bytes(after_state))
+        intent_unsigned = {
+            "operation_id": normalized_incident.incident_id,
+            "target": "discard_business_review",
+            "packet_path": f"work/{_BUSINESS_REVIEW_FILENAME}",
+            "audit_path": f"work/{_BUSINESS_REVIEW_DISCARD_AUDIT_FILENAME}",
+            "incident": normalized_incident.to_dict(),
+            "discarded_packet_hash": audit["discarded_packet_hash"],
+            "draft_hash": draft_hash,
+            "prior_audit_count": len(prior_audit),
+            "prior_audit_head": previous_audit_hash,
+            "expected_audit_count": len(prior_audit) + 1,
+            "expected_audit_head": audit["audit_hash"],
+            "expected_audit": audit,
+            "before_state_hash": before_state_hash,
+            "after_state_hash": after_state_hash,
+            "after_state": after_state,
+            "phase": "intent",
+        }
+        intent = {
+            **intent_unsigned,
+            "intent_hash": _sha256_bytes(_json_bytes(intent_unsigned)),
+        }
+        audit_path = self.business_review_discard_audit_path
+        audit_exists = audit_path.exists() or audit_path.is_symlink()
+        audit_bytes = audit_path.read_bytes() if audit_exists else None
+        discard_state_path = self.business_review_discard_state_path
+        discard_state_exists = discard_state_path.exists() or discard_state_path.is_symlink()
+        discard_state_bytes = discard_state_path.read_bytes() if discard_state_exists else None
+
+        try:
+            self._write_business_review_discard_state(
+                audit_count=len(prior_audit),
+                audit_head=previous_audit_hash,
+                intent=intent,
+            )
+            _append_jsonl(audit_path, audit)
+            intent = self._discard_intent_with_phase(intent, "audit_appended")
+            self._write_business_review_discard_state(
+                audit_count=len(prior_audit) + 1,
+                audit_head=audit["audit_hash"],
+                intent=intent,
+            )
+            packet_path.unlink()
+            _fsync_directory(packet_path.parent)
+            intent = self._discard_intent_with_phase(intent, "packet_removed")
+            self._write_business_review_discard_state(
+                audit_count=len(prior_audit) + 1,
+                audit_head=audit["audit_hash"],
+                intent=intent,
+            )
+            self._persist_state(after_state, touch=False)
+            self._write_business_review_discard_state(
+                audit_count=len(prior_audit) + 1,
+                audit_head=audit["audit_hash"],
+                intent=None,
+            )
+        except Exception as exc:
+            rollback_errors: list[Exception] = []
+            try:
+                _atomic_write_bytes(state_path, prior_state_bytes)
+            except Exception as rollback_error:
+                rollback_errors.append(rollback_error)
+            try:
+                _atomic_write_bytes(packet_path, packet_bytes)
+            except Exception as rollback_error:
+                rollback_errors.append(rollback_error)
+            try:
+                if audit_exists and audit_bytes is not None:
+                    _atomic_write_bytes(audit_path, audit_bytes)
+                elif audit_path.exists() or audit_path.is_symlink():
+                    audit_path.unlink()
+                    _fsync_directory(audit_path.parent)
+            except Exception as rollback_error:
+                rollback_errors.append(rollback_error)
+            try:
+                if discard_state_exists and discard_state_bytes is not None:
+                    _atomic_write_bytes(discard_state_path, discard_state_bytes)
+                elif discard_state_path.exists() or discard_state_path.is_symlink():
+                    discard_state_path.unlink()
+                    _fsync_directory(discard_state_path.parent)
+            except Exception as rollback_error:
+                rollback_errors.append(rollback_error)
+            self._state = prior_state
+            if rollback_errors:
+                raise RuntimeError("business review discard rollback failed") from exc
+            raise
+
+        self._emit(
+            "item_business_review_discarded",
+            artifact=f"work/{_BUSINESS_REVIEW_FILENAME}",
+            audit_artifact=f"work/{_BUSINESS_REVIEW_DISCARD_AUDIT_FILENAME}",
+            incident_id=normalized_incident.incident_id,
+            packet_hash=audit["discarded_packet_hash"],
+            audit_hash=audit["audit_hash"],
+        )
+        return copy.deepcopy(audit)
+
     @staticmethod
     def _canonical_draft_value(payload: bytes) -> Any:
         try:
@@ -1840,6 +2355,7 @@ class ItemWorkspace:
 
     def _write_json_artifact(self, relative: str, value: Any, *, event_type: str = "item_workspace_write") -> Path:
         self._ensure_not_terminal()
+        self._reconcile_business_review_discard()
         destination = self._resolve_item_subpath(relative)
         _assert_regular_no_symlink(destination, label="item artifact")
         payload = _json_bytes(value)
@@ -1916,6 +2432,7 @@ class ItemWorkspace:
         if not isinstance(mapping, Mapping):
             raise TypeError("source map entry must be a mapping")
         self._ensure_not_terminal()
+        self._reconcile_business_review_discard()
         destination = self._resolve_item_subpath(Path("work") / _SOURCE_MAP_FILENAME)
         _assert_regular_no_symlink(destination, label="source map artifact")
         self._repair_scope_check(artifact_path="work/source_map.json")
@@ -1938,6 +2455,7 @@ class ItemWorkspace:
         if not isinstance(mapping, Mapping):
             raise TypeError("finding must be a mapping")
         self._ensure_not_terminal()
+        self._reconcile_business_review_discard()
         destination = self._resolve_item_subpath(Path("work") / _FINDINGS_FILENAME)
         _assert_regular_no_symlink(destination, label="findings artifact")
         self._repair_scope_check(artifact_path="work/findings.jsonl")
@@ -2048,6 +2566,7 @@ class ItemWorkspace:
 
         self._ensure_execution_state()
         self._ensure_not_terminal()
+        self._reconcile_business_review_discard()
         lane_id = str(lane_id).strip()
         role = str(role).strip()
         route = str(route).strip()
@@ -2095,6 +2614,7 @@ class ItemWorkspace:
 
         self._ensure_execution_state()
         self._ensure_not_terminal()
+        self._reconcile_business_review_discard()
         attempt_id = str(attempt_id).strip()
         index, record = self._active_record(attempt_id)
         baseline = self._progress_from_dict(record["baseline"])
@@ -2136,6 +2656,7 @@ class ItemWorkspace:
 
         self._ensure_execution_state()
         self._ensure_not_terminal()
+        self._reconcile_business_review_discard()
         attempt_id = str(attempt_id).strip()
         status = str(status).strip()
         if not status or status == "active":
@@ -2185,6 +2706,7 @@ class ItemWorkspace:
 
         self._ensure_execution_state()
         self._ensure_not_terminal()
+        self._reconcile_business_review_discard()
         if self._state.get("lifecycle_state") not in {"work", "recovery_ready"}:
             raise ValueError("begin_recovery requires an active work attempt")
         prior_attempt_id = str(prior_attempt_id).strip()
@@ -2272,6 +2794,7 @@ class ItemWorkspace:
         self._ensure_execution_state()
         self._ensure_not_terminal()
         self._require_no_active_attempt()
+        self._reconcile_business_review_discard()
         status = str(review_status).strip()
         verdict = str(verdict).strip()
         normalized_findings = self._normalize_findings(findings)
@@ -2419,6 +2942,7 @@ class ItemWorkspace:
 
         self._ensure_execution_state()
         self._ensure_not_terminal()
+        self._reconcile_business_review_discard()
         if int(self._state["business_repair_count"]) >= 1:
             raise ValueError("only one business repair is allowed")
         review = self._state["review"]
@@ -2487,6 +3011,7 @@ class ItemWorkspace:
         """
 
         self._ensure_execution_state()
+        self._reconcile_business_review_discard()
         if self.accepted_root.exists() or self.accepted_root.is_symlink():
             raise FileExistsError(self.accepted_root)
         self._ensure_not_terminal()
@@ -2569,6 +3094,7 @@ class ItemWorkspace:
         """
 
         self._ensure_execution_state()
+        self._reconcile_business_review_discard()
         if self._state.get("lifecycle_state") != "accepted":
             raise ValueError("integration can be committed only for an accepted item")
         if self._state.get("integration_state") != "pending":
@@ -2591,6 +3117,7 @@ class ItemWorkspace:
         """Record an explicit, non-retryable integration technical failure."""
 
         self._ensure_execution_state()
+        self._reconcile_business_review_discard()
         if self._state.get("lifecycle_state") != "accepted":
             raise ValueError("integration can be failed only for an accepted item")
         if self._state.get("integration_state") != "pending":
@@ -2615,6 +3142,7 @@ class ItemWorkspace:
         if recovery_exhausted is not True:
             raise ValueError("technical_failure requires recovery_exhausted=True")
         self._ensure_execution_state()
+        self._reconcile_business_review_discard()
         if self.accepted_root.exists() or self.accepted_root.is_symlink():
             raise FileExistsError(self.accepted_root)
         self._ensure_not_terminal()

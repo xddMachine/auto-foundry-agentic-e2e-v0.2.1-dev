@@ -75,6 +75,12 @@
 - Business findings (all returned together): finding IDs, exact JSON-pointer/
   artifact paths, dependent outputs, reviewed draft hash, and targeted recheck
   scope:
+- Reviewer-scope packet recovery (only when the packet is inadmissible):
+  `ItemWorkspace.discard_business_review(...)`, incident ID/category/source,
+  discarded packet hash, draft hash, append-only audit path/hash, preserved
+  work/draft confirmation, pending-review reset, zero business-repair reset,
+  and the required new full-review reference. Never reinterpret findings or
+  use a compatibility fallback.
 - Final outcome:
 - Accepted answer bytes (immutable ref/hash):
 - Acceptance envelope (program-owned ref/hash/lifecycle):

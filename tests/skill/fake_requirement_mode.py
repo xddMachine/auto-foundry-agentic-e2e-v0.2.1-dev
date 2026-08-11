@@ -384,7 +384,7 @@ class FakeRequirementRun:
             metrics=("metric:bounded",),
             limitations=("fixture-only",),
             evidence_refs=(f"evidence:{requirement.requirement_id}",),
-            prepared_assets=(PreparedAsset("asset-1", "a" * 64, "0.3.2", "fixture-v1", "source"),),
+            prepared_assets=(PreparedAsset("asset-1", "a" * 64, "0.3.3", "fixture-v1", "source"),),
             ontology_refs=("ontology:fixture",),
             relationship_refs=("relationship:fixture",),
             dashboard_facts=("dashboard:fixture",),

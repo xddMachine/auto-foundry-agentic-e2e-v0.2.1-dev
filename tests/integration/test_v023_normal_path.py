@@ -356,7 +356,7 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
     fixture = {
         "title": "Generic reviewed product",
         "run_id": context.run_id,
-        "skill_version": "0.2.5",
+        "skill_version": "0.2.6",
         "freeze_markers": FreezeMarkers(True, True, True, True, True).to_dict(),
         "limitations": ["Synthetic fixture only; no new analytics."],
         "domains": [{

@@ -2,7 +2,7 @@
 
 ## Architecture
 
-- `auto_foundry_core` v0.3.2 is a small, source-agnostic deterministic
+- `auto_foundry_core` v0.3.3 is a small, source-agnostic deterministic
   substrate with typed contracts, local source/profile/normalization,
   identity/relationship/population/aggregation operations, artifact and cache
   boundaries, telemetry, a Living Enterprise Model, a capability catalog, a
@@ -17,7 +17,7 @@
   capability, records an `OperationReceipt`, and emits passive telemetry. Its
   `CoreExecutionResult` carries the value, receipt, and cache status. The
   deprecated mutable `Workspace` facade is removed.
-- `auto-foundry-agentic-e2e` v0.2.5 is a natural reviewed workflow with
+- `auto-foundry-agentic-e2e` v0.2.6 is a natural reviewed workflow with
   Question and analytics-only Requirement modes, progressive run-local LEM
   layers, exact-ID evidence selection, review routing, clean-room controls,
   passive telemetry, and reviewed-output-only products.
@@ -40,7 +40,7 @@
   automation is rejected. A separate fresh Optimization Agent is described
   but is not invoked by this helper; collection failure is non-blocking.
 - `analysis.py`, `integration.py`, `lifecycle.py`, `prepared.py`, and
-  `product_contracts.py` provide the current v0.3.2 public runtime,
+  `product_contracts.py` provide the current v0.3.3 public runtime,
   integration, registry, receipt, and strict product contracts. Accepted
   answer bytes remain immutable and separate from `acceptance_envelope.json`;
   integration commits are under each item's `integration/committed/` path.
@@ -49,7 +49,7 @@
 
 `tests/integration/test_vertical_acceptance.py` remains the broader closure
 proof for source/runtime/LEM/product behavior. The companion
-`tests/integration/test_workbench_durable_vertical.py` proves the normal v0.2.5
+`tests/integration/test_workbench_durable_vertical.py` proves the normal v0.2.6
 program path with a safe generic ZIP: catalog/search/read, item-local
 candidate staging before acceptance, accepted-only Result Integration commit,
 workspace creation before an attempt, exact-receipt execution recovery, a
@@ -72,6 +72,11 @@ recheck; sibling and cumulative context is excluded.
 Business repair scope honors explicit dependent artifact roots and JSON
 fragments by authorizing their owning artifact paths; unrelated artifact
 mutations remain fail-closed.
+`ItemWorkspace.discard_business_review(...)` is reserved for an inadmissible,
+item-bound `reviewer_scope` packet. It writes an append-only hash-bound audit,
+atomically removes the packet while preserving work/draft bytes, resets review
+and repair state, and requires a new full review without semantic
+reinterpretation or a compatibility fallback.
 
 Two concrete integration defects found by this proof are fixed: contract
 hashing now uses `to_dict()` before `dataclasses.asdict()` (mapping proxies are
@@ -113,7 +118,7 @@ tampering or stale counts.
 ## Release candidate boundary
 
 When the vertical proofs and full offline suite pass, the status is
-**v0.2.5 / core 0.3.2 — offline program validation complete for later Benchmark A**. Benchmark A
+**v0.2.6 / core 0.3.3 — offline program validation complete for later Benchmark A**. Benchmark A
 remains prepared and unexecuted. This is an experimental release candidate, not
 a production-hardened sandbox. A Coding Agent with unrestricted host
 shell/filesystem access cannot

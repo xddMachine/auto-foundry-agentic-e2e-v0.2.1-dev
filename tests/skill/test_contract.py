@@ -1,4 +1,4 @@
-"""Offline contract checks for the v0.2.5 Agent Workbench skill tree.
+"""Offline contract checks for the v0.2.6 Agent Workbench skill tree.
 
 These tests intentionally inspect owned text and templates only. Core loading
 of the item-state template is covered by the offline integration vertical;
@@ -46,19 +46,19 @@ def _owned_text() -> str:
     return "\n".join(_read(path) for path in OWNED_MARKDOWN + OWNED_JSON)
 
 
-def test_frontmatter_and_run_markers_are_v025() -> None:
+def test_frontmatter_and_run_markers_are_v026() -> None:
     skill = _read(SKILL / "SKILL.md")
     assert skill.startswith("---\n")
     frontmatter = skill.split("---\n", 2)[1]
     assert "name: auto-foundry-agentic-e2e" in frontmatter
-    assert 'version: "0.2.5"' in frontmatter
+    assert 'version: "0.2.6"' in frontmatter
     assert "core_name: auto_foundry_core" in frontmatter
-    assert 'core_version: "0.3.2"' in frontmatter
+    assert 'core_version: "0.3.3"' in frontmatter
     for marker in (
         "skill_name: auto-foundry-agentic-e2e",
-        "skill_version: 0.2.5",
+        "skill_version: 0.2.6",
         "core_name: auto_foundry_core",
-        "core_version: 0.3.2",
+        "core_version: 0.3.3",
     ):
         assert marker in skill
     assert "Agent Workbench" in skill
@@ -193,6 +193,9 @@ def test_requirement_and_dashboard_templates_use_program_owned_boundaries() -> N
     assert execution["failed_preflight_receipt_phase"] == "compile|dependency_check"
     assert execution["script_timeout_seconds"] == 3600
     assert execution["execution_recovery_authority"] == "canonical_persisted_receipt_ref_and_hash_only"
+    assert execution["reviewer_scope_packet_recovery"].startswith(
+        "ItemWorkspace.discard_business_review_only_for_inadmissible_item_bound_reviewer_scope_incident"
+    )
     assert execution["prepared_asset_boundary"].startswith("candidate_under_item_work_prepared")
     assert "live_integration_agent" in execution["semantic_completeness_boundary"]
     integration = requirement["result_integration"]

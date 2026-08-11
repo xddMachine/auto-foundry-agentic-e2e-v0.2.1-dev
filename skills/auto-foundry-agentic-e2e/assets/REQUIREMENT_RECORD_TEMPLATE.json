@@ -41,6 +41,7 @@
     "code_error_route": "same_attempt_feedback",
     "filesystem_no_progress_route": "await_runtime_or_materialization_guidance",
     "execution_recovery_authority": "canonical_persisted_receipt_ref_and_hash_only",
+    "reviewer_scope_packet_recovery": "ItemWorkspace.discard_business_review_only_for_inadmissible_item_bound_reviewer_scope_incident; append_only_hash_bound_audit; atomic_packet_removal_preserves_work_and_draft; resets_pending_review_and_business_repair; requires_new_full_review; no_semantic_reinterpretation_or_compatibility_fallback",
     "prepared_asset_boundary": "candidate_under_item_work_prepared_until_accepted_integration_commit",
     "semantic_completeness_boundary": "live_integration_agent_semantic_completeness; mechanical_validation_then_one_item_only_integration_fidelity_reviewer_before_commit; same_result_integration_agent_targeted_repair_and_recheck"
   },
