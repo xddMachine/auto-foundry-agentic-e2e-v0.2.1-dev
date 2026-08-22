@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Auto Foundry · Control Center</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="rail" aria-label="Primary navigation">
+        <a class="brand" href="#mission" aria-label="Auto Foundry Control Center">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span class="brand-copy"><strong>AUTO</strong><small>FOUNDRY</small></span>
+        </a>
+        <nav class="rail-nav">
+          <a href="#mission" data-route="mission" class="rail-link is-active">
+            <span class="nav-icon" aria-hidden="true">◇</span><span>Mission</span>
+          </a>
+          <a href="#runs" data-route="runs" class="rail-link">
+            <span class="nav-icon" aria-hidden="true">≡</span><span>Runs</span>
+          </a>
+          <a href="#launch" data-route="launch" class="rail-link">
+            <span class="nav-icon" aria-hidden="true">＋</span><span>Launch</span>
+          </a>
+          <a href="#evidence" data-route="evidence" class="rail-link">
+            <span class="nav-icon" aria-hidden="true">⌁</span><span>Evidence</span>
+          </a>
+        </nav>
+        <div class="rail-footer">
+          <span class="connection-dot" id="connectionDot"></span>
+          <span>Local</span>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div class="run-context">
+            <span class="eyebrow">CONTROL CENTER / <span id="viewCrumb">MISSION</span></span>
+            <button class="run-picker" id="runPickerButton" type="button" aria-haspopup="listbox" aria-expanded="false">
+              <span class="run-glyph">AF</span>
+              <span>
+                <strong id="selectedRunName">Loading mission…</strong>
+                <small id="selectedRunMeta">Connecting to local projection</small>
+              </span>
+              <span class="chevron">⌄</span>
+            </button>
+            <div class="run-menu" id="runMenu" role="listbox" hidden></div>
+          </div>
+          <div class="topbar-status">
+            <span class="readonly-pill">READ ONLY</span>
+            <span class="status-chip status-active" id="runStatus"><i></i> CONNECTING</span>
+            <span class="freshness" id="freshness">—</span>
+          </div>
+        </header>
+
+        <section class="view is-visible" id="missionView" data-view="mission">
+          <div class="mission-header">
+            <div>
+              <span class="section-kicker">LIVE ORCHESTRATION</span>
+              <h1>Mission control</h1>
+              <p id="missionSubtitle">Planner-owned mission with shared identity domains and requirement-owned analysis.</p>
+            </div>
+            <div class="mission-actions">
+              <div class="run-control" id="runControl" hidden>
+                <button class="secondary-button run-control-button" type="button" id="runControlButton">Pause run</button>
+                <small id="runControlMessage">Durable progress will be preserved.</small>
+              </div>
+              <button class="icon-button" type="button" id="fitGraph" title="Fit graph" aria-label="Fit graph">⌖</button>
+              <button class="secondary-button" type="button" id="toggleTrace">Technical trace</button>
+              <a class="primary-button is-disabled" id="openDashboard" aria-disabled="true">Open dashboard ↗</a>
+            </div>
+          </div>
+
+          <div class="metric-strip" id="metricStrip" aria-label="Mission metrics">
+            <article><span>ACTIVE</span><strong id="metricActive">—</strong><small>workers</small></article>
+            <article><span>WAITING</span><strong id="metricWaiting">—</strong><small>dependencies</small></article>
+            <article><span>COMPLETE</span><strong id="metricComplete">—</strong><small>agents</small></article>
+            <article><span>CAPACITY</span><strong id="metricCapacity">—</strong><small>Planner excluded</small></article>
+            <article class="metric-wide"><span>LAST DURABLE ACTIVITY</span><strong id="metricActivity">—</strong><small id="metricActivityDetail">No event loaded</small></article>
+          </div>
+
+          <div class="mission-layout">
+            <section class="graph-panel panel" aria-label="Mission graph">
+              <div class="panel-toolbar">
+                <div class="segmented" role="group" aria-label="Graph mode">
+                  <button class="is-active" type="button">Mission graph</button>
+                  <button type="button" id="showTraceFromSegment">Trace</button>
+                </div>
+                <div class="graph-legend" aria-label="Status legend">
+                  <span><i class="legend-active"></i>Active</span>
+                  <span><i class="legend-waiting"></i>Waiting</span>
+                  <span><i class="legend-review"></i>Review</span>
+                  <span><i class="legend-complete"></i>Complete</span>
+                </div>
+              </div>
+              <div class="graph-viewport" id="graphViewport">
+                <div class="graph-stage" id="graphStage">
+                  <svg class="edge-layer" id="edgeLayer" aria-hidden="true">
+                    <defs>
+                      <marker id="arrow-solid" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+                        <path d="M 0 0 L 10 5 L 0 10 z"></path>
+                      </marker>
+                      <marker id="arrow-dependency" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+                        <path d="M 0 0 L 10 5 L 0 10 z"></path>
+                      </marker>
+                    </defs>
+                  </svg>
+                  <div class="node-layer" id="nodeLayer"></div>
+                  <div class="empty-state" id="graphEmpty" hidden>
+                    <span>◇</span><strong>No recorded lineage</strong><p>Activity is available, but this run does not record enough ownership data to reconstruct agent relationships safely.</p>
+                  </div>
+                </div>
+              </div>
+              <div class="graph-footer">
+                <span id="graphDataQuality">Projection: waiting for data</span>
+                <span>Drag to pan · scroll to zoom · select for details</span>
+              </div>
+            </section>
+
+            <aside class="activity-panel panel" aria-label="Live activity">
+              <div class="panel-heading">
+                <div><span class="section-kicker">DURABLE EVENTS</span><h2>Live activity</h2></div>
+                <button class="icon-button compact" id="pauseFeed" type="button" title="Pause feed" aria-label="Pause feed">Ⅱ</button>
+              </div>
+              <div class="activity-filters" role="group" aria-label="Activity filters">
+                <button type="button" class="is-active" data-event-filter="all">All</button>
+                <button type="button" data-event-filter="file">Files</button>
+                <button type="button" data-event-filter="review">Review</button>
+                <button type="button" data-event-filter="error">Errors</button>
+              </div>
+              <div class="activity-list" id="activityList" aria-live="polite"></div>
+              <div class="activity-footer"><span class="live-dot"></span><span id="feedState">Polling durable telemetry</span></div>
+            </aside>
+          </div>
+
+          <section class="trace-panel panel" id="tracePanel" hidden>
+            <div class="panel-heading trace-heading">
+              <div><span class="section-kicker">DISTRIBUTED EXECUTION</span><h2>Technical trace</h2></div>
+              <div class="trace-key"><span>0:00</span><span>5:00</span><span>10:00</span><span>15:00</span><span>NOW</span></div>
+            </div>
+            <div class="trace-body" id="traceBody"></div>
+          </section>
+
+          <section class="limitations" id="limitations" hidden></section>
+        </section>
+
+        <section class="view" id="runsView" data-view="runs">
+          <div class="page-header">
+            <div><span class="section-kicker">LOCAL WORKSPACE</span><h1>Runs</h1><p>Discoverable runtime state. Opening a run is always read-only in Layer 1.</p></div>
+            <a href="#launch" class="primary-button">Prepare launch</a>
+          </div>
+          <div class="runs-toolbar panel">
+            <label class="search-field"><span>⌕</span><input id="runSearch" type="search" placeholder="Search runs" /></label>
+            <div class="status-summary" id="runSummary">0 runs</div>
+          </div>
+          <div class="runs-table-wrap panel">
+            <table class="runs-table">
+              <thead><tr><th>Run</th><th>Lifecycle</th><th>Requirements</th><th>Last durable update</th><th>Mode</th><th></th></tr></thead>
+              <tbody id="runsTableBody"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="view" id="launchView" data-view="launch">
+          <div class="page-header">
+            <div><span class="section-kicker">LAUNCH &amp; CONTROL</span><h1>Prepare a mission</h1><p>Compose and validate a launch draft. Runtime commands remain disabled in the safe Layer 1 build.</p></div>
+            <span class="readonly-banner">DRAFT VALIDATION ONLY</span>
+          </div>
+          <form class="launch-grid" id="launchForm" novalidate>
+            <div class="launch-main">
+              <section class="form-card panel">
+                <div class="form-card-heading"><span class="step-number">01</span><div><h2>Mission target</h2><p>Choose a clean new run or a discoverable existing run.</p></div></div>
+                <div class="mode-selector">
+                  <label><input type="radio" name="mode" value="new" checked /><span><strong>New project / run</strong><small>Prepare an isolated mission</small></span></label>
+                  <label><input type="radio" name="mode" value="continue" /><span><strong>Continue existing</strong><small>Add requirements later</small></span></label>
+                </div>
+                <label class="field" id="projectNameField"><span>Project / run name</span><input name="projectName" id="projectName" placeholder="e.g. Customer margin investigation" autocomplete="off" /><small class="field-error"></small></label>
+                <label class="field" id="existingRunField" hidden><span>Existing run</span><select name="runId" id="existingRun"></select><small class="field-error"></small></label>
+              </section>
+
+              <section class="form-card panel">
+                <div class="form-card-heading"><span class="step-number">02</span><div><h2>Business intake</h2><p>Use any natural structure. Planner will identify and schedule the actual requirements.</p></div></div>
+                <div id="requirementFields">
+                  <label class="field requirement-field"><span>Business brief, questions, or requirements</span><textarea name="intake-block" rows="8" placeholder="Write naturally or paste a whole brief. Planner will decide the requirement boundaries and execution order."></textarea><small class="field-error"></small></label>
+                </div>
+                <button class="text-button" id="addRequirement" type="button">＋ Add another context block</button>
+              </section>
+
+              <section class="form-card panel">
+                <div class="form-card-heading"><span class="step-number">03</span><div><h2>Data sources</h2><p>Attach local datasets or reference a path already available to the runtime.</p></div></div>
+                <label class="drop-zone" id="dropZone">
+                  <input id="fileInput" type="file" accept=".csv,.tsv,.json,.jsonl,.ndjson,.xlsx,.parquet,.zip,.txt,.text,.md,.markdown,.rst,.pdf,.docx,.odt" multiple />
+                  <span class="drop-icon">⇩</span>
+                  <strong>Drop files here</strong>
+                  <small>or click to browse · data files, ZIP, TXT/Markdown, PDF, DOCX, or ODT briefs</small>
+                </label>
+                <div class="source-actions">
+                  <label class="secondary-button folder-button">Choose folder<input id="folderInput" type="file" accept=".csv,.tsv,.json,.jsonl,.ndjson,.xlsx,.parquet,.zip,.txt,.text,.md,.markdown,.rst,.pdf,.docx,.odt" webkitdirectory directory multiple /></label>
+                  <span>Folder selection depends on browser support; only file metadata is staged in Layer 1.</span>
+                </div>
+                <div class="file-manifest" id="fileManifest"></div>
+                <div class="source-fields">
+                  <label class="field" id="sourcePathField"><span>Local path</span><input id="sourcePath" placeholder="/absolute/path/to/dataset" autocomplete="off" /><small class="field-error"></small></label>
+                  <label class="field" id="sourceUrlField"><span>Remote URL <em>deferred</em></span><input id="sourceUrl" type="url" placeholder="https://…" autocomplete="off" /><small class="field-error"></small></label>
+                </div>
+              </section>
+            </div>
+
+            <aside class="launch-side">
+              <section class="form-card panel capacity-card">
+                <div class="form-card-heading compact"><span class="step-number">04</span><div><h2>Agent capacity</h2><p>Planner is excluded.</p></div></div>
+                <div class="capacity-value"><strong id="capacityValue">8</strong><span>MAX ACTIVE</span></div>
+                <input id="maxAgents" name="maxAgents" type="range" min="1" max="8" value="8" />
+                <div class="range-labels"><span>1</span><span>8 workers</span></div>
+                <div class="capacity-breakdown">
+                  <div><span class="role-dot identity"></span><strong>4</strong><small>Identity</small></div>
+                  <div><span class="role-dot analysis"></span><strong>1</strong><small>AO</small></div>
+                  <div><span class="role-dot specialist"></span><strong>3</strong><small>Specialists</small></div>
+                </div>
+              </section>
+
+              <section class="preflight-card panel">
+                <span class="section-kicker">PREFLIGHT</span>
+                <h2>Launch draft</h2>
+                <dl id="preflightSummary">
+                  <div><dt>Target</dt><dd>New run</dd></div>
+                  <div><dt>Input blocks</dt><dd>0</dd></div>
+                  <div><dt>Data sources</dt><dd>0</dd></div>
+                  <div><dt>Capacity</dt><dd>8 workers</dd></div>
+                </dl>
+                <div class="safety-note"><span>◆</span><p><strong>Safe build</strong>This action validates only. It cannot start, stop, or change a run.</p></div>
+                <button class="primary-button wide" type="submit" id="validateDraft">Validate draft</button>
+                <div class="validation-result" id="validationResult" role="status" hidden></div>
+              </section>
+            </aside>
+          </form>
+        </section>
+
+        <section class="view" id="evidenceView" data-view="evidence">
+          <div class="page-header"><div><span class="section-kicker">AUDITABLE OUTPUT</span><h1>Evidence</h1><p>Recorded artifacts and source activity for the selected mission.</p></div></div>
+          <div class="evidence-grid" id="evidenceGrid"></div>
+        </section>
+      </main>
+
+      <aside class="inspector" id="inspector" aria-label="Selection inspector" aria-hidden="true">
+        <header><div><span class="section-kicker">INSPECTOR</span><h2 id="inspectorTitle">Details</h2></div><button type="button" id="closeInspector" aria-label="Close inspector">×</button></header>
+        <div class="inspector-body" id="inspectorBody"></div>
+      </aside>
+    </div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

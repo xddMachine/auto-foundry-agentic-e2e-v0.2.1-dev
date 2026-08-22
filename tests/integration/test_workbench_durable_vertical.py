@@ -31,7 +31,7 @@ from auto_foundry_core import (
     RunContext,
 )
 from auto_foundry_core.telemetry import TelemetryRecorder
-from auto_foundry_core.lifecycle import AgentInvocationReceipt, InvocationReceiptLedger, RUN_STATES
+from auto_foundry_core.lifecycle import AgentInvocationReceipt, InvocationReceiptLedger, RUN_STATES, RunLifecycle
 from auto_foundry_core.workspace import AllowedRootError
 
 
@@ -70,9 +70,10 @@ def test_complete_offline_workbench_and_durable_vertical_path(
         "RUN-WORKBENCH-VERTICAL",
         run_root,
         (input_root,),
-        core_version="0.3.5",
-        skill_version="0.2.8",
+        core_version="0.4.0",
+        skill_version="0.3.0",
     )
+    RunLifecycle.create(context, ("Q-001",))
     telemetry = TelemetryRecorder(context=context)
 
     # The run boundary rejects sibling/escaped paths before probing or writing.
@@ -135,7 +136,7 @@ def test_complete_offline_workbench_and_durable_vertical_path(
     first = item.observe_attempt(attempt.attempt_id)
     assert first.action == "materialize_now"
     second = item.observe_attempt(attempt.attempt_id)
-    assert second.action == "await_runtime"
+    assert second.action == "retry_same_attempt"
     loss_receipt = AgentInvocationReceipt(
         "I-WORKBENCH-LOSS",
         item.item_id,
@@ -215,12 +216,13 @@ def test_complete_offline_workbench_and_durable_vertical_path(
                 "finding_id": "F-WORKBENCH-ANSWER",
                 "message": "The bounded answer wording needs one targeted correction.",
                 "pointers": ["/answer"],
+                "semantic_categories": ["answer"],
             }
         ],
     )
     assert repair_review["findings"][0]["pointers"] == ["/answer"]
     assert repair_review["targeted_recheck"] is False
-    item.use_business_repair()
+    item.use_business_repair(owner_ref="owner")
     assert item.state["execution_recovery_count"] == 1
     assert item.state["business_repair_count"] == 1
 
@@ -279,8 +281,8 @@ def test_complete_offline_workbench_and_durable_vertical_path(
     # crash after registry publication is retried from the exact intent and
     # converges without mutating immutable accepted answer/envelope bytes.
     registry = bound.prepared_assets
-    lem = LivingEnterpriseModel(run_id=context.run_id)
-    lem.add_ontology_item(
+    external_lem = LivingEnterpriseModel(run_id=context.run_id)
+    external_lem.add_ontology_item(
         OntologyItem(
             item_id="cumulative-secret",
             item_type="entity",
@@ -295,7 +297,6 @@ def test_complete_offline_workbench_and_durable_vertical_path(
     integration = IntegrationSession.create(
         context,
         item,
-        lem,
         registry,
         "result-integration",
         invocation_id="inv-Q-001",
@@ -323,21 +324,21 @@ def test_complete_offline_workbench_and_durable_vertical_path(
         "accept",
         checked_record_ids=tuple(record.record_id for record in integration.records),
     )
-    original_apply = integration._apply_lem_record
+    original_apply = integration._apply_records
     raised = {"value": False}
 
-    def fail_once(record):
-        if record.kind == "prepared_asset" and not raised["value"]:
+    def fail_once():
+        original_apply()
+        if not raised["value"]:
             raised["value"] = True
             raise RuntimeError("integration apply crash")
-        return original_apply(record)
 
-    monkeypatch.setattr(integration, "_apply_lem_record", fail_once)
+    monkeypatch.setattr(integration, "_apply_records", fail_once)
     with pytest.raises(RuntimeError, match="integration apply crash"):
         integration.commit()
     assert item.integration_state == "pending"
     assert len(registry.search(prepared_asset_id="orders-prepared")) == 1
-    monkeypatch.setattr(integration, "_apply_lem_record", original_apply)
+    monkeypatch.setattr(integration, "_apply_records", original_apply)
     manifest = integration.commit()
     assert manifest["status"] == "committed"
     assert item.integration_state == "integrated"
@@ -348,8 +349,8 @@ def test_complete_offline_workbench_and_durable_vertical_path(
 
 def test_run_context_defaults_to_current_versions(tmp_path: Path) -> None:
     context = RunContext("RUN-DEFAULT-VERSION", tmp_path / "run")
-    assert context.core_version == "0.3.5"
-    assert context.skill_version == "0.2.8"
+    assert context.core_version == "0.8.0"
+    assert context.skill_version == "0.7.1"
 
 
 def test_item_state_template_loads_through_durable_core(tmp_path: Path) -> None:
@@ -362,7 +363,7 @@ def test_item_state_template_loads_through_durable_core(tmp_path: Path) -> None:
     assert tuple(template) == tuple(ITEM_STATE_FIELDS)
     assert set(template) <= set(ITEM_STATE_SCHEMA["fields"])
 
-    context = RunContext("RUN-TEMPLATE", tmp_path / "run", core_version="0.3.5", skill_version="0.2.8")
+    context = RunContext("RUN-TEMPLATE", tmp_path / "run", core_version="0.4.0", skill_version="0.3.0")
     item_root = context.resolve_run_path(Path("questions") / template["item_id"])
     (item_root / "work").mkdir(parents=True)
     state_path = item_root / "item_state.json"

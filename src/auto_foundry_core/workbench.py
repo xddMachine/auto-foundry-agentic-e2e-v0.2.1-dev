@@ -1906,6 +1906,7 @@ class DataRoomWorkbench:
         transformations: tuple[str, ...],
         identity_mappings: tuple[str, ...],
         relationship_mappings: tuple[str, ...],
+        ontology_refs: tuple[str, ...],
         limitations: tuple[str, ...],
         lineage: Mapping[str, Any] | None,
         scope: str,
@@ -1914,6 +1915,7 @@ class DataRoomWorkbench:
         source_hashes: tuple[str, ...],
         sheet: str | None,
         max_bytes: int,
+        effective_period: str | None = None,
     ) -> PreparedAssetDescriptor:
         member_lineage = [
             {"path": member.path, "content_hash": member.content_hash, "format": member.format, "sheet": sheet}
@@ -1930,6 +1932,8 @@ class DataRoomWorkbench:
             "schema": dict(schema),
             "source_hashes": list(source_hashes),
             "transformations": list(transformations),
+            "ontology_refs": list(ontology_refs),
+            "effective_period": effective_period,
         }
         operation_manifest_hash = _sha256_bytes(json.dumps(manifest_payload, sort_keys=True, separators=(",", ":")).encode())
         return PreparedAssetDescriptor(
@@ -1942,6 +1946,7 @@ class DataRoomWorkbench:
             transformations=transformations,
             identity_mappings=identity_mappings,
             relationship_mappings=relationship_mappings,
+            ontology_refs=ontology_refs,
             limitations=limitations,
             lineage=lineage_payload,
             scope=scope,
@@ -1950,6 +1955,7 @@ class DataRoomWorkbench:
             core_version=self.context.core_version,
             row_count=len(rows),
             byte_count=len(encoded),
+            effective_period=effective_period,
             metadata={
                 "format": normalized_format,
                 "source_member_paths": [member.path for member in unique_members],
@@ -1972,12 +1978,14 @@ class DataRoomWorkbench:
         transformations: Iterable[str] = (),
         identity_mappings: Iterable[str] = (),
         relationship_mappings: Iterable[str] = (),
+        ontology_refs: Iterable[str] = (),
         limitations: Iterable[str] = (),
         lineage: Mapping[str, Any] | None = None,
         scope: str = "requirement_scoped",
         max_rows: int = DEFAULT_CATALOG_ROWS,
         max_bytes: int = DEFAULT_PREPARED_MAX_BYTES,
         max_output_bytes: int | None = None,
+        effective_period: str | None = None,
     ) -> PreparedAssetDescriptor:
         prepared_asset_id = _safe_id(prepared_asset_id, "prepared_asset_id")
         normalized_format = str(format).lower().lstrip(".")
@@ -2001,7 +2009,9 @@ class DataRoomWorkbench:
         transformations = tuple(str(value) for value in transformations)
         identity_mappings = tuple(str(value) for value in identity_mappings)
         relationship_mappings = tuple(str(value) for value in relationship_mappings)
+        ontology_refs = tuple(str(value) for value in ontology_refs)
         limitations = tuple(str(value) for value in limitations)
+        normalized_effective_period = None if effective_period is None else str(effective_period).strip()
         materialized, inferred_members, sheet = self._materialize_rows(rows, sheet=sheet, max_rows=max_rows)
         unique_members, source_ref_values, source_hashes = self._prepared_sources(
             inferred_members,
@@ -2029,6 +2039,7 @@ class DataRoomWorkbench:
             transformations=transformations,
             identity_mappings=identity_mappings,
             relationship_mappings=relationship_mappings,
+            ontology_refs=ontology_refs,
             limitations=limitations,
             lineage=lineage,
             scope=scope,
@@ -2037,6 +2048,7 @@ class DataRoomWorkbench:
             source_hashes=source_hashes,
             sheet=sheet,
             max_bytes=max_bytes,
+            effective_period=normalized_effective_period,
         )
         descriptor_path = target_root / f"{prepared_asset_id}.descriptor.json"
         sidecar_bytes = (json.dumps(descriptor.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")

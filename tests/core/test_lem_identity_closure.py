@@ -56,6 +56,8 @@ def test_typed_supersession_resolves_collision_and_rolls_back():
 
 def test_later_delta_snapshots_nested_frozen_contracts_and_rejects_invalid_delta_atomically():
     model = LivingEnterpriseModel(run_id="r")
+    model.add_ontology_item(OntologyItem("supplier", "entity", "Supplier"))
+    model.add_ontology_item(OntologyItem("purchase-order", "entity", "Purchase order"))
     embedded = OntologyItem(
         "embedded",
         "object",
@@ -244,6 +246,10 @@ def test_semantic_operations_are_ontology_index_items_and_relationships_bounded(
     model = LivingEnterpriseModel(run_id="r")
     for kind in ("metric", "definition", "rule", "process"):
         model.apply_delta(KnowledgeDelta(f"d-{kind}", f"add_{kind}", {"item_id": kind, "label": kind.title()}, accepted=True))
+    reviewed = IdentityDecision("relationship-candidates", "same_object", decision_id="relationship-decision", reviewer_ref="reviewer", review_status="reviewed")
+    model.register_identity_decision(reviewed)
+    model.add_mapping(CanonicalMapping("a", "entity", ("source-a",), reviewed.decision_id))
+    model.add_mapping(CanonicalMapping("b", "entity", ("source-b",), reviewed.decision_id))
     model.apply_delta(KnowledgeDelta("d-rel", "add_relationship", {"relationship_id": "rel", "label": "Rel", "source_id": "a", "target_id": "b", "scope": "s", "effective_period": "2024"}, accepted=True))
     indexed = {item["item_id"]: item["item_type"] for item in model.ontology_index}
     assert indexed == {"definition": "definition", "metric": "metric", "process": "process", "rel": "relationship", "rule": "rule"}
@@ -252,18 +258,20 @@ def test_semantic_operations_are_ontology_index_items_and_relationships_bounded(
 
 def test_mapping_idempotence_alias_normalization_and_collision():
     model = LivingEnterpriseModel(run_id="r")
-    reviewed = IdentityDecision("candidate-1", "different_objects", decision_id="decision-1", reviewer_ref="reviewer", review_status="reviewed")
-    reviewed_2 = IdentityDecision("candidate-2", "different_objects", decision_id="decision-2", reviewer_ref="reviewer", review_status="reviewed")
+    reviewed = IdentityDecision("candidate-1", "same_object", decision_id="decision-1", reviewer_ref="reviewer", review_status="reviewed")
+    reviewed_2 = IdentityDecision("candidate-2", "alternate_representation", decision_id="decision-2", reviewer_ref="reviewer", review_status="reviewed")
     model.register_identity_decision(reviewed)
     model.register_identity_decision(reviewed_2)
-    mapping = CanonicalMapping("c1", "entity", ("a",), reviewed.decision_id)
+    mapping = CanonicalMapping("c1", "entity", ("a", "a2", "a3"), reviewed.decision_id)
     assert model.add_mapping(mapping) == mapping
     assert model.add_mapping(mapping) == mapping
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="unique"):
+        model.add_mapping(CanonicalMapping("duplicate-sources", "entity", ("a", "a"), reviewed.decision_id))
+    with pytest.raises(ValueError, match="different value"):
         model.add_mapping(CanonicalMapping("c1", "entity", ("b",), "decision-2"))
     model.apply_delta(KnowledgeDelta("alias", "add_alias", {"canonical_id": "c1", "alias": "Alpha", "source_identity": "a2"}, accepted=True))
     assert model.canonical_mappings["c1"].aliases == ("Alpha",)
-    assert model.canonical_mappings["c1"].source_identities == ("a", "a2")
+    assert model.canonical_mappings["c1"].source_identities == ("a", "a2", "a3")
 
 
 def test_mapping_requires_registered_reviewed_decision():
@@ -272,10 +280,13 @@ def test_mapping_requires_registered_reviewed_decision():
     with pytest.raises(ValueError, match="registered identity decision"):
         model.add_mapping(missing)
     pending = IdentityDecision("candidate-pending", "different_objects", decision_id="decision-pending", reviewer_ref="reviewer", review_status="pending")
-    model.register_identity_decision(pending)
-    with pytest.raises(ValueError, match="reviewed or accepted"):
-        model.add_mapping(CanonicalMapping("pending", "entity", ("a",), pending.decision_id))
-    accepted = IdentityDecision("candidate-accepted", "different_objects", decision_id="decision-accepted", reviewer_ref="reviewer", review_status="accepted")
+    with pytest.raises(ValueError, match="publication"):
+        model.register_identity_decision(pending)
+    rejected_semantic = IdentityDecision("candidate-rejected", "different_objects", decision_id="decision-rejected", reviewer_ref="reviewer", review_status="accepted")
+    model.register_identity_decision(rejected_semantic)
+    with pytest.raises(ValueError, match="same_object or alternate_representation"):
+        model.add_mapping(CanonicalMapping("rejected", "entity", ("a",), rejected_semantic.decision_id))
+    accepted = IdentityDecision("candidate-accepted", "same_object", decision_id="decision-accepted", reviewer_ref="reviewer", review_status="accepted")
     model.register_identity_decision(accepted)
     mapping = CanonicalMapping("accepted", "entity", ("a",), accepted.decision_id)
     assert model.add_mapping(mapping) == mapping

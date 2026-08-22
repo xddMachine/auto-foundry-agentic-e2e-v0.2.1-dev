@@ -111,6 +111,24 @@ def parse_date(
     return _failed(value, "date", message, attempts=attempts, failures=failures)
 
 
+def observation_as_of(values: Iterable[Any]) -> str | None:
+    """Return the latest valid *observed* date supplied by the caller.
+
+    Planned, due, target, forecast, and policy dates are intentionally not a
+    second argument and cannot silently extend the evidence window.  A caller
+    that has no observed timestamp receives ``None`` and must disclose that
+    limitation instead of substituting a future obligation date.
+    """
+
+    parsed = {
+        result.value
+        for value in values
+        for result in (parse_date(value),)
+        if result.ok and isinstance(result.value, str)
+    }
+    return max(parsed) if parsed else None
+
+
 def parse_number(value: Any) -> ParseResult:
     """Parse a finite decimal number, preserving the original representation."""
 

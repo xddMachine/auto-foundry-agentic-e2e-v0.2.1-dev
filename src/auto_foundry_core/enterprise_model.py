@@ -44,6 +44,99 @@ _EXPORT_FIELDS = frozenset({
     "conflicts", "conflict_links", "supersession_links", "conflict_state",
     "revisions",
 })
+_ANALYTICAL_RELATIONSHIP_FIELDS = frozenset({
+    "analysis_relationship_id",
+    "matched_pairs",
+    "source_population",
+    "target_population",
+    "matched_source_count",
+    "matched_target_count",
+    "source_coverage",
+    "target_coverage",
+    "coverage",
+})
+_SOURCE_ONLY_RELATIONSHIP_MEASUREMENT_FIELDS = frozenset({
+    "source_population",
+    "matched_source_count",
+    "source_coverage",
+})
+_TARGET_OR_EDGE_RELATIONSHIP_MEASUREMENT_FIELDS = frozenset({
+    "analysis_relationship_id",
+    "target_population",
+    "matched_target_count",
+    "target_coverage",
+})
+
+
+def _validate_analytical_relationship_payload_if_present(payload: Mapping[str, Any]) -> None:
+    """Validate analytical relationship measurements while preserving generic LEM joins."""
+
+    if not _ANALYTICAL_RELATIONSHIP_FIELDS.intersection(payload):
+        return
+    if "coverage" in payload:
+        raise ValueError("analytical relationship coverage is not a canonical field")
+    # Identity ``represents`` edges may report how much of one source
+    # representation was resolved without claiming a measured two-sided edge
+    # set.  This is a deliberately narrow partial shape; any target-side or
+    # edge-set field opts into the complete analytical relationship contract.
+    if payload.get("relationship_type") == "represents" and "matched_pairs" not in payload:
+        source_fields = _SOURCE_ONLY_RELATIONSHIP_MEASUREMENT_FIELDS.intersection(payload)
+        if _TARGET_OR_EDGE_RELATIONSHIP_MEASUREMENT_FIELDS.intersection(payload):
+            source_fields = frozenset()
+        elif not source_fields:
+            return
+        elif source_fields != _SOURCE_ONLY_RELATIONSHIP_MEASUREMENT_FIELDS:
+            missing = sorted(_SOURCE_ONLY_RELATIONSHIP_MEASUREMENT_FIELDS - source_fields)
+            raise ValueError(
+                "source-only represents measurement requires " + ", ".join(missing)
+            )
+        else:
+            cardinality = payload.get("cardinality")
+            if cardinality not in {"one_to_one", "one_to_many", "many_to_one", "many_to_many"}:
+                raise ValueError(
+                    f"source-only represents relationship cardinality is unsupported: {cardinality!r}"
+                )
+            source_population = payload.get("source_population")
+            matched_source_count = payload.get("matched_source_count")
+            source_coverage = payload.get("source_coverage")
+            for name, value in (
+                ("source_population", source_population),
+                ("matched_source_count", matched_source_count),
+            ):
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError(
+                        f"source-only represents relationship {name} must be a non-negative integer"
+                    )
+            if matched_source_count > source_population:
+                raise ValueError(
+                    "source-only represents relationship matched_source_count cannot exceed source_population"
+                )
+            if isinstance(source_coverage, bool) or not isinstance(source_coverage, (int, float)):
+                raise ValueError("source-only represents relationship source_coverage must be numeric")
+            if not math.isfinite(float(source_coverage)) or not 0 <= float(source_coverage) <= 1:
+                raise ValueError(
+                    "source-only represents relationship source_coverage must be between zero and one"
+                )
+            expected_coverage = 0.0 if source_population == 0 else matched_source_count / source_population
+            if float(source_coverage) != expected_coverage:
+                raise ValueError(
+                    "source-only represents relationship source_coverage is inconsistent with "
+                    "matched_source_count/source_population"
+                )
+            return
+    from .analyst_workspace import validate_analytical_relationship_measurement
+
+    validate_analytical_relationship_measurement(
+        cardinality=payload.get("cardinality"),
+        matched_pairs=payload.get("matched_pairs"),
+        source_population=payload.get("source_population"),
+        target_population=payload.get("target_population"),
+        matched_source_count=payload.get("matched_source_count"),
+        matched_target_count=payload.get("matched_target_count"),
+        source_coverage=payload.get("source_coverage"),
+        target_coverage=payload.get("target_coverage"),
+        publishable=True,
+    )
 
 
 def _is_sha256(value: Any) -> bool:
@@ -323,6 +416,10 @@ class LivingEnterpriseModel:
 
     def register_identity_decision(self, decision: IdentityDecision | Mapping[str, Any]) -> IdentityDecision:
         decision = decision if isinstance(decision, IdentityDecision) else IdentityDecision.from_dict(decision)
+        if decision.review_status not in {"reviewed", "accepted"} or not str(decision.reviewer_ref or "").strip():
+            raise ValueError(
+                f"identity decision publication requires reviewed or accepted status with reviewer_ref: {decision.decision_id}"
+            )
         existing = self.identity_decisions.get(decision.decision_id)
         if existing is not None and existing != decision:
             raise ValueError(f"identity decision already exists with different trace: {decision.decision_id}")
@@ -331,11 +428,23 @@ class LivingEnterpriseModel:
 
     def add_mapping(self, mapping: CanonicalMapping | Mapping[str, Any]) -> CanonicalMapping:
         mapping = mapping if isinstance(mapping, CanonicalMapping) else CanonicalMapping.from_dict(mapping)
+        if mapping.status != "accepted":
+            raise ValueError(f"canonical mapping publication requires accepted status: {mapping.canonical_id}")
+        if not mapping.source_identities or any(not str(value).strip() for value in mapping.source_identities):
+            raise ValueError(f"canonical mapping requires non-empty source_identities: {mapping.canonical_id}")
+        if len(set(mapping.source_identities)) != len(mapping.source_identities):
+            raise ValueError(f"canonical mapping source_identities must be unique: {mapping.canonical_id}")
         decision = self.identity_decisions.get(mapping.decision_id)
         if decision is None:
             raise ValueError(f"canonical mapping requires a registered identity decision: {mapping.decision_id}")
-        if decision.review_status not in {"reviewed", "accepted"}:
-            raise ValueError(f"canonical mapping requires a reviewed or accepted identity decision: {mapping.decision_id}")
+        if decision.review_status not in {"reviewed", "accepted"} or not str(decision.reviewer_ref or "").strip():
+            raise ValueError(
+                f"canonical mapping requires a reviewed or accepted identity decision with reviewer_ref: {mapping.decision_id}"
+            )
+        if decision.decision not in {"same_object", "alternate_representation"}:
+            raise ValueError(
+                f"canonical mapping requires same_object or alternate_representation decision: {mapping.decision_id}"
+            )
         existing = self.canonical_mappings.get(mapping.canonical_id)
         if existing is not None:
             if existing != mapping:
@@ -421,6 +530,13 @@ class LivingEnterpriseModel:
         relationship_id = payload.get("relationship_id") or payload.get("item_id") or payload.get("id")
         if relationship_id is None:
             raise ValueError("relationship requires relationship_id")
+        has_source = "source_id" in payload and payload.get("source_id") is not None
+        has_target = "target_id" in payload and payload.get("target_id") is not None
+        if has_source != has_target:
+            raise ValueError("relationship requires explicit source_id and target_id")
+        if has_source:
+            self._validate_relationship_endpoints(payload["source_id"], payload["target_id"])
+        _validate_analytical_relationship_payload_if_present(payload)
         if str(relationship_id) in self.relationships:
             raise ValueError(f"relationship already exists: {relationship_id}")
         record = _clean(dict(payload))
@@ -431,6 +547,31 @@ class LivingEnterpriseModel:
         except Exception:
             self.relationships.pop(str(relationship_id), None)
             raise
+
+    def _validate_relationship_endpoints(self, source_id: Any, target_id: Any) -> tuple[str, str]:
+        """Validate one relationship's endpoint namespace and acceptance.
+
+        Relationship endpoints are stable IDs, not free-form labels.  An
+        endpoint may resolve to an ontology item or to a canonical mapping
+        that has been explicitly accepted.  Keeping this rule on the model
+        makes staging, replay, and export rehydration share the same closed
+        reference boundary while leaving the exact record payload untouched.
+        """
+
+        resolved: list[str] = []
+        for role, raw in (("source", source_id), ("target", target_id)):
+            endpoint = str(raw).strip()
+            if endpoint in self.ontology:
+                resolved.append(endpoint)
+                continue
+            mapping = self.canonical_mappings.get(endpoint)
+            if mapping is not None and mapping.canonical_id == endpoint and mapping.status == "accepted":
+                resolved.append(endpoint)
+                continue
+            raise ValueError(
+                f"relationship {role}_id references an unknown or unaccepted endpoint: {raw}"
+            )
+        return resolved[0], resolved[1]
 
     def lookup_prepared_asset(
         self,
@@ -906,10 +1047,18 @@ class LivingEnterpriseModel:
                 relationship_id = str(raw.get("relationship_id", ""))
                 if relationship_id != str(raw_id):
                     raise ValueError("LEM export relationship key does not match relationship_id")
-                source = raw.get("source_id", raw.get("source_item_id"))
-                target = raw.get("target_id", raw.get("target_item_id"))
-                if source is None or target is None or str(source) not in candidate.ontology or str(target) not in candidate.ontology:
+                source = raw.get("source_id")
+                target = raw.get("target_id")
+                if source is None or target is None:
                     raise ValueError("LEM export relationship reference is invalid")
+                try:
+                    _validate_analytical_relationship_payload_if_present(raw)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("LEM export analytical relationship measurement is invalid") from exc
+                try:
+                    candidate._validate_relationship_endpoints(source, target)
+                except ValueError as exc:
+                    raise ValueError("LEM export relationship reference is invalid") from exc
                 # ``export()`` contains both the relationship registry record
                 # and the generated relationship ontology item.  Ontology was
                 # loaded above, so reusing the public add operation here would

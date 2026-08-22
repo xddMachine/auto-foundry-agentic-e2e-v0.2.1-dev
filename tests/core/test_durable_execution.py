@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import threading
 from typing import Mapping
 
 import pytest
@@ -72,7 +73,7 @@ def test_attempt_progress_decisions_are_deterministic_and_reloadable(tmp_path: P
     assert workspace.state["consecutive_no_progress"] == 1
 
     second = workspace.observe_attempt("A-001")
-    assert second.action == "await_runtime"
+    assert second.action == "retry_same_attempt"
     assert workspace.state["consecutive_no_progress"] == 2
     assert workspace.state["lifecycle_state"] == "work"
 
@@ -240,13 +241,13 @@ def test_review_guards_repair_once_and_acceptance_are_immutable(tmp_path: Path) 
     workspace.record_review(
         "repair_once",
         reviewer_ref="review-1",
-        findings=[{"finding_id": "F-LIMITS", "pointers": ["/limits"]}],
+        findings=[{"finding_id": "F-LIMITS", "pointers": ["/limits"], "semantic_categories": ["answer"]}],
     )
     assert workspace.state["review"]["verdict"] == "repair_once"
-    workspace.use_business_repair()
+    workspace.use_business_repair(owner_ref="owner")
     assert workspace.state["business_repair_count"] == 1
-    with pytest.raises(ValueError, match="one business repair"):
-        workspace.use_business_repair()
+    with pytest.raises(ValueError, match="repair_once review verdict"):
+        workspace.use_business_repair(owner_ref="owner")
     with pytest.raises(ValueError, match="review"):
         workspace.accept()
 
@@ -280,15 +281,15 @@ def test_repair_once_requires_structured_scope_and_targeted_review_failure_is_at
         workspace.record_review(
             "repair_once",
             reviewer_ref="review-1",
-            findings=[{"finding_id": "F-WILDCARD", "pointers": ["*"]}],
+            findings=[{"finding_id": "F-WILDCARD", "pointers": ["*"], "semantic_categories": ["answer"]}],
         )
 
     workspace.record_review(
         "repair_once",
         reviewer_ref="review-1",
-        findings=[{"finding_id": "F-VALUE", "pointers": ["/answer/value"]}],
+        findings=[{"finding_id": "F-VALUE", "pointers": ["/answer/value"], "semantic_categories": ["answer"]}],
     )
-    workspace.use_business_repair()
+    workspace.use_business_repair(owner_ref="owner")
     state_path = workspace.item_root / "item_state.json"
     review_path = workspace.business_review_path
     state_before = state_path.read_bytes()
@@ -305,32 +306,73 @@ def test_repair_once_requires_structured_scope_and_targeted_review_failure_is_at
     assert review_path.read_bytes() == review_before
 
 
+@pytest.mark.parametrize("mutation", ("change", "add", "remove"))
+def test_use_business_repair_rejects_artifact_progress_drift_before_activation(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    workspace = _workspace(tmp_path)
+    workspace.write_plan({"version": 1})
+    workspace.write_draft({"answer": "initial"})
+    workspace.record_review(
+        "repair_once",
+        reviewer_ref="reviewer",
+        findings=[
+            {
+                "finding_id": "F-ARTIFACT-BASELINE",
+                "pointers": ["/answer"],
+                "semantic_categories": ["answer"],
+            }
+        ],
+    )
+    packet_path = workspace.business_review_path
+    state_path = workspace.item_root / "item_state.json"
+    packet_before = packet_path.read_bytes()
+    state_before = state_path.read_bytes()
+    plan_path = workspace.work_root / "plan.json"
+    if mutation == "change":
+        plan_path.write_bytes(b'{"version":2}\n')
+    elif mutation == "add":
+        (workspace.work_root / "drift-output.json").write_bytes(b'{"drift":true}\n')
+    else:
+        plan_path.unlink()
+
+    with pytest.raises(ValueError, match="exact currently reviewed artifact progress"):
+        workspace.use_business_repair(owner_ref="owner")
+    assert packet_path.read_bytes() == packet_before
+    assert state_path.read_bytes() == state_before
+    assert workspace.state["business_repair_count"] == 0
+
+
 def test_repair_scope_allows_dependency_mutation_removal_and_targeted_recheck(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     workspace.write_draft({"answer": "initial", "unrelated": "keep"})
-    workspace.write_handoff({"result": "initial"})
     workspace.record_review(
         "repair_once",
         reviewer_ref="review-1",
         findings=[
             {
                 "finding_id": "F-DEPENDENCY",
-                "pointers": ["/answer"],
-                "dependent_outputs": ["work/handoff.json#/result", "work/findings.jsonl"],
+                "pointers": ["/answer", "/evidence_refs"],
+                "dependent_outputs": [
+                    "work/evidence.jsonl",
+                    "work/source_map.json",
+                    "work/specialist_memos.jsonl",
+                ],
+                "semantic_categories": ["evidence"],
             }
         ],
     )
-    workspace.use_business_repair()
+    workspace.use_business_repair(owner_ref="owner")
 
-    # A separate dependency remains available for mutation coverage.  Both
-    # public writers are explicitly dependency-scoped, even though the paths
-    # arrived through dependent_outputs rather than artifact_paths.
-    workspace.append_finding({"finding_id": "F-DEPENDENCY-REPAIRED", "support": "bounded"})
+    # A separate dependency remains available for mutation coverage through
+    # the evidence/source-map writer authorized by the semantic category.
+    workspace.append_source_map({"source_id": "S-DEPENDENCY-REPAIRED", "support": "bounded"})
 
     # Removal of an authorized dependency that existed at review time is also
     # in scope.  The next draft write runs the scope check and must not reject
-    # the missing handoff.
-    (workspace.work_root / "handoff.json").unlink()
+    # the missing source map.
+    (workspace.work_root / "source_map.json").unlink()
     workspace.write_draft({"answer": "repaired", "unrelated": "keep"})
 
     review = workspace.record_review("accept", reviewer_ref="review-2")
@@ -339,8 +381,15 @@ def test_repair_scope_allows_dependency_mutation_removal_and_targeted_recheck(tm
     assert json.loads(workspace.business_review_path.read_text(encoding="utf-8"))["targeted_recheck"] is True
 
 
-def test_repair_scope_rejects_unrelated_artifact_with_dependency_only_scope(tmp_path: Path) -> None:
+def test_repair_scope_allows_item_local_artifacts_without_touching_sibling(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
+    sibling = ItemWorkspace.create(
+        workspace.context,
+        "Q-002",
+        original_text="Analyze the sibling evidence",
+    )
+    sibling.write_open_issues({"sibling": "untouched"})
+    sibling_before = (sibling.work_root / "open_issues.json").read_bytes()
     workspace.write_draft({"answer": "initial"})
     workspace.record_review(
         "repair_once",
@@ -348,15 +397,22 @@ def test_repair_scope_rejects_unrelated_artifact_with_dependency_only_scope(tmp_
         findings=[
             {
                 "finding_id": "F-DEPENDENCY",
-                "pointers": ["/answer"],
-                "dependent_outputs": ["work/handoff.json#/result"],
+                "pointers": ["/answer", "/evidence_refs"],
+                "dependent_outputs": [
+                    "work/evidence.jsonl",
+                    "work/source_map.json",
+                    "work/specialist_memos.jsonl",
+                ],
+                "semantic_categories": ["evidence"],
             }
         ],
     )
-    workspace.use_business_repair()
-    with pytest.raises(ValueError, match="outside reviewed scope"):
-        workspace.write_open_issues({"unrelated": True})
-    assert not (workspace.work_root / "open_issues.json").exists()
+    workspace.use_business_repair(owner_ref="owner")
+    workspace.write_open_issues({"unrelated": True})
+    assert json.loads((workspace.work_root / "open_issues.json").read_text(encoding="utf-8")) == {
+        "unrelated": True
+    }
+    assert (sibling.work_root / "open_issues.json").read_bytes() == sibling_before
 
 
 def test_discard_business_review_preserves_repair_bytes_and_allows_clean_full_review(tmp_path: Path) -> None:
@@ -365,9 +421,9 @@ def test_discard_business_review_preserves_repair_bytes_and_allows_clean_full_re
     workspace.record_review(
         "repair_once",
         reviewer_ref="review-1",
-        findings=[{"finding_id": "F-SCOPE", "pointers": ["/answer"]}],
+        findings=[{"finding_id": "F-SCOPE", "pointers": ["/answer"], "semantic_categories": ["answer"]}],
     )
-    workspace.use_business_repair()
+    workspace.use_business_repair(owner_ref="owner")
     workspace.write_draft({"answer": "repaired", "limits": []})
     draft_before = workspace.draft_root.read_bytes()
     packet_before = workspace.business_review_path.read_bytes()
@@ -387,12 +443,12 @@ def test_discard_business_review_preserves_repair_bytes_and_allows_clean_full_re
     clean = workspace.record_review(
         "repair_once",
         reviewer_ref="review-2",
-        findings=[{"finding_id": "F-CLEAN", "pointers": ["/answer"]}],
+        findings=[{"finding_id": "F-CLEAN", "pointers": ["/answer"], "semantic_categories": ["answer"]}],
     )
     assert clean["review_scope"] == "full"
     assert clean["targeted_recheck"] is False
     assert workspace.state["business_repair_count"] == 0
-    workspace.use_business_repair()
+    workspace.use_business_repair(owner_ref="owner")
     assert workspace.state["business_repair_count"] == 1
 
     with pytest.raises(ValueError, match="already recorded"):
@@ -413,7 +469,7 @@ def test_discard_business_review_rejects_invalid_incidents(tmp_path: Path, incid
     workspace.record_review(
         "repair_once",
         reviewer_ref="review-1",
-        findings=[{"finding_id": "F-SCOPE", "pointers": ["/answer"]}],
+        findings=[{"finding_id": "F-SCOPE", "pointers": ["/answer"], "semantic_categories": ["answer"]}],
     )
     packet_before = workspace.business_review_path.read_bytes()
     with pytest.raises(ValueError, match=message):
@@ -429,14 +485,14 @@ def _review_packet_workspace(tmp_path: Path) -> ItemWorkspace:
     workspace.record_review(
         "repair_once",
         reviewer_ref="review-1",
-        findings=[{"finding_id": "F-SCOPE", "pointers": ["/answer"]}],
+        findings=[{"finding_id": "F-SCOPE", "pointers": ["/answer"], "semantic_categories": ["answer"]}],
     )
     return workspace
 
 
 def _repair_packet_workspace(tmp_path: Path) -> ItemWorkspace:
     workspace = _review_packet_workspace(tmp_path)
-    workspace.use_business_repair()
+    workspace.use_business_repair(owner_ref="owner")
     workspace.write_draft({"answer": "repaired"})
     return workspace
 
@@ -484,9 +540,9 @@ def test_discard_business_review_rolls_back_on_state_persist_failure(tmp_path: P
     workspace.record_review(
         "repair_once",
         reviewer_ref="review-1",
-        findings=[{"finding_id": "F-SCOPE", "pointers": ["/answer"]}],
+        findings=[{"finding_id": "F-SCOPE", "pointers": ["/answer"], "semantic_categories": ["answer"]}],
     )
-    workspace.use_business_repair()
+    workspace.use_business_repair(owner_ref="owner")
     workspace.write_draft({"answer": "repaired"})
     state_path = workspace.item_root / "item_state.json"
     state_before = state_path.read_bytes()
@@ -642,9 +698,9 @@ def test_discard_audit_anchor_rejects_delete_rewrite_and_valid_prefix_truncation
     workspace.record_review(
         "repair_once",
         reviewer_ref="review-2",
-        findings=[{"finding_id": "F-SCOPE-2", "pointers": ["/answer"]}],
+        findings=[{"finding_id": "F-SCOPE-2", "pointers": ["/answer"], "semantic_categories": ["answer"]}],
     )
-    workspace.use_business_repair()
+    workspace.use_business_repair(owner_ref="owner")
     workspace.discard_business_review(
         IncidentRecord(
             incident_id="INC-REVIEW-SCOPE-002",
@@ -900,6 +956,41 @@ def test_terminal_state_rejects_all_work_and_draft_writers(tmp_path: Path) -> No
     for writer in writers:
         with pytest.raises(ValueError, match="terminal"):
             writer()
+
+
+@pytest.mark.parametrize("terminalizer", ("accept", "technical_failure"))
+def test_terminalizers_linearize_against_stale_item_writer(tmp_path: Path, terminalizer: str) -> None:
+    workspace = _workspace(tmp_path / "terminal-first")
+    if terminalizer == "accept":
+        workspace.write_draft({"answer": "bounded"})
+        workspace.record_review("accept", reviewer_ref="review-1")
+    stale = ItemWorkspace.load(workspace.context, workspace.item_id)
+    finalizer = ItemWorkspace.load(workspace.context, workspace.item_id)
+    writer_errors: list[BaseException] = []
+    started = threading.Event()
+
+    def stale_writer() -> None:
+        started.set()
+        try:
+            stale.write_draft({"answer": "must-not-overwrite"})
+        except BaseException as exc:  # noqa: BLE001 - assert linearization
+            writer_errors.append(exc)
+
+    with finalizer._state_transition_lock():  # noqa: SLF001 - deterministic lock interleaving
+        thread = threading.Thread(target=stale_writer)
+        thread.start()
+        assert started.wait(2)
+        if terminalizer == "accept":
+            finalizer.accept()
+        else:
+            finalizer.technical_failure("runtime exhausted", recovery_exhausted=True)
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert writer_errors and isinstance(writer_errors[0], ValueError)
+    assert ItemWorkspace.load(workspace.context, workspace.item_id).state["lifecycle_state"] in {
+        "accepted",
+        "technical_failure",
+    }
 
 
 def test_post_create_alias_replacement_is_rejected_on_every_boundary(tmp_path: Path) -> None:

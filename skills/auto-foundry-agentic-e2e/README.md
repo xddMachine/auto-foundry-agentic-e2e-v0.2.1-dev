@@ -1,254 +1,270 @@
-# Auto Foundry Agentic E2E Skill v0.2.8
+# Auto Foundry Agentic E2E Skill v0.7.1
 
-`auto-foundry-agentic-e2e` is a natural, reviewed, offline-friendly workflow
-for turning supplied enterprise evidence into bounded answers and a traceable
-management dashboard prototype. The v0.2.8 contract is **Agent Workbench +
-Durable Execution**: the program owns one data room/source catalog and one
-durable item workspace before analysis, while the Lead Analyst remains free to
-choose the useful analytical route.
+This skill produces two things: strong reviewed business analysis and a clear
+offline dashboard built from reviewed results. Deterministic core code exists
+to make that work easier and safer, not to turn analytical agents into state or
+JSON operators.
 
-## Run markers
-
-Every run records:
+## Current markers
 
 ```text
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.2.8
+skill_version: 0.7.1
 core_name: auto_foundry_core
-core_version: 0.3.5
+core_version: 0.8.0
 ```
 
-The normal program path is `RunContext` + `DataRoomWorkbench` +
-`ItemWorkspace` + immutable `BoundAnalysisContext`; `CoreRuntime` remains
-available for deterministic operations. The program owns lifecycle,
-integration/product/optimizer transitions, strict freeze markers, and terminal
-state. Agents never hand-edit terminal state.
-
-The ontology remains a compact enterprise map of stable objects, identities,
-aliases, sources, documents, processes, definitions, rules, relationships,
-limitations, and reusable metric definitions. Current counts, shares,
-amounts, values, rankings, top-N rows, and dimensional observations remain
-accepted results, claims, dashboard facts, evidence, or prepared assets;
-`add_metric` records an observation and never promotes it into ontology.
-
-The run binds one physical source inventory. Initial archive/member hashes are
-counted once; bound child contexts reuse that inventory, selected-member reads
-are counted separately, and an explicit `verify_source_full()` call performs
-the final mutation check. Opaque members may be copied only through explicit
-safe materialization and are never semantically parsed.
-
-## Choose one mode
-
-- **Question Mode** preserves supplied wording and order, processes one
-  question at a time, and never runs a parallel question wave. The program
-  creates the item workspace, state, and `BoundAnalysisContext` before one Lead
-  Analyst. The analyst writes plan/script/evidence/draft;
-  `ControlledScriptRunner` performs compile/dependency preflight checks, then
-  emits successful runtime receipts for `smoke` and `full`; a requested
-  deterministic comparison adds a second `full` receipt, while a failed
-  preflight emits its `compile` or `dependency_check` receipt. Coding errors
-  return to the same attempt, while execution recovery requires a canonical
-  persisted receipt reference/hash proving lane/provider/host/process loss and
-  matching the active attempt and lane. The program then routes one
-  Independent Business Reviewer, allows at most one scoped business repair
-  plus targeted recheck, and
-  writes immutable accepted answer bytes beside a separate acceptance envelope
-  before continuing. It builds the dashboard after the complete queue and
-  whole-run freeze.
-
-Repair scope honors explicit dependent artifact roots and JSON fragments by
-authorizing their owning artifact paths; changes to unrelated artifacts remain
-fail-closed.
-
-When a reviewer packet is inadmissible because its scope is invalid, the
-program-only `ItemWorkspace.discard_business_review(...)` recovery path accepts
-only an item-bound, inadmissible `reviewer_scope` incident. It appends an
-append-only hash-bound audit record, atomically removes the packet while
-preserving all existing work and draft bytes, resets pending review and the
-business-repair count, and requires a new full review. It does not reinterpret
-findings or provide a compatibility fallback.
-
-For an implementation change, use only the public
-`BoundAnalysisContext.rebind_implementation(...)` transition. It requires a
-contiguous SHA/tree/version ledger and preserves the same source, catalog,
-source-stat signature, and physical inventory while changing identity only.
-Its durable intent, append-only audit, and anchored head recover idempotently
-after a crash; the lock order is journal → run lifecycle → item state. The
-shared `ItemWorkspace` state-transition lock serializes this with reviewer
-packet commit/discard. Rebind requires no active attempt/review, terminal or
-accepted state; discard an invalid review first. It performs no ZIP/member or
-raw-source reads, catalog rebuild, inventory-counter increment, or new
-analysis.
-
-For a later or multi-hop item, use only
-`BoundAnalysisContext.create_from_transitioned_catalog(...)`. This is
-immutable source inheritance, not a synthetic transition: the target reuses
-the original source/catalog/stat/inventory identity and performs no ZIP/member
-discovery, catalog rebuild, inventory-counter increment, or source read.
-Recursive upstream provenance is checked before target publication. Locks are
-ordered as inherited journals oldest first → target inheritance journal → run
-lifecycle → source/target item state (lexical item order). Target intent,
-manifest, inheritance record, and state recover idempotently after a crash;
-retry writes no synthetic transition audit. `earliest_affected_item` is a
-lower bound, so later items are covered while an earlier target is rejected.
-- **Requirement Mode** is analytics-only and keeps user-owned records and
-  explicit priority semantics. It records original text, objective, expected
-  analytical/visual outputs, internal and foundation dependencies, data/
-  ontology/prepared needs, definitions, limits, and status. Unprioritized
-  records may be ordered one at a time for observed dependencies or safe reuse;
-  there is no separate planner framework or keyword dictionary.
-
-## Agent Workbench + Durable Execution
-
-The program builds one physical source catalog from ZIP/archive and member
-metadata. Entries include bounded columns, samples/values, hashes, and
-workbook sheet information when available; the raw archive remains read-only.
-For each item it creates:
+## Architecture
 
 ```text
-questions/<id>/item_state.json
-questions/<id>/work/
-requirements/<id>/item_state.json
-requirements/<id>/work/
+user question
+  -> one Analytical Owner
+       -> bounded data room
+       -> reproducible calculations
+       -> optional 0-3 specialist memos
+       -> complete business answer
+       -> iterative material repairs, each with a targeted recheck
+  -> one Independent Business Reviewer
+  -> immutable accepted answer
+  -> one Result Integration Agent
+  -> one item-only Integration Fidelity Reviewer
+  -> reviewed-output dashboard
+
+Requirement Mode adds an event-driven Planner and parallel Entity Resolution
+Owner jobs. The Planner schedules runnable items; it does not answer them or
+predeclare runtime semantic dependencies.
 ```
 
-The Lead Analyst writes a plan, script, source map, evidence, and draft through
-the program-owned workspace. `ControlledScriptRunner` performs compile/
-dependency preflight checks and emits successful runtime receipts for `smoke`
-and `full`; a requested deterministic comparison adds a second `full` receipt,
-while a failed preflight emits only its `compile` or `dependency_check` receipt.
-`draft` appears only when materialized. Accepted answer bytes are immutable and separate from the
-program-owned acceptance envelope; `work` remains mutable. Filesystem
-no-progress produces `await_runtime` or `materialization_guidance`, not
-recovery. Only a canonical persisted receipt reference/hash proving lane/
-provider/host/process loss and matching the active attempt/lane authorizes
-execution recovery. There is no wall-time deadline for the workflow; the
-runner's explicit default 3600-second process guard is not an agent reasoning
-deadline,
-terminalizer agent, or per-question freeze incident.
+The host binds each Analytical Owner in the program-owned
+`work/analysis_owner.json` record. Agents return semantic content only and do
+not author that internal record or path.
 
-Compact source/LEM/prepared indexes remain searchable and the Lead Analyst
-selects relevant IDs directly. Catalog capabilities may be recommended or
-used internally; custom reproducible code is allowed. There is no Portfolio
-Planner, Navigator, descriptor/typed-validation role, business-repair
-  finalizer, reviewer-of-reviewer, manual terminalizer, or per-item
-catalog-compliance artifact.
+The Analytical Owner keeps the whole cognitive loop. It interprets the
+question, chooses the strategy, inspects sources, defines the population and
+method, tests data quality and relationships, calculates, interprets, and
+writes the final answer. It does not hand the answer to a separate coding
+worker.
 
-Prepared data is first a candidate written atomically below the current item's
-`work/prepared/` directory through
-`BoundAnalysisContext.save_prepared_candidate(...)`; the candidate is absent
-from `PreparedAssetRegistry`. After acceptance, exactly one Result Integration
-Agent stages it and the commit validates exact path, hash, byte/row counts,
-scope, and provenance before registering it once. Scope is retained, exact
-retries are idempotent, and rejected or technical-failure items leave no
-accepted entry. Mechanical validation cannot prove semantic completeness.
-Exactly one fresh, item-only Integration Fidelity Reviewer checks the staged
-candidate after mechanical validation and before commit; the same Result
-Integration Agent patches only affected records and receives one targeted
-recheck. Its packet excludes siblings, cumulative state, prior memory, and
-broad workspace context.
+Specialists are optional bounded spokes. They return evidence memos; they do
+not own the parent answer. The Business Reviewer checks business substance and
+describes findings by answer section and one or more semantic categories. It does not author JSON
+pointers, paths, hashes, or review packets.
 
-When exact identity overlap is absent but same-object representations are
-materially plausible, the run records candidates, evidence/coverage, a
-semantic identity decision, and the reviewer check before declaring a combined
-relationship unavailable (or explains why the route is inapplicable). Review
-also performs a targeted source-catalog completeness search for material
-absence claims without repeating the full analysis.
+`AnalystWorkspace` is the analytical-agent surface. It exposes business-shaped
+operations such as:
 
-Run-local Prepared Data Registry entries point to loadable assets and record
-hash, location, schema, grain, lineage/source IDs, scope, period, and limits.
-Every accepted asset is registered in a canonical catalog immutable by source
-hash/core/schema; scope/reuse eligibility controls visibility only, while
-samples/categories are derived views. Structured `no_change` Knowledge Deltas
-include a concrete reason, and the program—not custom question code—validates/
-applies reviewed deltas.
-
-After acceptance, exactly one Result Integration Agent incrementally consumes
-small program APIs for claims, metrics, limitations, evidence, prepared
-assets, ontology, relationships, and dashboard facts. It performs semantic
-mapping; deterministic code validates types, paths, refs, hashes, stages, and
-commits. There is no prose parser, semantic compiler, giant mandatory JSON,
-second integration reviewer, or finalizer chain. The runner's explicit configurable
-default is a 3600-second process guard, not an agent reasoning or workflow
-wall-time deadline. Recovery accepts only a canonical persisted receipt
-reference/hash with the active attempt and lane; unpersisted or mismatched
-references fail closed.
-
-Passive attempt/artifact telemetry records invocation lane/role/route,
-start/end/status/error when available, artifact before/after/counts, recovery
-and business-repair counts, source/member reads, core/cache facts, and literal
-provider/model/host/process identity (`unavailable` when unknown). Terminal
-reason classifier output is exactly `same_attempt_feedback`,
-`business_repair`, `execution_recovery`, `abort_and_new_clean_run`, or `null`;
-raw terminal reasons remain specific facts. It contains no raw rows and never
-controls routing.
-
-Phase timing is passive and separated for analyst/model work, controlled
-execution, business review, business repair, fidelity/integration review,
-integration commit, products, optimizer, reporting/finalization, and genuine
-recovery. Start, finish, and wall time come only from observed events; missing
-times and provider/model identities remain literal `null`/`unavailable`.
-Incident records are normalized and deduplicated so reviewer-scope, program,
-recovery, and metadata incidents enter cumulative reporting exactly once.
-Implementation transitions bind old/new SHA, tree, and version, earliest
-affected item, preserved accepted hashes, revalidation reason, and exact resume
-point. Finalization recomputes item outcomes/counts and atomically binds a
-report hash to a manifest and non-circular terminalization receipt; identical
-re-finalization is idempotent and stale/tampered inputs fail closed.
-
-## Install and verify
-
-Install this folder as the single `auto-foundry-agentic-e2e` skill directory;
-do not keep an older copy beside it. Start a fresh Codex task after changing a
-skill so discovery is refreshed. Run the offline contract suite from the
-repository root:
-
-```bash
-PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q tests/skill/test_contract.py
-git diff --check -- skills/auto-foundry-agentic-e2e tests/skill/test_contract.py
+```text
+brief
+search_sources / sample_source / source_categories
+search_ontology / select_ontology
+search_prepared_assets / select_prepared_assets / load_prepared_asset
+begin_analysis / select_sources / record_evidence
+assign_specialist / record_specialist_memo
+run_analysis
+prepare_data
+submit_answer
+review through BusinessReviewAdapter
+accept
 ```
 
-The contract suite inspects text, local Markdown links, JSON templates, and the
-deterministic protocol harness. It never imports the analytics core, calls a model, reads a dataset, or
-performs a run. Do not run Benchmark A, network calls, package builds, commits,
-or pushes as part of this offline check.
+The core translates these calls into strict JSON artifacts, hashes, receipts,
+semantic repair provenance, and lifecycle state. `NaN`, `Infinity`, unknown sections,
+invalid categories, duplicate IDs, and out-of-scope repair fail before
+acceptance.
 
-## Offline helper scripts
+Before analysis, the owner checks `brief` and searches the compact accepted
+semantic graph and prepared descriptors. When useful, it selects exact
+accepted ontology or prepared-asset IDs with a purpose. The program records
+those owner/item-bound decisions in `work/semantic_selections.jsonl`; prepared
+rows are loaded only after selection and exact registry content-hash
+validation. A missing or inapplicable descriptor sends the owner back to
+bounded source inspection rather than to a guessed join.
 
-The existing local dashboard helper renders reviewed values only, and the
-development-only optimizer collector remains a deterministic, strictly
-read-only observer after the whole-run freeze. Neither helper calculates new
-analytics or makes a model/network call. Their detailed contracts remain in
-[Final product and optimizer](references/FINAL_PRODUCT_AND_AUTOMATION.md).
+When present, a prepared descriptor's optional `effective_period` is carried
+unchanged through its candidate sidecar, operation manifest/hash inputs,
+accepted integration and registry, and later reuse. Omission remains valid and
+means no period constraint; never infer a period from the current date.
 
-The supplied [test prompts](TEST_PROMPTS.md) exercise both modes without real
-model calls or benchmark execution. The [run-state template](assets/RUN_STATE_TEMPLATE.json)
-is an illustrative nine-field lifecycle shape; its placeholder
-`manifest_hash` must be recomputed for a real run root. Queue, workbench, role,
-product, optimizer, telemetry, and other artifacts are separate files, not
-run-state fields. The [item-state template](assets/ITEM_STATE_TEMPLATE.json)
-and [dashboard contract](assets/DASHBOARD_PROTOTYPE_TEMPLATE.md) are optional
-starting points; do not create unused empty directories.
+Requirement Mode starts with an owner readiness/scouting pass: explicitly
+search and select applicable ontology, identity mappings, relationships, and
+prepared semantics, or record why none applies. If a needed identity domain is
+`resolving`, the owner reports `waiting_on_resolution` and releases its lane;
+the Planner skips to the next original-order runnable item and marks the
+earliest paused item `ready_to_resume` when the domain is `ready`. If all
+runnable items wait,
+the owner lane sleeps while active resolvers progress. Block only when nothing
+is runnable and no resolver can progress.
 
-This is an offline-friendly contract, not a claim of host-level sandboxing,
-Benchmark A.1 completion, or production hardening:
+Use one `RequirementSupervisorWorkspace.scheduling_tick()` after each wait,
+resume, or terminal transition so item/resolution state and owner capacity are
+joined once and the aggregate run status stays current.
 
-> A Coding Agent with unrestricted host shell/filesystem access cannot be fully
-> sandboxed by this Python package. True isolation requires a separate
-> workspace/container or host allowlist.
+Result Integration publishes material reusable semantics actually established:
+business objects and table mappings, grain, key fields and normalization,
+relationship/cardinality/coverage/date authority/limits, and truly reusable
+prepared-asset descriptors. It does not publish every merge, result row,
+metric observation, Japan/Spain filter, or question-specific aggregation.
+`no_change` is valid only when the item established no reusable semantic
+understanding or asset; it is not a default for every answer. For example, Q1
+can publish order-header/order-line/delivery/customer/material objects and
+relationships plus a reusable order-fulfillment core; Q2 and Q9 search,
+select, and load those exact IDs, then compute their own requirement-specific
+measures.
+
+After acceptance, `IntegrationSession` is deliberately typed. The Result
+Integration Agent maps the accepted answer into small claims, metrics,
+limitations, evidence links, prepared assets, ontology definitions,
+relationships, and dashboard facts. Integration is downstream and cannot
+repair or replace the business analysis.
+
+The Analytical Owner establishes actual joins and relationships and records
+`source_id`/`target_id`, `join_keys`, grain, cardinality, `matched_pairs` (the
+unique tested edge-pair count), `source_population`/`target_population`,
+`matched_source_count`/`matched_target_count` (distinct matched endpoints),
+and `source_coverage`/`target_coverage` (endpoint count divided by its
+population, with zero for a zero population), plus `as_of`/date authority,
+limitations, and evidence. Integration publishes only those
+reviewed tested relationships plus canonical identity mappings; it never
+completes a theoretical graph or infers one from prose.
+
+The program, not the agent or caller, restores cumulative LEM context. It
+projects validated prior committed integration records in lifecycle order, so
+there is no separate mutable LEM checkpoint to reconstruct or reconcile.
+
+## Modes
+
+Question Mode preserves supplied wording and order, activates one question at
+a time, and continues after bounded partial or technical outcomes when later
+questions remain runnable.
+
+Requirement Mode preserves each exact user-owned `RequirementRecord`, including
+priority, objective, expected outputs, dependencies, data needs, definitions,
+limits, and status. One run-level **Planner** is an event-driven control plane
+and cognitive scheduler. It receives those records, compact physical metadata,
+and current item/resolution outcomes. Initial order and grouping are advisory;
+the Planner preserves explicit user priority/order but never declares runtime
+semantic dependencies. The Analytical Owner discovers those only after
+understanding the requirement, and the runtime
+`waiting_on_resolution`/`ready_to_resume` ledger is the sole semantic block.
+
+`RequirementExecutionPlan` and `RequirementExecutionGroup` are revisionable
+recommendations/current scheduling, not catalog-hash or lifecycle authority.
+The Planner consumes typed runtime snapshots and next actions, dispatches the
+named roles until terminal, and records every intervention as a canonical run
+incident. It routes ordinary errors back to the same owner. It can replan after
+outcomes change, but a technical failure does not create Planner dependency
+blocks; independent groups remain eligible and runtime resolution state
+controls waiting and resume. Every requirement binds
+directly to the same `RunContext` and shared `DataRoomWorkbench`.
+The default capacity is four entity-resolution workers, one Analytical Owner,
+up to three owner specialists, and eight active workers total; the Planner is
+not counted. Hosts may configure lower or higher limits, but may never be
+oversubscribed. Requested Run A and Run B executions remain sequential.
+Within a group, one Analytical Owner remains responsible for each requirement;
+bounded shared investigation may be reused and independent groups may run when
+host capacity permits. Each item follows the ordinary loop: item-local
+`RequirementAnalysisPlan`, analysis, review, as many evidence-backed repair
+cycles as are useful, accept or `technical_failure`, then integration. `RequirementAnalysisTask`
+values are reasoning decomposition only and never child lifecycle workspaces.
+Entity-resolution jobs are parallel external jobs, not extra owner specialists
+and never answer a requirement.
+For the exact requirement “Dashboard should show the ratio of milk fat content
+to the procurement price of the raw material for that milk.”, example tasks are
+to define the milk lot/fat measure and map raw-material procurement cost, then
+calculate/reconcile the ratio and visualization. Requirement Mode is
+analytics-only and does not automate a client business process.
+
+The host/router records the current owner in program-owned audit state;
+analytical agents never emit internal paths or hashes. Another owner may later
+continue the same nonterminal item, at which point the audit binding is
+updated. A repair finding is provenance, not a filesystem capability: the
+owner may update any item-local work and coherent answer section needed to
+resolve it. Cross-item writes remain rejected.
+
+The current review verdicts are `accept`, `accept_with_limits`, `repair_once`,
+and `confirm_data_insufficiency`. Each material repair receives a targeted
+recheck, but there is no arbitrary repair-count limit. Code feedback and
+execution recovery are ordinary work, not a separate repair budget. Only the
+owner may write a `DataInsufficiencyConclusion`; the reviewer
+can only confirm it, after which the program may terminalize
+`blocked_by_evidence`. Other defects repair or technical-fail.
+
+When an Analytical Owner proposes a new arbitrary real-world identity domain
+during scouting, reserve that exact owner-bound proposal as `resolving` and
+launch an Entity Resolution Owner; the Planner cannot pre-reserve it. Strongly coupled classes may share a domain; there is no
+hardcoded Supplier/Factory/Order scope. The owner scans every row of
+domain-relevant tables and relevant documents selected from reservation hints,
+expanding only for concrete matching/conflict evidence. It reuses the run-level
+catalog instead of rescanning unrelated members, owns methodology, may inspect
+manually or write Python/SQL/scripts/use helpers, infer and bulk-apply justified patterns, test samples/coverage/
+exceptions/population differences, and revise the method. Manual row review,
+an authoritative crosswalk, or a fixed matching script is not required.
+Pattern rules remain run knowledge; future helper-library audit is deferred.
+
+The review decision is binary per proposed mapping (accepted or not accepted).
+Each accepted `CanonicalMapping` may contain one or many source identities or
+representations, including bulk pattern-derived populations. Unresolved or
+ambiguous records remain source-local and outside canonical mappings, with
+coverage and exceptions preserved; they do not downgrade proven mappings. A
+ready snapshot publishes the canonical class, source-account representation
+classes, reviewed `IdentityDecision` and `CanonicalMapping`, identity
+`represents` relationships, and a versioned mapping asset/coverage when
+available. Owners never see partial snapshots.
+The ready snapshot is exposed only after the reviewed result is committed
+atomically.
+
+Use `accept` when the core decision is answered and only normal disclosed limits
+remain. Use `accept_with_limits` only for a material requested component that
+is missing or unreliable; source-local, currency, or no-causality caveats alone
+do not force it. Resolution review decisions are binary per mapping; each
+accepted mapping may contain one or many source identities, while coverage and
+exceptions are reported at the job level. Semantic fidelity is reviewed
+independently.
+
+## Clean-room and recovery
+
+Inputs stay read-only. A clean-room run does not read sibling runs, prior
+answers, cross-run caches, or hidden memory. Program-owned state and receipts
+retain progress and audit evidence. Coding errors may be continued by the same
+or a different Analytical Owner and attempt; receipts do not grant permission
+or consume a repair budget.
+
+Every Requirement Mode item binds directly to the same run context and shared
+data room. Persisted analysis contexts load across core and skill revisions
+without transition or rebind ceremonies. Source/catalog hashes still detect
+real input corruption. Committed integration semantics, business conclusions,
+relationships, and prepared assets remain reusable. The portfolio and
+scheduling plan may be revised while running, paused, or complete.
+
+## Products
+
+Freeze reviewed accepted answers, integration state, prepared registry, LEM,
+and telemetry before rendering. The dashboard performs no new analytics. It
+uses a short overview plus separate business-domain, ontology, and
+evidence/audit pages. Charts lead; detail tables are collapsed. Every page
+shows the relevant periods, populations, denominators, units, proxies,
+limitations, and clickable evidence links. The optimizer observes frozen evidence read-only and
+never performs client-business automation.
 
 ## Reference map
 
-- [Skill instructions](SKILL.md)
-- [Question and requirement playbook](references/QUESTION_ANALYSIS_PLAYBOOK.md)
-- [Knowledge and reuse](references/KNOWLEDGE_AND_REUSE.md)
-- [Review protocol](references/REVIEW_PROTOCOL.md)
+- [Main skill contract](SKILL.md)
+- [Analytical playbook](references/QUESTION_ANALYSIS_PLAYBOOK.md)
+- [Analytical collaboration and role prompts](references/ANALYTICAL_COLLABORATION.md)
+- [Business and fidelity review protocol](references/REVIEW_PROTOCOL.md)
+- [Knowledge and prepared-data reuse](references/KNOWLEDGE_AND_REUSE.md)
 - [Artifact and efficiency policy](references/ARTIFACT_AND_EFFICIENCY_POLICY.md)
-- [Final product and optimizer](references/FINAL_PRODUCT_AND_AUTOMATION.md)
-- [Optimization follow-up template](assets/AUTOMATION_CANDIDATE_TEMPLATE.md)
-- [Question result template](assets/QUESTION_RESULT_TEMPLATE.md)
-- [Item state template](assets/ITEM_STATE_TEMPLATE.json)
-- [Dashboard prototype contract](assets/DASHBOARD_PROTOTYPE_TEMPLATE.md)
-- [Telemetry event template](assets/TELEMETRY_EVENT_TEMPLATE.json)
-- [Optimizer evidence bundle template](assets/OPTIMIZER_EVIDENCE_BUNDLE_TEMPLATE.md)
-- [Requirement record template](assets/REQUIREMENT_RECORD_TEMPLATE.json)
+- [Final products and optimizer](references/FINAL_PRODUCT_AND_AUTOMATION.md)
+- [Offline contract prompts](TEST_PROMPTS.md)
+- [Program-populated item result view](assets/QUESTION_RESULT_TEMPLATE.md)
+
+## Validation
+
+The canned replay is a synthetic zero-model cassette that exercises the real
+core path for three questions, optional specialists, business review and
+repair, integration fidelity repair, products, reporting, optimizer, and
+fail-closed probes. It is not an agent response schema and does not prove live
+model quality.
+
+This package is offline-friendly and experimental. It is not a production
+sandbox or a claim that Benchmark A has been completed.

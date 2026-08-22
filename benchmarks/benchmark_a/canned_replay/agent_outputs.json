@@ -1,0 +1,156 @@
+{
+  "schema_version": "benchmark_a.canned_agent_replay.v2",
+  "fixture_name": "generic_three_question_analytical_owner_replay",
+  "description": "Synthetic cassette conclusions consumed only by the zero-call replay harness; not an agent response schema.",
+  "questions": [
+    {
+      "item_id": "Q-001",
+      "text": "How reliably are synthetic orders delivered in the fixture?",
+      "analytical_owner": {
+        "conclusion": "The supplied fixture contains three bounded orders and supports only a fixture-level reliability summary.",
+        "method": "Inspect the bounded order table and run one deterministic summary script.",
+        "status": "pass"
+      },
+      "specialists": [],
+      "business_reviewer": {
+        "verdict": "accept_with_limits",
+        "conclusion": "The answer addresses the fixture population and clearly limits interpretation.",
+        "status": "pass"
+      },
+      "integration": {
+        "conclusion": "Typed claim, metric, limitation, ontology, prepared-asset, and dashboard records were staged.",
+        "status": "pass"
+      },
+      "fidelity_reviewer": {
+        "verdict": "accept",
+        "conclusion": "Q-001 staged records faithfully represent its accepted fixture answer.",
+        "status": "pass"
+      }
+    },
+    {
+      "item_id": "Q-002",
+      "text": "Which synthetic process stage has the most observable delay?",
+      "analytical_owner": {
+        "conclusion": "The carrier handoff is the bounded stage requiring the clearest delay wording.",
+        "method": "Compare the three supplied stage observations without causal inference.",
+        "status": "pass"
+      },
+      "specialists": [
+        {
+          "task_id": "S-Q002-METHOD",
+          "specialty": "metric_method",
+          "question": "Check whether a stage comparison from three fixture rows can be stated as a causal delay.",
+          "expected_output": "A bounded method memo.",
+          "conclusion": "The comparison is descriptive only; the fixture has no causal timing design.",
+          "method": "Inspect the supplied stage and amount fields and the question wording.",
+          "limitations": ["Three synthetic observations only."],
+          "open_questions": [],
+          "confidence": "high",
+          "status": "pass"
+        }
+      ],
+      "business_reviewer": {
+        "verdict": "repair_once",
+        "finding_id": "BR-Q002-HANDOFF",
+        "target_sections": ["answer"],
+        "semantic_categories": ["answer"],
+        "problem": "The initial wording is not explicit that the comparison is descriptive.",
+        "evidence": "The specialist memo confirms that three fixture rows do not support a causal delay claim.",
+        "required_change": "State that the carrier handoff is the largest observable fixture value, not a causal delay.",
+        "conclusion": "One answer-section correction is required.",
+        "status": "repair_once"
+      },
+      "targeted_business_reviewer": {
+        "verdict": "repair_once",
+        "second_finding_id": "BR-Q002-UNITS",
+        "second_target_sections": ["answer"],
+        "second_semantic_categories": ["answer"],
+        "second_problem": "The repaired answer still needs an explicit unit and denominator statement.",
+        "second_evidence": "The current draft names the observable handoff but does not state the comparison unit.",
+        "second_required_change": "Add the comparison unit and denominator to the parent answer.",
+        "conclusion": "A fresh material answer issue requires one second bounded repair.",
+        "status": "repair_once"
+      },
+      "second_targeted_business_reviewer": {
+        "verdict": "accept_with_limits",
+        "conclusion": "The second corrected answer states the descriptive unit and denominator and passes the final targeted recheck.",
+        "status": "pass"
+      },
+      "integration": {
+        "conclusion": "The corrected Q-002 answer was staged as typed integration records.",
+        "status": "pass"
+      },
+      "fidelity_reviewer": {
+        "verdict": "accept",
+        "conclusion": "Q-002 staged records match the repaired accepted answer.",
+        "status": "pass"
+      }
+    },
+    {
+      "item_id": "Q-003",
+      "text": "Which synthetic order is the next observable handoff risk?",
+      "analytical_owner": {
+        "conclusion": "O-002 is the bounded next handoff-risk observation, with no predictive claim.",
+        "method": "Combine a data-quality check with a business-context interpretation of the supplied fixture.",
+        "status": "pass"
+      },
+      "specialists": [
+        {
+          "task_id": "S-Q003-DQ",
+          "specialty": "data_quality",
+          "question": "Check order identifier uniqueness and stage completeness.",
+          "expected_output": "A bounded data-quality memo.",
+          "conclusion": "All three order IDs are unique and every stage value is populated.",
+          "method": "Inspect the three bounded fixture rows.",
+          "limitations": ["No historical recurrence evidence."],
+          "open_questions": [],
+          "confidence": "high",
+          "status": "pass"
+        },
+        {
+          "task_id": "S-Q003-CONTEXT",
+          "specialty": "business_context",
+          "question": "Assess whether the largest supplied value can be described as predictive handoff risk.",
+          "expected_output": "A bounded interpretation memo.",
+          "conclusion": "The result is an observable fixture risk flag, not a prediction.",
+          "method": "Compare the question language with the available fields.",
+          "limitations": ["No outcome history or calibrated risk target."],
+          "open_questions": ["A real prediction would require historical outcomes."],
+          "confidence": "high",
+          "status": "pass"
+        }
+      ],
+      "business_reviewer": {
+        "verdict": "accept",
+        "conclusion": "The risk observation is supported and explicitly non-predictive.",
+        "status": "pass"
+      },
+      "integration": {
+        "conclusion": "The initial Q-003 dashboard fact and metric records were staged.",
+        "status": "pass"
+      },
+      "fidelity_reviewer": {
+        "verdict": "repair_once",
+        "finding_id": "FR-Q003-RISK",
+        "record_pointer": "metric-q-003",
+        "record_semantic_key": "metric_id",
+        "conclusion": "One exact metric record needs a bounded label correction.",
+        "status": "repair_once"
+      },
+      "targeted_fidelity_reviewer": {
+        "verdict": "accept",
+        "conclusion": "The corrected Q-003 integration record passes targeted fidelity recheck.",
+        "status": "pass"
+      }
+    }
+  ],
+  "role_conclusions": {
+    "analytical_owner": "One owner retains interpretation, calculation, synthesis, answer, and repair for every canned item.",
+    "specialist": "Optional specialists return bounded evidence memos and never own the parent answer.",
+    "business_reviewer": "Business review accepts Q-001/Q-003 and authorizes two bounded semantic Q-002 answer repairs with a final targeted acceptance.",
+    "integration": "One Result Integration owner stages typed records for each accepted item.",
+    "fidelity_reviewer": "Item-only fidelity accepts Q-001/Q-002 and authorizes one exact Q-003 record repair.",
+    "product": "The real offline dashboard renderer writes a traceable reviewed product fixture.",
+    "optimizer": "The real evidence collector reads frozen run-relative evidence and writes optimizer evidence only."
+  }
+}

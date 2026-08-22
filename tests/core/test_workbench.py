@@ -375,6 +375,8 @@ def test_prepared_candidate_materialization_descriptor_and_registry_boundary(roo
         "sales.csv",
         format="jsonl",
         grain="one row per order",
+        effective_period="2023-12-19/2024-07-04",
+        ontology_refs=(ref for ref in ("ontology:order", "ontology:status")),
         transformations=(step for step in ("read_csv", "bounded")),
         source_refs=(ref for ref in (DataAssetRef.from_path(archive),)),
         lineage={"purpose": "test"},
@@ -388,9 +390,15 @@ def test_prepared_candidate_materialization_descriptor_and_registry_boundary(roo
     assert descriptor.byte_count == prepared_path.stat().st_size
     assert descriptor.core_version == context.core_version
     assert descriptor.scope == "requirement_scoped"
+    assert descriptor.effective_period == "2023-12-19/2024-07-04"
     assert descriptor.source_hashes
     assert descriptor.lineage["members"][0]["path"] == "sales.csv"
     assert descriptor.transformations == ("read_csv", "bounded")
+    assert descriptor.ontology_refs == ("ontology:order", "ontology:status")
+    sidecar = json.loads(descriptor_path.read_text(encoding="utf-8"))
+    assert sidecar["effective_period"] == "2023-12-19/2024-07-04"
+    assert sidecar["ontology_refs"] == ["ontology:order", "ontology:status"]
+    assert sidecar == descriptor.to_dict()
 
     assert bound.prepared_assets.search(prepared_asset_id="sales-prepared") == ()
     assert bound.save_prepared_candidate(
@@ -398,10 +406,28 @@ def test_prepared_candidate_materialization_descriptor_and_registry_boundary(roo
         "sales.csv",
         format="jsonl",
         grain="one row per order",
+        effective_period="2023-12-19/2024-07-04",
+        ontology_refs=(ref for ref in ("ontology:order", "ontology:status")),
         transformations=(step for step in ("read_csv", "bounded")),
         source_refs=(ref for ref in (DataAssetRef.from_path(archive),)),
         lineage={"purpose": "test"},
     ) == descriptor
+
+    with pytest.raises(ValueError, match="different descriptor"):
+        bound.save_prepared_candidate(
+            "sales-prepared",
+            "sales.csv",
+            format="jsonl",
+            grain="one row per order",
+            effective_period="2024-01-01/2024-12-31",
+            ontology_refs=("ontology:order", "ontology:status"),
+            transformations=(step for step in ("read_csv", "bounded")),
+            source_refs=(ref for ref in (DataAssetRef.from_path(archive),)),
+            lineage={"purpose": "test"},
+        )
+
+    no_period = bound.save_prepared_candidate("sales-without-period", "sales.csv")
+    assert no_period.effective_period is None
 
     prepared_path.write_text(prepared_path.read_text(encoding="utf-8") + "{}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="different descriptor|incomplete"):

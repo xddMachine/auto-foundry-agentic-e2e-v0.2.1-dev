@@ -1,222 +1,205 @@
 # Offline test prompts
 
-These prompts are contract fixtures. They use fake rows or metadata only; do
-not call a real model, benchmark, external system, network, or current
-dataset. The offline dashboard and optimizer helpers follow the same rule:
-dashboard rendering presents accepted values, while optimization is frozen,
-passive, and run-local.
+These are contract fixtures. Use synthetic sources only. Do not call a real
+model, benchmark, network, external system, or prior run.
 
-Keep the ontology compact: stable enterprise objects, identities, aliases,
-sources, documents, processes, definitions, rules, limitations, relationships,
-and reusable metric definitions only. Current counts, shares, amounts, values,
-rankings, top-N rows, and dimensional observations remain accepted results,
-claims, dashboard facts, evidence, or prepared assets; `add_metric` is an
-observation record, never ontology promotion.
-
-## Question Mode: clean-room queue
+Record these current markers in program metadata:
 
 ```text
-Use `$auto-foundry-agentic-e2e` in Question Mode.
-
-Start a fresh clean-room run using only the attached generic enterprise files
-and these questions. Do not read sibling runs, previous-run caches, ontologies,
-scripts, reports, dashboards, prompts, or prior agent outputs. Declare the
-allowed roots and record any discarded-lane incident.
-
-At run start, record these exact release markers in program run metadata and
-the final report (the lifecycle `run_state.json` remains the exact nine-field
-authority schema):
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.2.8
+skill_version: 0.7.1
 core_name: auto_foundry_core
-core_version: 0.3.5
+core_version: 0.8.0
+```
 
-Build one program-owned data room/source catalog from the supplied archive and
-member metadata. Keep the archive read-only. Process the questions in exactly
-this order, preserving each original string:
+## Question Mode: analytical-owner queue
+
+```text
+Use $auto-foundry-agentic-e2e in clean-room Question Mode.
+
+Preserve these exact questions and process one question at a time in order:
 1. Count fulfilled order lines by month from one supplied table.
-2. Compare invoice totals with a second source, but retain source-local
-   results when the identity link is incomplete.
+2. Compare invoice totals with a second source, preserving source-local results
+   when the identity link is incomplete.
 3. Normalize a small supplier-status field and report exclusions.
 
-Before each Lead Analyst invocation, create the item's durable `work`,
-authoritative `item_state.json`, and immutable `BoundAnalysisContext`. The Lead
-Analyst must write a plan, reproducible script, source map, and evidence before
-the draft. Run code through `ControlledScriptRunner`: compile and dependency
-checks are preflight; a successful pipeline emits `smoke` and `full` runtime
-receipts, and a requested deterministic comparison emits an optional second
-`full` receipt. A failed preflight emits its `compile` or `dependency_check`
-receipt. Syntax/import/type/script-validation errors go back to the same
-analyst and attempt; they never authorize recovery.
-After each response, use structured `artifact_progress`: progress continues
-the lane; filesystem no-progress returns `await_runtime` or
-`materialization_guidance`. Recover only when a completed invocation receipt
-proves lane/provider/host/process loss. The receipt must be a canonical
-persisted `receipt_ref`/hash matching the active attempt and lane; unpersisted
-or mismatched references fail closed. Do not use a workflow wall-time deadline
-or a terminalizer agent; the runner's explicit default 3600-second process
-guard is not an agent reasoning deadline. Preserve scratch during execution recovery; it does not
-consume the one scoped business repair allowed only after an Independent
-Business Reviewer `repair_once` verdict. Materialize `draft`, then immutable accepted answer bytes plus a
-separate program-owned acceptance envelope only when their contents exist.
+For every question, the host creates the durable item and BoundAnalysisContext,
+then gives one Analytical Owner an AnalystWorkspace. The owner keeps the full
+reasoning loop: interpret, search sources, define population and method, test
+relationships and quality, calculate, interpret, write the answer, and perform
+material repairs with targeted rechecks. A replacement owner may continue a
+nonterminal item; do not split one active reasoning loop across relay roles.
 
-Use one Lead Analyst and one Independent Business Reviewer per item. The
-reviewer should return all material findings with exact JSON-pointer/artifact
-paths and dependent outputs, perform a targeted source-catalog completeness
-search for material absence claims, and check any identity-escalation route
-without repeating the full analysis. Keep
-telemetry passive: record invocation lane/role/route, status/errors,
-artifact-before/after/counts, recovery and repair counts, source/member reads,
-and core/cache facts, never raw rows or route control.
+Before source analysis, call `brief`, then search the compact semantic graph and
+prepared descriptors with `search_ontology` and `search_prepared_assets`.
+When useful, select exact accepted IDs with `select_ontology` and
+`select_prepared_assets`, recording a purpose for each selection. Load prepared
+rows only after selection and hash validation through `load_prepared_asset`.
+The program records the owner/item-bound trace in
+`work/semantic_selections.jsonl`.
+If a selected prepared descriptor has `effective_period`, preserve it through
+the candidate sidecar, operation manifest/hash, accepted integration and
+registry, and later reuse; an omitted value remains valid with no period
+constraint.
 
-If a reviewer packet is itself out of scope, recover it only through
-`ItemWorkspace.discard_business_review(...)` with an inadmissible, item-bound
-`reviewer_scope` incident. Verify the append-only hash-bound
-`work/business_review_discard_audit.jsonl` record, atomic packet removal,
-unchanged work/draft bytes, pending review, and zero business-repair count;
-then require a new full review. Do not reinterpret findings or add a
-compatibility fallback.
+The owner may request zero to three independent specialist memos. Specialists
+receive only a bounded question, selected source IDs, expected output, and
+minimum context. They return conclusion, method, evidence, limitations, open
+questions, and confidence. They do not write the final answer or program state.
 
-When the implementation changes, call only
-`BoundAnalysisContext.rebind_implementation(...)`. Check a contiguous
-old/new SHA/tree/version ledger, the earliest affected item, preserved
-accepted hashes, and resume point. Verify that source/catalog/stat/inventory
-identity is reused without ZIP/member reads, catalog rebuilds, inventory
-counter changes, false telemetry, new analysis, or raw reads. Exercise the
-durable intent/audit/head crash-recovery path and strict journal → run → item
-lock order. Rebind is invalid while an attempt, review packet/reviewed state,
-terminal intent/outcome, accepted snapshot, or terminal lifecycle exists;
-discard an invalid reviewer packet first. The shared item state-transition
-lock must serialize reviewer packet atomicity with rebind.
+Use AnalystWorkspace methods rather than asking analytical agents to author
+JSON, paths, hashes, receipts, manifests, lifecycle state, or integration
+records. Use reproducible controlled code where material. Syntax, import,
+type, and output-validation errors return to the same owner and attempt.
 
-For a later item, call `BoundAnalysisContext.create_from_transitioned_catalog`
-from the current source context. Verify immutable source inheritance rather
-than a synthetic transition: the original catalog/source/stat/inventory is
-reused with no ZIP/member reads, catalog rebuild, inventory counters, or raw
-source reads. Exercise recursive Q2/Q3 provenance, oldest-upstream journal →
-target journal → run → lexical source/target item lock order, and target
-intent/manifest/record/state crash recovery. Retries must be byte-identical
-and emit no synthetic target transition audit. Treat
-`earliest_affected_item` as a lower bound; reject a target before it.
+After a complete answer, route one Independent Business Reviewer. It returns a
+verdict and all material findings using target answer section, business
+category, problem, evidence, and required change. It does not return JSON
+pointers or artifact paths; BusinessReviewAdapter creates fail-closed program
+scope. Allow additional material repairs whenever they are supported by a
+concrete finding, each followed by a targeted recheck. Do not impose an
+arbitrary repair-count or same-owner lock.
 
-Record separate observed phase timing for analyst/model work, controlled
-execution, business review, business repair, fidelity/integration review,
-integration commit, products, optimizer, reporting/finalization, and genuine
-recovery. Never infer missing start/finish/wall/provider/model facts: preserve
-`null` or `unavailable`. Normalize reviewer-scope, program, recovery, and
-metadata incidents so each appears once in cumulative reporting. Record every
-implementation transition with old/new SHA/tree/version, earliest affected
-item, preserved accepted hashes, revalidation reason, and exact resume point;
-resume at the earliest safely affected checkpoint, or restart only when the
-impact cannot be bounded.
+Accept exact reviewed answer bytes atomically. Only then route one Result
+Integration Agent to create typed claims, metrics, limitations, evidence links,
+prepared assets, ontology definitions, relationships, and dashboard facts.
+Run mechanical validation and one fresh item-only Integration Fidelity Reviewer
+before commit. Integration never repairs the business answer.
 
-Record run-level physical-inventory operation names/counters (one initial full
-bind, child loads without re-inventory, selected-member verification, and an
-explicit final `verify_source_full()` check). Opaque members may be copied only
-through safe explicit materialization and are never semantically parsed.
+Publish only material reusable semantics actually established: business
+objects/table mappings, grain, key fields/normalization,
+relationship/cardinality/coverage/date authority/limits, and truly reusable
+prepared descriptors. Do not publish every merge, result row, metric
+observation, Japan/Spain filter, or question-specific aggregation. `no_change`
+is valid only when no reusable semantic understanding or asset was established.
 
-Continue after partial, blocked, unsupported, or technical outcomes. After each
-accepted result, exactly one Result Integration Agent incrementally consumes
-claims, metrics, limitations, evidence refs, prepared assets, ontology,
-relationships, and dashboard facts through small program APIs; deterministic
-code validates types, paths, refs, hashes, stages, and commits. Build the final
-accepted-snapshot-only dashboard after the complete queue and whole-run freeze.
-Mechanical validation cannot prove semantic completeness. After it, route
-exactly one fresh item-only Integration Fidelity Reviewer before commit; if it
-finds issues, the same Result Integration Agent patches only affected records
-and receives one targeted recheck. Its packet excludes siblings, cumulative
-state, prior memory, and broad workspace context.
-Do not run Benchmark A, call a model, access a network, or publish.
+Continue after supported partial, limited, unsupported, blocked, or technical
+outcomes. Build the reviewed-output dashboard only after the supplied queue is
+terminal and frozen. Keep inputs read-only and telemetry passive.
 ```
 
 ## Requirement Mode: priority and reuse
 
 ```text
-Use `$auto-foundry-agentic-e2e` in analytics-only Requirement Mode.
+Use $auto-foundry-agentic-e2e in analytics-only Requirement Mode.
 
-Treat each manager requirement below as a primary user-owned record. Preserve
-original text, explicit priority, objective, expected analytical output,
-expected visual output, internal tasks, dependencies, foundation dependencies,
-data/ontology/prepared needs, working definitions, limits, and status.
+Give one run-level **Planner** (event-driven control plane and cognitive
+scheduler) the exact RequirementRecord input, compact physical-metadata
+catalog, and current item/resolution outcomes. It must preserve every
+original_text and RequirementRecord field exactly. Its initial order and
+grouping are advisory and preserve explicit user priority/order; it never
+declares runtime semantic dependencies. The Analytical Owner discovers those
+after understanding the requirement, and the runtime resolution ledger owns
+semantic blocking. The
+Planner may suggest zero to three bounded specialists per group and revise the
+recommendation after outcomes. It does not calculate or write answers and is
+not a deterministic ID/hash or lifecycle authority.
 
-R-001 (priority=1): Decide whether late shipments are concentrated by carrier;
-the answer needs a reviewed rate table and a trend chart.
-R-002 (priority=unset): Reconcile payment and invoice records; reuse any
-reviewed identity mapping but report missing fields.
-R-003 (priority=unset): Create a local evidence-readiness dashboard for the
-first two answers; this is a visual analytics deliverable, not a new metric.
-R-004 (priority=unset): Change the customer payment process automatically.
+Represent the recommendation with revisionable `RequirementExecutionPlan` and
+`RequirementExecutionGroup` values. They are scheduling recommendations, not
+catalog-hash or lifecycle authority. Do not pass rows, samples, prior-run
+state, or internal paths/hashes to analytical roles. The default capacity is
+four entity-resolution workers, one Analytical Owner, up to three owner
+specialists, and eight active workers total; the Planner is not counted. Host
+configuration may lower or raise these limits but must never oversubscribe the
+actual host. Requested Run A and Run B executions remain sequential.
 
-Preserve R-001 as first priority. Classify every record semantically as
-analytics_in_scope, analytics_requires_missing_data, or out_of_analytics_scope
-without a keyword dictionary, and record the rationale. Unprioritized records
-may be ordered one at a time for observed dependency or safe reuse; do not add
-a planner framework or parallel requirement wave. Shared foundation work is
-traceable but is not a user requirement.
+Preserve this exact requirement as one parent record:
+“Dashboard should show the ratio of milk fat content to the procurement price of
+the raw material for that milk.” Before analysis, one Analytical Owner creates
+a semantic item-local plan with 1..N internal analytical tasks, for example:
+define the milk lot/fat measure and map raw-material procurement cost;
+calculate/reconcile the ratio and visualization. The same owner executes and
+synthesizes one parent answer.
 
-Build one data room/source catalog. Before each Lead Analyst call, create the
-item workspace, authoritative state, and `BoundAnalysisContext`. The Lead
-Analyst selects relevant IDs directly from compact source/LEM/prepared indexes,
-writes a plan/script/source map first, and appends material findings and
-loadable run-local prepared assets. Stage candidates through
-`BoundAnalysisContext.save_prepared_candidate(...)` below the current item's
-`work/prepared/`; the accepted registry remains empty until one accepted Result
-Integration commit validates and registers the exact descriptor. There is no
-Portfolio Planner, Navigator,
-descriptor/typed-validation role, or per-item Capability Catalog compliance
-artifact; catalog operations may be used internally when they fit, and custom
-reproducible code is allowed.
+The host/router records the current owner in program state before work starts.
+Analytical agents never emit internal paths/hashes; a replacement owner may
+continue any nonterminal item and the audit binding is updated.
 
-Use artifact_progress after each response. Filesystem no-progress yields
-await_runtime/materialization guidance; recover execution separately from the
-one business repair only after a canonical persisted loss receipt reference.
-Preserve scratch and
-write technical_failure only after allowed recovery routes are exhausted. Have
-  one Independent Business Reviewer check source-catalog completeness and identity escalation where
-material, with at most one business repair and re-review. Materialize draft and
-then immutable answer bytes plus a separate acceptance envelope. Apply reviewed
-Knowledge Delta in program code; a no_change delta has a concrete reason.
-Every accepted prepared asset is registered in a canonical source-hash/core/
-schema catalog, while scope/reuse controls visibility only; rejected or
-technical-failure items leave no accepted registry entry, and exact retries are
-idempotent. Build products
-only after the whole-run freeze, then collect the deterministic read-only
-optimizer evidence bundle. Do not run a model, network, benchmark, or
-client-business automation.
+R-001 priority=1: Decide whether late shipments are concentrated by carrier;
+produce a reviewed rate table and trend chart.
+R-002 priority=unset: Reconcile payment and invoice records; reuse a reviewed
+identity mapping if valid and report missing fields.
+R-003 priority=unset: Create a local evidence-readiness dashboard for R-001 and
+R-002 without inventing new analytics.
+R-004 priority=unset: Change the customer payment process automatically.
+
+Classify each as analytics_in_scope, analytics_requires_missing_data, or
+out_of_analytics_scope. Honor explicit user priority while the Planner
+recommends the current order. Bind every item directly to the same RunContext
+and shared Data Room; do not inherit a previous item context. Each owner begins
+with a readiness/scouting pass: call `brief`, explicitly search/select
+applicable ontology, identity mappings, relationships, and prepared semantics,
+or record why none applies. Each item uses the ordinary loop: item-local
+RequirementAnalysisPlan, analysis, review, iterative material repairs, accept
+or technical_failure, then integration. If a needed identity domain is
+`resolving`, the owner reports `waiting_on_resolution` and releases its lane;
+the Planner skips to the next original-order runnable item and marks the
+earliest paused item `ready_to_resume` when ready. If all runnable items wait, the owner lane
+sleeps while active resolvers progress; block only when nothing is runnable and
+no resolver progresses. Entity-resolution jobs are parallel external jobs, not
+extra specialists and do not answer requirements. A technical failure does not
+create Planner dependency blocks; independent groups remain eligible and the
+runtime `waiting_on_resolution`/`ready_to_resume` ledger controls semantic
+waiting and resume.
+
+When an Analytical Owner proposes a new arbitrary real-world identity domain
+during scouting, reserve that exact owner-bound proposal as `resolving` and
+launch an Entity Resolution Owner; the Planner never pre-reserves it. No hardcoded Supplier/Factory/Order scope is assumed;
+strongly coupled classes may share a domain. The owner scans every row of
+domain-relevant tables and relevant documents from reservation hints, expands
+only for concrete matching/conflict evidence, reuses the run-level catalog,
+owns methodology, may inspect manually or write Python/SQL/scripts/
+use helpers, bulk-apply justified patterns, test samples/coverage/exceptions/
+population differences, and revise the method. Do not require row-by-row
+review, an authoritative crosswalk, or a fixed matching script. Pattern rules
+remain run knowledge; future helper-library audit is deferred.
+
+The review decision is binary per proposed mapping (accepted or not accepted).
+Each accepted CanonicalMapping may contain one or many source identities or
+representations, including bulk pattern-derived populations. Unresolved or
+ambiguous records stay source-local/outside canonical mappings with
+coverage/exceptions; accepted mappings are not downgraded. Publish the
+canonical class, source-account representation classes, reviewed
+IdentityDecision/CanonicalMapping, identity `represents` relationships, and
+versioned mapping asset/coverage where available. Owners see only resolving or
+ready snapshots, never partial.
+
+Route one Independent Business Reviewer and one downstream Result Integration
+Agent plus item-only Integration Fidelity Reviewer. Reviewer findings are
+semantic repair provenance; after authorization the same owner may update
+item-local work and the affected answer section, with no cross-item writes. Use
+`accept` when the core decision is answered and only normal disclosed limits
+remain; use `accept_with_limits` only for a material requested component that is
+missing or unreliable. Source-local, currency, or no-causality caveats alone do
+not force with-limits. Resolution review decisions are binary per mapping while
+each accepted mapping may contain one or many source identities and the job
+reports coverage/exceptions. Semantic fidelity is independently
+reviewed. Do not add a keyword router, business-term dictionary, auto
+optimizer, or client-business automation.
 ```
 
-## Minimal fake acceptance matrix
+## Canned replay acceptance matrix
 
-The offline tests should demonstrate:
+The no-model replay must exercise real program APIs with synthetic cassette
+conclusions:
 
-- v0.2.8 skill and v0.3.5 core markers in instructions and run metadata;
-- one data room/source catalog, read-only raw archive, and bounded metadata;
-- one run-level physical inventory with passive operation counters, safe opaque
-  materialization, and explicit final verification;
-- item workspace/state creation before agent invocation;
-- plan/source-map-first work, materialized draft, atomic accepted snapshot,
-  and mutable scratch;
-- artifact-based progress, two-strike execution recovery, no wall-time
-  deadline, and recovery/repair separation;
-- exact Question Mode wording/order and Requirement Mode priority semantics;
-- one Lead Analyst, one Independent Business Reviewer, one scoped business
-  repair maximum plus targeted recheck, no terminalizer;
-- no Portfolio Planner, Navigator, descriptor/typed-validation role,
-  business-repair finalizer, reviewer-of-reviewer, manual terminalizer, or
-  second integration reviewer;
-- same-attempt code feedback through the controlled preflight/runtime receipt
-  phases (`compile`/`dependency_check` only on failed preflight; `smoke`/`full`,
-  with an optional second `full` for deterministic comparison, on a successful
-  pipeline);
-- receipt-gated execution recovery using only a canonical persisted ref/hash,
-  with filesystem no-progress guidance only;
-- immutable answer bytes separate from the acceptance envelope;
-- one incremental Result Integration Agent and accepted-only canonical
-  prepared-asset registration (candidate first, registry entry only at commit);
-- source-completeness search, identity escalation, scoped knowledge, concrete
-  `no_change`, loadable prepared assets, and program-owned delta application;
-- passive attempt/artifact telemetry without rows or route control;
-- reviewed-output dashboard, whole-run freeze, and read-only optimizer boundary;
-- prohibitions on planner frameworks, dictionaries, domain recipes, central or
-  cross-run caches, parallel question waves, production apps, external calls,
-  fallback wrappers, and stale v0.2.1 current instructions.
+- one data room and one read-only source catalog;
+- `AnalystWorkspace` as the analytical-agent surface;
+- Q-001: one owner, no specialist, same-attempt code correction, accepted
+  business review;
+- Q-002: one owner, one bounded specialist memo, `repair_once`, owner repair,
+  and targeted acceptance;
+- Q-003: one owner, two independent specialist memos, accepted business answer,
+  typed integration records, fidelity `repair_once`, same integration-agent
+  record correction, and targeted fidelity acceptance;
+- strict rejection of NaN/Infinity, unknown review sections/categories,
+  out-of-scope repair, incomplete fidelity checked IDs, duplicate invocation,
+  commit before fidelity, stale reporting, and external calls;
+- accepted-only integration, compact ontology, reviewed-output dashboard,
+  final reporting, and frozen optimizer evidence;
+- repeated fresh cycles with zero agent, model, and network calls and one stable
+  semantic digest.
+
+The cassette is not an agent response schema. The harness, not the role
+fixtures, invokes core APIs and materializes internal artifacts.

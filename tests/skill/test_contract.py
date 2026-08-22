@@ -1,4 +1,4 @@
-"""Offline contract checks for the v0.2.8 Agent Workbench skill tree.
+"""Offline contract checks for the v0.7.1 entity-resolution skill tree.
 
 These tests intentionally inspect owned text and templates only. Core loading
 of the item-state template is covered by the offline integration vertical;
@@ -11,6 +11,7 @@ import json
 import re
 from pathlib import Path
 
+import auto_foundry_core as core
 from auto_foundry_core.lifecycle import classify_terminal_reason
 
 
@@ -23,6 +24,7 @@ OWNED_MARKDOWN = (
     SKILL / "CHANGELOG.md",
     SKILL / "TEST_PROMPTS.md",
     SKILL / "references" / "QUESTION_ANALYSIS_PLAYBOOK.md",
+    SKILL / "references" / "ANALYTICAL_COLLABORATION.md",
     SKILL / "references" / "KNOWLEDGE_AND_REUSE.md",
     SKILL / "references" / "REVIEW_PROTOCOL.md",
     SKILL / "references" / "ARTIFACT_AND_EFFICIENCY_POLICY.md",
@@ -46,23 +48,61 @@ def _owned_text() -> str:
     return "\n".join(_read(path) for path in OWNED_MARKDOWN + OWNED_JSON)
 
 
-def test_frontmatter_and_run_markers_are_v028() -> None:
+def test_frontmatter_and_run_markers_are_v071() -> None:
     skill = _read(SKILL / "SKILL.md")
+    normalized_skill = " ".join(skill.split())
     assert skill.startswith("---\n")
     frontmatter = skill.split("---\n", 2)[1]
     assert "name: auto-foundry-agentic-e2e" in frontmatter
-    assert 'version: "0.2.8"' in frontmatter
+    assert 'version: "0.7.1"' in frontmatter
     assert "core_name: auto_foundry_core" in frontmatter
-    assert 'core_version: "0.3.5"' in frontmatter
+    assert 'core_version: "0.8.0"' in frontmatter
+    assert "release: entity-resolution-and-analytical-relationships" in frontmatter
+    assert "release: cognitive-requirement-supervisor-and-simple-item-flow" not in frontmatter
+    assert "release: monotonic-accepted-preservation-and-context-root-rebind" not in frontmatter
+    assert "release: visual-repair-evidence-reference-scope" not in frontmatter
+    assert "release: standalone-rebindable-context" not in frontmatter
+    assert "release: targeted-review-scope-recompute" not in frontmatter
+    assert "release: accepted-intermediate-context-and-authoritative-portfolio-plan" not in frontmatter
+    assert "release: rebindable-inherited-context-and-transitioned-source-preflight" not in frontmatter
+    assert "release: inherited-catalog-context-audit-and-active-repair-context-rebase" not in frontmatter
     for marker in (
         "skill_name: auto-foundry-agentic-e2e",
-        "skill_version: 0.2.8",
+        "skill_version: 0.7.1",
         "core_name: auto_foundry_core",
-        "core_version: 0.3.5",
+        "core_version: 0.8.0",
     ):
         assert marker in skill
-    assert "Agent Workbench" in skill
-    assert "Durable Execution" in skill
+    assert "One Analytical Owner" in skill
+    assert "AnalystWorkspace" in skill
+    assert "event-driven Planner" in skill or "event-driven planner" in normalized_skill
+    assert "RequirementExecutionPlan" in skill
+    assert "RequirementExecutionGroup" in skill
+    assert "technical failure" in normalized_skill
+    assert "same run context and shared data room" in normalized_skill
+
+
+def test_v071_changelog_has_exactly_one_release_entry() -> None:
+    changelog = _read(SKILL / "CHANGELOG.md")
+    top_entry = changelog.split("## 0.7.0 / core 0.8.0", 1)[0]
+    normalized = " ".join(top_entry.split())
+    assert "## 0.7.1 / core 0.8.0 — production skill binding and scouting contract" in top_entry
+    assert "patch" in normalized.lower()
+    assert "No new run was launched." in top_entry
+    assert top_entry.count("\n1. ") == 1
+    assert top_entry.count("\n2. ") == 0
+    assert top_entry.count("\n3. ") == 0
+    for phrase in (
+        "readiness/scouting",
+        "search/select ontology",
+        "identity domain",
+        "Planner resumes",
+        "work/analysis_owner.json",
+        "material business repairs",
+        "targeted recheck",
+        "No benchmark or run success claim",
+    ):
+        assert phrase in normalized
 
 
 def test_run_state_template_is_exact_lifecycle_authority() -> None:
@@ -85,6 +125,7 @@ def test_run_state_template_is_exact_lifecycle_authority() -> None:
     assert state["status"].split("|") == [
         "initialized",
         "running",
+        "paused",
         "analytical_complete",
         "integration_complete",
         "products_complete",
@@ -135,6 +176,8 @@ def test_item_state_template_is_authoritative_and_durable() -> None:
 
 def test_telemetry_template_observes_attempts_and_artifacts_only() -> None:
     event = json.loads(_read(OWNED_JSON[1]))
+    assert "foundation-" not in event["item_id"]
+    assert event["item_id"] == "Q-...|R-...|product|optimizer"
     assert {"lane", "role", "route", "started_at", "ended_at"} <= set(
         event["invocation"]
     )
@@ -167,7 +210,7 @@ def test_telemetry_template_observes_attempts_and_artifacts_only() -> None:
     assert event["invocation"]["provider"] == "unavailable"
     assert event["invocation"]["model"] == "unavailable"
     assert event["terminal_reason_class"] == "same_attempt_feedback|business_repair|execution_recovery|abort_and_new_clean_run|null"
-    assert event["recovery_decision"] == "continue|await_runtime|materialization_guidance|execution_recovery|null"
+    assert event["recovery_decision"] == "continue|materialize_now|retry_same_attempt|execution_recovery|null"
     assert set(event["phase_timing"]["phase"].split("|")) >= {
         "analyst_model",
         "controlled_execution",
@@ -185,37 +228,34 @@ def test_telemetry_template_observes_attempts_and_artifacts_only() -> None:
 
 def test_requirement_and_dashboard_templates_use_program_owned_boundaries() -> None:
     requirement = json.loads(_read(SKILL / "assets" / "REQUIREMENT_RECORD_TEMPLATE.json"))
-    execution = requirement["execution_contract"]
-    assert execution["bound_analysis_context_before_attempt"] is True
-    assert execution["code_error_route"] == "same_attempt_feedback"
-    assert execution["controlled_script_preflight_checks"] == ["compile", "dependency_check"]
-    assert execution["successful_runtime_receipt_phases"] == ["smoke", "full"]
-    assert execution["failed_preflight_receipt_phase"] == "compile|dependency_check"
-    assert execution["script_timeout_seconds"] == 3600
-    assert execution["execution_recovery_authority"] == "canonical_persisted_receipt_ref_and_hash_only"
-    assert execution["reviewer_scope_packet_recovery"].startswith(
-        "ItemWorkspace.discard_business_review_only_for_inadmissible_item_bound_reviewer_scope_incident"
+    assert "execution_contract" not in requirement
+    assert requirement["original_text"] == (
+        "Dashboard should show the ratio of milk fat content to the procurement price "
+        "of the raw material for that milk."
     )
-    assert execution["prepared_asset_boundary"].startswith("candidate_under_item_work_prepared")
-    assert "live_integration_agent" in execution["semantic_completeness_boundary"]
-    integration = requirement["result_integration"]
-    assert integration["owner"] == "one_result_integration_agent"
-    assert "integration_reviewer" not in integration
-    fidelity = integration["fidelity_review"]
-    assert fidelity["reviewer"] == "one_item_only_integration_fidelity_reviewer"
-    assert fidelity["after"] == "mechanical_validation"
-    assert fidelity["before"] == "commit"
-    assert fidelity["same_agent_targeted_repair"] is True
-    assert set(integration["api_surfaces"]) == {
-        "claims",
-        "metrics",
-        "limitations",
-        "evidence",
-        "prepared_assets",
-        "ontology",
-        "relationships",
-        "dashboard_facts",
+    plan = requirement["requirement_plan"]
+    assert plan["tasks"]
+    assert 1 <= len(plan["tasks"])
+    assert plan["tasks"][0]["task_id"] == "T-1"
+    assert "milk lot" in plan["tasks"][0]["question"]
+    assert "ratio" in plan["tasks"][1]["question"]
+    assert requirement["program_owned"]["parent_item_only"] is True
+    assert requirement["program_owned"]["semantic_plan_before_analysis"] is True
+    assert "shared_foundation_dependencies" not in requirement
+    assert "foundation_dependencies" not in requirement
+    assert "internal_tasks" not in requirement
+    assert "planner" not in requirement
+    assert requirement["program_owned"]["analysis_owner_authority"] == {
+        "record": "work/analysis_owner.json",
+        "bound_by": "program host/router",
+        "owner_ref": "<host-bound stable owner_ref>",
+        "analytical_agents_emit_owner_ref": False,
+        "same_owner_scope": "requirement_plan, draft, both business repairs, and DataInsufficiencyConclusion",
     }
+    assert "material business repairs may repeat" in requirement["program_owned"]["repair_budget"]
+    assert "DataInsufficiencyConclusion" in requirement["program_owned"]["blocked_by_evidence_authority"]
+    assert requirement["review"]["verdict"].startswith("accept|")
+    assert "confirm_data_insufficiency" in requirement["review"]["verdict"]
     dashboard = _read(SKILL / "assets" / "DASHBOARD_PROTOTYPE_TEMPLATE.md")
     assert '"freeze_markers"' in dashboard
     assert '"prepared_data_registry_frozen": true' in dashboard
@@ -238,28 +278,78 @@ def test_terminal_reason_classifier_matches_current_template_vocabulary() -> Non
     assert telemetry["terminal_reason_class"] == "same_attempt_feedback|business_repair|execution_recovery|abort_and_new_clean_run|null"
 
 
-def test_question_mode_preserves_queue_and_bounded_review() -> None:
+def test_requirement_supervisor_exports_are_public_and_foundation_is_removed() -> None:
+    assert not hasattr(core, "FoundationTask")
+    assert core.RequirementExecutionPlan is not None
+    assert core.RequirementExecutionGroup is not None
+    assert core.RequirementSupervisorWorkspace is not None
+    assert callable(core.compact_catalog_payload)
+
+
+def test_requirement_scheduler_and_bounded_resolution_scan_are_explicit() -> None:
+    text = "\n".join(
+        _read(path)
+        for path in (
+            SKILL / "SKILL.md",
+            SKILL / "README.md",
+            SKILL / "TEST_PROMPTS.md",
+            SKILL / "references" / "ANALYTICAL_COLLABORATION.md",
+            SKILL / "references" / "QUESTION_ANALYSIS_PLAYBOOK.md",
+            SKILL / "references" / "KNOWLEDGE_AND_REUSE.md",
+        )
+    )
+    normalized = " ".join(text.split()).lower()
+    assert "requirementsupervisorworkspace.scheduling_tick()" in normalized
+    assert "domain-relevant tables" in normalized
+    assert "scans the full shared data room" not in normalized
+    assert "scan the full shared data room" not in normalized
+
+
+def test_semantic_reuse_methods_and_trace_are_public_contract() -> None:
+    text = _read(SKILL / "SKILL.md") + _read(SKILL / "README.md") + _read(
+        SKILL / "TEST_PROMPTS.md"
+    ) + _read(SKILL / "references" / "KNOWLEDGE_AND_REUSE.md")
+    normalized = " ".join(text.split()).lower()
+    for method in (
+        "brief()",
+        "search_ontology()",
+        "select_ontology()",
+        "search_prepared_assets()",
+        "select_prepared_assets()",
+        "load_prepared_asset()",
+    ):
+        assert method in normalized
+    assert "work/semantic_selections.jsonl" in normalized
+    workspace = core.AnalystWorkspace
+    for method_name in (
+        "brief",
+        "search_ontology",
+        "select_ontology",
+        "search_prepared_assets",
+        "select_prepared_assets",
+        "load_prepared_asset",
+    ):
+        assert callable(getattr(workspace, method_name, None))
+
+
+def test_question_mode_preserves_queue_and_one_analytical_owner() -> None:
     text = _read(SKILL / "SKILL.md") + _read(SKILL / "TEST_PROMPTS.md")
     normalized = " ".join(text.split()).lower()
     for phrase in (
-        "preserve its original wording and order",
         "one question at a time",
-        "one lead analyst",
-        "one reviewer",
-        "at most one targeted",
-        "continue after",
-        "build the final dashboard after",
-        "artifact_progress",
-        "materialization_guidance",
-        "execution recovery",
-        "same-attempt",
-        "controlledscriptrunner",
-        "boundanalysiscontext",
-        "accepted snapshot",
+        "one analytical owner",
+        "full reasoning loop",
+        "zero to three",
+        "same owner and attempt",
+        "one independent business reviewer",
+        "material repairs may repeat",
+        "targeted recheck",
+        "one result integration agent",
+        "build the reviewed-output dashboard",
     ):
-        assert phrase.lower() in normalized
-    assert "discover extra questions" in normalized
-    assert "parallel question wave" in normalized
+        assert phrase in normalized
+    assert "relay roles" in normalized
+    assert "independent groups may run when host capacity permits" in normalized
 
 
 def test_requirement_mode_is_analytics_only_and_priority_owned() -> None:
@@ -275,9 +365,8 @@ def test_requirement_mode_is_analytics_only_and_priority_owned() -> None:
         "objective",
         "expected analytical outputs",
         "expected visual outputs",
-        "internal tasks",
+        "requirement plan tasks",
         "dependencies",
-        "foundation dependencies",
         "data needs",
         "ontology needs",
         "prepared-data needs",
@@ -292,13 +381,25 @@ def test_requirement_mode_is_analytics_only_and_priority_owned() -> None:
         "out_of_analytics_scope",
     ):
         assert classification in text
-    assert "explicit user priority first" in normalized
-    assert "one item at a time" in normalized
-    assert "no separate planner framework" in normalized
+    assert "honor explicit priority" in normalized
+    assert "requirementanalysisplan" in normalized
+    assert "requirementanalysistask" in normalized
+    assert "milk fat content to the procurement price" in normalized
+    assert "child lifecycle workspaces" in normalized
+    assert "owner_ref" in normalized
+    assert "work/analysis_owner.json" in normalized
+    assert "analytical agents never emit" in normalized
+    assert "same bound owner" in normalized
+    assert "event-driven planner" in normalized
+    assert "requirementexecutionplan" in normalized
+    assert "requirementexecutiongroup" in normalized
+    assert "sole semantic block" in normalized
+    assert "same runcontext" in normalized
+    assert "shared data room" in normalized
     assert "keyword router" in normalized
     assert "business-term dictionary" in normalized
     assert "boundanalysiscontext" in normalized
-    assert "same-attempt" in normalized
+    assert "analystworkspace" in normalized
     assert "result integration agent" in normalized
     assert "independent business reviewer" in normalized
     assert "integration fidelity reviewer" in normalized
@@ -307,7 +408,7 @@ def test_requirement_mode_is_analytics_only_and_priority_owned() -> None:
 def test_question_result_no_progress_decisions_exclude_recovery() -> None:
     lines = _read(SKILL / "assets" / "QUESTION_RESULT_TEMPLATE.md").splitlines()
     no_progress = next(line for line in lines if line.startswith("- No-progress decisions:"))
-    assert no_progress == "- No-progress decisions: `await_runtime` | `materialization_guidance`"
+    assert no_progress == "- No-progress decisions: `materialize_now` | `retry_same_attempt`"
     assert "recover" not in no_progress
     recovery = " ".join(
         line.strip()
@@ -317,61 +418,39 @@ def test_question_result_no_progress_decisions_exclude_recovery() -> None:
     assert "canonical persisted execution-loss receipt" in recovery
 
 
-def test_workbench_sequence_and_recovery_are_progressive_and_separate() -> None:
-    skill = _read(SKILL / "SKILL.md")
-    workflow = skill.split("For each item, use this progressive sequence:", 1)[1]
-    sequence = (
-        "program builds data room/source catalog",
-        "program creates item_state.json and mutable work/",
-        "Lead Analyst writes plan, script, and source map first",
-        "Lead Analyst appends findings, evidence, and loadable prepared assets",
-        "Run Director checks artifact_progress after each response",
-        "canonical persisted invocation receipt_ref/hash proves lane/provider/host/process loss",
-        "materialized draft",
-        "one Independent Business Reviewer",
-        "at most one scoped business repair",
-        "atomic immutable answer bytes + separate acceptance envelope",
-        "one Result Integration Agent incremental API pass",
-        "program validates and applies the reviewed Knowledge Delta",
-    )
-    positions = [workflow.index(part) for part in sequence]
-    assert positions == sorted(positions)
-    assert "There is no mandatory Navigator role" in skill
-    assert "no per-item Capability Catalog lookup/compliance artifact" in skill
-    normalized = skill.lower()
-    assert "no wall-time deadline" in normalized
-    assert "there is no terminalizer agent" in normalized
-    assert "does not consume the business repair" in normalized
+def test_role_boundaries_keep_reasoning_with_owner_and_formats_with_program() -> None:
+    text = _owned_text()
+    normalized = " ".join(text.split()).lower()
+    for phrase in (
+        "interpret the decision",
+        "choose the answer strategy",
+        "calculate and explore alternatives",
+        "write the complete business answer",
+        "program-owned infrastructure",
+        "does not author json files",
+        "reviewer never authors json pointers",
+        "only agent-facing role that works with typed internal integration records",
+    ):
+        assert phrase in normalized
+    assert "handoff-only lead analyst" in normalized
+    assert "second author" in normalized
 
 
 def test_data_room_identity_review_and_prepared_asset_contract() -> None:
     text = _owned_text().lower()
     for phrase in (
-        "one physical source catalog",
-        "zip/archive and member metadata",
-        "raw archive remains read-only",
-        "bounded columns",
-        "samples or values",
+        "raw inputs read-only",
+        "bounded source catalog",
         "hashes",
-        "sheet information",
-        "same-object representations",
-        "identity-escalation",
+        "identity",
         "source-completeness",
-        "targeted source-completeness search",
-        "loadable run-local assets",
-        "asset hash",
-        "schema",
+        "specialist memo",
+        "population",
+        "denominator",
         "grain",
-        "lineage",
-        "concrete reason",
-        "applies the reviewed knowledge delta",
-        "candidate",
-        "accepted-only",
-        "semantic completeness",
+        "accepted",
         "integration fidelity reviewer",
-        "opaque",
-        "inventory counters",
-        "receipt_ref",
+        "prepared data registry",
     ):
         assert phrase in text, phrase
 
@@ -381,29 +460,29 @@ def test_catalog_is_optional_internal_and_custom_code_allowed() -> None:
         SKILL / "references" / "QUESTION_ANALYSIS_PLAYBOOK.md"
     )
     normalized = " ".join(text.split()).lower()
-    assert "catalog capabilities may be recommended or used internally" in normalized
-    assert "custom reproducible code" in normalized
-    assert "no mandatory navigator role" in normalized
-    assert "no per-item capability catalog lookup/compliance artifact" in normalized
-    assert "python -m auto_foundry_core catalog ..." in normalized
-    assert "python -m auto_foundry_core run ..." in normalized
+    assert "search_sources()" in normalized
+    assert "sample_source()" in normalized
+    assert "source_categories()" in normalized
+    assert "reproducible script" in normalized
+    assert "run_analysis()" in normalized
 
 
-def test_reviewer_routing_completeness_identity_and_disclosure() -> None:
+def test_reviewer_uses_semantic_findings_not_internal_schema() -> None:
     text = _read(SKILL / "SKILL.md") + _read(SKILL / "references" / "REVIEW_PROTOCOL.md")
     normalized = " ".join(text.split()).lower()
-    assert "independent business reviewer in a fresh context" in normalized
-    assert "alternate independent route" in normalized
-    assert "fresh same-family context" in normalized
-    assert '"review_status":"unavailable"' in text
-    assert '"review_strength":"none"' in text
-    assert '"verdict":"not_reviewed"' in text
-    assert "targeted source-completeness search" in normalized
-    assert "identity-escalation route" in normalized
-    assert "without repeating the full analysis" in normalized
+    assert "one fresh independent business reviewer" in normalized
+    assert "target answer section" in normalized
+    assert "businessreviewadapter" in normalized
+    assert "does not provide json pointers" in normalized
+    assert "unknown sections and categories fail" in normalized
+    assert "one targeted recheck" in normalized
     assert "accept_with_limits" in text
+    assert "confirm_data_insufficiency" in text
+    assert "blocked_by_evidence" in text
+    assert "datainsufficiencyconclusion" in normalized
+    assert "only the analytical owner" in normalized
+    assert "block_" + "specific_claims" not in normalized
     assert "result integration agent" in normalized
-    assert re.search(r"there is no [^.]*integration reviewer", normalized)
     assert not re.search(r"\b(?:gpt|claude|gemini|llama|sonnet|opus)[-_\d]", text, re.I)
 
 
@@ -420,7 +499,7 @@ def test_dashboard_telemetry_and_optimizer_boundary_remains_intact() -> None:
         "optimizer_evidence_bundle.md",
         "optimizer_evidence_appendix.md",
         "evidence bundle",
-        "strictly read-only",
+        "read-only",
         "observed evidence",
         "hypothesis",
         "expected benefit",
@@ -439,6 +518,16 @@ def test_regression_prohibitions_do_not_reintroduce_legacy_workflow() -> None:
     # Exact old markers and positive legacy workflow instructions are absent.
     assert "skill_version: 0.2.1" not in text
     assert "core_version: 0.1.0" not in text
+    assert "skill_version: 0.3.0" not in active_text
+    assert "skill_version: 0.4.0" not in active_text
+    assert "skill_version: 0.4.1" not in active_text
+    assert "core_version: 0.5.1" not in active_text
+    assert "skill_version: 0.2" + ".9" not in active_text
+    assert "core_version: 0.3" + ".6" not in active_text
+    assert "block_" + "specific_claims" not in active_text
+    assert "one permitted business" + " repair" not in active_text
+    assert "single permitted repair" not in active_text
+    assert "one repair" + " maximum" not in active_text
     assert "navigator selects bounded" not in text
     assert "inspect the local capability catalog" not in text
     assert "one concise lead analyst self-check" not in text
@@ -446,15 +535,14 @@ def test_regression_prohibitions_do_not_reintroduce_legacy_workflow() -> None:
     assert "marketing funnel recipe" not in text
     assert "sap implementation" not in text
     assert "cross-run cache" in text  # explicit prohibition remains
-    assert "no mandatory navigator role" in text
-    assert "no terminalizer agent" in text
-    assert "no wall-time deadline" in text
-    assert "fallback wrapper" in active_text
+    assert "handoff-only lead analyst" in text
+    assert "reviewer never authors json pointers" in text
+    assert "program schemas and paths" in text
     assert "compatibility wrapper" not in active_text
     assert not re.search(r"\bsave_prepared\s*\(", active_text)
     assert "materialize_accepted" not in active_text
-    assert "parallel question wave" in text
-    assert "production application" in text  # explicit prohibition/boundary
+    assert "host capacity permits" in text
+    assert "independent groups" in text
     for obsolete in ("Fake" + "PortfolioPlanner", "Fake" + "Navigator"):
         assert f"class {obsolete}" not in fake_text
     assert "class ControlledScriptRunner" in fake_text

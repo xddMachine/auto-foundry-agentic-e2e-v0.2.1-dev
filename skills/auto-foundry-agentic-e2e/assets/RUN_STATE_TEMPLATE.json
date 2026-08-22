@@ -3,7 +3,7 @@
   "run_root": "/current/run",
   "item_ids": ["Q-001"],
   "mode": "question|requirement",
-  "status": "initialized|running|analytical_complete|integration_complete|products_complete|complete|complete_with_limits",
+  "status": "initialized|running|paused|analytical_complete|integration_complete|products_complete|complete|complete_with_limits",
   "generation": 0,
   "manifest_hash": "<sha256(run_state fields excluding manifest_hash)>",
   "created_at": "2026-01-01T00:00:00+00:00",

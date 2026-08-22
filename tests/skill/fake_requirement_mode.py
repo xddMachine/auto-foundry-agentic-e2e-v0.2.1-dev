@@ -1,11 +1,12 @@
-"""Deterministic protocol harness for offline Requirement Mode coverage.
+"""Deterministic program-API harness for offline Requirement Mode coverage.
 
 The harness models the ownership boundaries that are easy to regress without
 calling a model, reading a source, or pretending that prose is lifecycle
-state. One Lead Analyst owns the item, a controlled runner feeds code errors
-back to that same attempt, one Independent Business Reviewer may request one
-scoped business repair and targeted recheck, and exactly one Result Integration
-Agent plus one item-only Integration Fidelity Reviewer consume accepted bytes.
+state. Its typed objects are test fixtures, not agent response schemas. One
+Analytical Owner owns the full item, a controlled runner feeds code errors back
+to that same attempt, one Independent Business Reviewer may request at most two
+scoped business repairs with a targeted recheck after each, and exactly one Result Integration Agent
+plus one item-only Integration Fidelity Reviewer consume accepted bytes.
 """
 
 from __future__ import annotations
@@ -339,13 +340,16 @@ class FakeRequirementRun:
             verdict,
             reviewed_draft_hash=draft_hash,
         )
-        if verdict == "repair_once":
+        reviewer_index = 0
+        while verdict == "repair_once":
+            if self.business_repair_count >= 2:
+                raise ValueError("at most two business repairs are allowed")
             self.business_repair_count += 1
-            if len(self.reviewer_verdicts) < 2:
-                raise ValueError("repair_once requires one re-review verdict")
+            if len(self.reviewer_verdicts) <= reviewer_index + 1:
+                raise ValueError("repair_once requires a targeted re-review verdict")
             findings = (
                 BusinessFinding(
-                    "finding-1",
+                    f"finding-{self.business_repair_count}",
                     "/answer/findings/0/value",
                     (f"claim:{requirement.requirement_id}",),
                 ),
@@ -364,18 +368,20 @@ class FakeRequirementRun:
                 reviewed_draft_hash=draft_hash,
             )
             self.reviewer_calls += 1
+            reviewer_index += 1
+            verdict = self.reviewer_verdicts[reviewer_index]
+            if verdict == "repair_once" and self.business_repair_count >= 2:
+                raise ValueError("second targeted recheck must be terminal")
             review = ReviewResult(
                 "available",
                 "independent",
-                self.reviewer_verdicts[1],
+                verdict,
                 finding_ids=(),
                 affected_paths=(),
                 dependent_outputs=(),
                 reviewed_draft_hash=draft_hash,
                 targeted_recheck_scope=tuple(item.pointer for item in findings),
             )
-        if self.business_repair_count > 1:
-            raise ValueError("at most one business repair is allowed")
 
         snapshot = AcceptedSnapshot.from_text(f"accepted answer for {requirement.requirement_id}")
         envelope = AcceptanceEnvelope(snapshot.content_hash, terminal_reason_class=("business_repair" if self.business_repair_count else "same_attempt_feedback"))
@@ -384,7 +390,7 @@ class FakeRequirementRun:
             metrics=("metric:bounded",),
             limitations=("fixture-only",),
             evidence_refs=(f"evidence:{requirement.requirement_id}",),
-            prepared_assets=(PreparedAsset("asset-1", "a" * 64, "0.3.5", "fixture-v1", "source"),),
+            prepared_assets=(PreparedAsset("asset-1", "a" * 64, "0.6.3", "fixture-v1", "source"),),
             ontology_refs=("ontology:fixture",),
             relationship_refs=("relationship:fixture",),
             dashboard_facts=("dashboard:fixture",),

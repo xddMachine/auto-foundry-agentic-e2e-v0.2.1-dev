@@ -15,3 +15,7 @@ dist/
 .coverage
 htmlcov/
 coverage.xml
+
+# Local macOS and browser acceptance artifacts
+.DS_Store
+output/

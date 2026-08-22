@@ -199,7 +199,7 @@ def test_filesystem_no_progress_does_not_authorize_recovery_and_reason_classifie
     workspace = ItemWorkspace.create(_context(tmp_path), "Q-001", original_text="bounded")
     attempt = workspace.begin_attempt("lane-1", "Lead Analyst")
     assert workspace.observe_attempt(attempt.attempt_id).action == "materialize_now"
-    assert workspace.observe_attempt(attempt.attempt_id).action == "await_runtime"
+    assert workspace.observe_attempt(attempt.attempt_id).action == "retry_same_attempt"
     with pytest.raises(ValueError, match="receipt_ref"):
         workspace.begin_recovery("lane-2", "Lead Analyst", prior_attempt_id=attempt.attempt_id, receipt_ref=None)
     for reason in ("syntax_error", "name_error", "type_error", "dependency_error"):

@@ -1,0 +1,255 @@
+{
+  "schemaVersion": "control-center-fixture-v1",
+  "run": {
+    "id": "fixture-mission",
+    "name": "Benchmark A · Customer Margin Mission",
+    "status": "running",
+    "updatedAt": "2026-08-18T10:24:36Z",
+    "requirementCount": 3,
+    "source": "fixture",
+    "readOnly": true,
+    "protected": true,
+    "dashboardUrl": null
+  },
+  "capacity": {
+    "total": 8,
+    "active": 7,
+    "entityResolution": 4,
+    "entityResolutionActive": 3,
+    "analyticalOwner": 1,
+    "analyticalOwnerActive": 1,
+    "specialist": 3,
+    "specialistActive": 3,
+    "plannerExcluded": true
+  },
+  "requirements": [
+    {"id": "REQ-001", "label": "Explain margin erosion by customer", "status": "waiting"},
+    {"id": "REQ-002", "label": "Identify late-delivery drivers", "status": "active"},
+    {"id": "REQ-003", "label": "Find product mix opportunities", "status": "queued"}
+  ],
+  "nodes": [
+    {
+      "id": "planner",
+      "role": "planner",
+      "label": "Planner",
+      "objective": "Coordinate mission, domains, review, and integration",
+      "status": "active",
+      "lane": "planner",
+      "active": true,
+      "startedAt": "2026-08-18T10:02:10Z"
+    },
+    {
+      "id": "domain-customer",
+      "role": "entity_resolution_owner",
+      "label": "Identity · Customer",
+      "objective": "Resolve customer identities across ERP and CRM",
+      "status": "active",
+      "lane": "identity",
+      "active": true,
+      "domain": "customer",
+      "progress": 72
+    },
+    {
+      "id": "domain-product",
+      "role": "entity_resolution_owner",
+      "label": "Identity · Product",
+      "objective": "Build canonical product mapping",
+      "status": "active",
+      "lane": "identity",
+      "active": true,
+      "domain": "product",
+      "progress": 44
+    },
+    {
+      "id": "domain-supplier",
+      "role": "entity_resolution_owner",
+      "label": "Identity · Supplier",
+      "objective": "Validate supplier reference keys",
+      "status": "reviewing",
+      "lane": "identity",
+      "active": true,
+      "domain": "supplier",
+      "progress": 91
+    },
+    {
+      "id": "ao-1",
+      "role": "analytical_owner",
+      "label": "Analytical Owner · REQ-001",
+      "objective": "Explain customer margin erosion",
+      "status": "waiting",
+      "lane": "analysis",
+      "active": false,
+      "requirementId": "REQ-001",
+      "waitingFor": ["domain-customer", "domain-product"]
+    },
+    {
+      "id": "ao-2",
+      "role": "analytical_owner",
+      "label": "Analytical Owner · REQ-002",
+      "objective": "Investigate late-delivery drivers",
+      "status": "active",
+      "lane": "analysis",
+      "active": true,
+      "requirementId": "REQ-002",
+      "progress": 38
+    },
+    {
+      "id": "specialist-a",
+      "role": "specialist",
+      "label": "Specialist A · Lead-time",
+      "objective": "Profile lead-time distributions",
+      "status": "active",
+      "lane": "specialist",
+      "active": true,
+      "requirementId": "REQ-002",
+      "progress": 63
+    },
+    {
+      "id": "specialist-b",
+      "role": "specialist",
+      "label": "Specialist B · Suppliers",
+      "objective": "Test supplier delay concentration",
+      "status": "active",
+      "lane": "specialist",
+      "active": true,
+      "requirementId": "REQ-002",
+      "progress": 49
+    },
+    {
+      "id": "specialist-c",
+      "role": "specialist",
+      "label": "Specialist C · Seasonality",
+      "objective": "Check calendar and route effects",
+      "status": "active",
+      "lane": "specialist",
+      "active": true,
+      "requirementId": "REQ-002",
+      "progress": 27
+    },
+    {
+      "id": "ao-3",
+      "role": "analytical_owner",
+      "label": "Analytical Owner · REQ-003",
+      "objective": "Find product mix opportunities",
+      "status": "queued",
+      "lane": "analysis",
+      "active": false,
+      "requirementId": "REQ-003"
+    }
+  ],
+  "edges": [
+    {"id": "e1", "source": "planner", "target": "domain-customer", "kind": "ownership", "label": "dispatch"},
+    {"id": "e2", "source": "planner", "target": "domain-product", "kind": "ownership", "label": "dispatch"},
+    {"id": "e3", "source": "planner", "target": "domain-supplier", "kind": "ownership", "label": "dispatch"},
+    {"id": "e4", "source": "planner", "target": "ao-1", "kind": "ownership", "label": "REQ-001"},
+    {"id": "e5", "source": "planner", "target": "ao-2", "kind": "ownership", "label": "REQ-002"},
+    {"id": "e6", "source": "planner", "target": "ao-3", "kind": "ownership", "label": "REQ-003"},
+    {"id": "e7", "source": "ao-2", "target": "specialist-a", "kind": "ownership", "label": "delegated"},
+    {"id": "e8", "source": "ao-2", "target": "specialist-b", "kind": "ownership", "label": "delegated"},
+    {"id": "e9", "source": "ao-2", "target": "specialist-c", "kind": "ownership", "label": "delegated"},
+    {"id": "e10", "source": "domain-customer", "target": "ao-1", "kind": "dependency", "label": "unblocks"},
+    {"id": "e11", "source": "domain-product", "target": "ao-1", "kind": "dependency", "label": "unblocks"},
+    {"id": "e12", "source": "domain-product", "target": "ao-3", "kind": "dependency", "label": "shared domain"},
+    {"id": "e13", "source": "domain-supplier", "target": "ao-2", "kind": "dependency", "label": "validation"}
+  ],
+  "events": [
+    {
+      "id": "event-1",
+      "cursor": 6,
+      "timestamp": "2026-08-18T10:24:36Z",
+      "type": "data_room_member_read",
+      "category": "file",
+      "status": "active",
+      "role": "specialist",
+      "nodeId": "specialist-a",
+      "itemId": "REQ-002",
+      "path": "/fixture/procurement/order_lines_2025.parquet",
+      "rows": 184293,
+      "summary": "Read order_lines_2025.parquet · 184,293 rows",
+      "details": {"format": "parquet", "columnsObserved": 28, "source": "fixture"}
+    },
+    {
+      "id": "event-2",
+      "cursor": 5,
+      "timestamp": "2026-08-18T10:24:19Z",
+      "type": "catalog_reused",
+      "category": "file",
+      "status": "active",
+      "role": "entity_resolution_owner",
+      "nodeId": "domain-customer",
+      "itemId": "customer",
+      "path": "/fixture/catalog/customer_crosswalk.json",
+      "summary": "Reused customer identity crosswalk",
+      "details": {"canonicalObjects": 12402, "source": "fixture"}
+    },
+    {
+      "id": "event-3",
+      "cursor": 4,
+      "timestamp": "2026-08-18T10:23:58Z",
+      "type": "specialist_progress",
+      "category": "lifecycle",
+      "status": "active",
+      "role": "specialist",
+      "nodeId": "specialist-b",
+      "itemId": "REQ-002",
+      "summary": "Supplier concentration test · 49% complete",
+      "details": {"groupsTested": 37, "source": "fixture"}
+    },
+    {
+      "id": "event-4",
+      "cursor": 3,
+      "timestamp": "2026-08-18T10:23:41Z",
+      "type": "identity_review_requested",
+      "category": "review",
+      "status": "review",
+      "role": "entity_resolution_owner",
+      "nodeId": "domain-supplier",
+      "itemId": "supplier",
+      "artifact": "/fixture/evidence/supplier_mapping_review.json",
+      "summary": "Supplier mapping sent for review",
+      "details": {"candidatePairs": 438, "confidenceFloor": 0.92, "source": "fixture"}
+    },
+    {
+      "id": "event-5",
+      "cursor": 2,
+      "timestamp": "2026-08-18T10:23:07Z",
+      "type": "dependency_wait",
+      "category": "dependency",
+      "status": "waiting",
+      "role": "analytical_owner",
+      "nodeId": "ao-1",
+      "itemId": "REQ-001",
+      "summary": "REQ-001 waiting for Customer and Product identity domains",
+      "details": {"releasedAnalyticalOwnerSlot": true, "source": "fixture"}
+    },
+    {
+      "id": "event-6",
+      "cursor": 1,
+      "timestamp": "2026-08-18T10:22:35Z",
+      "type": "artifact_created",
+      "category": "artifact",
+      "status": "completed",
+      "role": "specialist",
+      "nodeId": "specialist-c",
+      "itemId": "REQ-002",
+      "artifact": "/fixture/evidence/route_calendar_profile.json",
+      "summary": "Created route_calendar_profile.json",
+      "details": {"checks": 12, "source": "fixture"}
+    }
+  ],
+  "trace": [
+    {"id": "span-1", "nodeId": "planner", "parentId": null, "label": "Mission supervision", "role": "Planner", "status": "active", "startMs": 0, "durationMs": 1350000, "depth": 0},
+    {"id": "span-2", "nodeId": "domain-customer", "parentId": "span-1", "label": "Resolve Customer identity", "role": "Entity Resolution", "status": "active", "startMs": 42000, "durationMs": 970000, "depth": 1},
+    {"id": "span-3", "nodeId": "domain-product", "parentId": "span-1", "label": "Resolve Product identity", "role": "Entity Resolution", "status": "active", "startMs": 91000, "durationMs": 860000, "depth": 1},
+    {"id": "span-4", "nodeId": "ao-1", "parentId": "span-1", "label": "REQ-001 investigation", "role": "Analytical Owner", "status": "waiting", "startMs": 123000, "durationMs": 412000, "depth": 1},
+    {"id": "span-5", "nodeId": "ao-2", "parentId": "span-1", "label": "REQ-002 investigation", "role": "Analytical Owner", "status": "active", "startMs": 548000, "durationMs": 782000, "depth": 1},
+    {"id": "span-6", "nodeId": "specialist-a", "parentId": "span-5", "label": "Lead-time profile", "role": "Specialist", "status": "active", "startMs": 624000, "durationMs": 619000, "depth": 2},
+    {"id": "span-7", "nodeId": "specialist-b", "parentId": "span-5", "label": "Supplier concentration", "role": "Specialist", "status": "active", "startMs": 661000, "durationMs": 534000, "depth": 2},
+    {"id": "span-8", "nodeId": "specialist-c", "parentId": "span-5", "label": "Route seasonality", "role": "Specialist", "status": "completed", "startMs": 704000, "durationMs": 421000, "depth": 2}
+  ],
+  "limitations": [
+    "This is a deterministic UI fixture. It never invokes the Auto Foundry runtime.",
+    "Launch controls validate a draft only; command execution is disabled in Layer 1.",
+    "Real runs show only relationships present in durable state or telemetry."
+  ]
+}

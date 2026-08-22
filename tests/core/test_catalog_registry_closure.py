@@ -139,6 +139,9 @@ def test_bound_child_reuses_persisted_inventory_and_catalog_counters(
 
     item = ItemWorkspace.create(context, "Q-001", original_text="catalog")
     bound = BoundAnalysisContext.create(context, DataAssetRef.from_path(archive), item)
+    counter_path = context.run_root / "telemetry" / "inventory_counters.json"
+    counter_bytes = counter_path.read_bytes()
+    counter_mtime = counter_path.stat().st_mtime_ns
     for _ in range(2):
         monkeypatch.setattr(
             zipfile.ZipFile,
@@ -150,11 +153,13 @@ def test_bound_child_reuses_persisted_inventory_and_catalog_counters(
         monkeypatch.undo()
 
     counters = bound.data_room.instrumentation_counters
+    assert counter_path.read_bytes() == counter_bytes
+    assert counter_path.stat().st_mtime_ns == counter_mtime
     assert counters["archive_full_hash"]["count"] == 1
     assert counters["catalog_created"]["count"] == 1
-    assert counters["catalog_loaded"]["count"] == 2
-    assert counters["catalog_reused"]["count"] == 2
-    assert counters["central_directory_fingerprint"]["count"] == 3
+    assert "catalog_loaded" not in counters
+    assert "catalog_reused" not in counters
+    assert counters["central_directory_fingerprint"]["count"] == 1
     assert counters["member_content_hash"]["bytes"] >= sum(member.size_bytes for member in bound.data_room.members())
     assert "selected_member_read" not in counters
 

@@ -1,7 +1,7 @@
 # Benchmark A commands (PREPARE / LAUNCH LATER only)
 
 These commands document a later run. They were **not executed** while
-preparing v0.2.8/core v0.3.5, and no Benchmark A run root was created here.
+preparing v0.7.0/core v0.8.0, and no Benchmark A run root was created here.
 
 ## PREPARE (later)
 
@@ -36,9 +36,9 @@ read, reuse, copy, or import any prior run root, cache, script, prompt, answer,
 LEM, prepared registry, dashboard, or telemetry. Use exactly these markers in
 structured state and the final report:
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.2.8
+skill_version: 0.7.1
 core_name: auto_foundry_core
-core_version: 0.3.5
+core_version: 0.8.0
 
 Use the same immutable source ZIP and SHA-256 as the baseline:
 82e9c913bf437ac9e361d6890467a9aed9b1c6db9d887cfcf0cd659035a71ec2
@@ -48,6 +48,11 @@ SHA-256 is:
 3a40d2f7083f0d2f0e1b216d405a0ce6c38cd4913e157b9e48a99dfa96958236
 Keep the source read-only and do
 not make external/model calls beyond the approved product runtime boundary.
+
+If prepared data is reused, preserve any `effective_period` through its
+descriptor/sidecar, operation hash, accepted integration, registry, and later
+selection/load. Omission remains valid with no period constraint. Diagnostic
+run1/run2 artifacts were invalidated before counted runs.
 
 Before analysis begins, print the resolved empty run root, source path/hash,
 question-order hash, zero-prior-run-reuse marker, and the four markers. Then

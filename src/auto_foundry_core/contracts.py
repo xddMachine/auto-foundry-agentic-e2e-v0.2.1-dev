@@ -347,6 +347,116 @@ class OperationReceipt(ContractMixin):
 
 
 @dataclass(frozen=True)
+class RequirementAnalysisTask(ContractMixin):
+    """One bounded internal analytical task in a parent requirement."""
+
+    task_id: str
+    question: str
+    objective: str | None = None
+    dependencies: tuple[str, ...] = ()
+    expected_analytical_outputs: tuple[str, ...] = ()
+    expected_visual_outputs: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "task_id", _require(self.task_id, "task_id"))
+        object.__setattr__(self, "question", _require(self.question, "question"))
+        if self.objective is not None:
+            object.__setattr__(self, "objective", _require(self.objective, "objective"))
+        for name in ("dependencies", "expected_analytical_outputs", "expected_visual_outputs"):
+            values = tuple(_require(value, name) for value in getattr(self, name))
+            if len(values) != len(set(values)):
+                raise ValueError(f"{name} must not contain duplicates")
+            object.__setattr__(self, name, values)
+
+    @property
+    def expected_outputs(self) -> Mapping[str, tuple[str, ...]]:
+        return {
+            "analytical": self.expected_analytical_outputs,
+            "visual": self.expected_visual_outputs,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "RequirementAnalysisTask":
+        if not isinstance(data, Mapping):
+            raise TypeError("requirement analysis task must be a mapping")
+        raw = dict(data)
+        raw.pop("record_kind", None)
+        return cls(**raw)
+
+
+@dataclass(frozen=True)
+class RequirementAnalysisPlan(ContractMixin):
+    """Immutable semantic decomposition owned by one requirement item."""
+
+    tasks: tuple[RequirementAnalysisTask, ...]
+    synthesis_intent: str
+    original_text: str = ""
+
+    @property
+    def analysis_tasks(self) -> tuple[RequirementAnalysisTask, ...]:
+        return self.tasks
+
+    @property
+    def output_intent(self) -> str:
+        return self.synthesis_intent
+
+    def __post_init__(self) -> None:
+        tasks = tuple(
+            RequirementAnalysisTask.from_dict(task) if isinstance(task, Mapping) else task
+            for task in self.tasks
+        )
+        if not tasks:
+            raise ValueError("requirement analysis plan requires at least one task")
+        if any(not isinstance(task, RequirementAnalysisTask) for task in tasks):
+            raise TypeError("requirement analysis plan tasks must be RequirementAnalysisTask values")
+        ids = tuple(task.task_id for task in tasks)
+        if len(ids) != len(set(ids)):
+            raise ValueError("requirement analysis task IDs must be unique")
+        known = set(ids)
+        for task in tasks:
+            unknown = set(task.dependencies) - known
+            if unknown:
+                raise ValueError("requirement analysis task dependency is unknown")
+        graph = {task.task_id: set(task.dependencies) for task in tasks}
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(node: str) -> None:
+            if node in visiting:
+                raise ValueError("requirement analysis plan dependencies must be acyclic")
+            if node in visited:
+                return
+            visiting.add(node)
+            for dependency in graph[node]:
+                visit(dependency)
+            visiting.remove(node)
+            visited.add(node)
+
+        for task in tasks:
+            visit(task.task_id)
+        object.__setattr__(self, "tasks", tasks)
+        object.__setattr__(self, "synthesis_intent", _require(self.synthesis_intent, "synthesis_intent"))
+        if self.original_text:
+            object.__setattr__(self, "original_text", _require(self.original_text, "original_text"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "record_kind": "requirement_analysis_plan",
+            "original_text": self.original_text,
+            "tasks": [task.to_dict() for task in self.tasks],
+            "synthesis_intent": self.synthesis_intent,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "RequirementAnalysisPlan":
+        if not isinstance(data, Mapping):
+            raise TypeError("requirement analysis plan must be a mapping")
+        raw = dict(data)
+        raw.pop("record_kind", None)
+        return cls(**raw)
+
+
+@dataclass(frozen=True)
 class RequirementRecord(ContractMixin):
     requirement_id: str
     original_text: str
@@ -354,9 +464,7 @@ class RequirementRecord(ContractMixin):
     business_objective: str = ""
     expected_analytical_outputs: tuple[str, ...] = ()
     expected_visual_outputs: tuple[str, ...] = ()
-    internal_tasks: tuple[str, ...] = ()
     dependencies: tuple[str, ...] = ()
-    shared_foundation_dependencies: tuple[str, ...] = ()
     data_needs: tuple[str, ...] = ()
     ontology_needs: tuple[str, ...] = ()
     prepared_data_needs: tuple[str, ...] = ()
@@ -369,7 +477,6 @@ class RequirementRecord(ContractMixin):
     status: str = "queued"
     source_refs: tuple[str, ...] = ()
     evidence_refs: tuple[str, ...] = ()
-    planner: Mapping[str, Any] = field(default_factory=dict)
     review: Mapping[str, Any] = field(default_factory=dict)
     outcome: Any = None
     # ``priority`` and these names are direct fields for callers that use the
@@ -377,7 +484,6 @@ class RequirementRecord(ContractMixin):
     priority: Any = None
     objective: str | None = None
     expected_outputs: Mapping[str, Any] = field(default_factory=dict)
-    foundation_dependencies: tuple[str, ...] = ()
     needs: Mapping[str, Any] = field(default_factory=dict)
     limits: tuple[str, ...] = ()
     scope_classification: str | None = None
@@ -406,9 +512,6 @@ class RequirementRecord(ContractMixin):
         object.__setattr__(self, "expected_analytical_outputs", analytical)
         object.__setattr__(self, "expected_visual_outputs", visual)
         object.__setattr__(self, "expected_outputs", {"analytical": analytical, "visual": visual})
-        foundation = tuple(self.shared_foundation_dependencies or self.foundation_dependencies)
-        object.__setattr__(self, "shared_foundation_dependencies", _tuple_values(foundation))
-        object.__setattr__(self, "foundation_dependencies", _tuple_values(foundation))
         needs = dict(self.needs or {})
         data_needs = tuple(str(v) for v in (self.data_needs or needs.get("data", ())))
         ontology_needs = tuple(str(v) for v in (self.ontology_needs or needs.get("ontology", ())))
@@ -417,6 +520,8 @@ class RequirementRecord(ContractMixin):
         object.__setattr__(self, "ontology_needs", ontology_needs)
         object.__setattr__(self, "prepared_data_needs", prepared_needs)
         object.__setattr__(self, "needs", {"data": data_needs, "ontology": ontology_needs, "prepared": prepared_needs})
+        object.__setattr__(self, "dependencies", _tuple_values(self.dependencies))
+        object.__setattr__(self, "working_definitions", _tuple_values(self.working_definitions))
         limitations = tuple(self.limitations or self.limits)
         object.__setattr__(self, "limitations", _tuple_values(limitations))
         object.__setattr__(self, "limits", _tuple_values(limitations))
@@ -425,7 +530,6 @@ class RequirementRecord(ContractMixin):
         object.__setattr__(self, "scope_classification", self.scope)
         object.__setattr__(self, "source_refs", _tuple_values(self.source_refs))
         object.__setattr__(self, "evidence_refs", _tuple_values(self.evidence_refs))
-        object.__setattr__(self, "planner", _freeze(self.planner))
         object.__setattr__(self, "review", _freeze(self.review))
         object.__setattr__(self, "metadata", _freeze(self.metadata))
 
@@ -440,8 +544,6 @@ class RequirementRecord(ContractMixin):
             outputs = value["expected_outputs"] or {}
             value.setdefault("expected_analytical_outputs", outputs.get("analytical", ()))
             value.setdefault("expected_visual_outputs", outputs.get("visual", ()))
-        if "shared_foundation_dependencies" not in value and "foundation_dependencies" in value:
-            value["shared_foundation_dependencies"] = value["foundation_dependencies"]
         if "needs" in value:
             needs = value["needs"] or {}
             value.setdefault("data_needs", needs.get("data", ()))
@@ -452,46 +554,6 @@ class RequirementRecord(ContractMixin):
         if "scope" not in value and "scope_classification" in value:
             value["scope"] = value["scope_classification"]
         return cls(**value)
-
-
-@dataclass(frozen=True)
-class FoundationTask(ContractMixin):
-    task_id: str
-    description: str
-    supports_requirements: tuple[str, ...] = ()
-    capability_ids: tuple[str, ...] = ()
-    status: str = "planned"
-    metadata: Mapping[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "task_id", _require(self.task_id, "task_id"))
-        object.__setattr__(self, "description", _require(self.description, "description"))
-        object.__setattr__(self, "supports_requirements", _tuple_values(self.supports_requirements))
-        object.__setattr__(self, "capability_ids", _tuple_values(self.capability_ids))
-        object.__setattr__(self, "metadata", _freeze(self.metadata))
-
-
-@dataclass(frozen=True)
-class RequirementPortfolioPlan(ContractMixin):
-    plan_id: str
-    requirement_ids: tuple[str, ...] = ()
-    foundation_tasks: tuple[FoundationTask, ...] = ()
-    execution_order: tuple[str, ...] = ()
-    rationale: str = ""
-    metadata: Mapping[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "plan_id", _require(self.plan_id, "plan_id"))
-        object.__setattr__(self, "requirement_ids", _tuple_values(self.requirement_ids))
-        tasks = tuple(FoundationTask(**t) if isinstance(t, Mapping) else t for t in self.foundation_tasks)
-        object.__setattr__(self, "foundation_tasks", tasks)
-        object.__setattr__(self, "execution_order", _tuple_values(self.execution_order))
-        object.__setattr__(self, "metadata", _freeze(self.metadata))
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "RequirementPortfolioPlan":
-        return cls(**dict(data))
-
 
 @dataclass(frozen=True)
 class OntologyItem(ContractMixin):

@@ -56,12 +56,63 @@ def test_bound_context_manifest_and_environment_round_trip(tmp_path: Path, monke
     assert loaded.item_workspace.item_id == item.item_id
     assert loaded.source_catalog.content_hash == bound.source_catalog.content_hash
     assert loaded.manifest_hash == bound.manifest_hash
+    assert loaded.ontology_bundle == {"relevant": ("orders",)}
+    assert loaded.context_payload_ref == bound.context_payload_ref
 
     payload = json.loads(bound.manifest_path.read_text(encoding="utf-8"))
     payload["source_identity"]["uri"] = str(tmp_path / "wrong.zip")
     bound.manifest_path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="manifest hash"):
         load_bound_analysis_context(context, path=bound.manifest_path)
+
+
+def test_public_script_validation_is_bytecode_free(tmp_path: Path) -> None:
+    _context, _archive, item, bound = _fixture(tmp_path)
+    script = _write_script(item, "valid.py", "print('valid')\n")
+    result = bound.script_runner.validate_script(script)
+    assert result.succeeded
+    assert result.script_hash == hashlib.sha256(script.read_bytes()).hexdigest()
+    assert result.receipt is None
+    assert not tuple(item.context.run_root.rglob("*.pyc"))
+    assert not tuple(item.context.run_root.rglob("__pycache__"))
+
+
+def test_caller_context_payload_tamper_fails_closed_on_reload(tmp_path: Path) -> None:
+    context, _, _, bound = _fixture(tmp_path)
+    payload_ref = bound.context_payload_ref
+    assert payload_ref is not None
+    payload_path = context.resolve_run_path(payload_ref.payload_ref)
+    payload_path.write_bytes(payload_path.read_bytes() + b"\n")
+    with pytest.raises(ValueError, match="payload"):
+        load_bound_analysis_context(context, path=bound.manifest_path)
+
+
+def test_caller_context_payload_uses_bound_freeze_contract_for_nested_shapes(tmp_path: Path) -> None:
+    context, archive, _, _ = _fixture(tmp_path)
+    item = ItemWorkspace.create(context, "Q-002", original_text="Nested caller bundle")
+    caller_bundle = {
+        7: ["list", {3: ("nested",)}],
+        "path": Path("relative/source.csv"),
+        "set": {"beta", "alpha"},
+        "frozen": frozenset({"delta", "gamma"}),
+        "asset": DataAssetRef.from_path(archive),
+    }
+    bound = BoundAnalysisContext.create(context, DataAssetRef.from_path(archive), item, ontology_bundle=caller_bundle)
+    loaded = load_bound_analysis_context(context, path=bound.manifest_path)
+
+    # The persisted payload follows the same public canonical form as the
+    # context itself: string mapping keys, tuple-frozen sequences/sets, and
+    # JSONable Path strings rather than a second type-restoration protocol.
+    assert loaded.ontology_bundle == bound.ontology_bundle
+    assert set(loaded.ontology_bundle) == {"7", "path", "set", "frozen", "asset"}
+    assert loaded.ontology_bundle["path"] == "relative/source.csv"
+    assert isinstance(loaded.ontology_bundle["7"], tuple)
+    assert isinstance(loaded.ontology_bundle["set"], tuple)
+    assert isinstance(loaded.ontology_bundle["frozen"], tuple)
+    assert loaded.ontology_bundle["asset"] == bound.ontology_bundle["asset"]
+    payload_file = context.resolve_run_path(bound.context_payload_ref.payload_ref)  # type: ignore[union-attr]
+    payload = json.loads(payload_file.read_text(encoding="utf-8"))
+    assert "__af_context_type__" not in json.dumps(payload)
 
 
 def test_context_source_mutation_fails_closed_before_script(tmp_path: Path) -> None:
@@ -150,6 +201,29 @@ def test_compile_name_import_errors_are_same_attempt_feedback(tmp_path: Path) ->
     dependency_report = bound.script_runner.run_pipeline(dependency)
     assert dependency_report.same_attempt_feedback
     assert dependency_report.receipts[0].phase == "dependency_check"
+
+
+def test_failed_script_preserves_reviewed_work_baseline_and_stays_same_attempt(
+    tmp_path: Path,
+) -> None:
+    _context, _archive, item, bound = _fixture(tmp_path)
+    reviewed = item.work_root / "reviewed.json"
+    reviewed.write_text('{"status":"reviewed"}', encoding="utf-8")
+    baseline = reviewed.read_bytes()
+    script = _write_script(
+        item,
+        "repair_failure.py",
+        "from pathlib import Path\n"
+        "Path('reviewed.json').write_text('{\"status\":\"poisoned\"}', encoding='utf-8')\n"
+        "raise RuntimeError('correctable script failure')\n",
+    )
+
+    report = bound.script_runner.run_pipeline(script, allowed_outputs=(reviewed,))
+
+    assert report.status == "failed"
+    assert report.same_attempt_feedback
+    assert report.receipts[0].error_type == "ScriptError"
+    assert reviewed.read_bytes() == baseline
 
 
 def test_output_escape_timeout_and_output_cap_are_rejected_or_bounded(tmp_path: Path) -> None:

@@ -40,6 +40,7 @@ evidence_collector = _load("v023_optimizer_collector", SCRIPTS / "optimizer_evid
 from auto_foundry_core import (  # noqa: E402
     AcceptedAnalysisBundle,
     AgentInvocationReceipt,
+    AnalystWorkspace,
     BoundAnalysisContext,
     DataAssetRef,
     DataRoomWorkbench,
@@ -108,6 +109,7 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
         ontology_bundle={"relevant": ("generic-record",)},
         workbench=workbench,
     )
+    analyst = AnalystWorkspace(bound, owner_ref="owner-Q-001")
     source_before = archive.read_bytes()
     manifest_before = bound.manifest_path.read_bytes()
     assert bound.source_catalog.source_hash == archive_before
@@ -195,19 +197,40 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
                 "finding_id": "F-V023-ANSWER",
                 "message": "The bounded answer wording needs one targeted correction.",
                 "pointers": ["/answer"],
+                "semantic_categories": ["answer"],
             }
         ],
     )
     assert repair_review["findings"][0]["pointers"] == ["/answer"]
     assert repair_review["targeted_recheck"] is False
-    item.use_business_repair()
+    item.use_business_repair(owner_ref="owner-Q-001")
     assert item.state["business_repair_count"] == 1
     item.write_draft({"answer": "bounded corrected result after one repair", "evidence": "work/analysis.json"})
     targeted_review = item.record_review("accept", reviewer_ref="synthetic-reviewer-rereview")
     assert targeted_review["targeted_recheck"] is True
     assert targeted_review["changed_pointers"] == ["/answer"]
     assert json.loads(item.draft_root.read_text(encoding="utf-8"))["evidence"] == "work/analysis.json"
-    item.accept(accepted_refs=("work/analysis.json",))
+    relationship = analyst.record_analytical_relationship(
+        relationship_id="generic-record-value",
+        source_id="generic-record",
+        target_id="generic-value",
+        cardinality="one_to_one",
+        join_keys=({"source_field": "record_id", "target_field": "record_id"},),
+        matched_pairs=2,
+        source_population=2,
+        target_population=2,
+        matched_source_count=2,
+        matched_target_count=2,
+        source_coverage=1.0,
+        target_coverage=1.0,
+        date_authority="fixture-controlled snapshot",
+        as_of=None,
+        limitations=("Synthetic fixture only",),
+        evidence_refs=("work/analysis.json",),
+        publishable=True,
+    )
+    relationship_payload = relationship.to_dict()
+    analyst.accept(accepted_refs=("work/plan.json", "work/analysis.json", "work/analytical_relationships.jsonl"))
     accepted_bundle = AcceptedAnalysisBundle.load(item)
     answer_before = accepted_bundle.answer_content
     envelope_before = (item.accepted_root / "acceptance_envelope.json").read_bytes()
@@ -216,11 +239,11 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
     assert lifecycle.reconcile([item.state, item2.state]).state == "analytical_complete"
 
     # Exactly one owner stages all integration kinds through the program API.
-    lem = LivingEnterpriseModel(run_id=context.run_id)
+    external_lem = LivingEnterpriseModel(run_id=context.run_id)
     # The fidelity packet is an item-local boundary.  Populate nearby
     # cumulative/sibling surfaces with unmistakable sentinels so the vertical
     # proof catches accidental traversal of those stores.
-    lem.add_ontology_item(
+    external_lem.add_ontology_item(
         OntologyItem(
             item_id="cumulative-secret",
             item_type="entity",
@@ -237,7 +260,6 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
     session = IntegrationSession.create(
         context,
         item,
-        lem,
         registry,
         "result-integration",
         invocation_id="inv-Q-001",
@@ -246,7 +268,6 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
         IntegrationSession.create(
             context,
             item,
-            lem,
             registry,
             "result-integration",
             invocation_id="inv-Q-001-other",
@@ -264,14 +285,32 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
         scope="question",
         evidence_refs=("work/analysis.json",),
     )
-    claim = session.add_claim("The fixture is bounded.", scope="question", evidence_refs=("work/analysis.json",))
-    session.add_limitation("No production interpretation.", scope="question", evidence_refs=("work/analysis.json",))
+    claim = session.add_claim({"claim": "The fixture is bounded."}, scope="question", evidence_refs=("work/analysis.json",))
+    session.add_limitation({"limitation": "No production interpretation."}, scope="question", evidence_refs=("work/analysis.json",))
     session.link_evidence(claim, ("work/analysis.json",), scope="question")
     session.register_prepared_asset(prepared_descriptor, evidence_refs=("work/analysis.json",))
     session.add_relationship(
-        {"relationship_id": "generic-record-value", "source_id": "generic-record", "target_id": "generic-value", "label": "contains"},
+        {
+            "relationship_id": relationship_payload["relationship_id"],
+            "analysis_relationship_id": relationship_payload["relationship_id"],
+            "source_id": relationship_payload["source_id"],
+            "target_id": relationship_payload["target_id"],
+            "cardinality": relationship_payload["cardinality"],
+            "join_keys": relationship_payload["join_keys"],
+            "matched_pairs": relationship_payload["matched_pairs"],
+            "source_population": relationship_payload["source_population"],
+            "target_population": relationship_payload["target_population"],
+            "matched_source_count": relationship_payload["matched_source_count"],
+            "matched_target_count": relationship_payload["matched_target_count"],
+            "source_coverage": relationship_payload["source_coverage"],
+            "target_coverage": relationship_payload["target_coverage"],
+            "date_authority": relationship_payload["date_authority"],
+            "as_of": relationship_payload["as_of"],
+            "limitations": relationship_payload["limitations"],
+            "evidence_refs": relationship_payload["evidence_refs"],
+        },
         scope="question",
-        evidence_refs=("work/analysis.json",),
+        evidence_refs=("work/analytical_relationships.jsonl", "work/analysis.json"),
     )
     session.add_dashboard_fact({"fact": "generic-total", "value": 8}, scope="question", evidence_refs=("work/analysis.json",))
     assert session.validate().valid
@@ -307,7 +346,6 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
     session2 = IntegrationSession.create(
         context,
         item2,
-        lem,
         registry,
         "result-integration",
         invocation_id="inv-Q-002",
@@ -346,7 +384,7 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
         checked_record_ids=tuple(record.record_id for record in session2.records),
     )
     session2.commit()
-    assert len(lem.ontology) > 2
+    assert len(session2.lem.ontology) > 2
     assert registry.search(reusable_only=True, prepared_asset_id="generic-reusable")
     assert registry.load("generic-reusable").rows[0]["record_id"] == "R-1"
 
@@ -356,7 +394,7 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
     fixture = {
         "title": "Generic reviewed product",
         "run_id": context.run_id,
-        "skill_version": "0.2.8",
+        "skill_version": "0.3.0",
         "freeze_markers": FreezeMarkers(True, True, True, True, True).to_dict(),
         "limitations": ["Synthetic fixture only; no new analytics."],
         "domains": [{

@@ -1,7 +1,7 @@
-# Benchmark A — v0.2.8/core v0.3.5 preparation package
+# Benchmark A — v0.7.0/core v0.8.0 preparation package
 
-Benchmark A is prepared for a later, controlled comparison of the v0.2.8
-skill and `auto_foundry_core` v0.3.5 against the recorded v0.2.0 baseline. It
+Benchmark A is prepared for a later, controlled comparison of the v0.7.0
+skill and `auto_foundry_core` v0.8.0 against the recorded v0.2.0 baseline. It
 is not an analytical result and it was not executed in this deliverable.
 
 This directory intentionally contains only the preparation contract:
@@ -25,3 +25,8 @@ hash recorded in the baseline, the exact question order, and zero prior-run
 reuse. The user's instruction to run Benchmark A is sufficient; print the
 resolved run root and version/source/question markers for the record, then
 begin immediately. There is no time deadline in this package.
+
+Prepared-data `effective_period` is optional: when present it must remain
+unchanged through descriptor/sidecar, operation hash, accepted integration,
+registry, and later reuse; omission means no period constraint. Diagnostic
+run1/run2 artifacts are invalidated before counted runs and are not evidence.

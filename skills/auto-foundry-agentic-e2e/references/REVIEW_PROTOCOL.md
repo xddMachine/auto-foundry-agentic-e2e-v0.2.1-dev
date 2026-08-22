@@ -2,157 +2,166 @@
 
 ## Objective
 
-Catch material analytical errors and overclaiming at the business-result
-boundary without turning natural analysis into a chain of gates. The reviewer
-receives a materialized draft from the durable item workspace; scratch remains
-mutable until the program writes the accepted snapshot.
+Use review to improve and protect the business analysis. Do not turn the
+reviewer into a second analyst, a schema author, or a lifecycle operator.
 
-## Reviewer routing
+## Inputs
 
-Use one Independent Business Reviewer per active item. Prefer an independent
-business reviewer in a fresh context. If that route is unavailable, try an
-alternate independent route;
-then try a fresh context from the same family. Do not hardcode model/provider
-names. Release sessions when the host supports it.
+Give one fresh Independent Business Reviewer only the active item's:
 
-If no route is available, continue and disclose exactly:
+- exact question or requirement;
+- complete submitted answer;
+- selected sources and source-completeness evidence;
+- calculation method, scripts, outputs, and reconciliations;
+- population, denominator, period, units, grain, and exclusions;
+- relationship and identity tests;
+- specialist memos;
+- assumptions, proxies, unsupported components, and limitations.
 
-```json
-{"review_status":"unavailable","review_strength":"none","verdict":"not_reviewed"}
-```
-
-The item may still finish as `answered_with_limits` from the Lead Analyst
-result, with the unavailable-review limitation disclosed. A route that was not
-invoked cannot return `accept_with_limits` or any other reviewer verdict. Do
-not add a second review of the review.
-
-## Reviewer inputs
-
-The reviewer receives the user-owned question/requirement record, data-room
-source catalog references and bounded completeness-search target, Lead Analyst
-exact source/LEM/prepared IDs and validation evidence, plan/source map,
-material scripts and outputs, draft answer, self-check, assumptions/proxies,
-relationship measurements, population/denominator, limitations, telemetry
-references, intended Knowledge Delta, and any identity-escalation candidates.
+Do not expose siblings, cumulative LEM state, prior-run memory, broad reports,
+internal state files, hashes, or review packet machinery.
 
 ## Required checks
 
-1. Does the answer address the original request and expected outputs?
-2. Are headline values derived from supplied or prepared evidence?
-3. Are scope, period, units, population, and denominator clear?
-4. Are material joins measured and their coverage/fanout disclosed?
-5. Are working definitions, proxies, conflicts, and effective periods explicit?
-6. Are document, rule, and process claims scoped to applicable evidence?
-7. Are associations distinguished from causality?
-8. Are supported and unsupported components separated?
-9. Could a useful partial answer be retained?
-10. Are methods, scripts, and core operations reproducible?
-11. Does every intended Knowledge Delta item have evidence and limits?
-12. For each material absence claim, did a targeted search of the physical
-    source catalog check relevant archive/member metadata and bounded fields?
-13. If exact overlap is absent but same-object representations are plausible,
-    were candidates, evidence/coverage, semantic identity decision, and this
-    review check recorded—or was route inapplicability justified?
+Judge whether:
 
-The completeness and identity checks are targeted. Do not repeat the full
-analysis (without repeating the full analysis in another form), introduce a mandatory catalog-compliance artifact, or add another
-review layer.
+1. the answer addresses the user's decision;
+2. every material number and claim is supported;
+3. definitions, population, denominator, period, units, and grain are clear;
+4. joins, identities, exclusions, conflicts, and alternate controls were tested;
+5. policies and documents are authoritative and applicable;
+6. proxy, scenario, association, and causal language are honest;
+7. material source-completeness gaps were searched;
+8. useful supported components remain visible when others are unsupported;
+9. limitations and next actions match the evidence;
+10. suggested visuals do not overstate the result.
 
-## Verdicts
+For an identity domain, review the Entity Resolution Owner's method, evidence,
+sample tests, coverage, exceptions, unresolved/ambiguous populations, and
+source-account representation classes. The review decision is binary per
+proposed mapping (accepted or not accepted); one accepted `CanonicalMapping`
+may contain one or many source identities or representations, including bulk
+pattern-derived populations. Coverage and exceptions describe the job and do
+not turn unresolved records into canonical mappings or downgrade accepted ones.
+Review full-population results for every source used by the domain, plus the
+documented expansion decision; do not accept a sample-only mapping as complete.
 
-- `accept`: no material defect;
-- `accept_with_limits`: useful and accurate within explicit limits;
-- `repair_once`: one concrete, bounded material correction is needed;
-- `block_specific_claims`: remove or downgrade named unsupported claims while
-  preserving supported findings.
+## Reviewer output
 
-After `repair_once`, perform one short fresh recheck of the repaired points.
-Do not restart the item or create another business repair. Execution recovery
-before review is a separate program decision and does not consume this repair;
-it requires a canonical persisted invocation `receipt_ref`/hash proving
-lane/provider/host/process loss and matching the active attempt/lane.
-Unpersisted or mismatched references fail closed. Filesystem no-progress alone yields `await_runtime` or
-`materialization_guidance`. Provider/model identity may be literal
-`unavailable`.
+Return one verdict:
 
-### Reviewer-scope packet recovery
+- `accept`;
+- `accept_with_limits`;
+- `repair_once`;
+- `confirm_data_insufficiency`.
 
-If the persisted review packet is invalid because the reviewer supplied an
-out-of-scope packet, the program may use only
-`ItemWorkspace.discard_business_review(...)`. Its incident must be
-inadmissible, item-bound, and categorized `reviewer_scope`; other categories or
-admissible incidents are rejected. The method binds the discarded packet hash
-and draft hash in an append-only hash chain at
-`work/business_review_discard_audit.jsonl`, removes the packet and resets
-pending review/business-repair state atomically, and preserves every existing
-work and draft byte. The next review is a new full review, not a targeted
-recheck. Recovery never reinterprets findings or semantic content and has no
-compatibility fallback; it is not a general reset or a second repair route.
+Return all material findings together. For each finding provide only:
 
-### Implementation-context transition
+```text
+finding ID
+target answer section
+semantic categories (one or more, canonical order): answer | calculation | evidence | method | source_completeness | presentation
+problem
+evidence
+required change
+```
 
-`BoundAnalysisContext.rebind_implementation(...)` is an identity-only,
-resumable transition. Require a contiguous ledger of old/new skill/core
-versions and repository SHA/tree identities, matching earliest affected item,
-preserved accepted hashes, revalidation reason, and resume point. Rebind must
-reuse the bound catalog, source hash/stat signature, and physical inventory;
-it must not read ZIP members, rebuild a catalog, increment inventory counters,
-emit read telemetry, create analysis, or reread raw sources. The durable intent,
-append-only audit, and anchored head reconcile idempotently after a crash and
-fail closed on tampering. Acquire locks only in journal → run lifecycle → item
-state order. The shared item state-transition lock covers reviewer packet
-commit/discard as well, so rebind cannot cross a half-written review packet.
-Reject any active attempt/review/terminal/accepted state; discard an invalid
-review packet before rebinding.
+The reviewer does not provide JSON pointers, filesystem paths, dependent
+artifact paths, draft hashes, packet hashes, or state changes.
+`BusinessReviewAdapter` validates the section/category set and creates the exact
+program scope. Unknown sections and categories fail before review state is
+written.
+The host/router records the current `owner_ref` in program-owned audit state;
+the reviewer never emits it. A replacement owner may continue any nonterminal
+item, while the reviewer remains independent.
 
-### Later-item catalog inheritance
+Calibrate the verdict: `accept` means the core requested decision is answered
+and only normal disclosed limits remain. Use `accept_with_limits` only when a
+material requested component is missing or unreliable. Ordinary source-local,
+currency, or no-causality caveats alone do not force with-limits. Semantic
+fidelity is an independent review dimension; resolution review decisions remain
+binary per mapping while each accepted mapping may contain one or many source
+identities and coverage/exceptions remain job-level evidence.
 
-Use only `BoundAnalysisContext.create_from_transitioned_catalog(...)` for a
-later or multi-hop item. This is immutable source inheritance, not a synthetic
-transition: preserve the original source/catalog/source-stat/inventory
-identity and perform no ZIP/member discovery, catalog rebuild, inventory
-counter update, or raw-source read. Validate recursive upstream provenance
-before target bytes are touched. Acquire inherited journals oldest first, then
-the target inheritance journal, run lifecycle, and source/target item locks in
-lexical order. Target intent, manifest, inheritance record, and anchored state
-form durable phases that reconcile idempotently after a crash; an exact retry
-must not emit a synthetic target transition audit. `earliest_affected_item` is
-a lower bound, covering later items while rejecting an earlier target.
+Before independent resolution review, `submit_result()` runs the full typed
+projection validator used by commit. A malformed candidate stays with the same
+Entity Resolution Owner and lease for technical correction; this does not
+consume business `repair_once`. Mapping completeness is an advisory signal and
+its absence or failure never blocks review or commit.
 
-The repair packet may authorize explicit dependent artifact roots and JSON
-fragments; these resolve to their owning artifact paths. Any unrelated artifact
-mutation remains fail-closed.
-If the issue remains, record the supported outcome and disclose the unresolved
-component. The program then validates and atomically applies the reviewed
-Knowledge Delta; custom question code does not apply it.
+## Repair and targeted recheck
 
-## What a reviewer must not do
+For `repair_once`, return all material findings in the initial review. The
+program opens one item-local repair. The current or a replacement Analytical
+Owner may update any item-local work and coherent answer sections needed to
+resolve it. Finding categories remain reviewer provenance, not filesystem
+capabilities. There is no fixed repair budget; code feedback and execution
+recovery are ordinary work.
 
-Do not reject a valid source-local answer merely because there is no unique
-enterprise definition, a labelled proxy was used, a partial answer is
-possible, or the Knowledge Delta is `no_change`. Do not demand extra artifacts,
-formatting, helper use, wall-time targets, or hidden lifecycle proof.
+Run one targeted recheck after each repair. Verify each requested change and
+confirm unaffected content remains preserved. The recheck may accept or return
+another `repair_once` when a material finding remains. Stop when the answer is
+supported or terminalize honestly; do not use an arbitrary cycle count as the
+decision rule.
 
-Do not parse free-form prose, headings, bullets, or wording to determine state.
-Mechanical checks may verify structured fields, file existence, script
-results, exact IDs, raw-source immutability, artifact progress, and internal-
-link integrity; business judgment remains with the Lead Analyst and reviewer.
-There is no reviewer-of-reviewer, business-repair finalizer, manual terminalizer,
-or second integration reviewer. Result Integration mechanical validation cannot
-prove semantic completeness. Exactly one fresh item-only Integration Fidelity
-Reviewer checks the current item after mechanical validation and before commit;
-the same Result Integration Agent may make one targeted repair and receives one
-targeted recheck. The packet excludes siblings, cumulative state, prior memory,
-and broad workspace context; there is no prose parser or semantic compiler.
+Only the Analytical Owner may originate a `DataInsufficiencyConclusion` with
+an unanswerable component, missing information, searches/tests performed,
+evidence references, and supported components. The reviewer merely confirms
+that conclusion with `confirm_data_insufficiency`; the program then may publish
+`blocked_by_evidence`. Presentation, calculation, evidence, method, reviewer,
+program, and script defects require repair or technical failure and cannot be
+used to block a business component.
 
-## Technical defects
+If the reviewer is unavailable, preserve a useful bounded answer with explicit
+`review_status: unavailable` and reduced confidence rather than inventing a
+review.
 
-Record workflow/tool/parser defects as `technical_failure` only after the
-program's allowed execution-recovery routes are exhausted. Preserve valid
-supported analysis, disclose review availability, preserve scratch, and
-continue the queue when possible. A technical defect is not a conclusion
-about the data, and no terminalizer agent is involved. Classifier output is
-restricted to `same_attempt_feedback`, `business_repair`,
-`execution_recovery`, `abort_and_new_clean_run`, or `null`; raw
-`terminal_reason` values remain specific facts such as `syntax_error` or
-`core_defect`.
+## Scope incidents
+
+If a reviewer read sibling/prior/broad context or its packet is otherwise
+inadmissible, discard only that review through the program-owned
+`ItemWorkspace.discard_business_review(...)` route with an item-bound
+`reviewer_scope` incident. Preserve the analytical work, reset the unused
+business repair, and route one new full review. Never reinterpret or partially
+reuse the contaminated verdict.
+
+Discard journals, audit heads, locks, and packet hashes are program-owned
+details. Do not include them in a reviewer prompt. Implementation versions do
+not determine whether analytical work may resume.
+
+## Integration fidelity review
+
+Business review ends before acceptance. After acceptance, one Result
+Integration Agent creates typed records. Mechanical validation checks their
+shape, refs, hashes, and commit rules. One fresh item-only Integration Fidelity
+Reviewer then checks whether the records faithfully represent the accepted
+answer.
+
+The fidelity reviewer may identify affected record IDs and dependency IDs
+because those are the objects under review. The same Integration Agent may
+correct the authorized records once and receive one targeted recheck. It may
+not reopen or rewrite the accepted business answer.
+
+The Analytical Owner must establish actual joins/relationships with
+`source_id`/`target_id`, `join_keys`, grain, cardinality, `matched_pairs` (the
+unique tested edge-pair count), `source_population`/`target_population`,
+`matched_source_count`/`matched_target_count` (distinct matched endpoints),
+and `source_coverage`/`target_coverage` (endpoint count divided by its
+population, with zero for a zero population), plus `as_of`/date authority,
+limitations, and evidence. Integration Fidelity review accepts only
+those tested relationships plus reviewed canonical identity mappings; it does
+not complete a theoretical graph or infer relationships from prose.
+
+## Prohibitions
+
+- Do not repeat the entire analysis without a concrete issue.
+- Do not rewrite the answer during review.
+- Do not require the Business Reviewer to learn program schemas.
+- Do not treat formatting preferences as material findings.
+- Do not use review to hide supported partial results.
+- Do not allow review or integration defects to become data conclusions.
+- Do not require row-by-row identity review, an authoritative crosswalk, or a
+  fixed matching script; judge the owner's methodology and coverage evidence.
+- Do not treat an Entity Resolution Owner as an extra requirement specialist;
+  it is a parallel mapping job and never owns the requirement answer.
+- Do not add a reviewer-of-reviewer or a second integration reviewer.

@@ -94,6 +94,20 @@ def test_one_reviewer_one_business_repair_then_re_review() -> None:
     assert run.business_repair_count == 1
 
 
+def test_two_business_repairs_get_two_targeted_rechecks_and_third_repair_fails_closed() -> None:
+    run = FakeRequirementRun(reviewer_verdicts=("repair_once", "repair_once", "accept"))
+    result = run.run(_requirement())
+
+    assert run.reviewer_calls == 3
+    assert result.business_repair_count == 2
+    assert result.review.verdict == "accept"
+    assert result.review.targeted_recheck_scope == ("/answer/findings/0/value",)
+
+    exhausted = FakeRequirementRun(reviewer_verdicts=("repair_once", "repair_once", "repair_once"))
+    with pytest.raises(ValueError, match="second targeted recheck"):
+        exhausted.run(_requirement())
+
+
 def test_business_repair_finding_is_pointer_scoped_and_fidelity_review_is_item_only() -> None:
     run = FakeRequirementRun(reviewer_verdicts=("repair_once", "accept"))
     result = run.run(_requirement())
@@ -112,7 +126,7 @@ def test_business_repair_finding_is_pointer_scoped_and_fidelity_review_is_item_o
 
 def test_result_integration_agent_is_single_owner_and_catalog_scope_is_visibility_only() -> None:
     agent = ResultIntegrationAgent()
-    asset = PreparedAsset("asset-1", "b" * 64, "0.3.5", "fixture-v1", "source")
+    asset = PreparedAsset("asset-1", "b" * 64, "0.6.3", "fixture-v1", "source")
     receipt = agent.integrate(
         claims=("claim",),
         metrics=("metric",),

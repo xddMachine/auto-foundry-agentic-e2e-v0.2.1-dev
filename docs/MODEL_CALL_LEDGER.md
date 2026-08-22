@@ -4,9 +4,10 @@ This ledger covers the product-under-test and Benchmark A preparation only.
 
 | Scope | Analytical/model calls | Network/external calls | Status |
 |---|---:|---:|---|
-| v0.2.8/core v0.3.5 workbench, runtime, integration, and durable helpers | 0 | 0 | complete offline |
+| v0.7.1/core v0.8.0 workbench, runtime, integration, semantic reuse, cognitive requirement supervision, and durable helpers | 0 | 0 | complete offline |
 | Benchmark A preparation | 0 | 0 | prepared, not executed |
 | Generic offline vertical acceptance | 0 | 0 | complete fixture proof |
+| Three-question analytical-owner canned replay | 0 | 0 | repeatable fixture proof |
 | Baseline run reference | not re-executed here | not re-executed here | read-only evidence |
 
 Coding-agent orchestration used to edit and verify this repository is outside
@@ -24,9 +25,18 @@ commit. Exact retries converge through the persisted commit intent; rejected or
 technical-failure items leave no accepted registry entry. Integration binds the
 immutable accepted answer content hash and canonical descriptor payload, not raw
 rows. Mechanical validation cannot establish semantic completeness, so the
-exactly one fresh item-only Integration Fidelity Reviewer remain outside this
-zero-call ledger; the same Result Integration Agent may make one targeted
+exactly one fresh item-only Integration Fidelity Reviewer remains part of the
+synthetic zero-call contract; the same Result Integration Agent may make one targeted
 repair and receive one targeted recheck.
+
+Semantic reuse remains a zero-call local contract: the owner checks `brief`,
+searches/selects exact accepted ontology and prepared IDs with a purpose, and
+the program records `work/semantic_selections.jsonl`; prepared rows load only
+after registry hash validation. Result Integration publishes only material
+reusable semantics and assets, never every result row or question-specific
+filter. Optional prepared-data `effective_period` remains valid when omitted and
+is propagated through descriptor/sidecar, operation hash, accepted integration,
+registry, and later reuse when present.
 
 Physical-source evidence is run-level and passive: the initial full bind and
 member hashes are counted once, child context loads reuse that binding, selected
@@ -38,6 +48,6 @@ and hash only; it never records raw data. The script runner's explicit default
 deadline.
 
 The candidate status after passing the vertical proofs and full offline suites
-is **v0.2.8 / core 0.3.5 — offline program validation complete for later Benchmark A**. This is not a production-hardened
+is **v0.7.1 / core 0.8.0 — offline program validation complete for later Benchmark A**. This is not a production-hardened
 host sandbox; true isolation requires a separate workspace/container or host
 allowlist.

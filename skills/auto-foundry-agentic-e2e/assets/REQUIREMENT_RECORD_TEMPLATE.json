@@ -1,19 +1,38 @@
 {
   "requirement_id": "R-...",
-  "original_text": "...",
+  "original_text": "Dashboard should show the ratio of milk fat content to the procurement price of the raw material for that milk.",
   "priority": {
     "value": null,
     "source": "user|unset",
-    "explicit": false
+    "explicit": false,
+    "tie_handling": ""
   },
   "objective": "...",
   "expected_outputs": {
     "analytical": [],
     "visual": []
   },
-  "internal_tasks": [],
-  "dependencies": [],
-  "foundation_dependencies": [],
+  "requirement_plan": {
+    "synthesis_intent": "One parent answer that addresses the requirement and its limits.",
+    "tasks": [
+      {
+        "task_id": "T-1",
+        "question": "Define the milk lot and fat measure, and map raw-material procurement cost.",
+        "objective": "Establish the semantic inputs for the ratio.",
+        "dependencies": [],
+        "expected_analytical_outputs": ["defined milk-fat measure", "mapped procurement price"],
+        "expected_visual_outputs": []
+      },
+      {
+        "task_id": "T-2",
+        "question": "Calculate and reconcile the ratio, then specify its visualization.",
+        "objective": "Produce the requested ratio with visible reconciliation and limits.",
+        "dependencies": ["T-1"],
+        "expected_analytical_outputs": ["ratio and reconciliation"],
+        "expected_visual_outputs": ["ratio visualization"]
+      }
+    ]
+  },
   "needs": {
     "data": [],
     "ontology": [],
@@ -27,48 +46,24 @@
   "review": {
     "review_status": "pending|available|unavailable",
     "review_strength": "pending|independent|same_family|none",
-    "verdict": null,
-    "repair_count": 0
+    "verdict": "accept|accept_with_limits|repair_once|confirm_data_insufficiency|not_reviewed",
+    "same_owner_business_repairs": 0,
+    "targeted_rechecks": 0
   },
-  "execution_contract": {
-    "bound_analysis_context_before_attempt": true,
-    "lead_analyst_attempt_owner": true,
-    "controlled_script_preflight_checks": ["compile", "dependency_check"],
-    "successful_runtime_receipt_phases": ["smoke", "full"],
-    "deterministic_comparison": "optional_second_full_receipt",
-    "script_timeout_seconds": 3600,
-    "failed_preflight_receipt_phase": "compile|dependency_check",
-    "code_error_route": "same_attempt_feedback",
-    "filesystem_no_progress_route": "await_runtime_or_materialization_guidance",
-    "execution_recovery_authority": "canonical_persisted_receipt_ref_and_hash_only",
-    "reviewer_scope_packet_recovery": "ItemWorkspace.discard_business_review_only_for_inadmissible_item_bound_reviewer_scope_incident; append_only_hash_bound_audit; atomic_packet_removal_preserves_work_and_draft; resets_pending_review_and_business_repair; requires_new_full_review; no_semantic_reinterpretation_or_compatibility_fallback",
-    "implementation_rebind_boundary": "public_BoundAnalysisContext.rebind_implementation_only; contiguous_old_new_skill_core_version_sha_tree_ledger; same_source_catalog_stat_inventory_identity; identity_only; durable_intent_append_only_audit_anchored_head_crash_recovery; journal_then_run_then_item_lock_order; no_active_attempt_review_terminal_or_accepted_state; discard_invalid_review_first; no_zip_reads_catalog_rebuild_inventory_counters_false_telemetry_new_analysis_or_raw_reads",
-    "catalog_inheritance_boundary": "public_BoundAnalysisContext.create_from_transitioned_catalog_only_for_later_or_multi_hop_items; immutable_source_inheritance_not_synthetic_transition; original_source_catalog_stat_inventory_reuse; recursive_upstream_provenance; inherited_journals_oldest_first_then_target_journal_then_run_then_lexical_source_target_item_locks; target_intent_manifest_record_state_crash_recovery; no_zip_reads_catalog_rebuild_inventory_counters_raw_reads_or_synthetic_target_transition_audit; earliest_affected_item_is_lower_bound",
-    "prepared_asset_boundary": "candidate_under_item_work_prepared_until_accepted_integration_commit",
-    "semantic_completeness_boundary": "live_integration_agent_semantic_completeness; mechanical_validation_then_one_item_only_integration_fidelity_reviewer_before_commit; same_result_integration_agent_targeted_repair_and_recheck"
-  },
-  "result_integration": {
-    "owner": "one_result_integration_agent",
-    "api_surfaces": [
-      "claims",
-      "metrics",
-      "limitations",
-      "evidence",
-      "prepared_assets",
-      "ontology",
-      "relationships",
-      "dashboard_facts"
-    ],
-    "deterministic_validation": ["types", "paths", "refs", "hashes", "stages", "commits"],
-    "fidelity_review": {
-      "reviewer": "one_item_only_integration_fidelity_reviewer",
-      "packet_scope": "current_item_only_no_siblings_or_cumulative_state",
-      "timing": "after_mechanical_validation_before_commit",
-      "after": "mechanical_validation",
-      "before": "commit",
-      "same_agent_targeted_repair": true,
-      "repair": "same_result_integration_agent_one_targeted_repair_and_recheck"
-    }
-  },
-  "outcome": null
+  "outcome": null,
+  "program_owned": {
+    "parent_item_only": true,
+    "analytical_owner": "one owner executes the plan and synthesizes the parent answer",
+    "analysis_owner_authority": {
+      "record": "work/analysis_owner.json",
+      "bound_by": "program host/router",
+      "owner_ref": "<host-bound stable owner_ref>",
+      "analytical_agents_emit_owner_ref": false,
+      "same_owner_scope": "requirement_plan, draft, both business repairs, and DataInsufficiencyConclusion"
+    },
+    "semantic_plan_before_analysis": true,
+    "internal_artifacts": "program-populated; analytical roles return prose, values, and semantic findings only",
+    "blocked_by_evidence_authority": "owner DataInsufficiencyConclusion plus reviewer confirm_data_insufficiency",
+    "repair_budget": "material business repairs may repeat; each receives a targeted recheck; code feedback and execution recovery are separate"
+  }
 }

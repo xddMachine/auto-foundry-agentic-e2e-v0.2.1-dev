@@ -28,7 +28,7 @@ import shutil
 import tempfile
 import threading
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from .contracts import IncidentRecord
 from .workspace import AllowedRootError, RunContext
@@ -43,11 +43,94 @@ _VALID_MODES = frozenset({"question", "requirement"})
 _STATE_FILENAME = "item_state.json"
 _PLAN_FILENAME = "plan.json"
 _SOURCE_MAP_FILENAME = "source_map.json"
+_SOURCE_MAP_FIELDS = frozenset(
+    {
+        "record_kind",
+        "source_id",
+        "purpose",
+        "path",
+        "content_hash",
+        "columns",
+        "row_count",
+        "row_count_exact",
+    }
+)
 _FINDINGS_FILENAME = "findings.jsonl"
+_EVIDENCE_FILENAME = "evidence.jsonl"
+_SPECIALIST_TASKS_FILENAME = "specialist_tasks.jsonl"
+_SPECIALIST_MEMOS_FILENAME = "specialist_memos.jsonl"
+_SEMANTIC_SELECTIONS_FILENAME = "semantic_selections.jsonl"
+_IDENTITY_DOMAIN_PROPOSALS_FILENAME = "identity_domain_proposals.jsonl"
+_ANALYTICAL_RELATIONSHIPS_FILENAME = "analytical_relationships.jsonl"
 _OPEN_ISSUES_FILENAME = "open_issues.json"
 _HANDOFF_FILENAME = "handoff.json"
+_HANDOFF_ARTIFACT_PATH = (Path("work") / _HANDOFF_FILENAME).as_posix()
+_ANALYST_HANDOFF_SCHEMA = "auto_foundry.analyst_handoff.v1"
+_ANALYST_HANDOFF_FIELDS = frozenset(
+    {
+        "analysis_output_summary",
+        "analysis_status",
+        "attempt_id",
+        "business_repair_count",
+        "calculation_outputs",
+        "calculation_script",
+        "evidence_refs",
+        "freeze_note",
+        "item_id",
+        "limits",
+        "output_hashes",
+        "owner_ref",
+        "receipt_hashes",
+        "repair_finding_id",
+        "requirement",
+        "review_status",
+        "schema_version",
+    }
+)
+_ANALYST_HANDOFF_RESERVED_REFS = frozenset(
+    {
+        "item_state.json",
+        "work/analysis_owner.json",
+        "work/business_review.json",
+        "work/data_insufficiency_conclusion.json",
+        _HANDOFF_ARTIFACT_PATH,
+    }
+)
 _DRAFT_FILENAME = "draft.json"
 _BUSINESS_REVIEW_FILENAME = "business_review.json"
+# ``draft.json`` is an AnalystAnswer envelope.  During an authorized business
+# repair the reviewer still owns the immutable metadata envelope (schema
+# version and item identity), while the analytical owner may revise any
+# answer-facing section.  These names are deliberately independent from the
+# review finding categories: categories describe reviewer evidence, not write
+# capabilities.
+_ANSWER_DRAFT_SECTIONS = frozenset(
+    {
+        "answer",
+        "headline_findings",
+        "scope",
+        "method",
+        "supported_components",
+        "unsupported_components",
+        "limitations",
+        "next_actions",
+        "visuals",
+        "evidence_refs",
+    }
+)
+_DRAFT_IMMUTABLE_FIELDS = frozenset({"schema_version", "item_id"})
+_DATA_INSUFFICIENCY_FILENAME = "data_insufficiency_conclusion.json"
+_ANALYSIS_OWNER_FILENAME = "analysis_owner.json"
+_PROGRAM_CONTEXT_ARTIFACT_PATHS = frozenset(
+    {
+        "work/analysis_context.json",
+        "work/analysis_context_transitions.jsonl",
+        "work/analysis_context_transition_state.json",
+        "work/analysis_context_transition_intent.json",
+        "work/analysis_context_repair_upgrades.jsonl",
+        "work/analysis_context_repair_upgrade_intent.json",
+    }
+)
 _BUSINESS_REVIEW_DISCARD_AUDIT_FILENAME = "business_review_discard_audit.jsonl"
 _BUSINESS_REVIEW_DISCARD_STATE_FILENAME = "business_review_discard_state.json"
 _ITEM_STATE_TRANSITION_LOCK_FILENAME = ".item_state_transition.lock"
@@ -95,6 +178,32 @@ _BUSINESS_REVIEW_DISCARD_INTENT_FIELDS = frozenset(
         "after_state",
         "phase",
         "intent_hash",
+    }
+)
+_DATA_INSUFFICIENCY_FIELDS = frozenset(
+    {
+        "record_kind",
+        "item_id",
+        "mode",
+        "original_text_hash",
+        "draft_hash",
+        "artifact_progress_hash",
+        "reason",
+        "unanswerable_component",
+        "missing_information",
+        "searches_performed",
+        "evidence_refs",
+        "supported_components",
+    }
+)
+_ANALYSIS_OWNER_FIELDS = frozenset(
+    {
+        "record_kind",
+        "item_id",
+        "mode",
+        "original_text_hash",
+        "owner_ref",
+        "owner_hash",
     }
 )
 _ACCEPTED_FILENAME = "accepted"
@@ -158,9 +267,72 @@ _ATTEMPT_FIELDS = (
     "recovery_receipt_hash",
 )
 _REVIEW_FIELDS = frozenset({"status", "strength", "verdict", "reviewer_ref", "draft_hash"})
-_REVIEW_VERDICTS = frozenset({"accept", "accept_with_limits", "repair_once", "block_specific_claims"})
+_REVIEW_VERDICTS = frozenset({"accept", "accept_with_limits", "repair_once", "confirm_data_insufficiency"})
+# Semantic categories are persisted with each finding and are the sole source
+# for its program-derived dependency/artifact scope.
+_REPAIR_CATEGORY_ORDER = (
+    "answer",
+    "calculation",
+    "evidence",
+    "method",
+    "source_completeness",
+    "presentation",
+)
+_REPAIR_EVIDENCE_BINDING_CATEGORIES = frozenset({"evidence", "source_completeness"})
+# A visual repair that combines calculation and presentation is allowed to
+# bind the evidence record produced by that recomputation.  This is narrower
+# than granting every calculation/presentation repair the whole evidence-ref
+# field, and leaves ordinary category scopes unchanged.
+_REPAIR_VISUAL_EVIDENCE_BINDING_CATEGORIES = frozenset({"calculation", "presentation"})
+_REPAIR_ANSWER_BINDING_CATEGORIES = frozenset({"answer", "presentation", "calculation"})
+_REPAIR_CATEGORY_DEPENDENCIES = MappingProxyType(
+    {
+        # The owner-produced reviewer packet is an exact answer dependency.
+        # It is deliberately not the authoritative ``business_review.json``
+        # packet and does not authorize the surrounding work/ directory.
+        "answer": ("work/business_review_packet.json",),
+        "calculation": (
+            "work/calculations",
+            "work/analysis.py",
+            "work/analysis.json",
+            "work/prepared",
+            "work/evidence.jsonl",
+            "work/.analysis-run",
+            "work/script_receipts",
+        ),
+        "evidence": ("work/evidence.jsonl", "work/source_map.json", "work/specialist_memos.jsonl"),
+        "method": (
+            "work/plan.json",
+            "work/calculations",
+            "work/analysis.py",
+            "work/analysis.json",
+            "work/prepared",
+            "work/evidence.jsonl",
+            "work/source_map.json",
+            "work/specialist_memos.jsonl",
+            "work/.analysis-run",
+            "work/script_receipts",
+        ),
+        "source_completeness": ("work/source_map.json", "work/evidence.jsonl", "work/specialist_memos.jsonl"),
+        "presentation": (),
+    }
+)
+_REPAIR_CATEGORY_ARTIFACT_PATHS = MappingProxyType(
+    {
+        "answer": ("work/results",),
+        "presentation": ("work/results",),
+        "calculation": ("work/results",),
+        "evidence": (),
+        "method": (),
+        "source_completeness": (),
+    }
+)
 _KNOWLEDGE_DELTAS = frozenset({"promoted", "promoted_with_limits", "no_change"})
-_LIFECYCLE_STATES = frozenset({"work", "recovering", "recovery_ready", "review", "accepted", "technical_failure"})
+_BLOCKED_REVIEW_OUTCOME = "blocked_by_evidence"
+_CONFIRM_DATA_VERDICT = "confirm_data_insufficiency"
+_LIFECYCLE_STATES = frozenset(
+    {"work", "recovering", "recovery_ready", "review", "accepted", "technical_failure", _BLOCKED_REVIEW_OUTCOME}
+)
 ITEM_STATE_SCHEMA = {
     "fields": ITEM_STATE_FIELDS,
     "attempt_fields": _ATTEMPT_FIELDS,
@@ -170,6 +342,7 @@ ITEM_STATE_SCHEMA = {
     "acceptance_envelope": "accepted/acceptance_envelope.json",
     "accepted_manifest": "accepted/manifest.json",
     "business_review_artifact": "work/business_review.json",
+    "data_insufficiency_artifact": "work/data_insufficiency_conclusion.json",
     "integration_fields": ("integration_state", "integration_manifest_hash", "integration_manifest_ref"),
     "terminal_intent_fields": ("outcome", "manifest_hash"),
 }
@@ -194,6 +367,39 @@ _TECHNICAL_MANIFEST_FIELDS = frozenset(
         "outcome",
         "reason",
         "recovery_exhausted",
+        "hashes",
+        "artifact_progress",
+        "refs",
+        "content_hash",
+        "manifest_hash",
+    }
+)
+_BLOCKED_MANIFEST_FIELDS = frozenset(
+    {
+        "item_id",
+        "outcome",
+        "reason",
+        "draft_path",
+        "draft_hash",
+        "source_draft_path",
+        "source_draft_hash",
+        "business_review_path",
+        "business_review_hash",
+        "source_business_review_path",
+        "source_business_review_hash",
+        "data_insufficiency_path",
+        "data_insufficiency_hash",
+        "source_data_insufficiency_path",
+        "source_data_insufficiency_hash",
+        "review_status",
+        "review_strength",
+        "review_verdict",
+        "reviewer_ref",
+        "review_scope",
+        "targeted_recheck",
+        "repair_active",
+        "reviewed_draft_hash",
+        "finding_count",
         "hashes",
         "artifact_progress",
         "refs",
@@ -281,6 +487,15 @@ def _simple_component(value: str, label: str) -> str:
     return component
 
 
+def _owner_ref_value(value: Any) -> str:
+    """Normalize one host-supplied Analytical Owner identity."""
+
+    owner_ref = str(value).strip()
+    if not owner_ref or "\x00" in owner_ref:
+        raise ValueError("owner_ref must be a non-empty stable identifier")
+    return owner_ref
+
+
 def _validate_mode(mode: str) -> str:
     value = str(mode).strip()
     if value not in _VALID_MODES:
@@ -309,6 +524,7 @@ def _json_bytes(value: Any) -> bytes:
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
+            allow_nan=False,
         )
         + "\n"
     ).encode("utf-8")
@@ -440,51 +656,6 @@ def _pointer_diff(before: Any, after: Any, path: str = "") -> list[str]:
             changes.extend(_pointer_diff(left, right, _pointer_join(path, index)))
         return changes or [path]
     return [path]
-
-
-def _pointer_is_within(path: str, allowed: str) -> bool:
-    """Check JSON-pointer scope, where an allowed parent covers descendants."""
-
-    if allowed in {"", "/", "*"}:
-        return True
-    return path == allowed or path.startswith(allowed.rstrip("/") + "/")
-
-
-def _artifact_scope_roots(packet: Mapping[str, Any]) -> tuple[str, ...]:
-    """Return exact/descendant artifact roots from the reviewed scope.
-
-    ``allowed_dependencies`` may carry a JSON-fragment reference (for
-    example ``work/result.json#/metrics``), but artifact authorization is
-    path-based.  Pointer scopes remain handled separately by
-    ``_pointer_is_within``; only non-pointer dependencies contribute roots.
-    """
-
-    roots: set[str] = set()
-    for raw in (
-        *tuple(packet.get("allowed_artifact_paths", ())),
-        *tuple(packet.get("allowed_dependencies", ())),
-    ):
-        normalized = str(raw).replace("\\", "/")
-        if normalized.startswith("/"):
-            continue
-        root = normalized.split("#", 1)[0]
-        while root.startswith("./"):
-            root = root[2:]
-        root = root.rstrip("/")
-        if not root:
-            continue
-        if "*" in root:
-            raise ValueError("business repair artifact scope cannot use wildcard")
-        roots.add(root)
-    return tuple(sorted(roots))
-
-
-def _artifact_is_within(path: str, root: str) -> bool:
-    """Check exact/descendant run-relative artifact scope."""
-
-    normalized_path = str(path).replace("\\", "/")
-    normalized_root = str(root).replace("\\", "/").rstrip("/")
-    return normalized_path == normalized_root or normalized_path.startswith(normalized_root + "/")
 
 
 _INVOCATION_RECEIPT_REF_PREFIX = "telemetry/invocation_receipts.jsonl#"
@@ -654,7 +825,7 @@ class ProgressDecision:
     changed_files: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.action not in {"continue", "materialize_now", "await_runtime"}:
+        if self.action not in {"continue", "materialize_now", "retry_same_attempt"}:
             raise ValueError("progress decision action is invalid")
         if not isinstance(self.progress, ArtifactProgress):
             raise TypeError("progress must be ArtifactProgress")
@@ -796,7 +967,7 @@ class ItemWorkspace:
             # A prior process may have been interrupted after state creation
             # but before work/ creation.  Re-establish the required workspace
             # directory without touching any user artifact.
-            if workspace.state.get("lifecycle_state") not in {"accepted", "technical_failure"}:
+            if workspace.state.get("lifecycle_state") not in {"accepted", "technical_failure", _BLOCKED_REVIEW_OUTCOME}:
                 workspace._ensure_work_root()
             workspace._emit("item_workspace_load", artifact="item_state.json")
             return workspace
@@ -894,9 +1065,14 @@ class ItemWorkspace:
         if not isinstance(manifest, dict):
             raise ValueError("accepted snapshot manifest must be an object")
         outcome = manifest.get("outcome")
-        if outcome not in {"accepted", "accepted_with_limits", "technical_failure"}:
+        if outcome not in {"accepted", "accepted_with_limits", "technical_failure", _BLOCKED_REVIEW_OUTCOME}:
             raise ValueError("accepted snapshot outcome is invalid")
-        expected_fields = _ACCEPTED_MANIFEST_FIELDS if outcome in {"accepted", "accepted_with_limits"} else _TECHNICAL_MANIFEST_FIELDS
+        if outcome in {"accepted", "accepted_with_limits"}:
+            expected_fields = _ACCEPTED_MANIFEST_FIELDS
+        elif outcome == _BLOCKED_REVIEW_OUTCOME:
+            expected_fields = _BLOCKED_MANIFEST_FIELDS
+        else:
+            expected_fields = _TECHNICAL_MANIFEST_FIELDS
         if set(manifest) != expected_fields:
             raise ValueError("accepted snapshot manifest fields are invalid")
         content_hash = manifest.get("content_hash")
@@ -934,6 +1110,147 @@ class ItemWorkspace:
         hashes = manifest.get("hashes")
         if not isinstance(hashes, Mapping) or dict(hashes) != dict(progress["hashes"]):
             raise ValueError("accepted snapshot hashes are inconsistent")
+
+    def _validate_blocked_manifest(self, manifest: Mapping[str, Any], files: set[str]) -> None:
+        """Validate an immutable owner-data-insufficiency terminal snapshot."""
+
+        if manifest.get("outcome") != _BLOCKED_REVIEW_OUTCOME:
+            raise ValueError("blocked snapshot outcome is invalid")
+        if manifest.get("reason") != "data_insufficiency":
+            raise ValueError("blocked snapshot reason is invalid")
+        expected_paths = {
+            "draft_path": "reviewed_draft.json",
+            "business_review_path": "business_review.json",
+            "data_insufficiency_path": _DATA_INSUFFICIENCY_FILENAME,
+            "source_draft_path": _DRAFT_FILENAME,
+            "source_business_review_path": f"work/{_BUSINESS_REVIEW_FILENAME}",
+            "source_data_insufficiency_path": f"work/{_DATA_INSUFFICIENCY_FILENAME}",
+        }
+        for field, expected in expected_paths.items():
+            if manifest.get(field) != expected:
+                raise ValueError(f"blocked snapshot {field} is invalid")
+        for field in (
+            "draft_hash",
+            "source_draft_hash",
+            "business_review_hash",
+            "source_business_review_hash",
+            "data_insufficiency_hash",
+            "source_data_insufficiency_hash",
+            "reviewed_draft_hash",
+        ):
+            if not _is_sha256(manifest.get(field)):
+                raise ValueError(f"blocked snapshot {field} is invalid")
+        if manifest.get("review_status") != "reviewed":
+            raise ValueError("blocked snapshot review_status is invalid")
+        if manifest.get("review_verdict") != _CONFIRM_DATA_VERDICT:
+            raise ValueError("blocked snapshot review_verdict is invalid")
+        if not isinstance(manifest.get("reviewer_ref"), str) or not manifest["reviewer_ref"].strip():
+            raise ValueError("blocked snapshot reviewer_ref is invalid")
+        state_review = self._state.get("review")
+        if not isinstance(state_review, Mapping):
+            raise ValueError("blocked snapshot review metadata is missing")
+        for manifest_field, review_field in (
+            ("review_status", "status"),
+            ("review_strength", "strength"),
+            ("review_verdict", "verdict"),
+            ("reviewer_ref", "reviewer_ref"),
+        ):
+            if manifest.get(manifest_field) != state_review.get(review_field):
+                raise ValueError("blocked snapshot review metadata is stale")
+        if manifest.get("review_scope") not in {"full", "targeted"}:
+            raise ValueError("blocked snapshot review_scope is invalid")
+        if manifest.get("repair_active") is not False:
+            raise ValueError("blocked snapshot review remains repair-active")
+        finding_count = manifest.get("finding_count")
+        if isinstance(finding_count, bool) or not isinstance(finding_count, int) or finding_count != 0:
+            raise ValueError("blocked snapshot finding_count is invalid")
+        refs = self._validate_manifest_refs(manifest.get("refs"), label="refs")
+        if refs != [
+            _DRAFT_FILENAME,
+            f"work/{_BUSINESS_REVIEW_FILENAME}",
+            f"work/{_DATA_INSUFFICIENCY_FILENAME}",
+        ]:
+            raise ValueError("blocked snapshot refs are invalid")
+        self._validate_manifest_artifacts(manifest)
+        if files != {
+            "manifest.json",
+            "reviewed_draft.json",
+            "business_review.json",
+            _DATA_INSUFFICIENCY_FILENAME,
+        }:
+            raise ValueError("blocked snapshot files are inconsistent")
+
+        draft_copy = self._resolve_item_subpath(Path(_ACCEPTED_FILENAME) / manifest["draft_path"])
+        review_copy = self._resolve_item_subpath(Path(_ACCEPTED_FILENAME) / manifest["business_review_path"])
+        conclusion_copy = self._resolve_item_subpath(Path(_ACCEPTED_FILENAME) / manifest["data_insufficiency_path"])
+        source_draft = self._resolve_item_subpath(manifest["source_draft_path"])
+        source_review = self._resolve_item_subpath(manifest["source_business_review_path"])
+        source_conclusion = self._resolve_item_subpath(manifest["source_data_insufficiency_path"])
+        for path, label in (
+            (draft_copy, "blocked reviewed draft"),
+            (review_copy, "blocked business review"),
+            (conclusion_copy, "blocked data insufficiency conclusion"),
+            (source_draft, "blocked source draft"),
+            (source_review, "blocked source business review"),
+            (source_conclusion, "blocked source data insufficiency conclusion"),
+        ):
+            _assert_regular_no_symlink(path, label=label)
+            if not path.is_file():
+                raise ValueError(f"{label} is missing")
+        draft_copy_bytes = draft_copy.read_bytes()
+        source_draft_bytes = source_draft.read_bytes()
+        review_copy_bytes = review_copy.read_bytes()
+        source_review_bytes = source_review.read_bytes()
+        conclusion_copy_bytes = conclusion_copy.read_bytes()
+        source_conclusion_bytes = source_conclusion.read_bytes()
+        if _sha256_bytes(draft_copy_bytes) != manifest["draft_hash"]:
+            raise ValueError("blocked reviewed draft hash does not match manifest")
+        if _sha256_bytes(source_draft_bytes) != manifest["source_draft_hash"]:
+            raise ValueError("blocked source draft hash does not match manifest")
+        if _sha256_bytes(review_copy_bytes) != manifest["business_review_hash"]:
+            raise ValueError("blocked business review hash does not match manifest")
+        if _sha256_bytes(source_review_bytes) != manifest["source_business_review_hash"]:
+            raise ValueError("blocked source business review hash does not match manifest")
+        if _sha256_bytes(conclusion_copy_bytes) != manifest["data_insufficiency_hash"]:
+            raise ValueError("blocked data insufficiency hash does not match manifest")
+        if _sha256_bytes(source_conclusion_bytes) != manifest["source_data_insufficiency_hash"]:
+            raise ValueError("blocked source data insufficiency hash does not match manifest")
+        if (
+            draft_copy_bytes != source_draft_bytes
+            or review_copy_bytes != source_review_bytes
+            or conclusion_copy_bytes != source_conclusion_bytes
+        ):
+            raise ValueError("blocked snapshot source and immutable copies differ")
+        if manifest["draft_hash"] != manifest["source_draft_hash"]:
+            raise ValueError("blocked snapshot draft hashes are inconsistent")
+        if manifest["content_hash"] != manifest["draft_hash"]:
+            raise ValueError("blocked snapshot content hash is not the reviewed draft hash")
+        if manifest["reviewed_draft_hash"] != manifest["source_draft_hash"]:
+            raise ValueError("blocked snapshot reviewed draft hash is inconsistent")
+        progress = manifest["artifact_progress"]
+        if progress["hashes"].get(_DRAFT_FILENAME) != manifest["source_draft_hash"]:
+            raise ValueError("blocked snapshot artifact progress is not bound to the draft")
+
+        try:
+            review_value = json.loads(review_copy_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("blocked business review copy is invalid") from exc
+        if not isinstance(review_value, Mapping):
+            raise ValueError("blocked business review copy is invalid")
+        self._validate_business_review_payload(review_value)
+        if review_value.get("reviewed_draft_hash") != manifest["source_draft_hash"]:
+            raise ValueError("blocked business review copy draft hash is stale")
+        if review_value.get("repair_active") is not False:
+            raise ValueError("blocked business review copy remains repair-active")
+        if review_value.get("findings") != []:
+            raise ValueError("blocked business review copy findings are invalid")
+        try:
+            conclusion_value = json.loads(conclusion_copy_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("blocked data insufficiency copy is invalid") from exc
+        self._validate_data_insufficiency_binding(conclusion_value, require_current=False)
+        if conclusion_value.get("draft_hash") != manifest["source_draft_hash"]:
+            raise ValueError("blocked data insufficiency conclusion draft is stale")
 
     def _validate_terminal_manifest(self, manifest: Mapping[str, Any], files: set[str]) -> None:
         if _manifest_hash(manifest) != manifest["manifest_hash"]:
@@ -973,6 +1290,9 @@ class ItemWorkspace:
                 content_hash=content_hash,
                 outcome=outcome,
             )
+            return
+        if outcome == _BLOCKED_REVIEW_OUTCOME:
+            self._validate_blocked_manifest(manifest, files)
             return
         if not isinstance(manifest["reason"], str) or not manifest["reason"]:
             raise ValueError("technical failure reason is invalid")
@@ -1079,6 +1399,19 @@ class ItemWorkspace:
             if review.get("draft_hash") != manifest.get("content_hash"):
                 raise ValueError("accepted snapshot review hash does not match content")
             return
+        if outcome == _BLOCKED_REVIEW_OUTCOME:
+            if lifecycle not in {"review", _BLOCKED_REVIEW_OUTCOME}:
+                raise ValueError("blocked snapshot requires a reviewed preterminal state")
+            review = self._state.get("review", {})
+            if review.get("status") != "reviewed" or review.get("verdict") != _CONFIRM_DATA_VERDICT:
+                raise ValueError("blocked snapshot requires reviewer confirmation of data insufficiency")
+            if review.get("draft_hash") != manifest.get("source_draft_hash"):
+                raise ValueError("blocked snapshot review hash does not match source draft")
+            conclusion = self._read_data_insufficiency_conclusion()
+            if conclusion is None:
+                raise ValueError("blocked snapshot requires owner data insufficiency conclusion")
+            self._validate_data_insufficiency_binding(conclusion, require_current=True)
+            return
         if lifecycle not in {"work", "review", "technical_failure"}:
             raise ValueError("technical failure snapshot requires a valid preterminal state")
 
@@ -1087,7 +1420,7 @@ class ItemWorkspace:
 
         accepted = self.accepted_root
         if not accepted.exists() and not accepted.is_symlink():
-            if self._state.get("lifecycle_state") in {"accepted", "technical_failure"}:
+            if self._state.get("lifecycle_state") in {"accepted", "technical_failure", _BLOCKED_REVIEW_OUTCOME}:
                 raise ValueError("terminal state has no accepted snapshot")
             if self._state.get("terminal_intent") is not None:
                 state = copy.deepcopy(self._state)
@@ -1097,7 +1430,7 @@ class ItemWorkspace:
         snapshot, manifest = self._read_valid_terminal_snapshot()
         self._validate_preterminal_binding(snapshot.outcome, manifest)
         lifecycle = self._state["lifecycle_state"]
-        if lifecycle in {"accepted", "technical_failure"}:
+        if lifecycle in {"accepted", "technical_failure", _BLOCKED_REVIEW_OUTCOME}:
             terminal = self._state.get("terminal_outcome")
             # Compare the terminal payload's business outcome independently
             # from the canonical lifecycle state.  In particular, limited
@@ -1118,7 +1451,7 @@ class ItemWorkspace:
         review = self._state.get("review")
         if not isinstance(review, Mapping) or review.get("status") == "pending":
             return
-        if self._state.get("lifecycle_state") in {"accepted", "technical_failure"}:
+        if self._state.get("lifecycle_state") in {"accepted", "technical_failure", _BLOCKED_REVIEW_OUTCOME}:
             return
         if self._state.get("terminal_intent") is not None and self.accepted_root.exists():
             # The intent binds the exact bytes selected before publication; a
@@ -1395,6 +1728,8 @@ class ItemWorkspace:
                 raise ValueError("item_state.json terminal_outcome values are invalid")
             if terminal["status"] != terminal["outcome"] or terminal["item_id"] != state["item_id"]:
                 raise ValueError("terminal_outcome identity is invalid")
+            if terminal["outcome"] not in {"accepted", "accepted_with_limits", "technical_failure", _BLOCKED_REVIEW_OUTCOME}:
+                raise ValueError("terminal_outcome outcome is invalid")
             if len(terminal["content_hash"]) != 64:
                 raise ValueError("terminal_outcome content_hash is invalid")
         return terminal
@@ -1406,7 +1741,7 @@ class ItemWorkspace:
             return None
         if not isinstance(intent, Mapping) or set(intent) != _TERMINAL_INTENT_FIELDS:
             raise ValueError("item_state.json terminal_intent is invalid")
-        if intent["outcome"] not in {"accepted", "accepted_with_limits", "technical_failure"}:
+        if intent["outcome"] not in {"accepted", "accepted_with_limits", "technical_failure", _BLOCKED_REVIEW_OUTCOME}:
             raise ValueError("item_state.json terminal_intent outcome is invalid")
         manifest_hash = intent["manifest_hash"]
         if not isinstance(manifest_hash, str) or len(manifest_hash) != 64 or any(char not in "0123456789abcdef" for char in manifest_hash):
@@ -1422,7 +1757,7 @@ class ItemWorkspace:
         review_status: str,
     ) -> None:
         lifecycle = state["lifecycle_state"]
-        if lifecycle in {"accepted", "technical_failure"}:
+        if lifecycle in {"accepted", "technical_failure", _BLOCKED_REVIEW_OUTCOME}:
             accepted_match = lifecycle == "accepted" and terminal is not None and terminal["outcome"] in {
                 "accepted",
                 "accepted_with_limits",
@@ -1441,8 +1776,8 @@ class ItemWorkspace:
             raise ValueError("non-terminal lifecycle cannot have terminal_outcome")
         if intent is not None and active is not None:
             raise ValueError("terminal intent cannot have an active attempt")
-        if intent is not None and lifecycle not in {"accepted", "technical_failure"}:
-            allowed_preterminal = {"review"} if intent["outcome"] in {"accepted", "accepted_with_limits"} else {"work", "review"}
+        if intent is not None and lifecycle not in {"accepted", "technical_failure", _BLOCKED_REVIEW_OUTCOME}:
+            allowed_preterminal = {"review"} if intent["outcome"] in {"accepted", "accepted_with_limits", _BLOCKED_REVIEW_OUTCOME} else {"work", "review"}
             if lifecycle not in allowed_preterminal:
                 raise ValueError("terminal intent lifecycle is invalid")
         if lifecycle == "review" and (active is not None or review_status not in {"reviewed", "unavailable"}):
@@ -1556,6 +1891,16 @@ class ItemWorkspace:
         candidate = copy.deepcopy(dict(state))
         if touch:
             candidate["updated_at"] = _now()
+        # A terminal directory is the durable publication authority.  A
+        # stale workspace that began a write before terminalization must not
+        # acquire the lock afterward and erase the terminal state with a
+        # non-terminal snapshot.
+        if (self.accepted_root.exists() or self.accepted_root.is_symlink()) and candidate.get("lifecycle_state") not in {
+            "accepted",
+            "technical_failure",
+            _BLOCKED_REVIEW_OUTCOME,
+        }:
+            raise ValueError("cannot persist non-terminal state after terminal snapshot publication")
         self._validate_state_shape(candidate)
         self._validate_recovery_authorizations(candidate)
         _atomic_write_json(self._resolve_item_subpath(_STATE_FILENAME), candidate)
@@ -1626,6 +1971,247 @@ class ItemWorkspace:
         if not draft.is_file():
             raise FileNotFoundError(draft)
         return _sha256_file(draft)
+
+    @property
+    def analysis_owner_path(self) -> Path:
+        """Program-owned binding for the Analytical Owner of this item."""
+
+        return self._resolve_item_subpath(Path("work") / _ANALYSIS_OWNER_FILENAME)
+
+    @staticmethod
+    def _validate_analysis_owner_payload(value: Any, *, item_id: str | None = None) -> dict[str, Any]:
+        if not isinstance(value, Mapping) or set(value) != _ANALYSIS_OWNER_FIELDS:
+            raise ValueError("analysis owner binding fields are invalid")
+        if value.get("record_kind") != "analysis_owner_binding":
+            raise ValueError("analysis owner binding kind is invalid")
+        if item_id is not None and value.get("item_id") != item_id:
+            raise ValueError("analysis owner binding item_id is invalid")
+        if value.get("mode") not in _VALID_MODES:
+            raise ValueError("analysis owner binding mode is invalid")
+        owner_ref = value.get("owner_ref")
+        if not isinstance(owner_ref, str) or not owner_ref.strip() or "\x00" in owner_ref:
+            raise ValueError("analysis owner binding owner_ref is invalid")
+        if not _is_sha256(value.get("original_text_hash")) or not _is_sha256(value.get("owner_hash")):
+            raise ValueError("analysis owner binding hash is invalid")
+        unsigned = {key: value[key] for key in _ANALYSIS_OWNER_FIELDS if key != "owner_hash"}
+        if _sha256_bytes(_json_bytes(unsigned)) != value["owner_hash"]:
+            raise ValueError("analysis owner binding hash is inconsistent")
+        return copy.deepcopy(dict(value))
+
+    def _read_analysis_owner(self) -> dict[str, Any] | None:
+        path = self.analysis_owner_path
+        if not path.exists() and not path.is_symlink():
+            return None
+        _assert_regular_no_symlink(path, label="analysis owner binding")
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("analysis owner binding is invalid") from exc
+        normalized = self._validate_analysis_owner_payload(value, item_id=self.item_id)
+        if normalized["mode"] != self.mode:
+            raise ValueError("analysis owner binding mode does not match workspace")
+        expected_original = _sha256_bytes(self.original_text.encode("utf-8"))
+        if normalized["original_text_hash"] != expected_original:
+            raise ValueError("analysis owner binding original text is stale")
+        return normalized
+
+    def _verify_analysis_owner_locked(self, owner_ref: Any, *, bind_if_missing: bool = False) -> str:
+        """Verify one stable logical owner, adopting it during facade binding."""
+
+        normalized_owner = _owner_ref_value(owner_ref)
+        existing = self._read_analysis_owner()
+        if existing is not None:
+            if existing["owner_ref"] == normalized_owner:
+                return normalized_owner
+            if bind_if_missing:
+                # A replacement process continues as the already-bound
+                # logical owner.  Rotating this durable identity would make
+                # append-only owner-authored evidence internally inconsistent.
+                return str(existing["owner_ref"])
+            raise ValueError("Analytical Owner does not match the bound item owner")
+        if not bind_if_missing:
+            raise ValueError("item has no bound Analytical Owner")
+        self._ensure_not_terminal()
+        unsigned = {
+            "record_kind": "analysis_owner_binding",
+            "item_id": self.item_id,
+            "mode": self.mode,
+            "original_text_hash": _sha256_bytes(self.original_text.encode("utf-8")),
+            "owner_ref": normalized_owner,
+        }
+        payload = {**unsigned, "owner_hash": _sha256_bytes(_json_bytes(unsigned))}
+        _atomic_write_json(self.analysis_owner_path, payload)
+        return normalized_owner
+
+    def bind_analysis_owner(self, owner_ref: Any) -> str:
+        """Bind or reload the one program-owned Analytical Owner identity."""
+
+        with self._state_transition_lock():
+            self._reload_authoritative_state_locked()
+            bound = self._verify_analysis_owner_locked(owner_ref, bind_if_missing=True)
+            self._ensure_execution_state()
+            self._reconcile_business_review_discard()
+            return bound
+
+    def analysis_owner_ref(self) -> str:
+        """Return the current program-owned Analytical Owner identity."""
+
+        with self._state_transition_lock():
+            self._reload_authoritative_state_locked()
+            existing = self._read_analysis_owner()
+            if existing is None:
+                raise ValueError("item has no bound Analytical Owner")
+            return str(existing["owner_ref"])
+
+    @property
+    def data_insufficiency_path(self) -> Path:
+        """Path for the owner-authored data-insufficiency conclusion."""
+
+        return self._resolve_item_subpath(Path("work") / _DATA_INSUFFICIENCY_FILENAME)
+
+    @staticmethod
+    def _validate_data_insufficiency_payload(value: Any, *, item_id: str | None = None) -> dict[str, Any]:
+        if not isinstance(value, Mapping) or set(value) != _DATA_INSUFFICIENCY_FIELDS:
+            raise ValueError("data insufficiency conclusion fields are invalid")
+        if value.get("record_kind") != "data_insufficiency_conclusion":
+            raise ValueError("data insufficiency conclusion kind is invalid")
+        if item_id is not None and value.get("item_id") != item_id:
+            raise ValueError("data insufficiency conclusion item_id is invalid")
+        if value.get("mode") not in _VALID_MODES:
+            raise ValueError("data insufficiency conclusion mode is invalid")
+        for field_name in ("original_text_hash", "draft_hash", "artifact_progress_hash"):
+            if not _is_sha256(value.get(field_name)):
+                raise ValueError(f"data insufficiency conclusion {field_name} is invalid")
+        for field_name in ("reason", "unanswerable_component"):
+            if not isinstance(value.get(field_name), str) or not value[field_name].strip():
+                raise ValueError(f"data insufficiency conclusion {field_name} must be non-empty")
+        for field_name in ("missing_information", "searches_performed", "evidence_refs"):
+            values = value.get(field_name)
+            if (
+                not isinstance(values, list)
+                or not values
+                or any(not isinstance(entry, str) or not entry.strip() for entry in values)
+                or len(values) != len(set(values))
+            ):
+                raise ValueError(f"data insufficiency conclusion {field_name} is invalid")
+        supported = value.get("supported_components")
+        if (
+            not isinstance(supported, list)
+            or any(not isinstance(entry, str) or not entry.strip() for entry in supported)
+            or len(supported) != len(set(supported))
+        ):
+            raise ValueError("data insufficiency conclusion supported_components is invalid")
+        return copy.deepcopy(dict(value))
+
+    def _read_data_insufficiency_conclusion(self) -> dict[str, Any] | None:
+        path = self.data_insufficiency_path
+        if not path.exists() and not path.is_symlink():
+            return None
+        _assert_regular_no_symlink(path, label="data insufficiency conclusion")
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("data insufficiency conclusion is invalid") from exc
+        return self._validate_data_insufficiency_payload(value, item_id=self.item_id)
+
+    def _validate_data_insufficiency_binding(
+        self,
+        value: Mapping[str, Any],
+        *,
+        require_current: bool = True,
+    ) -> dict[str, Any]:
+        normalized = self._validate_data_insufficiency_payload(value, item_id=self.item_id)
+        if normalized["mode"] != self.mode:
+            raise ValueError("data insufficiency conclusion mode does not match workspace")
+        expected_original = _sha256_bytes(self.original_text.encode("utf-8"))
+        if normalized["original_text_hash"] != expected_original:
+            raise ValueError("data insufficiency conclusion original text is stale")
+        if require_current:
+            draft_hash = self._draft_hash()
+            if normalized["draft_hash"] != draft_hash:
+                raise ValueError("data insufficiency conclusion draft is stale")
+            progress_hash = _sha256_bytes(_json_bytes(self.artifact_progress().to_dict()))
+            if normalized["artifact_progress_hash"] != progress_hash:
+                raise ValueError("data insufficiency conclusion artifact progress is stale")
+        return normalized
+
+    def record_data_insufficiency_conclusion(
+        self,
+        value: Mapping[str, Any],
+        *,
+        owner_ref: Any,
+    ) -> dict[str, Any]:
+        """Persist the analytical owner's explicit material data insufficiency.
+
+        The caller supplies semantic fields only.  Item identity, mode, draft
+        and artifact bindings are program-owned and are added while holding the
+        shared transition lock.  A second identical conclusion is idempotent;
+        a different conclusion is rejected without mutation.
+        """
+
+        if not isinstance(value, Mapping):
+            raise TypeError("data insufficiency conclusion must be a mapping")
+        semantic_fields = {
+            "reason",
+            "unanswerable_component",
+            "missing_information",
+            "searches_performed",
+            "evidence_refs",
+            "supported_components",
+        }
+        if set(value) != semantic_fields:
+            raise ValueError("data insufficiency conclusion semantic fields are invalid")
+        with self._state_transition_lock():
+            self._reload_authoritative_state_locked()
+            self._verify_analysis_owner_locked(owner_ref, bind_if_missing=True)
+            self._ensure_execution_state()
+            self._reconcile_business_review_discard()
+            self._ensure_not_terminal()
+            self._require_no_active_attempt()
+            draft_hash = self._draft_hash()
+            progress = self.artifact_progress()
+            payload = {
+                "record_kind": "data_insufficiency_conclusion",
+                "item_id": self.item_id,
+                "mode": self.mode,
+                "original_text_hash": _sha256_bytes(self.original_text.encode("utf-8")),
+                "draft_hash": draft_hash,
+                "artifact_progress_hash": _sha256_bytes(_json_bytes(progress.to_dict())),
+                **copy.deepcopy(dict(value)),
+            }
+            self._validate_data_insufficiency_payload(payload, item_id=self.item_id)
+            existing = self._read_data_insufficiency_conclusion()
+            if existing is not None:
+                if existing != payload:
+                    raise ValueError("data insufficiency conclusion is immutable")
+                return copy.deepcopy(existing)
+            destination = self.data_insufficiency_path
+            _assert_regular_no_symlink(destination, label="data insufficiency conclusion")
+            state_path = self._resolve_item_subpath(_STATE_FILENAME)
+            prior_state_bytes = state_path.read_bytes()
+            prior_state = copy.deepcopy(self._state)
+            try:
+                _atomic_write_json(destination, payload)
+                state = copy.deepcopy(self._state)
+                state["updated_at"] = _now()
+                self._persist_state_unlocked(state, touch=False)
+            except Exception as exc:
+                rollback_errors: list[Exception] = []
+                try:
+                    _atomic_write_bytes(state_path, prior_state_bytes)
+                    self._state = prior_state
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+                try:
+                    destination.unlink(missing_ok=True)
+                    _fsync_directory(destination.parent)
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+                if rollback_errors:
+                    raise RuntimeError("data insufficiency conclusion rollback failed") from exc
+                raise
+        self._emit("item_data_insufficiency_concluded", artifact=f"work/{_DATA_INSUFFICIENCY_FILENAME}")
+        return copy.deepcopy(payload)
 
     @property
     def business_review_path(self) -> Path:
@@ -2109,10 +2695,17 @@ class ItemWorkspace:
         return value
 
     @staticmethod
-    def _normalize_finding(value: Mapping[str, Any], index: int) -> dict[str, Any]:
+    def _normalize_finding(
+        value: Mapping[str, Any],
+        index: int,
+        *,
+        allow_legacy_scope_subset: bool = False,
+    ) -> dict[str, Any]:
         if not isinstance(value, Mapping):
             raise TypeError("business review findings must be mappings")
         raw = dict(value)
+        has_semantic_categories = "semantic_categories" in raw
+        semantic_categories = raw.pop("semantic_categories", None)
         finding_id = raw.pop("finding_id", raw.pop("id", None))
         message = raw.pop("message", raw.pop("finding", raw.pop("reason", "")))
         pointers = raw.pop("pointers", raw.pop("json_pointers", raw.pop("pointer", raw.pop("path", ()))))
@@ -2146,24 +2739,136 @@ class ItemWorkspace:
             "dependent_outputs": tuple(sorted(set(dependent_outputs))),
             "material": bool(raw.pop("material", True)),
         }
+        if has_semantic_categories:
+            if isinstance(semantic_categories, (str, bytes)):
+                raise TypeError("business finding semantic_categories must be a nonempty sequence")
+            try:
+                supplied_categories = tuple(str(category).strip() for category in semantic_categories)
+            except TypeError as exc:
+                raise TypeError("business finding semantic_categories must be a nonempty sequence") from exc
+            if not supplied_categories or any(not category for category in supplied_categories):
+                raise ValueError("business finding semantic_categories must be non-empty")
+            if len(supplied_categories) != len(set(supplied_categories)):
+                raise ValueError("business finding semantic_categories must not contain duplicates")
+            if any(category not in _REPAIR_CATEGORY_DEPENDENCIES for category in supplied_categories):
+                raise ValueError("business finding semantic category is invalid")
+            canonical_categories = tuple(
+                category for category in _REPAIR_CATEGORY_ORDER if category in supplied_categories
+            )
+            if canonical_categories != supplied_categories:
+                raise ValueError("business finding semantic_categories must use canonical order")
+            canonical["semantic_categories"] = canonical_categories
+            # Public core callers may provide typed categories without using
+            # the business facade.  Derive the same immutable scope here so
+            # category provenance cannot silently omit controlled outputs or
+            # canonical answer fields.  Explicit non-canonical scope is
+            # rejected rather than widened by the normalizer.
+            expected_dependencies = frozenset(
+                dependency
+                for category in canonical_categories
+                for dependency in _REPAIR_CATEGORY_DEPENDENCIES[category]
+            )
+            expected_artifacts = frozenset(
+                artifact_path
+                for category in canonical_categories
+                for artifact_path in _REPAIR_CATEGORY_ARTIFACT_PATHS[category]
+            )
+            supplied_dependencies = frozenset(
+                path for path in canonical["dependent_outputs"] if not path.startswith("/")
+            )
+            supplied_artifacts = frozenset(canonical["artifact_paths"])
+            if supplied_dependencies:
+                if allow_legacy_scope_subset:
+                    if not supplied_dependencies.issubset(expected_dependencies):
+                        raise ValueError("business review finding dependencies do not match semantic categories")
+                elif supplied_dependencies != expected_dependencies:
+                    raise ValueError("business review finding dependencies do not match semantic categories")
+            if supplied_artifacts:
+                if allow_legacy_scope_subset:
+                    if not supplied_artifacts.issubset(expected_artifacts):
+                        raise ValueError("business review finding artifacts do not match semantic categories")
+                elif supplied_artifacts != expected_artifacts:
+                    raise ValueError("business review finding artifacts do not match semantic categories")
+            if supplied_dependencies:
+                dependency_scope = (
+                    supplied_dependencies if allow_legacy_scope_subset else expected_dependencies
+                )
+                canonical["dependent_outputs"] = tuple(sorted(dependency_scope)) + tuple(
+                    path for path in canonical["dependent_outputs"] if path.startswith("/")
+                )
+            if supplied_artifacts:
+                artifact_scope = supplied_artifacts if allow_legacy_scope_subset else expected_artifacts
+                canonical["artifact_paths"] = tuple(sorted(artifact_scope))
+            answer_bound = bool(_REPAIR_ANSWER_BINDING_CATEGORIES.intersection(canonical_categories))
+            forbidden_answer_pointers = tuple(
+                pointer
+                for pointer in (*canonical["pointers"], *canonical["dependent_outputs"])
+                if pointer.startswith("/")
+                and (
+                    pointer in {"/scope", "/next_actions"}
+                    or pointer.startswith("/scope/")
+                    or pointer.startswith("/next_actions/")
+                )
+            )
+            if forbidden_answer_pointers and not answer_bound:
+                raise ValueError(
+                    "business review canonical answer pointers require answer, calculation, or presentation semantic categories"
+                )
         if not canonical["finding_id"]:
             seed = _json_bytes({key: value for key, value in canonical.items() if key != "finding_id"})
             canonical["finding_id"] = f"F-{_sha256_bytes(seed)[:12]}"
         return canonical
 
     @classmethod
-    def _normalize_findings(cls, findings: Any) -> list[dict[str, Any]]:
+    def _normalize_findings(
+        cls,
+        findings: Any,
+        *,
+        allow_legacy_scope_subset: bool = False,
+    ) -> list[dict[str, Any]]:
         if findings is None:
             return []
         if isinstance(findings, Mapping):
             findings = (findings,)
         if isinstance(findings, (str, bytes)):
             raise TypeError("business review findings must be mappings")
-        normalized = [cls._normalize_finding(value, index) for index, value in enumerate(findings)]
+        normalized = [
+            cls._normalize_finding(
+                value,
+                index,
+                allow_legacy_scope_subset=allow_legacy_scope_subset,
+            )
+            for index, value in enumerate(findings)
+        ]
         ids = [value["finding_id"] for value in normalized]
         if len(ids) != len(set(ids)):
             raise ValueError("business finding IDs must be unique")
         return normalized
+
+    @staticmethod
+    def _business_review_scope_union(
+        findings: Iterable[Mapping[str, Any]],
+    ) -> tuple[list[str], list[str], list[str]]:
+        """Derive packet aggregate scope from canonical finding rows."""
+
+        pointers = sorted(
+            {
+                path
+                for finding in findings
+                for path in (*finding.get("pointers", ()), *finding.get("dependent_outputs", ()))
+                if str(path).startswith("/") or path == ""
+            }
+        )
+        artifacts = sorted({path for finding in findings for path in finding.get("artifact_paths", ())})
+        dependencies = sorted(
+            {
+                path
+                for finding in findings
+                for path in finding.get("dependent_outputs", ())
+                if not str(path).startswith("/")
+            }
+        )
+        return pointers, artifacts, dependencies
 
     @staticmethod
     def _require_repair_findings(findings: list[dict[str, Any]]) -> None:
@@ -2179,7 +2884,223 @@ class ItemWorkspace:
             ):
                 raise ValueError("every repair finding must authorize an exact scope")
 
-    def _read_business_review(self) -> dict[str, Any] | None:
+    @classmethod
+    def _normalize_repair_category_sets(cls, semantic_categories: Any) -> tuple[tuple[str, ...], ...]:
+        """Validate typed semantic-category tuples supplied by the adapter."""
+
+        if isinstance(semantic_categories, (str, bytes)):
+            raise TypeError("active repair semantic categories must be tuples per finding")
+        try:
+            raw_findings = tuple(semantic_categories)
+        except TypeError as exc:
+            raise TypeError("active repair semantic categories must be tuples per finding") from exc
+        normalized: list[tuple[str, ...]] = []
+        for raw_categories in raw_findings:
+            if isinstance(raw_categories, (str, bytes)):
+                raise TypeError("active repair semantic categories must be tuples per finding")
+            try:
+                supplied = tuple(str(value).strip() for value in raw_categories)
+            except TypeError as exc:
+                raise TypeError("active repair semantic categories must be tuples per finding") from exc
+            if not supplied or any(not value for value in supplied):
+                raise ValueError("active repair semantic categories must be non-empty")
+            if len(supplied) != len(set(supplied)):
+                raise ValueError("active repair semantic categories must not contain duplicates")
+            if any(value not in _REPAIR_CATEGORY_DEPENDENCIES for value in supplied):
+                raise ValueError("active repair semantic category is invalid")
+            canonical = tuple(category for category in _REPAIR_CATEGORY_ORDER if category in supplied)
+            if canonical != supplied:
+                raise ValueError("active repair semantic categories must use canonical order")
+            normalized.append(canonical)
+        return tuple(normalized)
+
+    @classmethod
+    def _derived_repair_scope(cls, categories: tuple[str, ...]) -> tuple[frozenset[str], frozenset[str]]:
+        dependencies = frozenset(
+            dependency
+            for category in categories
+            for dependency in _REPAIR_CATEGORY_DEPENDENCIES[category]
+        )
+        artifacts = frozenset(
+            artifact_path
+            for category in categories
+            for artifact_path in _REPAIR_CATEGORY_ARTIFACT_PATHS[category]
+        )
+        return dependencies, artifacts
+
+    @staticmethod
+    def _repair_scope_is_superset(original: Mapping[str, Any], proposed: Mapping[str, Any]) -> bool:
+        """Return whether each proposed finding retains all prior scope."""
+
+        for field in ("pointers", "artifact_paths", "dependent_outputs"):
+            if not set(original.get(field, ())).issubset(set(proposed.get(field, ()) )):
+                return False
+        return True
+
+    def _reconcile_active_business_repair_scope(
+        self,
+        findings: Any,
+        *,
+        semantic_categories: tuple[tuple[str, ...], ...],
+        owner_ref: Any,
+    ) -> dict[str, Any]:
+        """Reconcile one active repair packet under the item transition lock."""
+
+        # Reload the authoritative state only after acquiring the same lock
+        # used by every state transition.  A caller may hold a stale
+        # ItemWorkspace instance while another instance starts an attempt;
+        # validating that stale in-memory state before the lock could allow a
+        # later commit to erase the attempt.
+        with self._state_transition_lock():
+            self._reload_authoritative_state_locked()
+            # Owner identity is an authorization boundary.  Verify it before
+            # any execution-state migration or discard/recovery reconciliation
+            # can touch durable bytes.
+            self._verify_analysis_owner_locked(owner_ref)
+            self._ensure_execution_state()
+            self._reconcile_business_review_discard()
+            return self._reconcile_active_business_repair_scope_locked(
+                findings,
+                semantic_categories=semantic_categories,
+            )
+
+    def _reconcile_active_business_repair_scope_locked(
+        self,
+        findings: Any,
+        *,
+        semantic_categories: tuple[tuple[str, ...], ...],
+    ) -> dict[str, Any]:
+        """Upgrade one active pre-fix repair packet to the current scope.
+
+        Only :class:`BusinessReviewAdapter` supplies ``semantic_categories``;
+        this private core operation is not a generic scope-extension escape
+        hatch.  It preserves the original review baseline and validates all
+        current changes against the exact category-derived scope before one
+        atomic commit.
+        """
+
+        self._ensure_not_terminal()
+        self._require_no_active_attempt()
+        state = self._state
+        review = state.get("review")
+        if state.get("lifecycle_state") != "work":
+            raise ValueError("active repair scope reconciliation requires lifecycle_state=work")
+        if not isinstance(review, Mapping) or review.get("status") != "pending" or review.get("verdict") is not None:
+            raise ValueError("active repair scope reconciliation requires a pending review")
+        if any(review.get(field) is not None for field in ("strength", "reviewer_ref", "draft_hash")):
+            raise ValueError("active repair scope reconciliation requires an untouched pending review")
+        if int(state.get("business_repair_count", -1)) < 1:
+            raise ValueError("active repair scope reconciliation requires a business repair")
+        if state.get("integration_state") != "pending":
+            raise ValueError("active repair scope reconciliation requires pending integration")
+        if state.get("terminal_outcome") is not None or state.get("terminal_intent") is not None:
+            raise ValueError("active repair scope reconciliation requires a non-terminal item")
+
+        # A packet produced before a program-owned dependency was added may
+        # be a valid active baseline with a strict subset of today's derived
+        # scope.  Read it under the reconciliation-only legacy validator; the
+        # proposed typed finding is still checked against the exact current
+        # category union below before any commit.  Keep the call itself
+        # argument-free so instrumentation/lock tests that wrap this read
+        # continue to observe the same boundary.
+        self._allow_legacy_business_review_scope = True
+        try:
+            packet = self._read_business_review()
+        finally:
+            self._allow_legacy_business_review_scope = False
+        if packet is None:
+            raise ValueError("active repair scope reconciliation requires an existing packet")
+        if packet.get("review_scope") != "full" or packet.get("repair_active") is not True:
+            raise ValueError("active repair scope reconciliation requires a full active repair packet")
+        if packet.get("targeted_recheck") is not False:
+            raise ValueError("active repair scope reconciliation requires a pre-recheck packet")
+
+        normalized = self._normalize_findings(findings)
+        categories_by_finding = self._normalize_repair_category_sets(semantic_categories)
+        if len(categories_by_finding) != len(normalized):
+            raise ValueError("active repair semantic categories must match finding count")
+        original = self._normalize_findings(
+            packet.get("findings"),
+            allow_legacy_scope_subset=True,
+        )
+        self._require_repair_findings(original)
+        if len(original) != len(normalized):
+            raise ValueError("active repair finding count cannot change")
+        for prior, proposed, categories in zip(original, normalized, categories_by_finding):
+            persisted_categories = prior.get("semantic_categories")
+            if persisted_categories is None:
+                raise ValueError("active repair packet lacks semantic category provenance")
+            if (
+                prior["finding_id"] != proposed["finding_id"]
+                or prior["message"] != proposed["message"]
+                or prior["material"] is not proposed["material"]
+            ):
+                raise ValueError("active repair finding identity, message, or material flag changed")
+            expected_dependencies, expected_artifacts = self._derived_repair_scope(categories)
+            proposed_dependencies = frozenset(proposed.get("dependent_outputs", ()))
+            proposed_artifacts = frozenset(proposed.get("artifact_paths", ()))
+            if proposed_dependencies != expected_dependencies:
+                raise ValueError("active repair scope does not match exact semantic category union")
+            if proposed_artifacts != expected_artifacts:
+                raise ValueError("active repair artifact scope does not match exact semantic category union")
+            prior_pointers = frozenset(prior.get("pointers", ()))
+            proposed_pointers = frozenset(proposed.get("pointers", ()))
+            prior_dependencies = frozenset(prior.get("dependent_outputs", ()))
+            prior_artifacts = frozenset(prior.get("artifact_paths", ()))
+            if tuple(categories) != tuple(persisted_categories):
+                raise ValueError("active repair semantic category set changed")
+            # A packet opened by an older program version may have captured a
+            # strict subset of the current category-derived scope.  Permit
+            # only the program-derived additive upgrade: every prior path
+            # must remain authorized, while the proposed finding must still
+            # equal the exact scope derived from its unchanged categories.
+            if not prior_dependencies.issubset(proposed_dependencies):
+                raise ValueError("active repair dependency scope removed")
+            if not prior_artifacts.issubset(proposed_artifacts):
+                raise ValueError("active repair artifact scope removed")
+            if proposed_pointers != prior_pointers:
+                raise ValueError("active repair pointer scope changed")
+
+        proposed_packet = copy.deepcopy(packet)
+        proposed_packet["findings"] = normalized
+        proposed_packet["allowed_pointers"] = sorted(
+            {
+                pointer
+                for finding in normalized
+                for pointer in (*finding["pointers"], *finding["dependent_outputs"])
+                if pointer.startswith("/") or pointer == ""
+            }
+        )
+        proposed_packet["allowed_artifact_paths"] = sorted(
+            {path for finding in normalized for path in finding["artifact_paths"]}
+        )
+        proposed_packet["allowed_dependencies"] = sorted(
+            {
+                path
+                for finding in normalized
+                for path in finding["dependent_outputs"]
+                if not path.startswith("/")
+            }
+        )
+        # Validate the packet and every current draft/artifact change against
+        # the proposed scope before touching the persisted baseline.  This
+        # intentionally does not recompute any before/after hash fields.
+        self._validate_business_review_payload(proposed_packet)
+        self._repair_scope_check(_packet=proposed_packet)
+        self._commit_business_review(proposed_packet, copy.deepcopy(dict(state)))
+        self._emit(
+            "item_business_repair_scope_reconciled",
+            review_scope=proposed_packet["review_scope"],
+            finding_count=len(proposed_packet["findings"]),
+            repair_active=proposed_packet["repair_active"],
+            repair_count=state["business_repair_count"],
+        )
+        return copy.deepcopy(proposed_packet)
+
+    def _read_business_review(self, *, allow_legacy_scope_subset: bool = False) -> dict[str, Any] | None:
+        allow_legacy_scope_subset = allow_legacy_scope_subset or bool(
+            getattr(self, "_allow_legacy_business_review_scope", False)
+        )
         path = self.business_review_path
         if not path.exists():
             return None
@@ -2190,10 +3111,46 @@ class ItemWorkspace:
             raise ValueError("business review artifact is invalid") from exc
         if not isinstance(value, dict):
             raise ValueError("business review artifact must be an object")
-        self._validate_business_review_payload(value)
+        self._validate_business_review_payload(
+            value,
+            allow_legacy_scope_subset=allow_legacy_scope_subset,
+        )
         return copy.deepcopy(value)
 
-    def _validate_business_review_payload(self, value: Mapping[str, Any]) -> None:
+    def _deactivate_active_business_repair(self) -> None:
+        """Mark an active repair packet historical before terminal failure.
+
+        Technical failure is a terminal item-local outcome, not a business
+        re-review.  A packet left with ``repair_active=true`` would advertise
+        authority that no longer exists and could make a later recovery/load
+        path attempt stale scope reconciliation.  Keep the packet bytes and
+        reviewer findings, but clear only the active flag.  Parsing is kept
+        deliberately shallow: a stale/corrupt historical packet must never
+        block terminalization of the item itself; the fixed item-local path is
+        still checked for symlink escapes.
+        """
+
+        path = self.business_review_path
+        if not path.exists() and not path.is_symlink():
+            return
+        _assert_regular_no_symlink(path, label="business review artifact")
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return
+        if not isinstance(raw, Mapping) or raw.get("repair_active") is not True:
+            return
+        packet = copy.deepcopy(dict(raw))
+        packet["repair_active"] = False
+        _atomic_write_json(path, packet)
+        self._emit("item_business_repair_deactivated", artifact=f"work/{_BUSINESS_REVIEW_FILENAME}")
+
+    def _validate_business_review_payload(
+        self,
+        value: Mapping[str, Any],
+        *,
+        allow_legacy_scope_subset: bool = False,
+    ) -> None:
         """Validate one complete review packet without mutating state."""
 
         required = {
@@ -2249,7 +3206,52 @@ class ItemWorkspace:
             raise ValueError("business review artifact before pointer hashes do not match snapshot")
         if not isinstance(value.get("findings"), list):
             raise ValueError("business review artifact findings are invalid")
-        self._normalize_findings(value["findings"])
+        normalized_findings = self._normalize_findings(
+            value["findings"],
+            allow_legacy_scope_subset=allow_legacy_scope_subset,
+        )
+        for finding in normalized_findings:
+            categories = finding.get("semantic_categories")
+            if categories is None:
+                raise ValueError("business review finding lacks semantic category provenance")
+            expected_dependencies, expected_artifacts = self._derived_repair_scope(tuple(categories))
+            actual_dependencies = frozenset(finding.get("dependent_outputs", ()))
+            if allow_legacy_scope_subset:
+                if not actual_dependencies.issubset(expected_dependencies):
+                    raise ValueError("business review finding dependencies do not match semantic categories")
+            elif actual_dependencies != expected_dependencies:
+                # Preserve the historical minimal packet accepted by direct
+                # durable callers: when no artifact/dependency scope was
+                # supplied, the typed category remains provenance-only and
+                # cannot authorize any work/ path.  BusinessReviewAdapter
+                # findings always carry their exact program-derived scope
+                # (including the answer-owned reviewer packet).
+                if actual_dependencies or finding.get("artifact_paths"):
+                    raise ValueError("business review finding dependencies do not match semantic categories")
+            actual_artifacts = frozenset(finding.get("artifact_paths", ()))
+            # Typed findings emitted by BusinessReviewAdapter carry the exact
+            # controlled result root.  Retain the core's historical minimal
+            # packet form when a direct durable caller supplied no artifact
+            # scope; it cannot authorize that root or any other artifact.
+            if allow_legacy_scope_subset:
+                if not actual_artifacts.issubset(expected_artifacts):
+                    raise ValueError("business review finding artifacts do not match semantic categories")
+            elif actual_artifacts and actual_artifacts != expected_artifacts:
+                raise ValueError("business review finding artifacts do not match semantic categories")
+            has_evidence_category = bool(_REPAIR_EVIDENCE_BINDING_CATEGORIES.intersection(categories))
+            has_visual_evidence_binding = (
+                "/visuals" in set(finding.get("pointers", ()))
+                and _REPAIR_VISUAL_EVIDENCE_BINDING_CATEGORIES.issubset(categories)
+            )
+            has_evidence_pointer = "/evidence_refs" in set(finding.get("pointers", ()))
+            if (has_evidence_category or has_visual_evidence_binding) != has_evidence_pointer:
+                raise ValueError("business review finding /evidence_refs pointer does not match semantic categories")
+            required_answer_pointers = {"/scope", "/next_actions"}
+            if actual_artifacts.intersection(expected_artifacts) and _REPAIR_ANSWER_BINDING_CATEGORIES.intersection(categories):
+                if not required_answer_pointers.issubset(set(finding.get("pointers", ()) )):
+                    raise ValueError(
+                        "business review finding answer pointers do not match semantic categories"
+                    )
         for name in (
             "allowed_pointers",
             "allowed_artifact_paths",
@@ -2265,6 +3267,22 @@ class ItemWorkspace:
             for path in value[name]
         ):
             raise ValueError("business review artifact cannot use wildcard scope")
+        if _PROGRAM_CONTEXT_ARTIFACT_PATHS.intersection(
+            str(path).replace("\\", "/")
+            for name in ("allowed_artifact_paths", "allowed_dependencies")
+            for path in value[name]
+        ):
+            raise ValueError("business review artifact cannot authorize program-owned context artifacts")
+        if normalized_findings:
+            expected_pointers, expected_artifacts, expected_dependencies = self._business_review_scope_union(
+                normalized_findings
+            )
+            if value["allowed_pointers"] != expected_pointers:
+                raise ValueError("business review artifact allowed_pointers do not match findings")
+            if value["allowed_artifact_paths"] != expected_artifacts:
+                raise ValueError("business review artifact allowed_artifact_paths do not match findings")
+            if value["allowed_dependencies"] != expected_dependencies:
+                raise ValueError("business review artifact allowed_dependencies do not match findings")
         if not isinstance(value.get("repair_active"), bool) or not isinstance(value.get("targeted_recheck"), bool):
             raise ValueError("business review artifact flags are invalid")
 
@@ -2332,41 +3350,1248 @@ class ItemWorkspace:
         payload = draft.read_bytes()
         return self._canonical_draft_value(payload), _sha256_bytes(payload)
 
-    def _repair_scope_check(self, *, candidate_payload: bytes | None = None, artifact_path: str | None = None) -> dict[str, Any] | None:
-        """Fail closed when a repair mutates outside the reviewed scope."""
+    def _validate_repair_handoff(
+        self,
+        packet: Mapping[str, Any],
+        *,
+        current_hashes: Mapping[str, str],
+    ) -> frozenset[str]:
+        """Validate one owner handoff that was produced by the current repair attempt.
 
-        packet = self._read_business_review()
+        ``write_handoff`` remains a general work-artifact writer for ordinary
+        execution and recovery.  A changed handoff is different while a
+        business repair is being reconciled: it may advance the repair only
+        when its typed analyst-handoff payload binds the current item owner,
+        completed latest attempt, repair finding, and every referenced output
+        or receipt to the bytes currently on disk.  This keeps the exception
+        narrow without turning ``work/handoff.json`` into a general repair
+        allowlist entry.
+        """
+
+        destination = self._resolve_item_subpath(_HANDOFF_ARTIFACT_PATH)
+        _assert_regular_no_symlink(destination, label="handoff artifact")
+        if not destination.is_file():
+            raise ValueError("active repair handoff artifact is missing")
+        raw = destination.read_bytes()
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("active repair handoff artifact is invalid") from exc
+        if not isinstance(value, Mapping):
+            raise ValueError("active repair handoff artifact must be an object")
+        if raw != _json_bytes(value):
+            raise ValueError("active repair handoff artifact is not canonical JSON")
+        if set(value) != _ANALYST_HANDOFF_FIELDS:
+            raise ValueError("active repair handoff artifact fields are invalid")
+
+        def required_text(field_name: str) -> str:
+            field_value = value.get(field_name)
+            if not isinstance(field_value, str) or not field_value.strip() or field_value != field_value.strip():
+                raise ValueError(f"active repair handoff {field_name} is invalid")
+            return field_value
+
+        if value.get("schema_version") != _ANALYST_HANDOFF_SCHEMA:
+            raise ValueError("active repair handoff schema_version is invalid")
+        if value.get("item_id") != self.item_id:
+            raise ValueError("active repair handoff item_id does not match workspace")
+        owner_binding = self._read_analysis_owner()
+        if owner_binding is None:
+            raise ValueError("active repair handoff requires a bound Analytical Owner")
+        if value.get("owner_ref") != owner_binding["owner_ref"]:
+            raise ValueError("active repair handoff owner_ref does not match item owner")
+        if value.get("requirement") != self.original_text:
+            raise ValueError("active repair handoff requirement is stale")
+        if value.get("analysis_status") != "completed":
+            raise ValueError("active repair handoff analysis_status is invalid")
+        if value.get("review_status") != "pending_targeted_business_recheck":
+            raise ValueError("active repair handoff review_status is invalid")
+        if not isinstance(value.get("analysis_output_summary"), Mapping):
+            raise ValueError("active repair handoff analysis_output_summary is invalid")
+        freeze_note = required_text("freeze_note")
+        if not freeze_note:
+            raise ValueError("active repair handoff freeze_note is invalid")
+
+        repair_count = value.get("business_repair_count")
+        if isinstance(repair_count, bool) or not isinstance(repair_count, int):
+            raise ValueError("active repair handoff business_repair_count is invalid")
+        if repair_count != int(self._state.get("business_repair_count", -1)):
+            raise ValueError("active repair handoff business_repair_count does not match item state")
+        if packet.get("repair_active") is not True or packet.get("targeted_recheck") is not False:
+            raise ValueError("active repair handoff requires the current full repair")
+        finding_ids = {
+            str(finding.get("finding_id"))
+            for finding in packet.get("findings", ())
+            if isinstance(finding, Mapping) and finding.get("finding_id")
+        }
+        if value.get("repair_finding_id") not in finding_ids:
+            raise ValueError("active repair handoff repair_finding_id is not in the active repair")
+
+        if self._state.get("active_attempt_id") is not None:
+            raise ValueError("active repair handoff requires a completed attempt")
+        attempts = self._state.get("attempts")
+        if not isinstance(attempts, list) or not attempts:
+            raise ValueError("active repair handoff attempt state is invalid")
+        attempt_id = required_text("attempt_id")
+        attempt = attempts[-1]
+        if not isinstance(attempt, Mapping) or attempt.get("attempt_id") != attempt_id:
+            raise ValueError("active repair handoff attempt_id is not the current attempt")
+        if attempt.get("lane_id") != owner_binding["owner_ref"]:
+            raise ValueError("active repair handoff attempt owner does not match item owner")
+        if attempt.get("role") != "Analytical Owner":
+            raise ValueError("active repair handoff attempt role is invalid")
+        if attempt.get("route") != "requirement":
+            raise ValueError("active repair handoff attempt route is invalid")
+        if attempt.get("status") != "completed":
+            raise ValueError("active repair handoff attempt is not completed")
+        baseline = attempt.get("baseline")
+        packet_after = packet.get("after_artifact_hashes")
+        baseline_hashes = baseline.get("hashes") if isinstance(baseline, Mapping) else None
+        packet_after_hashes = packet_after if isinstance(packet_after, Mapping) else None
+        handoff_finding = next(
+            (
+                finding
+                for finding in packet.get("findings", ())
+                if isinstance(finding, Mapping)
+                and finding.get("finding_id") == value.get("repair_finding_id")
+            ),
+            None,
+        )
+        if handoff_finding is None:
+            raise ValueError("active repair handoff repair finding scope is invalid")
+        handoff_scope_roots = tuple(
+            str(root).replace("\\", "/")
+            for name in ("artifact_paths", "dependent_outputs")
+            for root in handoff_finding.get(name, ())
+            if not str(root).startswith("/")
+        )
+
+        def packet_scope_allows(path: str) -> bool:
+            normalized = path.replace("\\", "/")
+            if normalized == _DRAFT_FILENAME:
+                return True
+            return any(
+                normalized == root or normalized.startswith(root.rstrip("/") + "/")
+                for root in handoff_scope_roots
+            )
+
+        def packet_after_matches_current(path: str) -> bool:
+            return (
+                path in packet_after_hashes
+                and packet_after_hashes.get(path) == current_hashes.get(path)
+            )
+
+        def current_work_file(
+            raw_ref: Any,
+            *,
+            field_name: str,
+            prefix: str | None = None,
+        ) -> tuple[str, Path]:
+            """Resolve a typed handoff reference to one current item-local file."""
+
+            if (
+                not isinstance(raw_ref, str)
+                or not raw_ref
+                or raw_ref != raw_ref.strip()
+                or "\\" in raw_ref
+                or "\x00" in raw_ref
+            ):
+                raise ValueError(f"active repair handoff {field_name} path is invalid")
+            pure = PurePath(raw_ref)
+            if (
+                pure.is_absolute()
+                or ".." in pure.parts
+                or pure.as_posix() != raw_ref
+                or not raw_ref.startswith("work/")
+            ):
+                raise ValueError(f"active repair handoff {field_name} path is invalid")
+            if field_name == "evidence_refs" and raw_ref in _ANALYST_HANDOFF_RESERVED_REFS:
+                raise ValueError(f"active repair handoff {field_name} path is invalid")
+            if prefix is not None and not raw_ref.startswith(prefix):
+                raise ValueError(f"active repair handoff {field_name} path is invalid")
+            path = self._resolve_item_subpath(raw_ref)
+            _assert_regular_no_symlink(path, label=f"active repair handoff {field_name}")
+            if not path.is_file():
+                raise ValueError(f"active repair handoff {field_name} path is missing")
+            if raw_ref not in current_hashes:
+                raise ValueError(
+                    f"active repair handoff {field_name} path is outside current artifact progress"
+                )
+            return raw_ref, path
+
+        def validate_handoff_execution_refs() -> frozenset[str]:
+            """Validate every current handoff-declared execution reference.
+
+            This runs before repair-baseline reconciliation so these exact,
+            hash-bound references can provide a narrowly typed execution
+            provenance closure.  The finding scope still gates which of them
+            may explain progress drift below.
+            """
+
+            script_ref, _ = current_work_file(
+                value.get("calculation_script"),
+                field_name="calculation_script",
+                prefix="work/calculations/",
+            )
+            outputs = value.get("calculation_outputs")
+            if (
+                not isinstance(outputs, list)
+                or not outputs
+                or any(not isinstance(output, str) for output in outputs)
+                or len(outputs) != len(set(outputs))
+            ):
+                raise ValueError("active repair handoff calculation_outputs are invalid")
+            output_paths = {
+                current_work_file(output, field_name="calculation_outputs", prefix="work/results/")[0]: output
+                for output in outputs
+            }
+            if len(output_paths) != len(outputs):
+                raise ValueError("active repair handoff calculation_outputs are invalid")
+
+            evidence_refs = value.get("evidence_refs")
+            if (
+                not isinstance(evidence_refs, list)
+                or not evidence_refs
+                or any(not isinstance(ref, str) for ref in evidence_refs)
+                or len(evidence_refs) != len(set(evidence_refs))
+            ):
+                raise ValueError("active repair handoff evidence_refs are invalid")
+            evidence_paths = {
+                current_work_file(ref, field_name="evidence_refs")[0]: ref
+                for ref in evidence_refs
+            }
+            if not set(output_paths).issubset(evidence_paths):
+                raise ValueError("active repair handoff evidence_refs do not cover calculation outputs")
+
+            output_hashes = value.get("output_hashes")
+            if not isinstance(output_hashes, Mapping):
+                raise ValueError("active repair handoff output_hashes are invalid")
+            expected_output_refs = {script_ref, *output_paths}
+            if set(output_hashes) != expected_output_refs:
+                raise ValueError("active repair handoff output_hashes are incomplete")
+            for ref, expected_hash in output_hashes.items():
+                if not _is_sha256(expected_hash):
+                    raise ValueError("active repair handoff output_hashes are invalid")
+                _ref, path = current_work_file(ref, field_name="output_hashes")
+                actual_hash = _sha256_file(path)
+                if actual_hash != expected_hash or current_hashes.get(ref) != expected_hash:
+                    raise ValueError(f"active repair handoff output hash is stale: {ref}")
+
+            receipt_refs = {
+                ref for ref in evidence_paths if ref.startswith("work/script_receipts/")
+            }
+            receipt_hashes = value.get("receipt_hashes")
+            if (
+                not isinstance(receipt_hashes, Mapping)
+                or set(receipt_hashes) != receipt_refs
+                or not receipt_refs
+            ):
+                raise ValueError("active repair handoff receipt_hashes are incomplete")
+            for ref, expected_hash in receipt_hashes.items():
+                if not _is_sha256(expected_hash):
+                    raise ValueError("active repair handoff receipt_hashes are invalid")
+                receipt_path = PurePath(ref)
+                if (
+                    receipt_path.parent.as_posix() != "work/script_receipts"
+                    or not receipt_path.name.startswith("receipt-")
+                    or not receipt_path.name.endswith(".json")
+                ):
+                    raise ValueError("active repair handoff receipt path is invalid")
+                _ref, path = current_work_file(
+                    ref,
+                    field_name="receipt_hashes",
+                    prefix="work/script_receipts/",
+                )
+                actual_hash = _sha256_file(path)
+                if actual_hash != expected_hash or current_hashes.get(ref) != expected_hash:
+                    raise ValueError(f"active repair handoff receipt hash is stale: {ref}")
+
+            limits = value.get("limits")
+            if (
+                not isinstance(limits, list)
+                or any(not isinstance(limit, str) or not limit.strip() for limit in limits)
+                or len(limits) != len(set(limits))
+            ):
+                raise ValueError("active repair handoff limits are invalid")
+            # Only references covered by a declared byte hash can authorize a
+            # newly-produced artifact at the repair boundary.  Evidence refs
+            # without an accompanying hash remain subject to the review packet's
+            # existing allowed paths, preventing the handoff from becoming a
+            # generic item-local allowlist.
+            return frozenset({script_ref, *output_paths, *receipt_refs})
+
+        handoff_execution_refs = validate_handoff_execution_refs()
+
+        def baseline_omission_matches_current(path: str) -> bool:
+            """Allow an unchanged authorized file omitted by a stale packet map."""
+
+            return (
+                path not in program_paths
+                and path in current_hashes
+                and current_hashes.get(path) == baseline_hashes.get(path)
+                and (
+                    handoff_baseline_matches_current(str(path))
+                    or (
+                        is_execution_history_path(str(path))
+                        and (
+                            handoff_execution_history_matches(str(path))
+                            or prior_execution_history_matches(str(path))
+                        )
+                    )
+                    or (
+                        not is_execution_history_path(str(path))
+                        and packet_scope_allows(str(path))
+                    )
+                )
+            )
+
+        program_paths = set(_PROGRAM_CONTEXT_ARTIFACT_PATHS)
+        repair_upgrade_paths = {
+            "work/analysis_context.json",
+            "work/analysis_context_repair_upgrades.jsonl",
+        }
+        unsupported_program_paths = program_paths - repair_upgrade_paths
+        existing_program_paths = {
+            path
+            for path in program_paths
+            if (
+                self._resolve_item_subpath(path).exists()
+                or self._resolve_item_subpath(path).is_symlink()
+            )
+        }
+        current_program_paths = set(current_hashes) & program_paths
+        if current_program_paths != existing_program_paths:
+            raise ValueError("active repair handoff program context current paths are invalid")
+        if existing_program_paths & unsupported_program_paths:
+            raise ValueError("active repair handoff program context has unauthorized artifacts")
+
+        # A finding that explicitly authorizes ``work/results`` may rely on
+        # the exact execution references declared by this typed handoff when
+        # those references explain a packet/baseline drift.  The output files
+        # themselves still have to be under that finding's declared roots;
+        # script and receipt paths are admitted only through this fixed,
+        # hash-bound handoff schema.
+        handoff_scope_allows_execution = packet_scope_allows("work/results")
+
+        def handoff_ref_matches_current(path: str) -> bool:
+            return (
+                handoff_scope_allows_execution
+                and path in handoff_execution_refs
+                and (
+                    not path.startswith("work/results/")
+                    or packet_scope_allows(path)
+                )
+            )
+
+        def is_execution_history_path(path: str) -> bool:
+            """Recognize the fixed direct receipt/log families only."""
+
+            pure = PurePath(path)
+            return pure.parent.as_posix() == "work/script_receipts" or (
+                pure.parent.as_posix() == "work/.analysis-run"
+                and pure.name.startswith("receipt-")
+            )
+
+        receipt_fields = frozenset(
+            {
+                "receipt_id",
+                "phase",
+                "script_path",
+                "script_hash",
+                "context_path",
+                "context_hash",
+                "source_hash",
+                "started_at",
+                "finished_at",
+                "wall_seconds",
+                "exit_code",
+                "stdout",
+                "stderr",
+                "stdout_truncated",
+                "stderr_truncated",
+                "timed_out",
+                "output_limited",
+                "error_type",
+                "error_category",
+                "traceback",
+                "output_hashes",
+                "receipt_path",
+            }
+        )
+        receipt_phases = frozenset({"compile", "dependency", "dependency_check", "smoke", "full"})
+        packet_before_for_receipts = packet.get("before_artifact_hashes")
+        packet_after_for_receipts = packet_after_hashes if isinstance(packet_after_hashes, Mapping) else {}
+        program_context_rebased_for_receipts = any(
+            isinstance(mapping, Mapping)
+            and (
+                mapping.get("work/analysis_context.json")
+                != packet_after_for_receipts.get("work/analysis_context.json")
+                or mapping.get("work/analysis_context_repair_upgrades.jsonl")
+                != packet_after_for_receipts.get("work/analysis_context_repair_upgrades.jsonl")
+            )
+            for mapping in (baseline_hashes, packet_before_for_receipts)
+        )
+
+        def item_relative_absolute(raw_path: Any, *, label: str) -> tuple[str, Path]:
+            if not isinstance(raw_path, str) or not raw_path or "\x00" in raw_path:
+                raise ValueError(f"active repair handoff {label} is invalid")
+            absolute = Path(raw_path)
+            if not absolute.is_absolute():
+                raise ValueError(f"active repair handoff {label} is invalid")
+            try:
+                relative = absolute.relative_to(self.item_root)
+            except ValueError as exc:
+                raise ValueError(f"active repair handoff {label} escapes item") from exc
+            normalized = relative.as_posix()
+            if (
+                not normalized.startswith("work/")
+                or ".." in relative.parts
+                or str(self._resolve_item_subpath(relative)) != str(absolute)
+            ):
+                raise ValueError(f"active repair handoff {label} is invalid")
+            path = self._resolve_item_subpath(relative)
+            _assert_regular_no_symlink(path, label=f"active repair handoff {label}")
+            return normalized, path
+
+        def current_manifest_identity() -> tuple[str, str]:
+            manifest_ref = "work/analysis_context.json"
+            manifest = self._resolve_item_subpath(manifest_ref)
+            _assert_regular_no_symlink(manifest, label="analysis context manifest")
+            if not manifest.is_file():
+                raise ValueError("active repair handoff analysis context manifest is missing")
+            try:
+                manifest_bytes = manifest.read_bytes()
+                manifest_value = json.loads(manifest_bytes.decode("utf-8"))
+                from .analysis import (
+                    _json_bytes as _analysis_json_bytes,
+                    _manifest_bytes as _analysis_manifest_bytes,
+                )
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ImportError) as exc:
+                raise ValueError("active repair handoff analysis context manifest is invalid") from exc
+            if (
+                not isinstance(manifest_value, Mapping)
+                or manifest_bytes != _analysis_manifest_bytes(manifest_value)
+                or not _is_sha256(manifest_value.get("manifest_hash"))
+                or manifest_value.get("manifest_hash")
+                != _sha256_bytes(
+                    _analysis_json_bytes(
+                        {key: item for key, item in manifest_value.items() if key != "manifest_hash"}
+                    )
+                )
+            ):
+                raise ValueError("active repair handoff analysis context manifest is invalid")
+            source_identity = manifest_value.get("source_identity")
+            source_hash = source_identity.get("content_hash") if isinstance(source_identity, Mapping) else None
+            if not _is_sha256(source_hash):
+                raise ValueError("active repair handoff analysis context source identity is invalid")
+            return str(manifest_value["manifest_hash"]), str(source_hash)
+
+        def validate_script_receipt(
+            receipt_ref: str,
+            *,
+            expected_script_hash: str | None,
+        ) -> tuple[str, frozenset[str]]:
+            """Validate one canonical ScriptExecutionReceipt and its outputs."""
+
+            pure = PurePath(receipt_ref)
+            if (
+                pure.parent.as_posix() != "work/script_receipts"
+                or not pure.name.startswith("receipt-")
+                or not pure.name.endswith(".json")
+                or receipt_ref not in current_hashes
+            ):
+                raise ValueError("active repair handoff receipt path is invalid")
+            receipt_path = self._resolve_item_subpath(receipt_ref)
+            _assert_regular_no_symlink(receipt_path, label="active repair handoff receipt")
+            try:
+                receipt_bytes = receipt_path.read_bytes()
+                receipt_value = json.loads(receipt_bytes.decode("utf-8"))
+                from .analysis import _json_file_bytes as _analysis_json_file_bytes
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ImportError) as exc:
+                raise ValueError("active repair handoff receipt is invalid") from exc
+            if (
+                not isinstance(receipt_value, Mapping)
+                or set(receipt_value) != receipt_fields
+                or receipt_bytes != _analysis_json_file_bytes(receipt_value)
+            ):
+                raise ValueError("active repair handoff receipt is not canonical")
+            receipt_id = receipt_value.get("receipt_id")
+            if not isinstance(receipt_id, str) or receipt_id != pure.stem:
+                raise ValueError("active repair handoff receipt identity is invalid")
+            phase = receipt_value.get("phase")
+            if phase not in receipt_phases:
+                raise ValueError("active repair handoff receipt phase is invalid")
+
+            script_ref, script_path = item_relative_absolute(
+                receipt_value.get("script_path"),
+                label="receipt script_path",
+            )
+            if not script_ref.startswith("work/calculations/"):
+                raise ValueError("active repair handoff receipt script_path is invalid")
+            script_hash = receipt_value.get("script_hash")
+            if not _is_sha256(script_hash):
+                raise ValueError("active repair handoff receipt script_hash is invalid")
+            if expected_script_hash is not None and script_hash != expected_script_hash:
+                raise ValueError("active repair handoff receipt script identity is stale")
+            if not script_path.is_file() or _sha256_file(script_path) != script_hash:
+                raise ValueError("active repair handoff receipt script hash is stale")
+
+            context_path = self._resolve_item_subpath("work/analysis_context.json")
+            if receipt_value.get("context_path") != str(context_path):
+                raise ValueError("active repair handoff receipt context_path is invalid")
+            context_hash, source_hash = current_manifest_identity()
+            receipt_context_hash = receipt_value.get("context_hash")
+            if not _is_sha256(receipt_context_hash):
+                raise ValueError("active repair handoff receipt context hash is invalid")
+            if receipt_context_hash != context_hash:
+                # A public implementation upgrade legitimately rebases the
+                # current context after an attempt's receipts were written.
+                # Accept that historical context only when an unchanged,
+                # canonical receipt already present in the immutable attempt
+                # baseline carries the same identity; a caller cannot invent
+                # a new context hash through the handoff itself.
+                known_context_hashes = {context_hash}
+                if isinstance(baseline_hashes, Mapping):
+                    for candidate_ref, candidate_hash in baseline_hashes.items():
+                        candidate_pure = PurePath(str(candidate_ref))
+                        if (
+                            candidate_pure.parent.as_posix() != "work/script_receipts"
+                            or not candidate_pure.name.startswith("receipt-")
+                            or not candidate_pure.name.endswith(".json")
+                            or current_hashes.get(candidate_ref) != candidate_hash
+                        ):
+                            continue
+                        candidate_path = self._resolve_item_subpath(str(candidate_ref))
+                        _assert_regular_no_symlink(candidate_path, label="active repair handoff receipt")
+                        try:
+                            candidate_value = json.loads(candidate_path.read_text(encoding="utf-8"))
+                        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                            continue
+                        if (
+                            isinstance(candidate_value, Mapping)
+                            and candidate_value.get("context_path") == str(context_path)
+                            and _is_sha256(candidate_value.get("context_hash"))
+                        ):
+                            known_context_hashes.add(str(candidate_value["context_hash"]))
+                if (
+                    receipt_context_hash not in known_context_hashes
+                    and not program_context_rebased_for_receipts
+                ):
+                    raise ValueError("active repair handoff receipt context hash is stale")
+            if receipt_value.get("source_hash") != source_hash:
+                raise ValueError("active repair handoff receipt source hash is stale")
+
+            for field_name in ("started_at", "finished_at"):
+                field_value = receipt_value.get(field_name)
+                if not isinstance(field_value, str) or not field_value.strip():
+                    raise ValueError(f"active repair handoff receipt {field_name} is invalid")
+            wall_seconds = receipt_value.get("wall_seconds")
+            if isinstance(wall_seconds, bool) or not isinstance(wall_seconds, (int, float)) or wall_seconds < 0:
+                raise ValueError("active repair handoff receipt wall_seconds is invalid")
+            exit_code = receipt_value.get("exit_code")
+            if exit_code is not None and (isinstance(exit_code, bool) or not isinstance(exit_code, int)):
+                raise ValueError("active repair handoff receipt exit_code is invalid")
+            for field_name in ("stdout", "stderr"):
+                if not isinstance(receipt_value.get(field_name), str):
+                    raise ValueError(f"active repair handoff receipt {field_name} is invalid")
+            for field_name in (
+                "stdout_truncated",
+                "stderr_truncated",
+                "timed_out",
+                "output_limited",
+            ):
+                if not isinstance(receipt_value.get(field_name), bool):
+                    raise ValueError(f"active repair handoff receipt {field_name} is invalid")
+            for field_name in ("error_type", "error_category", "traceback"):
+                field_value = receipt_value.get(field_name)
+                if field_value is not None and not isinstance(field_value, str):
+                    raise ValueError(f"active repair handoff receipt {field_name} is invalid")
+
+            output_hashes = receipt_value.get("output_hashes")
+            if not isinstance(output_hashes, Mapping):
+                raise ValueError("active repair handoff receipt output_hashes are invalid")
+            output_refs: set[str] = set()
+            for raw_output_path, expected_hash in output_hashes.items():
+                output_ref, output_path = item_relative_absolute(
+                    raw_output_path,
+                    label="receipt output path",
+                )
+                if not (
+                    output_ref.startswith("work/.analysis-run/")
+                    or output_ref.startswith("work/results/")
+                ):
+                    raise ValueError("active repair handoff receipt output path is invalid")
+                if not _is_sha256(expected_hash):
+                    raise ValueError("active repair handoff receipt output hash is invalid")
+                if output_path.is_file():
+                    if _sha256_file(output_path) != expected_hash:
+                        raise ValueError("active repair handoff receipt output hash is stale")
+                    if output_ref not in current_hashes or current_hashes.get(output_ref) != expected_hash:
+                        raise ValueError("active repair handoff receipt output is outside current progress")
+                output_refs.add(output_ref)
+
+            receipt_path_value = receipt_value.get("receipt_path")
+            if receipt_path_value != str(receipt_path):
+                raise ValueError("active repair handoff receipt_path is invalid")
+            return script_ref, frozenset(output_refs)
+
+        declared_script_ref = value.get("calculation_script")
+        declared_output_hashes = value.get("output_hashes")
+        declared_script_hash = (
+            declared_output_hashes.get(declared_script_ref)
+            if isinstance(declared_output_hashes, Mapping)
+            and isinstance(declared_script_ref, str)
+            else None
+        )
+        validated_handoff_execution_history_refs = set(handoff_execution_refs)
+        for receipt_ref in sorted(
+            ref for ref in handoff_execution_refs if ref.startswith("work/script_receipts/")
+        ):
+            receipt_script_ref, _outputs = validate_script_receipt(
+                receipt_ref,
+                expected_script_hash=declared_script_hash,
+            )
+            if receipt_script_ref != declared_script_ref:
+                raise ValueError("active repair handoff receipt script does not match handoff")
+            receipt_id = PurePath(receipt_ref).stem
+            for suffix in (".stdout", ".stderr"):
+                sibling_ref = f"work/.analysis-run/{receipt_id}{suffix}"
+                if sibling_ref not in current_hashes:
+                    continue
+                sibling_path = self._resolve_item_subpath(sibling_ref)
+                _assert_regular_no_symlink(sibling_path, label="active repair handoff receipt output")
+                if not sibling_path.is_file():
+                    raise ValueError("active repair handoff receipt output is missing")
+                validated_handoff_execution_history_refs.add(sibling_ref)
+
+        def handoff_execution_history_matches(path: str) -> bool:
+            """Bind a receipt's exact stdout/stderr siblings to its handoff ref."""
+
+            if handoff_ref_matches_current(path):
+                return True
+            pure = PurePath(path)
+            if pure.parent.as_posix() != "work/.analysis-run" or pure.suffix not in {".stdout", ".stderr"}:
+                return False
+            receipt_ref = f"work/script_receipts/{pure.stem}.json"
+            if receipt_ref not in handoff_execution_refs:
+                return False
+            try:
+                receipt_script_ref, _outputs = validate_script_receipt(
+                    receipt_ref,
+                    expected_script_hash=declared_script_hash,
+                )
+            except ValueError:
+                return False
+            return receipt_script_ref == declared_script_ref
+
+        validated_prior_execution_history_refs: set[str] = set()
+
+        def handoff_baseline_matches_current(path: str) -> bool:
+            """Allow a declared A5 execution ref whose packet hash is stale.
+
+            A completed attempt snapshots its calculation script/results before
+            the public repair boundary.  A handoff may then be written from
+            those same bytes while an older packet map still carries a prior
+            execution's hashes.  Only the exact typed handoff ref (or its
+            validated receipt log sibling) may bridge that common-path drift,
+            and only when the latest attempt baseline and current bytes are
+            byte-identical.  This is deliberately separate from the prior
+            failed-attempt closure: an undeclared or changed path cannot use
+            the exception merely because it lives under ``work/results``.
+            """
+
+            return (
+                path in baseline_hashes
+                and path in current_hashes
+                and current_hashes.get(path) == baseline_hashes.get(path)
+                and handoff_execution_history_matches(path)
+            )
+
+        def prior_execution_history_matches(path: str) -> bool:
+            """Authorize only unchanged receipt/log families from the prior terminal attempt."""
+
+            if not isinstance(baseline_hashes, Mapping) or path not in baseline_hashes:
+                return False
+            if path not in current_hashes:
+                return False
+            if current_hashes.get(path) != baseline_hashes.get(path):
+                return False
+            pure = PurePath(path)
+            if pure.parent.as_posix() == "work/script_receipts" and pure.name.startswith("receipt-") and pure.name.endswith(".json"):
+                receipt_ref = path
+                receipt_id = pure.stem
+            elif pure.parent.as_posix() == "work/.analysis-run" and pure.name.startswith("receipt-") and pure.suffix in {".stdout", ".stderr"}:
+                receipt_id = pure.stem
+                receipt_ref = f"work/script_receipts/{receipt_id}.json"
+            else:
+                return False
+            sibling_refs = {
+                receipt_ref,
+                f"work/.analysis-run/{receipt_id}.stdout",
+                f"work/.analysis-run/{receipt_id}.stderr",
+            }
+            if any(
+                sibling not in baseline_hashes
+                or sibling not in current_hashes
+                or current_hashes.get(sibling) != baseline_hashes.get(sibling)
+                or (
+                    sibling in packet_after_hashes
+                    and packet_after_hashes.get(sibling) != current_hashes.get(sibling)
+                )
+                for sibling in sibling_refs
+            ):
+                return False
+            if not isinstance(attempts, list) or len(attempts) < 2:
+                return False
+            prior_attempt = attempts[-2]
+            if not isinstance(prior_attempt, Mapping):
+                return False
+            if (
+                prior_attempt.get("status") not in {"failed", "completed"}
+                or prior_attempt.get("lane_id") != owner_binding["owner_ref"]
+                or prior_attempt.get("role") != "Analytical Owner"
+                or prior_attempt.get("route") != "requirement"
+                or not isinstance(prior_attempt.get("attempt_id"), str)
+                or prior_attempt.get("attempt_id") == attempt_id
+            ):
+                return False
+            prior_baseline = prior_attempt.get("baseline")
+            prior_hashes = prior_baseline.get("hashes") if isinstance(prior_baseline, Mapping) else None
+            if not isinstance(prior_hashes, Mapping) or any(sibling in prior_hashes for sibling in sibling_refs):
+                return False
+            script_ref = value.get("calculation_script")
+            expected_script_hash = (
+                baseline_hashes.get(script_ref)
+                if isinstance(script_ref, str)
+                else None
+            )
+            try:
+                receipt_script_ref, _outputs = validate_script_receipt(
+                    receipt_ref,
+                    expected_script_hash=expected_script_hash,
+                )
+            except ValueError:
+                return False
+            if receipt_script_ref != script_ref:
+                return False
+            validated_prior_execution_history_refs.update(sibling_refs)
+            return True
+
+        packet_before_candidate = packet.get("before_artifact_hashes")
+        for mapping in (baseline_hashes, packet_before_candidate, packet_after_hashes):
+            if isinstance(mapping, Mapping) and set(mapping) & unsupported_program_paths:
+                raise ValueError("active repair handoff program context packet paths are invalid")
+
+        def validate_rebased_program_context(
+            baseline_hashes: Mapping[str, str],
+            packet_before_hashes: Mapping[str, str],
+            packet_after_hashes: Mapping[str, str],
+            current_hashes: Mapping[str, str],
+        ) -> None:
+            """Authenticate only the exact program-context rebase contract."""
+
+            # ``_rebase_active_repair_context_artifacts`` is deliberately
+            # narrower than the complete program-context path set: a public
+            # repair implementation upgrade changes the manifest and creates
+            # (or appends) its owner/audit journal, but it does not create an
+            # inheritance transition journal, transition state/intent, or an
+            # upgrade intent.  Do not let a forged packet map turn those paths
+            # into an authorization channel.
+            if current_program_paths != existing_program_paths:
+                raise ValueError("active repair handoff program context current paths are invalid")
+            if existing_program_paths != repair_upgrade_paths:
+                raise ValueError("active repair handoff program context has unauthorized artifacts")
+
+            baseline_program_paths = set(baseline_hashes) & program_paths
+            packet_before_program_paths = set(packet_before_hashes) & program_paths
+            packet_after_program_paths = set(packet_after_hashes) & program_paths
+            if baseline_program_paths - repair_upgrade_paths:
+                raise ValueError("active repair handoff program context baseline paths are invalid")
+            if packet_before_program_paths - repair_upgrade_paths:
+                raise ValueError("active repair handoff program context before paths are invalid")
+            if packet_after_program_paths - repair_upgrade_paths:
+                raise ValueError("active repair handoff program context after paths are invalid")
+            if packet_after_program_paths != repair_upgrade_paths:
+                raise ValueError("active repair handoff program context rebase paths are incomplete")
+            if packet_before_program_paths != repair_upgrade_paths:
+                raise ValueError("active repair handoff program context before paths are incomplete")
+            if baseline_program_paths - packet_after_program_paths:
+                raise ValueError("active repair handoff program context rebase removed artifacts")
+            added_program_paths = packet_after_program_paths - baseline_program_paths
+            changed_program_paths = {
+                path
+                for path in baseline_program_paths & packet_after_program_paths
+                if baseline_hashes[path] != packet_after_hashes[path]
+            }
+            if "work/analysis_context.json" not in changed_program_paths:
+                raise ValueError("active repair handoff program context manifest was not upgraded")
+            if not (
+                {"work/analysis_context_repair_upgrades.jsonl"}.issubset(
+                    added_program_paths | changed_program_paths
+                )
+            ):
+                raise ValueError("active repair handoff program context upgrade audit was not published")
+
+            nonprogram_added_paths = (set(packet_after_hashes) - set(packet_before_hashes)) - program_paths
+            if any(
+                not (
+                    handoff_execution_history_matches(str(path))
+                    or prior_execution_history_matches(str(path))
+                    or (
+                        not is_execution_history_path(str(path))
+                        and packet_scope_allows(str(path))
+                    )
+                )
+                or not packet_after_matches_current(str(path))
+                for path in nonprogram_added_paths
+            ):
+                raise ValueError("active repair handoff program context rebase is invalid")
+            if (set(current_hashes) - set(packet_after_hashes)) & program_paths:
+                raise ValueError("active repair handoff program context rebase is stale")
+            for path in program_paths:
+                before = packet_before_hashes.get(path)
+                after = packet_after_hashes.get(path)
+                current = current_hashes.get(path)
+                if after is None:
+                    if before is not None or current is not None:
+                        raise ValueError("active repair handoff program context rebase is incomplete")
+                    continue
+                if before is not None and before != after:
+                    raise ValueError("active repair handoff program context rebase baseline is stale")
+                if current != after:
+                    raise ValueError("active repair handoff program context rebase hash is stale")
+            intent_paths = {
+                path for path in program_paths if path.endswith("_intent.json")
+            }
+            for path in intent_paths:
+                intent = self._resolve_item_subpath(path)
+                if intent.exists() or intent.is_symlink():
+                    raise ValueError("active repair handoff program context rebase has intent residue")
+            manifest_ref = "work/analysis_context.json"
+            manifest = self._resolve_item_subpath(manifest_ref)
+            _assert_regular_no_symlink(manifest, label="analysis context manifest")
+            if not manifest.is_file() or packet_after_hashes.get(manifest_ref) != current_hashes.get(manifest_ref):
+                raise ValueError("active repair handoff program context manifest is stale")
+            try:
+                manifest_bytes = manifest.read_bytes()
+                manifest_value = json.loads(manifest_bytes.decode("utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("active repair handoff program context manifest is invalid") from exc
+            if not isinstance(manifest_value, Mapping):
+                raise ValueError("active repair handoff program context manifest is not canonical")
+            unsigned_manifest = dict(manifest_value)
+            manifest_hash = unsigned_manifest.pop("manifest_hash", None)
+            try:
+                from .analysis import (
+                    _json_bytes as _analysis_json_bytes,
+                    _manifest_bytes,
+                    _validate_implementation_identity,
+                    _validate_repair_upgrade_manifest_binding,
+                )
+            except ImportError as exc:
+                raise ValueError("active repair handoff program context validator is unavailable") from exc
+            if manifest_hash != _sha256_bytes(_analysis_json_bytes(unsigned_manifest)):
+                raise ValueError("active repair handoff program context manifest hash is stale")
+            try:
+                if manifest_bytes != _manifest_bytes(manifest_value):
+                    raise ValueError("manifest is not canonical")
+                records = _validate_repair_upgrade_manifest_binding(
+                    manifest,
+                    manifest_value,
+                    run_id=self.context.run_id,
+                    item_id=self.item_id,
+                )
+                if not records:
+                    raise ValueError("manifest does not bind a repair-upgrade audit")
+            except ValueError as exc:
+                raise ValueError("active repair handoff program context audit is invalid") from exc
+
+            # The analysis module owns the implementation identity algorithm.
+            # Keep this repair-boundary exception fail-closed when the source
+            # has changed again: a packet/audit pair must be bound to the
+            # implementation currently executing this validator, not merely
+            # to a self-consistent identity chosen by its writer.
+            for field_name, expected in (
+                ("run_id", self.context.run_id),
+                ("run_root", str(self.context.run_root)),
+                ("item_id", self.item_id),
+                ("item_mode", self.mode),
+                ("core_version", self.context.core_version),
+                ("skill_version", self.context.skill_version),
+            ):
+                if manifest_value.get(field_name) != expected:
+                    raise ValueError(
+                        "active repair handoff program context manifest identity is not current"
+                    )
+            try:
+                current_pair = _validate_implementation_identity(
+                    self.context,
+                    manifest_value,
+                    require_current=True,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "active repair handoff program context manifest identity is not current"
+                ) from exc
+
+            audit_ref = "work/analysis_context_repair_upgrades.jsonl"
+            audit_path = self._resolve_item_subpath(audit_ref)
+            _assert_regular_no_symlink(audit_path, label="analysis context repair-upgrade audit")
+            if not audit_path.is_file():
+                raise ValueError("active repair handoff program context audit is missing")
+            try:
+                audit_bytes = audit_path.read_bytes()
+            except OSError as exc:
+                raise ValueError("active repair handoff program context audit is unreadable") from exc
+            expected_audit_bytes = b"".join(
+                _analysis_json_bytes(record) + b"\n" for record in records
+            )
+            if audit_bytes != expected_audit_bytes:
+                raise ValueError("active repair handoff program context audit is not canonical")
+
+            # ``_validate_repair_upgrade_manifest_binding`` authenticates each
+            # row and the manifest's count/head pointer.  It intentionally
+            # cannot know the business attempt's immutable baseline or owner,
+            # so bind those facts here before allowing the program-context
+            # rebase to cross the repair boundary.
+            for record in records:
+                if (
+                    record.get("run_id") != self.context.run_id
+                    or record.get("item_id") != self.item_id
+                    or record.get("owner_ref") != owner_binding["owner_ref"]
+                ):
+                    raise ValueError(
+                        "active repair handoff program context audit owner or item binding is invalid"
+                    )
+            latest = records[-1]
+            if (
+                latest.get("run_id") != self.context.run_id
+                or latest.get("item_id") != self.item_id
+                or latest.get("owner_ref") != owner_binding["owner_ref"]
+                or manifest_value.get("item_mode") != self.mode
+                or (latest.get("new_sha"), latest.get("new_tree")) != current_pair
+            ):
+                raise ValueError(
+                    "active repair handoff program context audit latest binding is invalid"
+                )
+
+            baseline_manifest_hash = baseline_hashes.get(manifest_ref)
+            if not _is_sha256(baseline_manifest_hash):
+                raise ValueError(
+                    "active repair handoff program context baseline manifest anchor is invalid"
+                )
+            baseline_audit_hash = baseline_hashes.get(audit_ref)
+            if baseline_audit_hash is not None and not _is_sha256(baseline_audit_hash):
+                raise ValueError(
+                    "active repair handoff program context baseline audit anchor is invalid"
+                )
+
+            # Locate the immutable attempt's audit prefix by its byte hash.  A
+            # missing baseline journal means A-003 began before the first
+            # public implementation upgrade; an existing journal may be a
+            # prefix from an earlier completed upgrade and is still part of
+            # the chain root, never a free-form writer capability.
+            audit_prefix_count: int | None = None
+            if baseline_audit_hash is None:
+                audit_prefix_count = 0
+            else:
+                for count in range(len(records) + 1):
+                    prefix = b"".join(
+                        _analysis_json_bytes(record) + b"\n"
+                        for record in records[:count]
+                    )
+                    if _sha256_bytes(prefix) == baseline_audit_hash:
+                        audit_prefix_count = count
+                        break
+                if audit_prefix_count is None:
+                    raise ValueError(
+                        "active repair handoff program context audit prefix is not rooted"
+                    )
+            if audit_prefix_count >= len(records):
+                raise ValueError(
+                    "active repair handoff program context audit prefix has no current upgrade"
+                )
+
+            def manifest_for_state(
+                implementation_sha: str,
+                implementation_tree: str,
+                audit_count: int,
+                audit_head: str | None,
+            ) -> tuple[dict[str, Any], bytes]:
+                candidate_unsigned = dict(manifest_value)
+                candidate_unsigned.pop("manifest_hash", None)
+                candidate_unsigned["implementation_sha"] = implementation_sha
+                candidate_unsigned["implementation_tree"] = implementation_tree
+                if audit_count:
+                    if audit_head is None:
+                        raise ValueError(
+                            "active repair handoff program context audit binding is incomplete"
+                        )
+                    candidate_unsigned["active_repair_implementation_upgrade"] = {
+                        "path": audit_ref,
+                        "audit_count": audit_count,
+                        "audit_head": audit_head,
+                    }
+                else:
+                    candidate_unsigned.pop("active_repair_implementation_upgrade", None)
+                candidate_manifest_hash = _sha256_bytes(_analysis_json_bytes(candidate_unsigned))
+                candidate_manifest = {
+                    **candidate_unsigned,
+                    "manifest_hash": candidate_manifest_hash,
+                }
+                return candidate_manifest, _manifest_bytes(candidate_manifest)
+
+            # Reconstruct every manifest transition from the immutable static
+            # context fields and the append-only audit rows.  This proves the
+            # first appended row starts at the attempt baseline, each row's
+            # old identity is exactly the previous new identity, and every
+            # before-manifest hash is the canonical bytes published by the
+            # preceding state.  The final reconstructed bytes must be the
+            # manifest currently on disk, so a self-consistent forged audit
+            # plus rewritten manifest cannot authorize the rebase.
+            prior_manifest: dict[str, Any] | None = None
+            prior_manifest_bytes: bytes | None = None
+            for index, record in enumerate(records):
+                if index == 0:
+                    prior_manifest, prior_manifest_bytes = manifest_for_state(
+                        record["old_sha"],
+                        record["old_tree"],
+                        0,
+                        None,
+                    )
+                else:
+                    previous = records[index - 1]
+                    if (
+                        record["old_sha"] != previous["new_sha"]
+                        or record["old_tree"] != previous["new_tree"]
+                    ):
+                        raise ValueError(
+                            "active repair handoff program context audit implementation chain is broken"
+                        )
+                    prior_manifest, prior_manifest_bytes = manifest_for_state(
+                        previous["new_sha"],
+                        previous["new_tree"],
+                        index,
+                        previous["record_hash"],
+                    )
+                if prior_manifest_bytes is None or _sha256_bytes(prior_manifest_bytes) != record["before_manifest_hash"]:
+                    raise ValueError(
+                        "active repair handoff program context audit manifest chain is broken"
+                    )
+                if index == audit_prefix_count and record["before_manifest_hash"] != baseline_manifest_hash:
+                    raise ValueError(
+                        "active repair handoff program context audit baseline root is invalid"
+                    )
+                _next_manifest, next_manifest_bytes = manifest_for_state(
+                    record["new_sha"],
+                    record["new_tree"],
+                    index + 1,
+                    record["record_hash"],
+                )
+                if index + 1 == len(records):
+                    if next_manifest_bytes != manifest_bytes:
+                        raise ValueError(
+                            "active repair handoff program context audit manifest continuity is invalid"
+                        )
+                elif _sha256_bytes(next_manifest_bytes) != records[index + 1]["before_manifest_hash"]:
+                    raise ValueError(
+                        "active repair handoff program context audit manifest continuity is invalid"
+                    )
+
+        if (
+            not isinstance(baseline, Mapping)
+            or not isinstance(baseline_hashes, Mapping)
+            or not isinstance(packet_after_hashes, Mapping)
+        ):
+            raise ValueError("active repair handoff attempt is not bound to the repair baseline")
+
+        current_only_paths = set(current_hashes) - (set(baseline_hashes) | set(packet_after_hashes))
+        if any(
+            handoff_scope_allows_execution
+            and
+            is_execution_history_path(str(path))
+            and not handoff_execution_history_matches(str(path))
+            for path in current_only_paths
+        ):
+            raise ValueError("active repair handoff execution history is outside its bound family")
+
+        baseline_only_paths = set(baseline_hashes) - set(packet_after_hashes)
+        after_only_paths = set(packet_after_hashes) - set(baseline_hashes)
+        common_changed_paths = {
+            path
+            for path in set(baseline_hashes) & set(packet_after_hashes)
+            if path != _HANDOFF_ARTIFACT_PATH
+            and baseline_hashes[path] != packet_after_hashes[path]
+        }
+        # An exact retry may have reconciled the prior family into
+        # ``after_artifact_hashes`` on the first public replacement.  Re-run
+        # the same prior-attempt provenance check for unchanged common receipt
+        # paths so the outer scope receives that exact family again; no path
+        # absent from the immutable current-attempt baseline can enter here.
+        for path in set(baseline_hashes) & set(packet_after_hashes):
+            if is_execution_history_path(str(path)):
+                prior_execution_history_matches(str(path))
+        if (
+            baseline_only_paths & program_paths
+            or any(
+                not baseline_omission_matches_current(str(path))
+                for path in baseline_only_paths
+            )
+            or any(
+                path not in program_paths
+                and (
+                    not (
+                        handoff_execution_history_matches(str(path))
+                        or (
+                            not is_execution_history_path(str(path))
+                            and packet_scope_allows(str(path))
+                        )
+                    )
+                    or not packet_after_matches_current(str(path))
+                )
+                for path in after_only_paths
+            )
+            or any(
+                path not in program_paths
+                and (
+                    not (
+                        handoff_baseline_matches_current(str(path))
+                        or (
+                            (
+                                handoff_execution_history_matches(str(path))
+                                or (
+                                    not is_execution_history_path(str(path))
+                                    and packet_scope_allows(str(path))
+                                )
+                            )
+                            and packet_after_matches_current(str(path))
+                        )
+                    )
+                )
+                for path in common_changed_paths
+            )
+        ):
+            raise ValueError("active repair handoff attempt is not bound to the repair baseline")
+        if isinstance(baseline_hashes, Mapping) and isinstance(packet_after_hashes, Mapping):
+            packet_before_hashes = packet.get("before_artifact_hashes")
+            packet_program_rebased = (
+                isinstance(packet_before_hashes, Mapping)
+                and (
+                    bool((set(packet_after_hashes) - set(packet_before_hashes)) & program_paths)
+                    or any(
+                        packet_before_hashes[path] != packet_after_hashes[path]
+                        for path in set(packet_before_hashes) & set(packet_after_hashes) & program_paths
+                    )
+                )
+            )
+            baseline_program_rebased = (
+                bool((set(packet_after_hashes) - set(baseline_hashes)) & program_paths)
+                or any(
+                    baseline_hashes[path] != packet_after_hashes[path]
+                    for path in set(baseline_hashes) & set(packet_after_hashes) & program_paths
+                )
+            )
+            if packet_program_rebased or baseline_program_rebased:
+                if not isinstance(packet_before_hashes, Mapping):
+                    raise ValueError("active repair handoff program context baseline is invalid")
+                validate_rebased_program_context(
+                    baseline_hashes,
+                    packet_before_hashes,
+                    packet_after_hashes,
+                    current_hashes,
+                )
+        return frozenset(
+            validated_handoff_execution_history_refs | validated_prior_execution_history_refs
+        )
+
+    def _repair_scope_check(
+        self,
+        *,
+        candidate_payload: bytes | None = None,
+        artifact_path: str | None = None,
+        _packet: Mapping[str, Any] | None = None,
+        _ignore_artifact_paths: Iterable[str] = (),
+    ) -> dict[str, Any] | None:
+        """Validate the *item boundary* of an active business repair.
+
+        Review findings retain their semantic categories for reviewer evidence
+        and targeted re-checks.  They are intentionally not translated into a
+        filesystem capability list here.  Once the same owner has consumed a
+        bounded repair authorization, every answer section and every artifact
+        below this item's ``work/`` directory is writable.  The lexical item
+        path checks in :meth:`_resolve_item_subpath` remain the authority that
+        prevents a write from escaping the item/run root.
+
+        ``_packet`` and ``_ignore_artifact_paths`` are retained for the atomic
+        packet-reconciliation caller.  They affect only which current packet
+        is read and which self-generated progress paths are ignored; neither
+        widens nor narrows the item-local repair boundary.
+        """
+
+        # ``_packet`` is reserved for the atomic active-repair scope upgrade.
+        # It lets the same current-state checks run against a proposed packet
+        # without re-reading or mutating the persisted baseline packet.
+        packet = self._read_business_review() if _packet is None else copy.deepcopy(dict(_packet))
         if packet is None or not packet.get("repair_active"):
             return packet
+
         before_value = packet["before_snapshot"]
         current_value, _current_hash = self._current_draft_value_and_hash()
         candidate_value = current_value if candidate_payload is None else self._canonical_draft_value(candidate_payload)
         changed_current = _pointer_diff(before_value, current_value)
         changed_candidate = _pointer_diff(before_value, candidate_value)
-        allowed_pointers = tuple(packet.get("allowed_pointers", ()))
-        allowed_artifacts = tuple(packet.get("allowed_artifact_paths", ()))
-        allowed_dependencies = tuple(packet.get("allowed_dependencies", ()))
-        if not (allowed_pointers or allowed_artifacts or allowed_dependencies):
-            raise ValueError("business repair packet has no authorized scope")
-        artifact_roots = _artifact_scope_roots(packet)
+
+        def answer_pointer(pointer: str) -> bool:
+            # A whole-envelope replacement is only accepted when both values
+            # remain structured answer envelopes.  This keeps the immutable
+            # item/schema binding out of an owner repair without prescribing a
+            # category-derived subset of answer sections.
+            if pointer == "":
+                return isinstance(before_value, Mapping) and isinstance(candidate_value, Mapping)
+            if not pointer.startswith("/"):
+                return False
+            first = pointer[1:].split("/", 1)[0].replace("~1", "/").replace("~0", "~")
+            return first in _ANSWER_DRAFT_SECTIONS and first not in _DRAFT_IMMUTABLE_FIELDS
+
         for pointer in (*changed_current, *changed_candidate):
-            if not any(_pointer_is_within(pointer, allowed) for allowed in allowed_pointers):
-                raise ValueError(f"business repair changed pointer outside reviewed scope: {pointer}")
-        if artifact_path is not None and str(artifact_path).replace("\\", "/") not in {_DRAFT_FILENAME, "work/" + _DRAFT_FILENAME}:
+            if not answer_pointer(pointer):
+                raise ValueError(f"business repair changed answer outside reviewed scope: {pointer}")
+
+        ignored_artifacts = frozenset(str(path).replace("\\", "/") for path in _ignore_artifact_paths)
+
+        def item_work_path(raw_path: str) -> str:
+            normalized = str(raw_path).replace("\\", "/")
+            pure = PurePath(normalized)
+            if pure.is_absolute() or ".." in pure.parts or not pure.parts:
+                raise AllowedRootError("business repair artifact must remain under item work/")
+            normalized = pure.as_posix()
+            if not normalized.startswith("work/") or normalized == "work/":
+                raise AllowedRootError("business repair artifact must remain under item work/")
+            return normalized
+
+        if artifact_path is not None:
             normalized = str(artifact_path).replace("\\", "/")
-            if not any(_artifact_is_within(normalized, root) for root in artifact_roots):
-                raise ValueError(f"business repair changed artifact outside reviewed scope: {normalized}")
+            if normalized not in {_DRAFT_FILENAME, "work/" + _DRAFT_FILENAME}:
+                normalized = item_work_path(normalized)
+                if normalized not in ignored_artifacts:
+                    # Resolving the path is deliberately enough here: the
+                    # caller's write method performs the regular-file and
+                    # lexical containment checks before touching bytes.
+                    pass
+
         before_artifacts = dict(packet.get("before_artifact_hashes", {}))
         current_progress = self._artifact_progress(candidate_payload if candidate_payload is not None else None)
         for path, digest in current_progress.hashes.items():
-            if path == _DRAFT_FILENAME:
+            if path in ignored_artifacts or path == _DRAFT_FILENAME:
                 continue
-            if before_artifacts.get(path) != digest:
-                if not any(_artifact_is_within(path, root) for root in artifact_roots):
-                    raise ValueError(f"business repair changed artifact outside reviewed scope: {path}")
+            normalized = item_work_path(path)
+            if before_artifacts.get(normalized) != digest:
+                # Any changed work artifact is in scope for this item-local
+                # repair.  No finding category is consulted.
+                continue
         for path in set(before_artifacts) - set(current_progress.hashes):
-            if not any(_artifact_is_within(path, root) for root in artifact_roots):
-                raise ValueError(f"business repair removed artifact outside reviewed scope: {path}")
+            if path in ignored_artifacts or path == _DRAFT_FILENAME:
+                continue
+            item_work_path(path)
         return packet
 
     @staticmethod
@@ -2399,7 +4624,7 @@ class ItemWorkspace:
             raise ValueError("operation requires no active attempt")
 
     def _ensure_not_terminal(self) -> None:
-        if self._state.get("lifecycle_state") in {"accepted", "technical_failure"}:
+        if self._state.get("lifecycle_state") in {"accepted", "technical_failure", _BLOCKED_REVIEW_OUTCOME}:
             raise ValueError("item is terminal")
 
     def _next_attempt_id(self) -> str:
@@ -2447,27 +4672,91 @@ class ItemWorkspace:
             # Telemetry is observational only and never controls persistence.
             pass
 
-    def _write_json_artifact(self, relative: str, value: Any, *, event_type: str = "item_workspace_write") -> Path:
-        self._ensure_not_terminal()
+    def _reload_authoritative_state_locked(self) -> None:
+        """Reload and validate item state without recovery-side effects."""
+
+        state_path = self._resolve_item_subpath(_STATE_FILENAME)
+        authoritative_state = self._read_state(state_path)
+        self._validate_state(
+            authoritative_state,
+            item_id=self.item_id,
+            mode=self.mode,
+            original_text=self.original_text,
+        )
+        self._state = authoritative_state
+
+    def _reload_authoritative_for_artifact_mutation_locked(self) -> None:
+        """Reload item state before a work-artifact mutation under its lock.
+
+        Terminal publication and artifact writes share the same transition
+        lock.  A stale workspace must therefore re-check the authoritative
+        lifecycle before touching bytes; otherwise it could write a draft
+        while a finalizer is binding the prior draft into an immutable
+        terminal snapshot.
+        """
+
+        self._reload_authoritative_state_locked()
+        self._ensure_execution_state()
         self._reconcile_business_review_discard()
-        destination = self._resolve_item_subpath(relative)
-        _assert_regular_no_symlink(destination, label="item artifact")
+
+    def _reload_authoritative_for_terminal_transition_locked(self) -> None:
+        """Reload and reconcile every terminal precondition under one lock."""
+
+        self._reload_authoritative_for_artifact_mutation_locked()
+        self._validate_recovery_authorizations()
+        self._reconcile_terminal_snapshot()
+
+    @staticmethod
+    def _restore_artifact_bytes(path: Path, existed: bool, payload: bytes | None) -> None:
+        """Restore one artifact after a paired state-write failure."""
+
+        if existed:
+            if payload is None:
+                raise RuntimeError("artifact rollback payload is missing")
+            _atomic_write_bytes(path, payload)
+        elif path.exists() or path.is_symlink():
+            path.unlink()
+            _fsync_directory(path.parent)
+
+    def _write_json_artifact(self, relative: str, value: Any, *, event_type: str = "item_workspace_write") -> Path:
+        relative_path = Path(relative).as_posix()
         payload = _json_bytes(value)
-        if Path(relative).as_posix() == _DRAFT_FILENAME:
-            self._repair_scope_check(candidate_payload=payload, artifact_path=_DRAFT_FILENAME)
-        else:
-            self._repair_scope_check(artifact_path=Path(relative).as_posix())
-        _atomic_write_bytes(destination, payload)
-        if Path(relative).as_posix() == _DRAFT_FILENAME:
-            state = copy.deepcopy(self._state)
-            if set(state) == _BASE_STATE_FIELDS:
-                state.update(self._execution_defaults())
-            state["review"] = self._pending_review()
-            state["lifecycle_state"] = "work"
-            state["updated_at"] = _now()
-            self._persist_state(state, touch=False)
-        else:
-            self._touch_state()
+        with self._state_transition_lock():
+            self._reload_authoritative_for_artifact_mutation_locked()
+            self._ensure_not_terminal()
+            destination = self._resolve_item_subpath(relative_path)
+            _assert_regular_no_symlink(destination, label="item artifact")
+            if relative_path == _DRAFT_FILENAME:
+                self._repair_scope_check(candidate_payload=payload, artifact_path=_DRAFT_FILENAME)
+            else:
+                self._repair_scope_check(artifact_path=relative_path)
+            state_path = self._resolve_item_subpath(_STATE_FILENAME)
+            prior_state_bytes = state_path.read_bytes()
+            prior_state = copy.deepcopy(self._state)
+            prior_destination_exists = destination.exists() or destination.is_symlink()
+            prior_destination_bytes = destination.read_bytes() if prior_destination_exists else None
+            try:
+                _atomic_write_bytes(destination, payload)
+                state = copy.deepcopy(self._state)
+                if relative_path == _DRAFT_FILENAME:
+                    state["review"] = self._pending_review()
+                    state["lifecycle_state"] = "work"
+                state["updated_at"] = _now()
+                self._persist_state_unlocked(state, touch=False)
+            except Exception as exc:
+                rollback_errors: list[Exception] = []
+                try:
+                    self._restore_artifact_bytes(destination, prior_destination_exists, prior_destination_bytes)
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+                try:
+                    _atomic_write_bytes(state_path, prior_state_bytes)
+                    self._state = prior_state
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+                if rollback_errors:
+                    raise RuntimeError("item artifact mutation rollback failed") from exc
+                raise
         self._emit(event_type, artifact=Path(relative).as_posix())
         return destination
 
@@ -2525,37 +4814,931 @@ class ItemWorkspace:
     def append_source_map(self, mapping: Mapping[str, Any]) -> None:
         if not isinstance(mapping, Mapping):
             raise TypeError("source map entry must be a mapping")
-        self._ensure_not_terminal()
-        self._reconcile_business_review_discard()
-        destination = self._resolve_item_subpath(Path("work") / _SOURCE_MAP_FILENAME)
-        _assert_regular_no_symlink(destination, label="source map artifact")
-        self._repair_scope_check(artifact_path="work/source_map.json")
-        if destination.exists():
+        with self._state_transition_lock():
+            self._reload_authoritative_for_artifact_mutation_locked()
+            self._ensure_not_terminal()
+            destination = self._resolve_item_subpath(Path("work") / _SOURCE_MAP_FILENAME)
+            _assert_regular_no_symlink(destination, label="source map artifact")
+            self._repair_scope_check(artifact_path="work/source_map.json")
+            prior_state = copy.deepcopy(self._state)
+            state_path = self._resolve_item_subpath(_STATE_FILENAME)
+            prior_state_bytes = state_path.read_bytes()
+            prior_destination_exists = destination.exists() or destination.is_symlink()
+            prior_destination_bytes = destination.read_bytes() if prior_destination_exists else None
+            if destination.exists():
+                try:
+                    current = json.loads(destination.read_text(encoding="utf-8"))
+                except json.JSONDecodeError as exc:
+                    raise ValueError("source_map.json is not valid JSON") from exc
+                if not isinstance(current, list):
+                    raise ValueError("source_map.json must contain a JSON array")
+                entries = list(current)
+            else:
+                entries = []
+            entries.append(_jsonable(mapping))
             try:
-                current = json.loads(destination.read_text(encoding="utf-8"))
-            except json.JSONDecodeError as exc:
-                raise ValueError("source_map.json is not valid JSON") from exc
-            if not isinstance(current, list):
-                raise ValueError("source_map.json must contain a JSON array")
-            entries = list(current)
-        else:
-            entries = []
-        entries.append(_jsonable(mapping))
-        _atomic_write_json(destination, entries)
-        self._touch_state()
+                _atomic_write_json(destination, entries)
+                state = copy.deepcopy(self._state)
+                state["updated_at"] = _now()
+                self._persist_state_unlocked(state, touch=False)
+            except Exception as exc:
+                rollback_errors: list[Exception] = []
+                try:
+                    self._restore_artifact_bytes(destination, prior_destination_exists, prior_destination_bytes)
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+                try:
+                    _atomic_write_bytes(state_path, prior_state_bytes)
+                    self._state = prior_state
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+                if rollback_errors:
+                    raise RuntimeError("source map mutation rollback failed") from exc
+                raise
         self._emit("item_workspace_append", artifact="work/source_map.json")
 
-    def append_finding(self, mapping: Mapping[str, Any]) -> None:
+    @staticmethod
+    def _validate_source_map_rows(
+        rows: Iterable[Mapping[str, Any]],
+        *,
+        unique: bool,
+    ) -> tuple[dict[str, Any], ...]:
+        """Validate the canonical shape used by ``select_sources``.
+
+        The append API intentionally remains permissive for historical work
+        records.  Replacement is stricter: callers provide complete,
+        canonical source-selection rows and duplicate identities are rejected.
+        Existing rows are shape-checked but may contain the duplicate identity
+        that a replacement is explicitly repairing.
+        """
+
+        if isinstance(rows, (str, bytes)):
+            raise TypeError("source map rows must be an iterable of mappings")
+        validated: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for index, value in enumerate(rows):
+            if not isinstance(value, Mapping):
+                raise TypeError(f"source_map[{index}] must be a mapping")
+            row = dict(value)
+            if set(row) != _SOURCE_MAP_FIELDS:
+                raise ValueError(f"source_map[{index}] fields are not canonical")
+            if row.get("record_kind") != "analyst_source_selection":
+                raise ValueError(f"source_map[{index}] record_kind is invalid")
+            for field_name in ("source_id", "purpose", "path"):
+                field_value = row.get(field_name)
+                if (
+                    not isinstance(field_value, str)
+                    or not field_value.strip()
+                    or field_value != field_value.strip()
+                ):
+                    raise ValueError(f"source_map[{index}] {field_name} must be non-empty text")
+            if not _is_sha256(row.get("content_hash")):
+                raise ValueError(f"source_map[{index}] content_hash must be a SHA-256 digest")
+            columns = row.get("columns")
+            if not isinstance(columns, list) or any(
+                not isinstance(column, str) or not column.strip() or column != column.strip()
+                for column in columns
+            ):
+                raise ValueError(f"source_map[{index}] columns must be a canonical string array")
+            if len(columns) != len(set(columns)):
+                raise ValueError(f"source_map[{index}] columns must not contain duplicates")
+            row_count = row.get("row_count")
+            if row_count is not None and (isinstance(row_count, bool) or not isinstance(row_count, int) or row_count < 0):
+                raise ValueError(f"source_map[{index}] row_count must be a non-negative integer or null")
+            if not isinstance(row.get("row_count_exact"), bool):
+                raise ValueError(f"source_map[{index}] row_count_exact must be boolean")
+            source_id = row["source_id"]
+            if unique and source_id in seen:
+                raise ValueError("source map source_id values must be unique")
+            seen.add(source_id)
+            # Enforce JSON-safe, canonical value types before the list is
+            # serialized.  _json_bytes also rejects NaN/Infinity.
+            try:
+                canonical = json.loads(_json_bytes(row).decode("utf-8"))
+            except (TypeError, ValueError, UnicodeDecodeError) as exc:
+                raise ValueError(f"source_map[{index}] is not canonical JSON") from exc
+            if not isinstance(canonical, dict) or canonical != row:
+                raise ValueError(f"source_map[{index}] is not canonical")
+            validated.append(canonical)
+        return tuple(validated)
+
+    def replace_source_map(
+        self,
+        mappings: Iterable[Mapping[str, Any]],
+        *,
+        owner_ref: Any,
+        expected_artifact_hash: str,
+    ) -> tuple[dict[str, Any], ...]:
+        """Atomically replace the complete source-selection map using CAS.
+
+        ``expected_artifact_hash`` is required and is compared with the raw
+        current ``work/source_map.json`` bytes under the item lock.  The
+        current artifact must also be canonical JSON; this prevents a caller
+        from silently normalizing an unrelated or tampered source map.  New
+        rows are strict, unique, owner-scoped source-selection records.  An
+        exact retry returns without rewriting bytes or lifecycle state.
+        """
+
+        if isinstance(mappings, (str, bytes)):
+            raise TypeError("source map rows must be an iterable of mappings")
+        try:
+            supplied = tuple(mappings)
+        except TypeError as exc:
+            raise TypeError("source map rows must be an iterable of mappings") from exc
+        desired_rows = self._validate_source_map_rows(supplied, unique=True)
+        owner = _owner_ref_value(owner_ref)
+        if not _is_sha256(expected_artifact_hash):
+            raise ValueError("expected_artifact_hash must be a SHA-256 digest")
+
+        relative = (Path("work") / _SOURCE_MAP_FILENAME).as_posix()
+        with self._state_transition_lock():
+            self._reload_authoritative_for_artifact_mutation_locked()
+            self._ensure_not_terminal()
+            # Replacement is an owner-scoped CAS operation.  Unlike the
+            # initial owner-binding APIs, it must never silently rebind an
+            # existing workspace to a different caller.
+            existing_owner = self._read_analysis_owner()
+            if existing_owner is None:
+                raise ValueError("item has no bound Analytical Owner")
+            if existing_owner["owner_ref"] != owner:
+                raise ValueError("owner_ref does not match the bound Analytical Owner")
+            self._verify_analysis_owner_locked(owner, bind_if_missing=False)
+
+            destination = self._resolve_item_subpath(relative)
+            _assert_regular_no_symlink(destination, label="source map artifact")
+            if destination.exists() and not destination.is_file():
+                raise ValueError("source map artifact must be a regular file")
+            current_bytes = destination.read_bytes() if destination.exists() else b""
+            current_hash = _sha256_bytes(current_bytes)
+            if expected_artifact_hash != current_hash:
+                raise ValueError("expected_artifact_hash does not match the current source map artifact")
+            if destination.exists():
+                try:
+                    current_value = json.loads(current_bytes.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ValueError("source map artifact is not valid JSON") from exc
+                if not isinstance(current_value, list):
+                    raise ValueError("source map artifact must contain a JSON array")
+                current_rows = self._validate_source_map_rows(current_value, unique=False)
+                if _json_bytes(list(current_rows)) != current_bytes:
+                    raise ValueError("source map artifact is not canonical JSON")
+            elif current_bytes:
+                raise ValueError("source map artifact is not a regular file")
+
+            desired_bytes = _json_bytes(list(desired_rows))
+            # Exact retries are read-only, including state and mtime.
+            if desired_bytes == current_bytes:
+                return tuple(copy.deepcopy(dict(row)) for row in desired_rows)
+
+            self._repair_scope_check(artifact_path=relative)
+            prior_state = copy.deepcopy(self._state)
+            state_path = self._resolve_item_subpath(_STATE_FILENAME)
+            prior_state_bytes = state_path.read_bytes()
+            prior_destination_exists = destination.exists() or destination.is_symlink()
+            prior_destination_bytes = destination.read_bytes() if prior_destination_exists else None
+            try:
+                _atomic_write_bytes(destination, desired_bytes)
+                next_state = copy.deepcopy(self._state)
+                next_state["updated_at"] = _now()
+                self._persist_state_unlocked(next_state, touch=False)
+            except Exception as exc:
+                rollback_errors: list[Exception] = []
+                try:
+                    self._restore_artifact_bytes(destination, prior_destination_exists, prior_destination_bytes)
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+                try:
+                    _atomic_write_bytes(state_path, prior_state_bytes)
+                    self._state = prior_state
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+                if rollback_errors:
+                    raise RuntimeError("source map replacement rollback failed") from exc
+                raise
+        self._emit(
+            "item_workspace_replace_source_map",
+            artifact=relative,
+            source_count=len(desired_rows),
+            artifact_hash=_sha256_bytes(desired_bytes),
+        )
+        return tuple(copy.deepcopy(dict(row)) for row in desired_rows)
+
+    def _append_work_record(
+        self,
+        filename: str,
+        mapping: Mapping[str, Any],
+        *,
+        label: str,
+        dedupe_field: str | tuple[str, ...] | None = None,
+        dedupe_ignored_fields: tuple[str, ...] = (),
+        owner_ref: str | None = None,
+    ) -> None:
         if not isinstance(mapping, Mapping):
-            raise TypeError("finding must be a mapping")
-        self._ensure_not_terminal()
-        self._reconcile_business_review_discard()
-        destination = self._resolve_item_subpath(Path("work") / _FINDINGS_FILENAME)
-        _assert_regular_no_symlink(destination, label="findings artifact")
-        self._repair_scope_check(artifact_path="work/findings.jsonl")
-        _append_jsonl(destination, mapping)
-        self._touch_state()
-        self._emit("item_workspace_append", artifact="work/findings.jsonl")
+            raise TypeError(f"{label} must be a mapping")
+        relative = (Path("work") / filename).as_posix()
+        with self._state_transition_lock():
+            self._reload_authoritative_for_artifact_mutation_locked()
+            self._ensure_not_terminal()
+            if owner_ref is not None:
+                self._verify_analysis_owner_locked(owner_ref)
+            destination = self._resolve_item_subpath(relative)
+            _assert_regular_no_symlink(destination, label=f"{label} artifact")
+            self._repair_scope_check(artifact_path=relative)
+            if dedupe_field is not None:
+                dedupe_fields = (dedupe_field,) if isinstance(dedupe_field, str) else tuple(dedupe_field)
+                dedupe_values = {
+                    field: mapping.get(field)
+                    for field in dedupe_fields
+                    if mapping.get(field) is not None
+                }
+                if not dedupe_values:
+                    raise ValueError(f"{label} dedupe field is missing: {', '.join(dedupe_fields)}")
+                if destination.exists():
+                    try:
+                        prior_records = [
+                            json.loads(line)
+                            for line in destination.read_text(encoding="utf-8").splitlines()
+                            if line.strip()
+                        ]
+                    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        raise ValueError(f"{label} artifact is invalid") from exc
+                    for prior in prior_records:
+                        if not isinstance(prior, Mapping):
+                            raise ValueError(f"{label} artifact is invalid")
+                        matched_field = next(
+                            (
+                                field
+                                for field, value in dedupe_values.items()
+                                if prior.get(field) == value
+                            ),
+                            None,
+                        )
+                        if matched_field is not None:
+                            comparable_prior = {
+                                key: value
+                                for key, value in prior.items()
+                                if key not in dedupe_ignored_fields
+                            }
+                            comparable_mapping = {
+                                key: value
+                                for key, value in dict(_jsonable(mapping)).items()
+                                if key not in dedupe_ignored_fields
+                            }
+                            if comparable_prior == comparable_mapping:
+                                return
+                            raise ValueError(
+                                f"{label} dedupe identity conflicts: {matched_field}={dedupe_values[matched_field]}"
+                            )
+            prior_state = copy.deepcopy(self._state)
+            state_path = self._resolve_item_subpath(_STATE_FILENAME)
+            prior_state_bytes = state_path.read_bytes()
+            prior_destination_exists = destination.exists() or destination.is_symlink()
+            prior_destination_bytes = destination.read_bytes() if prior_destination_exists else None
+            try:
+                _append_jsonl(destination, mapping)
+                state = copy.deepcopy(self._state)
+                state["updated_at"] = _now()
+                self._persist_state_unlocked(state, touch=False)
+            except Exception as exc:
+                rollback_errors: list[Exception] = []
+                try:
+                    self._restore_artifact_bytes(destination, prior_destination_exists, prior_destination_bytes)
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+                try:
+                    _atomic_write_bytes(state_path, prior_state_bytes)
+                    self._state = prior_state
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+                if rollback_errors:
+                    raise RuntimeError("work-record mutation rollback failed") from exc
+                raise
+        self._emit("item_workspace_append", artifact=relative)
+
+    def append_finding(self, mapping: Mapping[str, Any]) -> None:
+        self._append_work_record(_FINDINGS_FILENAME, mapping, label="finding")
+
+    def append_evidence(self, mapping: Mapping[str, Any]) -> None:
+        """Append one program-normalized analytical evidence record."""
+
+        self._append_work_record(_EVIDENCE_FILENAME, mapping, label="evidence record")
+
+    def _validate_evidence_replacement_scope(self, packet: Mapping[str, Any]) -> None:
+        """Require reviewer scope that explicitly authorizes evidence replacement.
+
+        A broad business repair may carry calculation, method, presentation,
+        and answer findings alongside its evidence finding.  The evidence
+        replacement boundary therefore binds to the evidence finding's
+        semantic category and pointer, plus the packet's explicit evidence
+        dependency, without treating unrelated findings as evidence authority.
+        """
+
+        findings = packet.get("findings")
+        if not isinstance(findings, list) or not findings:
+            raise ValueError("evidence replacement requires an evidence repair finding")
+        evidence_path = "work/evidence.jsonl"
+        evidence_findings = []
+        for finding in findings:
+            if not isinstance(finding, Mapping):
+                raise ValueError("evidence replacement finding is invalid")
+            categories = tuple(finding.get("semantic_categories", ()))
+            if "evidence" not in categories:
+                continue
+            pointers = frozenset(str(value) for value in finding.get("pointers", ()))
+            dependencies = frozenset(str(value) for value in finding.get("dependent_outputs", ()))
+            if "/evidence_refs" not in pointers or evidence_path not in dependencies:
+                raise ValueError("evidence replacement finding does not authorize evidence refs")
+            evidence_findings.append(finding)
+        if not evidence_findings:
+            raise ValueError("evidence replacement requires an evidence finding")
+        allowed_pointers = frozenset(str(value) for value in packet.get("allowed_pointers", ()))
+        if "/evidence_refs" not in allowed_pointers:
+            raise ValueError("evidence replacement allowed pointers are invalid")
+        allowed_paths = frozenset(
+            str(value)
+            for name in ("allowed_artifact_paths", "allowed_dependencies")
+            for value in packet.get(name, ())
+        )
+        if evidence_path not in allowed_paths:
+            raise ValueError("evidence replacement evidence path is not authorized")
+
+    def _validate_evidence_note_rows(
+        self,
+        rows: Iterable[Mapping[str, Any]],
+        *,
+        current_hashes: Mapping[str, str],
+        existing_external_refs: frozenset[str] = frozenset(),
+        allow_unknown_external_refs: bool = False,
+    ) -> tuple[dict[str, Any], ...]:
+        """Validate canonical typed evidence rows and item-local references."""
+
+        # Import lazily to keep the durable module's import graph acyclic.
+        from .analyst_workspace import EvidenceNote
+
+        required_fields = frozenset(
+            {
+                "record_kind",
+                "evidence_id",
+                "conclusion",
+                "method",
+                "evidence_refs",
+                "limitations",
+                "facts",
+            }
+        )
+        validated: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+
+        def validate_ref(raw_ref: Any) -> str:
+            if (
+                not isinstance(raw_ref, str)
+                or not raw_ref
+                or raw_ref != raw_ref.strip()
+                or "\\" in raw_ref
+                or "\x00" in raw_ref
+                or "\n" in raw_ref
+                or "\r" in raw_ref
+            ):
+                raise ValueError("evidence reference is invalid")
+            base, separator, fragment = raw_ref.partition("#")
+            pure = PurePath(base)
+            if pure.is_absolute() or ".." in pure.parts or pure.as_posix() != base or not base:
+                raise ValueError("evidence reference path is invalid")
+            if separator and not fragment:
+                raise ValueError("evidence reference fragment is invalid")
+            if base.startswith("work/"):
+                if base in _ANALYST_HANDOFF_RESERVED_REFS:
+                    raise ValueError("evidence reference path is reserved")
+                path = self._resolve_item_subpath(base)
+                _assert_regular_no_symlink(path, label="evidence reference")
+                if not path.is_file() or base not in current_hashes:
+                    raise ValueError("evidence reference is outside current artifact progress")
+            elif not allow_unknown_external_refs and raw_ref not in existing_external_refs:
+                # Source/catalog references are not item files and have no
+                # durable hash at this boundary.  A replacement may retain a
+                # previously recorded source reference, but cannot introduce a
+                # new opaque ref that the durable core cannot authenticate.
+                raise ValueError("evidence reference is not current item evidence")
+            return raw_ref
+
+        for value in rows:
+            if not isinstance(value, Mapping):
+                raise TypeError("evidence note must be a mapping")
+            if set(value) != required_fields:
+                raise ValueError("evidence note row fields are invalid")
+            if value.get("record_kind") != "analytical_evidence":
+                raise ValueError("evidence note record_kind is invalid")
+            raw = dict(value)
+            raw.pop("record_kind", None)
+            try:
+                typed = EvidenceNote(**raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("evidence note row is invalid") from exc
+            canonical = typed.to_dict()
+            if dict(value) != canonical:
+                raise ValueError("evidence note row is not canonical")
+            if typed.evidence_id in seen_ids:
+                raise ValueError("evidence_id values must be unique")
+            seen_ids.add(typed.evidence_id)
+            for ref in typed.evidence_refs:
+                validate_ref(ref)
+            validated.append(canonical)
+        return tuple(validated)
+
+    def replace_evidence_notes(
+        self,
+        mappings: Iterable[Mapping[str, Any]],
+        *,
+        owner_ref: Any,
+        expected_artifact_hash: str | None = None,
+    ) -> tuple[dict[str, Any], ...]:
+        """Atomically replace the current evidence view.
+
+        Evidence is an editable analytical artifact, not a repair-only
+        privilege.  The current owner is recorded for audit, while attempts,
+        review packets and implementation versions do not gate the write.
+        ``expected_artifact_hash`` remains an optional caller-side concurrency
+        check and exact retries remain byte/mtime stable.
+        """
+
+        if isinstance(mappings, (str, bytes)):
+            raise TypeError("evidence notes must be an iterable of mappings")
+        try:
+            supplied = tuple(mappings)
+        except TypeError as exc:
+            raise TypeError("evidence notes must be an iterable of mappings") from exc
+        if any(not isinstance(value, Mapping) for value in supplied):
+            raise TypeError("evidence notes must contain mappings")
+        owner = _owner_ref_value(owner_ref)
+        if expected_artifact_hash is not None and not _is_sha256(expected_artifact_hash):
+            raise ValueError("expected_artifact_hash must be a SHA-256 digest")
+
+        relative = (Path("work") / _EVIDENCE_FILENAME).as_posix()
+        with self._state_transition_lock():
+            self._reload_authoritative_for_artifact_mutation_locked()
+            self._ensure_not_terminal()
+            self._verify_analysis_owner_locked(owner, bind_if_missing=True)
+
+            destination = self._resolve_item_subpath(relative)
+            _assert_regular_no_symlink(destination, label="evidence artifact")
+            if destination.exists() and not destination.is_file():
+                raise ValueError("evidence artifact must be a regular file")
+            current_bytes = destination.read_bytes() if destination.exists() else b""
+            current_hash = _sha256_bytes(current_bytes) if destination.exists() else None
+            if expected_artifact_hash is not None and expected_artifact_hash != current_hash:
+                raise ValueError("expected_artifact_hash does not match the current evidence artifact")
+
+            current_progress = self._artifact_progress()
+            current_hashes = dict(current_progress.hashes)
+            current_records = self._read_work_records(_EVIDENCE_FILENAME, label="evidence")
+            canonical_current = b"".join(_json_bytes(row) for row in current_records)
+            if canonical_current != current_bytes:
+                raise ValueError("evidence artifact is not canonical JSONL")
+            current_external_refs = frozenset(
+                ref
+                for row in current_records
+                for ref in row.get("evidence_refs", ())
+                if isinstance(ref, str) and not ref.startswith("work/")
+            )
+            current_rows = self._validate_evidence_note_rows(
+                current_records,
+                current_hashes=current_hashes,
+                allow_unknown_external_refs=True,
+            )
+            new_rows = self._validate_evidence_note_rows(
+                supplied,
+                current_hashes=current_hashes,
+                existing_external_refs=current_external_refs,
+            )
+            desired_bytes = b"".join(_json_bytes(row) for row in new_rows)
+            if desired_bytes == current_bytes:
+                return tuple(copy.deepcopy(dict(row)) for row in new_rows)
+
+            prior_state = copy.deepcopy(self._state)
+            state_path = self._resolve_item_subpath(_STATE_FILENAME)
+            prior_state_bytes = state_path.read_bytes()
+            prior_destination_exists = destination.exists() or destination.is_symlink()
+            prior_destination_bytes = destination.read_bytes() if prior_destination_exists else None
+            try:
+                _atomic_write_bytes(destination, desired_bytes)
+                progress = self._artifact_progress()
+                next_state = copy.deepcopy(self._state)
+                next_state["updated_at"] = _now()
+                self._persist_state_unlocked(next_state, touch=False)
+            except Exception as exc:
+                rollback_errors: list[Exception] = []
+                try:
+                    self._restore_artifact_bytes(destination, prior_destination_exists, prior_destination_bytes)
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+                try:
+                    _atomic_write_bytes(state_path, prior_state_bytes)
+                    self._state = prior_state
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+                if rollback_errors:
+                    raise RuntimeError("evidence replacement rollback failed") from exc
+                raise
+        self._emit(
+            "item_workspace_replace_evidence_notes",
+            artifact=relative,
+            evidence_count=len(new_rows),
+            artifact_hash=progress.hashes.get(relative),
+        )
+        return tuple(copy.deepcopy(dict(row)) for row in new_rows)
+
+    def append_specialist_task(self, mapping: Mapping[str, Any]) -> None:
+        """Append one bounded specialist assignment owned by the analytical lead."""
+
+        self._append_work_record(_SPECIALIST_TASKS_FILENAME, mapping, label="specialist task")
+
+    def append_specialist_memo(self, mapping: Mapping[str, Any]) -> None:
+        """Append one specialist evidence memo without creating another item lifecycle."""
+
+        self._append_work_record(_SPECIALIST_MEMOS_FILENAME, mapping, label="specialist memo")
+
+    def append_semantic_selection(self, mapping: Mapping[str, Any]) -> None:
+        """Append one owner-bound semantic reuse selection trace."""
+
+        self._append_work_record(
+            _SEMANTIC_SELECTIONS_FILENAME,
+            mapping,
+            label="semantic selection",
+            dedupe_field="selection_id",
+        )
+
+    def append_identity_domain_proposal(self, mapping: Mapping[str, Any]) -> None:
+        """Append one owner-bound identity-domain proposal.
+
+        Proposals are deliberately item-local evidence.  They do not reserve
+        an entity-resolution domain or publish an accepted mapping; the
+        runtime/entity-resolution boundary decides what, if anything, to do
+        with them later.
+        """
+
+        if not isinstance(mapping, Mapping):
+            raise TypeError("identity domain proposal must be a mapping")
+        owner_ref = mapping.get("owner_ref")
+        if owner_ref is None:
+            raise ValueError("identity domain proposal owner_ref is required")
+        self._append_work_record(
+            _IDENTITY_DOMAIN_PROPOSALS_FILENAME,
+            mapping,
+            label="identity domain proposal",
+            dedupe_field="domain_id",
+            # Historical retries may have used a different transport label
+            # for the same logical owner.  Semantic proposal identity does
+            # not include that provenance-only field.
+            dedupe_ignored_fields=("owner_ref",),
+            owner_ref=_owner_ref_value(owner_ref),
+        )
+
+    def append_analytical_relationship(self, mapping: Mapping[str, Any]) -> None:
+        """Append one owner-bound analytical relationship evidence record."""
+
+        if not isinstance(mapping, Mapping):
+            raise TypeError("analytical relationship must be a mapping")
+        owner_ref = mapping.get("owner_ref")
+        if owner_ref is None:
+            raise ValueError("analytical relationship owner_ref is required")
+        dedupe_field = ("relationship_id", "audit_id")
+        self._append_work_record(
+            _ANALYTICAL_RELATIONSHIPS_FILENAME,
+            mapping,
+            label="analytical relationship",
+            dedupe_field=dedupe_field,
+            owner_ref=_owner_ref_value(owner_ref),
+        )
+
+    def replace_analytical_relationships(
+        self,
+        mappings: Iterable[Mapping[str, Any]],
+        *,
+        owner_ref: Any,
+        replace_ids: Iterable[str] | None = None,
+        expected_artifact_hash: str | None = None,
+    ) -> tuple[dict[str, Any], ...]:
+        """Atomically replace analytical relationships in the current view.
+
+        With ``replace_ids`` omitted, supplied rows are the complete artifact;
+        otherwise only the named relationships change.  Review packets,
+        attempts and implementation versions are history, not write locks.
+        """
+
+        if isinstance(mappings, (str, bytes)):
+            raise TypeError("analytical relationships must be an iterable of mappings")
+        try:
+            supplied = tuple(mappings)
+        except TypeError as exc:
+            raise TypeError("analytical relationships must be an iterable of mappings") from exc
+        if any(not isinstance(value, Mapping) for value in supplied):
+            raise TypeError("analytical relationships must contain mappings")
+        owner = _owner_ref_value(owner_ref)
+        if expected_artifact_hash is not None and not _is_sha256(expected_artifact_hash):
+            raise ValueError("expected_artifact_hash must be a SHA-256 digest")
+
+        if replace_ids is None:
+            target_ids: tuple[str, ...] | None = None
+        else:
+            if isinstance(replace_ids, (str, bytes)):
+                raise TypeError("replace_ids must be an iterable of relationship IDs")
+            try:
+                target_ids = tuple(_owner_ref_value(value) for value in replace_ids)
+            except TypeError as exc:
+                raise TypeError("replace_ids must be an iterable of relationship IDs") from exc
+            if not target_ids:
+                raise ValueError("replace_ids cannot be empty; omit it for a full replacement")
+            if len(target_ids) != len(set(target_ids)):
+                raise ValueError("replace_ids must not contain duplicates")
+
+        relative = (Path("work") / _ANALYTICAL_RELATIONSHIPS_FILENAME).as_posix()
+        with self._state_transition_lock():
+            self._reload_authoritative_for_artifact_mutation_locked()
+            self._ensure_not_terminal()
+            self._verify_analysis_owner_locked(owner, bind_if_missing=True)
+
+            destination = self._resolve_item_subpath(relative)
+            _assert_regular_no_symlink(destination, label="analytical relationship artifact")
+            if destination.exists() and not destination.is_file():
+                raise ValueError("analytical relationship artifact must be a regular file")
+            current_bytes = destination.read_bytes() if destination.exists() else b""
+            current_hash = _sha256_bytes(current_bytes) if destination.exists() else None
+            if expected_artifact_hash is not None and expected_artifact_hash != current_hash:
+                raise ValueError("expected_artifact_hash does not match the current relationship artifact")
+
+            current_records = self._read_work_records(
+                _ANALYTICAL_RELATIONSHIPS_FILENAME,
+                label="analytical relationship",
+            )
+            current_rows = self._validate_analytical_relationship_rows(current_records, owner=None)
+            new_rows = self._validate_analytical_relationship_rows(supplied, owner=owner)
+            current_by_id = {row["relationship_id"]: row for row in current_rows}
+            if len(current_by_id) != len(current_rows):
+                raise ValueError("analytical relationship relationship_id values must be unique")
+            if target_ids is not None:
+                missing = [value for value in target_ids if value not in current_by_id]
+                if missing:
+                    raise ValueError(
+                        "replace_ids must identify existing analytical relationships: "
+                        + ", ".join(missing)
+                    )
+                supplied_ids = tuple(row["relationship_id"] for row in new_rows)
+                if set(supplied_ids) != set(target_ids) or len(supplied_ids) != len(target_ids):
+                    raise ValueError("replacement rows must match replace_ids exactly")
+                replacements = {row["relationship_id"]: row for row in new_rows}
+                desired_rows = tuple(
+                    replacements.get(row["relationship_id"], row)
+                    for row in current_rows
+                )
+            else:
+                desired_rows = tuple(new_rows)
+            self._validate_analytical_relationship_rows(desired_rows, owner=None)
+            desired_ids = [row["relationship_id"] for row in desired_rows]
+            if len(desired_ids) != len(set(desired_ids)):
+                raise ValueError("analytical relationship relationship_id values must be unique")
+            audit_ids = [row["audit_id"] for row in desired_rows if row.get("audit_id") is not None]
+            if len(audit_ids) != len(set(audit_ids)):
+                raise ValueError("analytical relationship audit_id values must be unique")
+
+            desired_bytes = b"".join(_json_bytes(row) for row in desired_rows)
+            # Exact retries are read-only.  In particular, do not rewrite the
+            # JSONL file, state, or review packet and thereby perturb mtimes.
+            if desired_bytes == current_bytes:
+                return tuple(copy.deepcopy(dict(row)) for row in desired_rows)
+
+            prior_state = copy.deepcopy(self._state)
+            state_path = self._resolve_item_subpath(_STATE_FILENAME)
+            prior_state_bytes = state_path.read_bytes()
+            prior_destination_exists = destination.exists() or destination.is_symlink()
+            prior_destination_bytes = destination.read_bytes() if prior_destination_exists else None
+            try:
+                _atomic_write_bytes(destination, desired_bytes)
+                progress = self._artifact_progress()
+                next_state = copy.deepcopy(self._state)
+                next_state["updated_at"] = _now()
+                self._persist_state_unlocked(next_state, touch=False)
+            except Exception as exc:
+                rollback_errors: list[Exception] = []
+                try:
+                    self._restore_artifact_bytes(destination, prior_destination_exists, prior_destination_bytes)
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+                try:
+                    _atomic_write_bytes(state_path, prior_state_bytes)
+                    self._state = prior_state
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+                if rollback_errors:
+                    raise RuntimeError("analytical relationship replacement rollback failed") from exc
+                raise
+        self._emit(
+            "item_workspace_replace_analytical_relationships",
+            artifact=relative,
+            relationship_count=len(desired_rows),
+            artifact_hash=progress.hashes.get(relative),
+        )
+        return tuple(copy.deepcopy(dict(row)) for row in desired_rows)
+
+    def _validate_active_repair_progress(
+        self,
+        packet: Mapping[str, Any],
+        *,
+        current_hashes: Mapping[str, str],
+        relationship_path: str,
+    ) -> None:
+        """Reject stale or out-of-scope progress before a repair replacement."""
+
+        before_hashes = packet.get("before_artifact_hashes")
+        after_hashes = packet.get("after_artifact_hashes")
+        allowed_paths = tuple(
+            str(path).replace("\\", "/")
+            for name in ("allowed_artifact_paths", "allowed_dependencies")
+            for path in packet.get(name, ())
+            if not str(path).startswith("/")
+        )
+
+        def allowed(path: str) -> bool:
+            normalized = path.replace("\\", "/")
+            if normalized == relationship_path:
+                return True
+            # The draft file is governed by the JSON-pointer check below;
+            # keeping it out of the artifact-path allowlist would reject the
+            # ordinary same-owner narrative revision that an active repair
+            # is explicitly authorized to make.
+            if normalized == _DRAFT_FILENAME:
+                return True
+            return any(
+                normalized == root or normalized.startswith(root.rstrip("/") + "/")
+                for root in allowed_paths
+            )
+
+        if not isinstance(before_hashes, Mapping) or not isinstance(after_hashes, Mapping):
+            raise ValueError("active business repair artifact hashes are invalid")
+        if after_hashes.get(relationship_path) != current_hashes.get(relationship_path):
+            raise ValueError("analytical relationship artifact changed since the active repair baseline")
+        handoff_changed = (
+            _HANDOFF_ARTIFACT_PATH in set(before_hashes) | set(after_hashes) | set(current_hashes)
+            and before_hashes.get(_HANDOFF_ARTIFACT_PATH) != current_hashes.get(_HANDOFF_ARTIFACT_PATH)
+            and after_hashes.get(_HANDOFF_ARTIFACT_PATH) != current_hashes.get(_HANDOFF_ARTIFACT_PATH)
+        )
+        handoff_refs = frozenset()
+        typed_handoff_present = False
+        if current_hashes.get(_HANDOFF_ARTIFACT_PATH) is not None:
+            handoff_path = self._resolve_item_subpath(_HANDOFF_ARTIFACT_PATH)
+            _assert_regular_no_symlink(handoff_path, label="handoff artifact")
+            try:
+                handoff_value = json.loads(handoff_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                handoff_value = None
+            typed_handoff_present = (
+                isinstance(handoff_value, Mapping)
+                and handoff_value.get("schema_version") == _ANALYST_HANDOFF_SCHEMA
+            )
+        if (handoff_changed or typed_handoff_present) and current_hashes.get(_HANDOFF_ARTIFACT_PATH) is not None:
+            handoff_refs = self._validate_repair_handoff(
+                packet,
+                current_hashes=current_hashes,
+            )
+        for path in set(before_hashes) | set(after_hashes) | set(current_hashes):
+            before = before_hashes.get(path)
+            after = after_hashes.get(path)
+            current = current_hashes.get(path)
+            if before != current or after != current:
+                normalized = str(path).replace("\\", "/")
+                if normalized == _HANDOFF_ARTIFACT_PATH and current is not None:
+                    continue
+                if normalized in handoff_refs:
+                    continue
+                if not allowed(str(path)):
+                    raise ValueError(
+                        "business repair changed artifact outside authorized scope: " + str(path)
+                    )
+
+        draft_value, _draft_hash = self._current_draft_value_and_hash()
+        before_snapshot = packet.get("before_snapshot")
+        if not isinstance(before_snapshot, Mapping):
+            raise ValueError("active business repair draft baseline is invalid")
+        changed_pointers = _pointer_diff(before_snapshot, draft_value)
+        allowed_pointers = {
+            str(path) for path in packet.get("allowed_pointers", ())
+        }
+        # ``/answer`` is the canonical narrative root emitted by the
+        # semantic review adapter.  An answer-semantic finding owns the
+        # complete mutable AnalystAnswer body (headline findings, scope,
+        # method, supported/unsupported components, limitations, next
+        # actions, visuals, and evidence refs), while the immutable envelope
+        # fields remain outside this set.  Older packets intentionally retain
+        # their narrow stored pointer union; this deterministic virtual
+        # expansion lets the durable boundary enforce the same semantic
+        # contract without rewriting historical review bytes.
+        answer_body_bound = False
+        answer_aliases = {"/answer", "/scope", "/next_actions"}
+        for finding in packet.get("findings", ()):
+            if not isinstance(finding, Mapping):
+                continue
+            categories = {
+                str(category) for category in finding.get("semantic_categories", ())
+            }
+            pointers = {
+                str(pointer) for pointer in finding.get("pointers", ())
+            }
+            if "answer" in categories or (
+                categories.intersection({"calculation", "presentation"})
+                and "/answer" in pointers
+                and pointers.issubset(answer_aliases)
+            ):
+                answer_body_bound = True
+                break
+        if answer_body_bound:
+            allowed_pointers.update(f"/{section}" for section in _ANSWER_DRAFT_SECTIONS)
+        for pointer in changed_pointers:
+            if not any(
+                pointer == allowed_pointer
+                or pointer.startswith(allowed_pointer.rstrip("/") + "/")
+                for allowed_pointer in allowed_pointers
+            ):
+                raise ValueError(
+                    "business repair changed answer outside authorized scope: " + str(pointer)
+                )
+        # Preserve the existing lexical/item-root and immutable-envelope
+        # checks.  The explicit comparisons above narrow its item-local
+        # repair allowance to the reviewer packet's actual scope.
+        self._repair_scope_check()
+
+    def _validate_analytical_relationship_rows(
+        self,
+        rows: Iterable[Mapping[str, Any]],
+        *,
+        owner: str | None,
+    ) -> tuple[dict[str, Any], ...]:
+        """Re-validate the strict typed facade shape at the durable boundary."""
+
+        # Import lazily to keep the durable module's import graph acyclic.
+        from .analyst_workspace import AnalyticalRelationshipEvidence
+
+        validated: list[dict[str, Any]] = []
+        for value in rows:
+            if not isinstance(value, Mapping):
+                raise TypeError("analytical relationship must be a mapping")
+            if value.get("item_id") != self.item_id:
+                raise ValueError("analytical relationship item_id is invalid")
+            row_owner = value.get("owner_ref")
+            if not isinstance(row_owner, str) or not row_owner.strip():
+                raise ValueError("analytical relationship owner_ref is invalid")
+            if owner is not None and row_owner != owner:
+                raise ValueError("analytical relationship owner_ref is invalid")
+            if "record_kind" not in value:
+                raise ValueError("analytical relationship record_kind is required")
+            try:
+                typed = AnalyticalRelationshipEvidence.from_dict(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("analytical relationship row is invalid") from exc
+            canonical = typed.to_dict()
+            if set(value) != set(canonical) | {"item_id", "owner_ref"}:
+                raise ValueError("analytical relationship row fields are invalid")
+            validated.append(
+                {
+                    **canonical,
+                    "item_id": self.item_id,
+                    "owner_ref": row_owner,
+                }
+            )
+        return tuple(validated)
+
+    def _read_work_records(self, filename: str, *, label: str) -> tuple[dict[str, Any], ...]:
+        """Read an item-local JSONL work record without exposing mutable state."""
+
+        path = self._resolve_item_subpath(Path("work") / filename)
+        _assert_regular_no_symlink(path, label=f"{label} artifact")
+        if not path.exists():
+            return ()
+        try:
+            records = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"{label} artifact is invalid") from exc
+        if any(not isinstance(record, Mapping) for record in records):
+            raise ValueError(f"{label} artifact is invalid")
+        return tuple(copy.deepcopy(dict(record)) for record in records)
+
+    def read_identity_domain_proposals(self) -> tuple[dict[str, Any], ...]:
+        """Return immutable-by-copy identity-domain proposal records."""
+
+        return self._read_work_records(
+            _IDENTITY_DOMAIN_PROPOSALS_FILENAME,
+            label="identity domain proposal",
+        )
+
+    def read_analytical_relationships(self) -> tuple[dict[str, Any], ...]:
+        """Return immutable-by-copy analytical relationship evidence."""
+
+        return self._read_work_records(
+            _ANALYTICAL_RELATIONSHIPS_FILENAME,
+            label="analytical relationship",
+        )
 
     def write_open_issues(self, value: Any) -> None:
         self._write_json_artifact(Path("work") / _OPEN_ISSUES_FILENAME, value)
@@ -2585,7 +5768,17 @@ class ItemWorkspace:
                     continue
                 relative_path = path.relative_to(item_root)
                 relative = relative_path.as_posix()
-                if relative in {_STATE_FILENAME, str(Path("work") / _BUSINESS_REVIEW_FILENAME)} or "telemetry" in relative_path.parts:
+                if relative in {
+                    _STATE_FILENAME,
+                    str(Path("work") / _BUSINESS_REVIEW_FILENAME),
+                    str(Path("work") / _DATA_INSUFFICIENCY_FILENAME),
+                    # The repair-upgrade intent is a transient transaction
+                    # record.  It remains independently validated and any
+                    # residue fails closed, but must never become part of the
+                    # business repair artifact baseline: the intent is
+                    # removed after the manifest/audit commit.
+                    "work/analysis_context_repair_upgrade_intent.json",
+                } or "telemetry" in relative_path.parts:
                     continue
                 files.append(relative)
                 hashes[relative] = _sha256_file(path)
@@ -2728,11 +5921,11 @@ class ItemWorkspace:
             if consecutive == 1:
                 action = "materialize_now"
             else:
-                # Filesystem progress is only a host observation.  A second
-                # unchanged poll must not authorize recovery: the caller
-                # needs a completed invocation receipt that classifies the
-                # failure as a confirmed execution loss.
-                action = "await_runtime"
+                # Do not leave the only Analytical Owner slot occupied by a
+                # turn that has produced no material artifact twice.  This is
+                # an operational retry of the same owner and attempt, not a
+                # lifecycle recovery or a business-repair transition.
+                action = "retry_same_attempt"
                 state["lifecycle_state"] = "work"
         self._persist_state(state)
         decision = ProgressDecision(action, progress, changed_files)
@@ -2869,7 +6062,7 @@ class ItemWorkspace:
         )
         return attempt
 
-    def record_review(
+    def _record_review_unlocked(
         self,
         verdict: str,
         *,
@@ -2894,6 +6087,17 @@ class ItemWorkspace:
         normalized_findings = self._normalize_findings(findings)
         if verdict == "repair_once":
             self._require_repair_findings(normalized_findings)
+            if any(finding.get("semantic_categories") is None for finding in normalized_findings):
+                raise ValueError("repair_once requires canonical semantic category provenance")
+        if verdict == _CONFIRM_DATA_VERDICT:
+            if normalized_findings:
+                raise ValueError("confirm_data_insufficiency cannot carry reviewer findings")
+            if reviewer_ref is None or not str(reviewer_ref).strip():
+                raise ValueError("confirm_data_insufficiency requires reviewer_ref")
+            conclusion = self._read_data_insufficiency_conclusion()
+            if conclusion is None:
+                raise ValueError("confirm_data_insufficiency requires an owner conclusion")
+            self._validate_data_insufficiency_binding(conclusion, require_current=True)
 
         # Read and validate every input needed by the packet before touching
         # item_state.json or the prior business-review artifact.
@@ -2904,8 +6108,10 @@ class ItemWorkspace:
         targeted = previous_packet is not None and previous_packet.get("repair_active") is True
         if targeted:
             # A repair re-review is intentionally narrow.  It cannot silently
-            # become another full-answer review, and only one repair is ever
-            # permitted by the durable counter.
+            # become another full-answer review.
+            # The active repair boundary is item-local, not category-local:
+            # validate all current answer/work changes before producing the
+            # targeted packet.  Finding categories remain reviewer evidence.
             self._repair_scope_check()
         if status in {"unavailable", "not_reviewed"}:
             if reviewer_ref is not None:
@@ -2936,13 +6142,6 @@ class ItemWorkspace:
         if targeted and previous_packet is not None:
             before_value = previous_packet["before_snapshot"]
             changed_pointers = _pointer_diff(before_value, draft_value)
-            allowed = tuple(previous_packet.get("allowed_pointers", ()))
-            if not allowed and not previous_packet.get("allowed_artifact_paths") and not previous_packet.get("allowed_dependencies"):
-                raise ValueError("targeted business re-review has no authorized scope")
-            if any(
-                not any(_pointer_is_within(pointer, value) for value in allowed) for pointer in changed_pointers
-            ):
-                raise ValueError("targeted business re-review escaped the authorized scope")
             packet = copy.deepcopy(previous_packet)
             packet.update(
                 {
@@ -2966,7 +6165,24 @@ class ItemWorkspace:
                 if path in pointer_hashes
             }
             packet["unchanged_aggregate_hash"] = _sha256_bytes(_json_bytes(unchanged_hashes))
-            if normalized_findings:
+            if verdict == _CONFIRM_DATA_VERDICT:
+                packet["findings"] = []
+            elif verdict == "repair_once":
+                packet["findings"] = normalized_findings
+                # A targeted reviewer may authorize a second same-owner
+                # repair with a narrower semantic finding set.  Replace the
+                # aggregate authorization with the exact union derived from
+                # those new canonical findings; retaining the prior repair's
+                # union would fail validation (and, worse, leave the old
+                # scope active for the next repair).  The prior scope was
+                # already used above to validate every changed pointer and
+                # artifact before this replacement is staged.
+                (
+                    packet["allowed_pointers"],
+                    packet["allowed_artifact_paths"],
+                    packet["allowed_dependencies"],
+                ) = self._business_review_scope_union(normalized_findings)
+            elif normalized_findings:
                 packet["findings"] = normalized_findings
         else:
             allowed_pointers = sorted(
@@ -3031,43 +6247,100 @@ class ItemWorkspace:
         )
         return result
 
-    def use_business_repair(self) -> dict[str, Any]:
-        """Consume the one bounded business repair and bind its exact scope."""
+    def record_review(
+        self,
+        verdict: str,
+        *,
+        reviewer_ref: str | None = None,
+        review_status: str = "reviewed",
+        findings: Any = None,
+    ) -> dict[str, Any]:
+        """Record one reviewer verdict against freshly reloaded item state."""
 
-        self._ensure_execution_state()
-        self._ensure_not_terminal()
-        self._reconcile_business_review_discard()
-        if int(self._state["business_repair_count"]) >= 1:
-            raise ValueError("only one business repair is allowed")
-        review = self._state["review"]
-        if review.get("verdict") != "repair_once":
-            raise ValueError("business repair requires a repair_once review verdict")
-        packet = self._read_business_review()
-        if packet is None:
-            raise ValueError("business repair requires a structured finding packet")
-        self._require_repair_findings(self._normalize_findings(packet.get("findings")))
-        if packet.get("reviewed_draft_hash") != self._draft_hash():
-            raise ValueError("business repair requires the exact currently reviewed draft")
-        packet = copy.deepcopy(packet)
-        packet["repair_active"] = True
-        packet["targeted_recheck"] = False
-        packet["review_scope"] = "full"
-        packet["changed_pointers"] = []
-        state = dict(self._state)
-        state["business_repair_count"] = int(self._state["business_repair_count"]) + 1
-        state["review"] = self._execution_defaults()["review"]
-        state["lifecycle_state"] = "work"
-        self._commit_business_review(packet, state)
-        self._emit(
-            "item_business_repair_used",
-            repair_count=state["business_repair_count"],
-            allowed_pointers=packet["allowed_pointers"],
-            allowed_artifact_paths=packet["allowed_artifact_paths"],
-            allowed_dependencies=packet["allowed_dependencies"],
-            before_hash=packet["before_hash"],
-            unchanged_aggregate_hash=packet["unchanged_aggregate_hash"],
-        )
-        return copy.deepcopy(packet)
+        with self._state_transition_lock():
+            self._reload_authoritative_for_artifact_mutation_locked()
+            return self._record_review_unlocked(
+                verdict,
+                reviewer_ref=reviewer_ref,
+                review_status=review_status,
+                findings=findings,
+            )
+
+    def use_business_repair(self, *, owner_ref: Any) -> dict[str, Any]:
+        """Open the next item-local business repair from a reviewed finding."""
+
+        with self._state_transition_lock():
+            self._reload_authoritative_state_locked()
+            # Validate an existing owner binding without creating a new
+            # program-owned artifact before the reviewer baseline check.  A
+            # direct durable caller may establish its owner at repair
+            # activation; that first binding must not mask reviewer-artifact
+            # drift or mutate state before the fail-closed check below.
+            owner_binding = self._read_analysis_owner()
+            if owner_binding is not None:
+                self._verify_analysis_owner_locked(owner_ref)
+            self._ensure_execution_state()
+            self._reconcile_business_review_discard()
+            self._ensure_not_terminal()
+            self._require_no_active_attempt()
+            self._reconcile_business_review_discard()
+            count = int(self._state["business_repair_count"])
+            review = self._state["review"]
+            if review.get("verdict") != "repair_once":
+                raise ValueError("business repair requires a repair_once review verdict")
+            packet = self._read_business_review()
+            if packet is None:
+                raise ValueError("business repair requires a structured finding packet")
+            self._require_repair_findings(self._normalize_findings(packet.get("findings")))
+            draft_value, draft_hash = self._current_draft_value_and_hash()
+            if packet.get("reviewed_draft_hash") != draft_hash:
+                raise ValueError("business repair requires the exact currently reviewed draft")
+            progress = self._artifact_progress()
+            reviewed_artifact_hashes = packet.get("after_artifact_hashes")
+            if not isinstance(reviewed_artifact_hashes, Mapping) or dict(progress.hashes) != dict(reviewed_artifact_hashes):
+                raise ValueError("business repair requires the exact currently reviewed artifact progress")
+            self._verify_analysis_owner_locked(owner_ref, bind_if_missing=True)
+            # Binding a previously-unbound owner is itself a durable
+            # program-owned artifact.  Capture it in the active repair
+            # baseline only after the exact reviewer baseline has passed.
+            progress = self._artifact_progress()
+            pointer_hashes = _pointer_hashes(draft_value)
+            packet = copy.deepcopy(packet)
+            # Every repair gets the currently reviewed draft and artifact set
+            # as its own immutable baseline.  This prevents a second repair
+            # from inheriting the first repair's before-snapshot and scope.
+            packet.update(
+                {
+                    "reviewed_draft_hash": draft_hash,
+                    "before_hash": draft_hash,
+                    "before_snapshot": draft_value,
+                    "before_pointer_hashes": pointer_hashes,
+                    "before_artifact_hashes": dict(progress.hashes),
+                    "after_pointer_hashes": pointer_hashes,
+                    "after_artifact_hashes": dict(progress.hashes),
+                    "changed_pointers": [],
+                    "unchanged_paths": sorted(pointer_hashes),
+                    "unchanged_aggregate_hash": _sha256_bytes(_json_bytes(pointer_hashes)),
+                    "repair_active": True,
+                    "targeted_recheck": False,
+                    "review_scope": "full",
+                }
+            )
+            state = dict(self._state)
+            state["business_repair_count"] = count + 1
+            state["review"] = self._execution_defaults()["review"]
+            state["lifecycle_state"] = "work"
+            self._commit_business_review(packet, state)
+            self._emit(
+                "item_business_repair_used",
+                repair_count=state["business_repair_count"],
+                allowed_pointers=packet["allowed_pointers"],
+                allowed_artifact_paths=packet["allowed_artifact_paths"],
+                allowed_dependencies=packet["allowed_dependencies"],
+                before_hash=packet["before_hash"],
+                unchanged_aggregate_hash=packet["unchanged_aggregate_hash"],
+            )
+            return copy.deepcopy(packet)
 
     def _publish_accepted_directory(self, files: Mapping[str, bytes], manifest: Mapping[str, Any]) -> Path:
         self._reject_existing_symlink_components(self.context, self.item_root)
@@ -3092,6 +6365,21 @@ class ItemWorkspace:
         return accepted / "manifest.json"
 
     def accept(
+        self,
+        *,
+        knowledge_delta: str = "no_change",
+        accepted_refs: tuple[str, ...] = (),
+    ) -> AcceptedSnapshot:
+        """Linearize acceptance against all item writers and terminalizers."""
+
+        with self._state_transition_lock():
+            self._reload_authoritative_for_terminal_transition_locked()
+            return self._accept_unlocked(
+                knowledge_delta=knowledge_delta,
+                accepted_refs=accepted_refs,
+            )
+
+    def _accept_unlocked(
         self,
         *,
         knowledge_delta: str = "no_change",
@@ -3231,6 +6519,13 @@ class ItemWorkspace:
         return copy.deepcopy(self._state)
 
     def technical_failure(self, reason: str, *, recovery_exhausted: bool) -> AcceptedSnapshot:
+        """Linearize technical terminalization against all item writers."""
+
+        with self._state_transition_lock():
+            self._reload_authoritative_for_terminal_transition_locked()
+            return self._technical_failure_unlocked(reason, recovery_exhausted=recovery_exhausted)
+
+    def _technical_failure_unlocked(self, reason: str, *, recovery_exhausted: bool) -> AcceptedSnapshot:
         """Publish a terminal workflow failure only after recovery exhaustion."""
 
         if recovery_exhausted is not True:
@@ -3244,6 +6539,11 @@ class ItemWorkspace:
         reason = str(reason)
         if not reason:
             raise ValueError("technical_failure reason must be non-empty")
+        # Retain reviewer findings as historical evidence, but make the
+        # consumed repair authority inactive before publishing the terminal
+        # snapshot.  This prevents stale repair metadata from participating in
+        # a later terminal reload or next-item transition.
+        self._deactivate_active_business_repair()
         progress = self.artifact_progress()
         refs = ["work/handoff.json"] if progress.handoff_present else []
         unsigned = {
@@ -3275,6 +6575,156 @@ class ItemWorkspace:
             content_hash=content_hash,
         )
         return snapshot
+
+    def finalize_blocked_by_evidence(self) -> AcceptedSnapshot:
+        """Publish an immutable terminal snapshot for owner data insufficiency.
+
+        The transition is authorized only by an explicit Analytical Owner
+        conclusion bound to the current draft/artifact progress and an
+        independent reviewer ``confirm_data_insufficiency`` verdict.  No
+        accepted answer content or integration bundle is produced.
+        """
+
+        with self._state_transition_lock():
+            # A caller-held workspace is not an authorization token.  Reload
+            # under the shared lock so an attempt, terminal intent, or review
+            # update committed by another workspace cannot be overwritten.
+            state_path = self._resolve_item_subpath(_STATE_FILENAME)
+            authoritative_state = self._read_state(state_path)
+            self._validate_state(
+                authoritative_state,
+                item_id=self.item_id,
+                mode=self.mode,
+                original_text=self.original_text,
+            )
+            self._state = authoritative_state
+            self._ensure_execution_state()
+            self._reconcile_business_review_discard()
+            if self.accepted_root.exists() or self.accepted_root.is_symlink():
+                raise FileExistsError(self.accepted_root)
+            self._ensure_not_terminal()
+            self._require_no_active_attempt()
+            if self._state.get("terminal_outcome") is not None or self._state.get("terminal_intent") is not None:
+                raise ValueError("blocked review finalization requires a non-terminal item")
+            if self._state.get("lifecycle_state") != "review":
+                raise ValueError("blocked_by_evidence finalization requires lifecycle_state=review")
+            if self._state.get("integration_state") != "pending":
+                raise ValueError("blocked_by_evidence finalization requires pending integration")
+
+            review = self._state.get("review")
+            if not isinstance(review, Mapping):
+                raise ValueError("blocked_by_evidence finalization requires review metadata")
+            if review.get("status") != "reviewed" or review.get("verdict") != _CONFIRM_DATA_VERDICT:
+                raise ValueError("blocked_by_evidence finalization requires reviewer data-insufficiency confirmation")
+
+            draft_path = self.draft_root
+            _assert_regular_no_symlink(draft_path, label="draft artifact")
+            if not draft_path.is_file():
+                raise FileNotFoundError(draft_path)
+            draft_bytes = draft_path.read_bytes()
+            draft_hash = _sha256_bytes(draft_bytes)
+            if review.get("draft_hash") != draft_hash:
+                raise ValueError("blocked_by_evidence finalization requires the exact currently reviewed draft")
+
+            conclusion = self._read_data_insufficiency_conclusion()
+            if conclusion is None:
+                raise ValueError("blocked_by_evidence finalization requires an owner conclusion")
+            conclusion = self._validate_data_insufficiency_binding(conclusion, require_current=True)
+            conclusion_path = self.data_insufficiency_path
+            _assert_regular_no_symlink(conclusion_path, label="data insufficiency conclusion")
+            conclusion_bytes = conclusion_path.read_bytes()
+
+            review_path = self.business_review_path
+            _assert_regular_no_symlink(review_path, label="business review artifact")
+            if not review_path.is_file():
+                raise FileNotFoundError(review_path)
+            review_bytes = review_path.read_bytes()
+            try:
+                packet = json.loads(review_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("business review artifact is invalid") from exc
+            if not isinstance(packet, Mapping):
+                raise ValueError("business review artifact must be an object")
+            self._validate_business_review_payload(packet)
+            if packet.get("review_scope") not in {"full", "targeted"}:
+                raise ValueError("blocked_by_evidence finalization requires a completed review packet")
+            if packet.get("repair_active") is not False:
+                raise ValueError("blocked_by_evidence finalization requires an inactive repair packet")
+            findings = packet.get("findings")
+            if findings != []:
+                raise ValueError("blocked_by_evidence finalization cannot use reviewer findings as authority")
+            if packet.get("reviewed_draft_hash") != draft_hash:
+                raise ValueError("blocked_by_evidence finalization requires a packet bound to the draft")
+
+            progress = self._artifact_progress(draft_bytes)
+            unsigned = {
+                "item_id": self.item_id,
+                "outcome": _BLOCKED_REVIEW_OUTCOME,
+                "reason": "data_insufficiency",
+                "draft_path": "reviewed_draft.json",
+                "draft_hash": draft_hash,
+                "source_draft_path": _DRAFT_FILENAME,
+                "source_draft_hash": draft_hash,
+                "business_review_path": "business_review.json",
+                "business_review_hash": _sha256_bytes(review_bytes),
+                "source_business_review_path": f"work/{_BUSINESS_REVIEW_FILENAME}",
+                "source_business_review_hash": _sha256_bytes(review_bytes),
+                "data_insufficiency_path": _DATA_INSUFFICIENCY_FILENAME,
+                "data_insufficiency_hash": _sha256_bytes(conclusion_bytes),
+                "source_data_insufficiency_path": f"work/{_DATA_INSUFFICIENCY_FILENAME}",
+                "source_data_insufficiency_hash": _sha256_bytes(conclusion_bytes),
+                "review_status": str(review.get("status")),
+                "review_strength": review.get("strength"),
+                "review_verdict": str(review.get("verdict")),
+                "reviewer_ref": review.get("reviewer_ref"),
+                "review_scope": packet["review_scope"],
+                "targeted_recheck": packet["targeted_recheck"],
+                "repair_active": packet["repair_active"],
+                "reviewed_draft_hash": packet["reviewed_draft_hash"],
+                "finding_count": len(findings),
+                "hashes": dict(progress.hashes),
+                "artifact_progress": progress.to_dict(),
+                "refs": [
+                    _DRAFT_FILENAME,
+                    f"work/{_BUSINESS_REVIEW_FILENAME}",
+                    f"work/{_DATA_INSUFFICIENCY_FILENAME}",
+                ],
+            }
+            # ``content_hash`` retains the terminal snapshot convention used
+            # by accepted items: for this no-answer outcome the immutable
+            # reviewed draft is the canonical content, while the business
+            # review copy has its own explicit hash.
+            content_hash = draft_hash
+            manifest = {**unsigned, "content_hash": content_hash}
+            manifest["manifest_hash"] = _manifest_hash(manifest)
+
+            intent_state = copy.deepcopy(self._state)
+            intent_state["terminal_intent"] = {
+                "outcome": _BLOCKED_REVIEW_OUTCOME,
+                "manifest_hash": manifest["manifest_hash"],
+            }
+            self._persist_state(intent_state, _lock_held=True)
+            manifest_path = self._publish_accepted_directory(
+                {
+                    "reviewed_draft.json": draft_bytes,
+                    "business_review.json": review_bytes,
+                    _DATA_INSUFFICIENCY_FILENAME: conclusion_bytes,
+                },
+                manifest,
+            )
+            snapshot = AcceptedSnapshot(self.item_id, _BLOCKED_REVIEW_OUTCOME, str(manifest_path), content_hash)
+            state = copy.deepcopy(self._state)
+            state["lifecycle_state"] = _BLOCKED_REVIEW_OUTCOME
+            state["terminal_outcome"] = {"status": _BLOCKED_REVIEW_OUTCOME, **snapshot.to_dict()}
+            self._persist_state(state, _lock_held=True)
+            self._emit(
+                "item_blocked_by_evidence",
+                outcome=_BLOCKED_REVIEW_OUTCOME,
+                manifest_path=str(manifest_path),
+                content_hash=content_hash,
+                finding_count=len(findings),
+            )
+            return snapshot
 
 
 __all__ = [

@@ -1,0 +1,28 @@
+{
+  "schema_version": "benchmark_a.canned_requirement_replay.v1",
+  "fixture_name": "milk_fat_to_raw_material_procurement_price",
+  "requirement_id": "R-001",
+  "requirement_text": "Dashboard should show the ratio of milk fat content to the procurement price of the raw material for that milk.",
+  "rows": [
+    {
+      "milk_lot_id": "ML-001",
+      "milk_fat_percent": "3.5",
+      "procurement_price_eur_per_kg": "2.0"
+    },
+    {
+      "milk_lot_id": "ML-002",
+      "milk_fat_percent": "4.0",
+      "procurement_price_eur_per_kg": "2.0"
+    },
+    {
+      "milk_lot_id": "ML-003",
+      "milk_fat_percent": "3.0",
+      "procurement_price_eur_per_kg": "2.0"
+    }
+  ],
+  "limits": [
+    "Synthetic fixture only.",
+    "Descriptive ratio; no causal or time-series interpretation.",
+    "No production pricing or coverage claim."
+  ]
+}

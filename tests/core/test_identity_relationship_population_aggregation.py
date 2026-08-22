@@ -57,9 +57,7 @@ def test_requirement_record_keeps_explicit_user_owned_fields():
         business_objective="support a decision",
         expected_analytical_outputs=("comparison",),
         expected_visual_outputs=("trend",),
-        internal_tasks=("prepare",),
         dependencies=("source-a",),
-        shared_foundation_dependencies=("foundation-1",),
         data_needs=("records",),
         ontology_needs=("object",),
         prepared_data_needs=("prepared-records",),
@@ -68,7 +66,7 @@ def test_requirement_record_keeps_explicit_user_owned_fields():
         status="queued",
     )
     payload = record.to_dict()
-    for key in ("original_text", "explicit_priority", "business_objective", "expected_analytical_outputs", "expected_visual_outputs", "internal_tasks", "dependencies", "shared_foundation_dependencies", "data_needs", "ontology_needs", "prepared_data_needs", "working_definitions", "limitations", "status"):
+    for key in ("original_text", "explicit_priority", "business_objective", "expected_analytical_outputs", "expected_visual_outputs", "dependencies", "data_needs", "ontology_needs", "prepared_data_needs", "working_definitions", "limitations", "status"):
         assert key in payload
     assert payload["original_text"].startswith("Compare")
 

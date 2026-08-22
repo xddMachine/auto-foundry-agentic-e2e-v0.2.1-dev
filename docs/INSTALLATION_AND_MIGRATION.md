@@ -4,7 +4,7 @@ These instructions describe a local replacement. The package/validator smoke
 uses a temporary offline install target only; it never installs into this
 repository's Python environment or the Codex runtime automatically.
 
-The current contract is skill `0.2.8` with core `0.3.5`. Benchmark A remains
+The current contract is skill `0.7.1` with core `0.8.0`. Benchmark A remains
 prepared but unexecuted; this document does not authorize a run, installation,
 or remote operation.
 
@@ -43,15 +43,89 @@ The same context bounds source reads, products, cache, telemetry, and
 optimizer evidence. Public exports include `RunContext`, `DataRoom`,
 `DataRoomWorkbench`, `DataRoomMember`, `DataRoomCatalogEntry`, `PreparedAsset`,
 `ItemWorkspace`, `ArtifactProgress`, `ProgressDecision`, `ExecutionAttempt`,
-`AcceptedSnapshot`, `CoreRuntime`, `CoreExecutionResult`, `LEMRef`, and the
+`AcceptedSnapshot`, `AnalystWorkspace`, `AnalystAnswer`, `EvidenceNote`,
+`SpecialistTask`, `SpecialistMemo`, `ReviewFinding`, `BusinessReviewAdapter`,
+`CoreRuntime`, `CoreExecutionResult`, `LEMRef`, and the
 immutable contracts. The old mutable `Workspace` export is removed; callers
 should not keep a second root-plumbing layer. The workbench owns physical
-source access and durable execution, while the Lead Analyst owns semantic
-judgment. A normal run begins from the explicit task and does not require
-manual authorization or an extra confirmation step.
+source access and durable execution, while one Analytical Owner owns the full
+semantic loop and final answer. Analytical roles use `AnalystWorkspace`; they
+do not author internal JSON, paths, hashes, or state.
 
-For prepared data, the Lead Analyst writes a candidate through the bound item
-context; the accepted registry stays empty until Result Integration commits the
+Before analysis, the owner calls `brief()` and searches compact accepted
+ontology/prepared descriptors with `search_ontology()` and
+`search_prepared_assets()`. Useful exact IDs are selected with
+`select_ontology()` or `select_prepared_assets()` and a purpose; the program
+records the item-bound trace in `work/semantic_selections.jsonl`. Prepared rows
+are loaded only after selection and exact registry content-hash validation via
+`load_prepared_asset()`.
+
+This is an explicit readiness/scouting pass: search/select applicable ontology,
+identity mappings, relationships, and prepared semantics, or record why none
+applies. If a needed identity domain is `resolving`, the Analytical Owner
+reports `waiting_on_resolution` and releases its lane. The Planner skips to the
+next original-order runnable item and marks the earliest paused item
+`ready_to_resume` when the domain is `ready`; if all runnable items wait, the owner lane sleeps while
+active resolvers progress. Block only when nothing is runnable and no resolver
+progresses.
+
+Call `RequirementSupervisorWorkspace.scheduling_tick()` after each wait,
+resume, or terminal transition; it returns the host-ready next requirement and
+keeps `run_state.json` reconciled with item state.
+
+Requirement Mode uses one run-level **Planner**, an event-driven control plane
+and cognitive scheduler. It receives exact `RequirementRecord` values, compact
+physical catalog metadata, and current item/resolution outcomes. Initial order
+and grouping are advisory and preserve explicit user priority/order; the
+Planner never declares runtime semantic dependencies. The Analytical Owner
+discovers those after understanding the requirement, and the runtime
+`waiting_on_resolution`/`ready_to_resume` ledger is the sole semantic block.
+may suggest zero to three owner specialists but does not calculate or write
+answers and is not a deterministic ID/hash or lifecycle authority.
+`RequirementExecutionPlan` and `RequirementExecutionGroup` are revisionable
+scheduling recommendations, separate from catalog hashes and lifecycle state.
+A technical failure does not create Planner dependency blocks; independent groups
+remain eligible and runtime resolution state controls waiting and resume.
+
+The default capacity is four entity-resolution workers, one Analytical Owner,
+up to three owner specialists, and eight active workers total; the Planner is
+not counted. Hosts may configure lower or higher limits but must never
+oversubscribe actual host capacity. Requested Run A and Run B executions remain
+sequential.
+
+Every requirement binds directly to the same `RunContext` and shared Data Room.
+Each item creates an item-local `RequirementAnalysisPlan` and follows the
+ordinary loop: analysis, review, iterative material repairs, accept or
+`technical_failure`, then integration. Within a group one Analytical Owner
+remains per requirement; bounded shared investigation may be reused and
+independent groups may run when host capacity permits. No previous-item
+context or internal paths/hashes are exposed to analytical roles.
+
+Entity-resolution jobs are parallel external jobs, not extra specialists and do
+not answer requirements. When an Analytical Owner proposes a new arbitrary
+real-world identity domain during scouting, reserve that exact owner-bound
+proposal as `resolving` and launch an Entity Resolution Owner; the Planner does
+not pre-reserve it. Do not hardcode Supplier/Factory/Order
+scope; strongly coupled classes may share a domain. The owner scans the full
+shared Data Room, owns methodology, may inspect manually or write
+Python/SQL/scripts/use helpers, infer and bulk-apply justified patterns, test
+samples/coverage/exceptions/population differences, and revise the method.
+Row-by-row review, an authoritative crosswalk, and a fixed matching script are
+not required; pattern rules remain run knowledge and future helper-library
+audit is deferred.
+
+The review decision is binary per proposed mapping (accepted or not accepted).
+Each accepted `CanonicalMapping` may contain one or many source identities or
+representations, including bulk pattern-derived populations. Unresolved or
+ambiguous records remain source-local/outside canonical mappings with coverage
+and exceptions preserved, without downgrading proven mappings. Ready snapshots
+publish the canonical class, source-account representation classes, reviewed
+`IdentityDecision`/`CanonicalMapping`, identity `represents` relationships, and
+a versioned mapping asset/coverage where available. Ready is exposed only after
+an atomic reviewed commit; owners never see partial snapshots.
+
+For prepared data, the Analytical Owner asks the bound facade to materialize a
+candidate; the accepted registry stays empty until Result Integration commits the
 accepted item:
 
 ```python
@@ -73,32 +147,47 @@ cannot prove semantic completeness. After mechanical validation, exactly one
 fresh item-only Integration Fidelity Reviewer checks the current item before
 commit. The packet excludes sibling, cumulative, prior-memory, and
 broad-workspace context; the same Result Integration Agent may make one
-targeted repair and receives one targeted recheck.
-Repair scope honors explicit dependent artifact roots and JSON fragments by
-authorizing their owning artifact paths; unrelated artifact mutations remain
-fail-closed.
-An invalid reviewer-scope packet may be recovered only with
-`ItemWorkspace.discard_business_review(...)` and an inadmissible, item-bound
-`reviewer_scope` incident. The append-only hash-bound audit and atomic discard
-preserve work/draft bytes, reset review and repair state, and require a new
-full review; no semantic reinterpretation or compatibility fallback is used.
-For an implementation change, use only
-`BoundAnalysisContext.rebind_implementation(...)`: a contiguous transition
-ledger and durable intent/audit/head preserve the same source, catalog, stat,
-and inventory under journal → run → item lock order. It rejects active
-attempt/review/terminal/accepted state (discard an invalid review first) and
-does not read ZIP members, rebuild catalogs, increment counters, emit false
-telemetry, create analysis, or reread raw sources.
+targeted repair and receives a targeted recheck.
+Review findings identify an answer section and business category as semantic
+repair provenance. The current or a replacement owner may update any
+item-local work and coherent answer section; cross-item writes remain
+fail-closed and internal paths/hashes stay program-owned.
+The current business verdicts are `accept`, `accept_with_limits`, `repair_once`,
+and `confirm_data_insufficiency`. Material repairs may repeat and each receives
+a targeted recheck. Only an owner-originated
+`DataInsufficiencyConclusion` confirmed by the reviewer can publish
+`blocked_by_evidence`; other defects repair or technical-fail. Result
+Integration may reuse committed semantics, relationships, conclusions, and
+prepared assets selected through the analytical facade. Persisted analysis
+contexts load across implementation revisions without a transition/rebind
+handoff.
 
-For later or multi-hop items use only
-`BoundAnalysisContext.create_from_transitioned_catalog(...)`. It performs
-immutable source inheritance, not a synthetic transition: original
-source/catalog/stat/inventory identity is reused with no ZIP/member discovery,
-catalog rebuild, inventory counters, or raw reads. Recursive upstream
-provenance uses inherited journals oldest first → target journal → run →
-lexical source/target item locks. Target intent/manifest/record/state recover
-idempotently after a crash and retries write no synthetic transition audit;
-`earliest_affected_item` is a lower bound, so an earlier target is rejected.
+Use `accept` when the core requested decision is answered and only normal
+disclosed limits remain. Use `accept_with_limits` only when a material requested
+component is missing or unreliable; source-local, currency, or no-causality
+caveats alone do not force with-limits. Semantic fidelity is independent, and
+resolution review decisions are binary per mapping while each accepted mapping
+may contain one or many source identities and coverage/exceptions are job-level
+evidence.
+
+Result Integration publishes material reusable business objects/table mappings,
+grain, key fields/normalization, relationship/cardinality/coverage/date
+authority/limits, and truly reusable prepared descriptors. It does not publish
+every merge, result row, metric observation, Japan/Spain filter, or
+question-specific aggregation. `no_change` is valid only when no reusable
+semantic understanding or asset was established, with a concrete reason.
+Q2/Q9 can search, select, and load Q1's exact order-fulfillment semantics, then
+compute their own requirement-specific measures.
+
+Analytical Owners establish actual joins/relationships with
+`source_id`/`target_id`, `join_keys`, grain, cardinality, `matched_pairs` (the
+number of unique tested edge pairs), `source_population`/`target_population`,
+`matched_source_count`/`matched_target_count` (distinct matched endpoints),
+and `source_coverage`/`target_coverage` (each matched endpoint count divided
+by its population; zero when that population is zero), plus `as_of`/date
+authority, limitations, and evidence. Integration publishes only reviewed tested
+relationships and canonical identity mappings; it never completes a theoretical
+graph or infers joins from prose.
 
 The run-level physical inventory is bound once and exposed through passive
 counter operations (`archive_full_hash`, `member_content_hash`,
@@ -113,64 +202,52 @@ active attempt and lane; unpersisted or mismatched references fail closed.
 
 ## Skill replacement (same name)
 
-1. Build/validate `dist/auto-foundry-agentic-e2e-v0.2.8.zip` locally.
-2. Inspect that the ZIP has exactly one top-level directory named
-   `auto-foundry-agentic-e2e/`.
-3. Back up the existing same-name directory, then replace it atomically in the
-   local skills directory (normally `$CODEX_HOME/skills`, if configured):
+Build and validate `dist/auto-foundry-agentic-e2e-v0.7.1.zip` locally. The
+replacement must be staged and validated before it enters a discovery root;
+never unzip directly over the active directory. The repository provides a
+stdlib-only atomic installer with a dry-run mode:
 
 ```bash
-SKILLS_DIR="$(cd "${CODEX_HOME:-$HOME/.codex}/skills" && pwd -P)"
-BACKUP_DIR="${SKILLS_DIR}/auto-foundry-agentic-e2e.backup"
-test -d "$SKILLS_DIR"
-test -d "${SKILLS_DIR}/auto-foundry-agentic-e2e"
-test ! -e "$BACKUP_DIR"
-mv "${SKILLS_DIR}/auto-foundry-agentic-e2e" "$BACKUP_DIR"
-unzip -q dist/auto-foundry-agentic-e2e-v0.2.8.zip -d "$SKILLS_DIR"
+python3 scripts/package_release.py
+python3 scripts/validate_release.py
+python3 scripts/install_skill_release.py \
+  --zip dist/auto-foundry-agentic-e2e-v0.7.1.zip \
+  --skills-root "${CODEX_HOME:-$HOME/.codex}/skills" \
+  --dry-run
 ```
 
-4. Verify the installed `SKILL.md` frontmatter and markers are `0.2.8` with
-   core version `0.3.5`, then
-   start a **fresh Codex task**. Skill discovery is refreshed at task start;
-   do not assume the current task sees a changed skill.
+For the authorized replacement, omit `--dry-run`. The installer verifies CRCs,
+member count and paths, frontmatter/runtime markers, the deterministic package
+hash, and every staged file before guarded directory renames. A stable
+cross-process lock and fsynced swap journal live in a sibling transaction
+directory outside `skills/`; if the process dies between renames, the next
+invocation recovers the recorded transaction before doing anything else.
+The previous active tree and any old `*.backup`/`*.previous-backup` trees are
+moved to a timestamped archive root outside `skills/`; existing active or
+archive paths are never overwritten. The CLI accepts no hash/count/version
+override: the v0.7.1 production manifest is authoritative. The installer never
+changes the real user runtime as part of this repository task; use a temporary
+`--skills-root` in tests.
 
-Rollback is a replacement, not a merge. The active v0.2.8 tree must leave the
-skills discovery root before the previous entrypoint is restored; otherwise a
-recursive discovery scan can see two same-name skills. Keep the replacement
-tree in a timestamped retained directory outside `$CODEX_HOME/skills`:
-
-```bash
-SKILLS_DIR="$(cd "${CODEX_HOME:-$HOME/.codex}/skills" && pwd -P)"
-ACTIVE="${SKILLS_DIR}/auto-foundry-agentic-e2e"
-BACKUP_DIR="${SKILLS_DIR}/auto-foundry-agentic-e2e.previous-backup"
-ROLLBACK_ROOT="${CODEX_HOME:-$HOME/.codex}/skill-rollback-replacements"
-REPLACEMENT="${ROLLBACK_ROOT}/auto-foundry-agentic-e2e-v0.2.8-$(date -u +%Y%m%dT%H%M%SZ)"
-mkdir -p "$ROLLBACK_ROOT"
-test -d "$SKILLS_DIR"
-test -d "$ACTIVE"
-test -d "$BACKUP_DIR"
-test ! -e "$REPLACEMENT"
-test ! -e "$BACKUP_DIR/SKILL.md"
-test -f "$BACKUP_DIR/SKILL.md.rollback-previous"
-mv "$ACTIVE" "$REPLACEMENT"
-mv "$BACKUP_DIR/SKILL.md.rollback-previous" "$BACKUP_DIR/SKILL.md"
-mv "$BACKUP_DIR" "$ACTIVE"
-```
-
-After the final move, the only discoverable `auto-foundry-agentic-e2e` entrypoint
-under `SKILLS_DIR` is the restored active path; the retained replacement is
-outside that root. Keep the replacement until the fresh-task discovery check
-succeeds, then remove only that explicitly named retained directory if desired.
+After a successful replacement, verify the installed `SKILL.md` markers are
+`0.7.1` with core `0.8.0`, then start a **fresh Codex task**. Skill discovery is
+refreshed at task start; do not assume the current task sees a changed skill.
+Keep exactly one discoverable `auto-foundry-agentic-e2e` entrypoint: retained
+archives belong outside the discovery root.
 
 ## Core wheel replacement (same package name)
 
-The validated wheel is `dist/auto_foundry_core-0.3.5-*.whl`. Install into an
-explicit target or environment selected by the operator; do not install into
-the repository or a user runtime as part of this deliverable:
+`scripts/package_release.py` would create
+`dist/auto_foundry_core-0.8.0-*.whl`; run `scripts/validate_release.py` and
+confirm validation passes before installing it. This repository task does not
+claim that a wheel already exists or has been validated; current evidence is
+offline tests and static checks only. After that conditional validation,
+install into an explicit target or environment selected by the operator; do
+not install into the repository or a user runtime as part of this deliverable:
 
 ```bash
 TARGET="$(mktemp -d)"
-python3 -m pip install --no-index --no-deps --target "$TARGET" dist/auto_foundry_core-0.3.5-*.whl
+python3 -m pip install --no-index --no-deps --target "$TARGET" dist/auto_foundry_core-0.8.0-*.whl
 PYTHONPATH="$TARGET" python3 -c 'import auto_foundry_core; print(auto_foundry_core.__version__)'
 PYTHONPATH="$TARGET" python3 -m auto_foundry_core catalog list
 ```
@@ -188,7 +265,7 @@ do not fetch packages or use a remote index.
 ## Release candidate status
 
 After the complete offline vertical proofs and full suite pass, use the status
-label **v0.2.8 / core 0.3.5 — offline program validation complete for later
+label **v0.7.1 / core 0.8.0 — offline program validation complete for later
 Benchmark A**. Benchmark A is prepared but not run by this repository task. This remains an experimental
 release candidate, not a production-hardened sandbox.
 

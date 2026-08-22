@@ -176,6 +176,9 @@ class IntegrationFidelityPacket:
             raise ValueError("fidelity packet collections are invalid")
         if any(not isinstance(item, Mapping) for item in (*records, *evidence, *candidates)):
             raise ValueError("fidelity packet collection item is invalid")
+        records_bytes = b"".join(_json_bytes(item) for item in records)
+        if hashlib.sha256(records_bytes).hexdigest() != value.get("records_hash"):
+            raise ValueError("fidelity packet records hash does not match records")
         unsigned = {key: value[key] for key in value if key != "packet_hash"}
         if value.get("packet_hash") != _digest(unsigned):
             raise ValueError("fidelity packet hash does not match content")
@@ -441,6 +444,9 @@ class FidelityRepairProgress:
     invocation_id: str
     authorization_hash: str
     corrected_record_hashes: Mapping[str, str]
+    removed_record_ids: tuple[str, ...]
+    current_records_hash: str
+    current_packet_hash: str | None
     progress_hash: str
 
     def unsigned(self) -> dict[str, Any]:
@@ -451,6 +457,9 @@ class FidelityRepairProgress:
             "invocation_id": self.invocation_id,
             "authorization_hash": self.authorization_hash,
             "corrected_record_hashes": dict(self.corrected_record_hashes),
+            "removed_record_ids": list(self.removed_record_ids),
+            "current_records_hash": self.current_records_hash,
+            "current_packet_hash": self.current_packet_hash,
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -461,15 +470,22 @@ class FidelityRepairProgress:
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "FidelityRepairProgress":
         expected = set(cls.__dataclass_fields__)  # type: ignore[attr-defined]
-        if not isinstance(value, Mapping) or set(value) != expected:
+        # The removal field was added while the current repair artifacts were
+        # still active.  Accepting its absence as an empty set keeps those
+        # artifacts loadable without introducing a deprecated schema path;
+        # every subsequent durable write emits the explicit field.
+        required = expected - {"removed_record_ids"}
+        if not isinstance(value, Mapping) or set(value) not in (required, expected):
             raise ValueError("fidelity repair progress fields are invalid")
         if value.get("schema_version") != _SCHEMA_VERSION:
             raise ValueError("fidelity repair progress schema_version is invalid")
         for name in ("item_id", "session_id", "invocation_id"):
             _safe_id(value.get(name), f"fidelity repair progress {name}")
-        for name in ("authorization_hash", "progress_hash"):
+        for name in ("authorization_hash", "current_records_hash", "progress_hash"):
             if not _sha256(value.get(name)):
                 raise ValueError(f"fidelity repair progress {name} is invalid")
+        if value.get("current_packet_hash") is not None and not _sha256(value.get("current_packet_hash")):
+            raise ValueError("fidelity repair progress current_packet_hash is invalid")
         raw_hashes = value.get("corrected_record_hashes")
         if not isinstance(raw_hashes, Mapping):
             raise ValueError("fidelity repair progress corrected hashes are invalid")
@@ -477,6 +493,12 @@ class FidelityRepairProgress:
             _safe_id(record_id, "fidelity repair progress record_id")
             if not _sha256(digest):
                 raise ValueError("fidelity repair progress record hash is invalid")
+        raw_removed = value.get("removed_record_ids", [])
+        if not isinstance(raw_removed, list):
+            raise ValueError("fidelity repair progress removed record IDs are invalid")
+        removed = tuple(_safe_id(item, "fidelity repair progress removed_record_id") for item in raw_removed)
+        if len(removed) != len(set(removed)):
+            raise ValueError("fidelity repair progress removed record IDs contain duplicates")
         unsigned = {key: value[key] for key in value if key != "progress_hash"}
         if value.get("progress_hash") != _digest(unsigned):
             raise ValueError("fidelity repair progress hash does not match content")
@@ -487,6 +509,13 @@ class FidelityRepairProgress:
             invocation_id=str(value["invocation_id"]),
             authorization_hash=str(value["authorization_hash"]),
             corrected_record_hashes={str(key): str(item) for key, item in raw_hashes.items()},
+            removed_record_ids=removed,
+            current_records_hash=str(value["current_records_hash"]),
+            current_packet_hash=(
+                str(value["current_packet_hash"])
+                if value["current_packet_hash"] is not None
+                else None
+            ),
             progress_hash=str(value["progress_hash"]),
         )
 
