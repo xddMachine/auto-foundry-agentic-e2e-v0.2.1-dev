@@ -318,6 +318,8 @@ class FidelityResult:
                 _safe_id(item, f"fidelity result {name}")
             if len(raw) != len(set(raw)):
                 raise ValueError(f"fidelity result {name} contain duplicates")
+        if set(value["affected_record_ids"]) & set(value["dependency_ids"]):
+            raise ValueError("fidelity result affected and dependency record IDs overlap")
         baseline = value.get("baseline_record_hashes")
         if not isinstance(baseline, Mapping) or any(not _sha256(item) for item in baseline.values()):
             raise ValueError("fidelity result baseline hashes are invalid")
@@ -416,6 +418,8 @@ class FidelityRepairAuthorization:
             if any(item not in baseline for item in ids):
                 raise ValueError(f"fidelity repair authorization {name} reference unknown records")
             parsed_ids[name] = ids
+        if set(parsed_ids["affected_record_ids"]) & set(parsed_ids["dependency_ids"]):
+            raise ValueError("fidelity repair authorization affected and dependency record IDs overlap")
         unsigned = {key: value[key] for key in value if key != "authorization_hash"}
         if value.get("authorization_hash") != _digest(unsigned):
             raise ValueError("fidelity repair authorization hash does not match content")

@@ -1276,8 +1276,8 @@ class IntegrationSession:
             or progress.authorization_hash != authorization.authorization_hash
         ):
             raise ValueError("integration fidelity repair progress is unbound")
-        authorized = set(authorization.affected_record_ids) | set(authorization.dependency_ids)
-        if not set(progress.corrected_record_hashes).issubset(authorized):
+        affected = set(authorization.affected_record_ids)
+        if not set(progress.corrected_record_hashes).issubset(affected):
             raise ValueError("integration fidelity repair progress references unauthorized records")
         if not set(progress.removed_record_ids).issubset(set(authorization.affected_record_ids)):
             raise ValueError("integration fidelity repair progress removals are outside the affected scope")
@@ -1775,8 +1775,8 @@ class IntegrationSession:
             or progress.authorization_hash != authorization.authorization_hash
         ):
             raise ValueError("integration fidelity repair progress is unbound")
-        authorized = set(authorization.affected_record_ids) | set(authorization.dependency_ids)
-        if not set(progress.corrected_record_hashes).issubset(authorized):
+        affected = set(authorization.affected_record_ids)
+        if not set(progress.corrected_record_hashes).issubset(affected):
             raise ValueError("integration fidelity repair progress references unauthorized records")
         removed = set(progress.removed_record_ids)
         if not removed.issubset(set(authorization.affected_record_ids)):
@@ -1881,6 +1881,8 @@ class IntegrationSession:
         baseline = dict(authorization.baseline_record_hashes)
         corrected = dict(progress.corrected_record_hashes)
         removed = set(progress.removed_record_ids)
+        if not set(corrected).issubset(set(authorization.affected_record_ids)):
+            raise ValueError("integration repair correction is outside the affected scope")
         if removed & set(corrected):
             raise ValueError("integration repair cannot correct and remove one record")
         if not removed.issubset(set(authorization.affected_record_ids)):
@@ -1981,12 +1983,6 @@ class IntegrationSession:
                         raise ValueError("initial fidelity repair is already recorded; use targeted recheck")
                     if existing.review_kind == "targeted":
                         raise ValueError("targeted fidelity recheck is terminal")
-                raw_packet = self._read_fidelity_packet_raw()
-                packet = (
-                    self._read_fidelity_packet()
-                    if raw_packet is not None and raw_packet.records_hash == current_records_hash
-                    else self._build_fidelity_packet()
-                )
                 parsed_findings = self._normalize_finding_values(findings, known_ids=known_ids)
                 raw_affected = tuple(affected_record_ids)
                 raw_dependencies = tuple(dependency_ids)
@@ -1996,6 +1992,8 @@ class IntegrationSession:
                 dependencies = tuple(_validate_record_id(value) for value in dependency_values)
                 if len(affected) != len(set(affected)) or len(dependencies) != len(set(dependencies)):
                     raise ValueError("fidelity review record IDs contain duplicates")
+                if set(affected) & set(dependencies):
+                    raise ValueError("fidelity review affected and dependency record IDs overlap")
                 if any(value not in known_ids for value in (*affected, *dependencies)):
                     raise ValueError("fidelity review references unknown record")
                 if verdict in {"accept", "repair_once"}:
@@ -2008,6 +2006,12 @@ class IntegrationSession:
                     checked = tuple()
                 if verdict == "repair_once" and not affected:
                     raise ValueError("repair_once fidelity result requires affected records")
+                raw_packet = self._read_fidelity_packet_raw()
+                packet = (
+                    self._read_fidelity_packet()
+                    if raw_packet is not None and raw_packet.records_hash == current_records_hash
+                    else self._build_fidelity_packet()
+                )
             else:
                 if existing is None or existing.review_kind != "initial" or existing.verdict != "repair_once":
                     raise ValueError("targeted fidelity recheck requires an initial repair_once result")
@@ -2139,6 +2143,8 @@ class IntegrationSession:
         progress = self._read_repair_progress(authorization)
         current_hashes = self._current_record_hashes()
         self._assert_repair_snapshot(authorization, progress, current_hashes)
+        if target in set(authorization.dependency_ids):
+            raise ValueError("record correction target is a fidelity dependency, not an affected record")
         if target not in set(authorization.affected_record_ids):
             raise ValueError("record correction is outside the affected fidelity finding scope")
         if target in progress.removed_record_ids:

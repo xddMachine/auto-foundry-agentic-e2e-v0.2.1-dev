@@ -19,6 +19,7 @@ from auto_foundry_core import (
     deterministic_record_id,
 )
 from auto_foundry_core.contracts import KnowledgeDelta, LEMRef, PreparedAssetDescriptor
+from auto_foundry_core.integration_review import FidelityRepairAuthorization, FidelityRepairProgress, FidelityResult
 from auto_foundry_core.durable import ItemWorkspace
 from auto_foundry_core.telemetry import TelemetryRecorder
 from auto_foundry_core.workspace import RunContext
@@ -235,6 +236,71 @@ def test_repair_once_scopes_correction_and_targeted_recheck(tmp_path: Path) -> N
     assert lem.ontology == {}
 
 
+def test_fidelity_overlap_rejected_before_any_durable_write(tmp_path: Path) -> None:
+    _context, _workspace, _lem, _registry, session = _setup(tmp_path)
+    record_id = session.add_claim({"claim": "wrong"}, scope="question", evidence_refs=("work/plan.json",))
+    paths = (
+        session.staging_root / "snapshot.json",
+        session.staging_root / "session.json",
+        session.staging_root / "records.jsonl",
+        session.fidelity_authorization_path,
+        session.fidelity_progress_path,
+        session.fidelity_packet_path,
+        session.fidelity_result_path,
+    )
+
+    def snapshot() -> dict[Path, tuple[bool, bytes | None]]:
+        return {
+            path: (path.exists(), path.read_bytes() if path.exists() else None)
+            for path in paths
+        }
+
+    before = snapshot()
+    with pytest.raises(ValueError, match="affected and dependency record IDs overlap"):
+        session.record_fidelity_review(
+            "repair_once",
+            affected_record_ids=(record_id,),
+            dependency_ids=(record_id,),
+            checked_record_ids=(record_id,),
+        )
+    assert snapshot() == before
+
+
+def test_typed_fidelity_result_and_authorization_reject_overlap(tmp_path: Path) -> None:
+    _context, _workspace, _lem, _registry, session = _setup(tmp_path)
+    affected = session.add_claim({"claim": "wrong"}, scope="question", evidence_refs=("work/plan.json",))
+    session.record_fidelity_review(
+        "repair_once",
+        affected_record_ids=(affected,),
+        checked_record_ids=tuple(record.record_id for record in session.records),
+    )
+
+    result = json.loads(session.fidelity_result_path.read_text(encoding="utf-8"))
+    result["dependency_ids"] = [affected]
+    unsigned_result = {key: value for key, value in result.items() if key != "result_hash"}
+    result["result_hash"] = hashlib.sha256(
+        json.dumps(unsigned_result, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    with pytest.raises(ValueError, match="affected and dependency record IDs overlap"):
+        FidelityResult.from_dict(result)
+
+    authorization = json.loads(session.fidelity_authorization_path.read_text(encoding="utf-8"))
+    authorization["dependency_ids"] = [affected]
+    unsigned_authorization = {
+        key: value for key, value in authorization.items() if key != "authorization_hash"
+    }
+    authorization["authorization_hash"] = hashlib.sha256(
+        json.dumps(
+            unsigned_authorization,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    with pytest.raises(ValueError, match="affected and dependency record IDs overlap"):
+        FidelityRepairAuthorization.from_dict(authorization)
+
+
 def test_dependency_correction_rejected_before_any_durable_write(tmp_path: Path) -> None:
     _context, _workspace, _lem, _registry, session = _setup(tmp_path)
     affected = session.add_claim({"claim": "wrong"}, scope="question", evidence_refs=("work/plan.json",))
@@ -256,7 +322,7 @@ def test_dependency_correction_rejected_before_any_durable_write(tmp_path: Path)
         session.fidelity_result_path,
     )
     before = {path: path.read_bytes() for path in paths}
-    with pytest.raises(ValueError, match="affected fidelity finding scope"):
+    with pytest.raises(ValueError, match="fidelity dependency|affected fidelity finding scope"):
         session.correct_record(dependency, {"claim": "dependency mutated"})
     assert {path: path.read_bytes() for path in paths} == before
     assert {record.record_id for record in session.records} == set(all_ids)
@@ -309,6 +375,52 @@ def test_repair_progress_and_rehashed_packet_tamper_rejects_targeted_recheck(tmp
     with pytest.raises(ValueError, match="records hash|packet hash|packet"):
         session.record_fidelity_review("accept", checked_record_ids=(affected,))
     assert session.fidelity_result_path.read_bytes() == result_before
+
+
+def test_rehashed_dependency_progress_rejects_targeted_accept_and_snapshot_validation(
+    tmp_path: Path,
+) -> None:
+    _context, _workspace, _lem, _registry, session = _setup(tmp_path)
+    affected = session.add_claim({"claim": "wrong"}, scope="question", evidence_refs=("work/plan.json",))
+    dependency = session.add_claim({"claim": "dependency"}, scope="question", evidence_refs=("work/plan.json",))
+    all_ids = tuple(record.record_id for record in session.records)
+    session.record_fidelity_review(
+        "repair_once",
+        findings=[{"message": "claim text", "record_id": affected}],
+        dependency_ids=(dependency,),
+        checked_record_ids=all_ids,
+    )
+    session.correct_record(affected, {"claim": "fixed"})
+    session.build_fidelity_packet()
+
+    progress_path = session.fidelity_progress_path
+    forged_progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    forged_progress["corrected_record_hashes"] = {dependency: "a" * 64}
+    unsigned_progress = {key: value for key, value in forged_progress.items() if key != "progress_hash"}
+    forged_progress["progress_hash"] = hashlib.sha256(
+        json.dumps(unsigned_progress, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    forged_progress_bytes = (json.dumps(forged_progress, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    progress_path.write_bytes(forged_progress_bytes)
+
+    authorization = session._read_repair_authorization()
+    progress = FidelityRepairProgress.from_dict(forged_progress)
+    with pytest.raises(ValueError, match="outside the affected scope|unauthorized"):
+        IntegrationSession._assert_repair_snapshot(authorization, progress, session._current_record_hashes())
+
+    paths = (
+        session.staging_root / "snapshot.json",
+        session.staging_root / "session.json",
+        session.staging_root / "records.jsonl",
+        session.fidelity_authorization_path,
+        session.fidelity_progress_path,
+        session.fidelity_packet_path,
+        session.fidelity_result_path,
+    )
+    before = {path: path.read_bytes() for path in paths}
+    with pytest.raises(ValueError, match="unauthorized|dependency"):
+        session.record_fidelity_review("accept", checked_record_ids=all_ids)
+    assert {path: path.read_bytes() for path in paths} == before
 
 
 def test_rehashed_progress_cannot_claim_an_unchanged_affected_record(tmp_path: Path) -> None:
