@@ -65,7 +65,7 @@
         var key = button.getAttribute("data-series-toggle");
         var marks = matchingDataElements(root, "data-series-key", key);
         var hidden = !button.classList.contains("is-off");
-        for (var m = 0; m < marks.length; m += 1) marks[m].hidden = hidden;
+        for (var m = 0; m < marks.length; m += 1) { if (hidden) marks[m].setAttribute("hidden", ""); else marks[m].removeAttribute("hidden"); }
         button.classList.toggle("is-off", hidden);
         button.setAttribute("aria-pressed", hidden ? "false" : "true");
       });

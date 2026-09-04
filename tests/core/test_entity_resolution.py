@@ -335,16 +335,11 @@ def test_resolution_result_reuses_and_extends_existing_ontology_item() -> None:
         source_hash=SOURCE_HASH,
     )
 
-    EntityResolutionWorkspace._apply_result(model, result)
-    item = model.ontology["erp_transactions.parquet"]
-    assert len(model.ontology) == 1
-    assert item.label == "ERP sales transactions"
-    assert item.properties["analytical_role"] == "distinct-sales-document customer activity"
-    assert item.properties["columns"] == ["SALESDOCUMENT", "SALESDOCUMENTITEM"]
-    assert item.properties["row_count"] == 1916685
-    assert item.source_refs == ("erp_transactions.parquet", "erp_transactions.schema.json")
-    assert item.effective_period == "2019-07-06/2020-06-29"
-    assert item.limitations == ("Line-level fan-out",)
+    from auto_foundry_core.enterprise_model import OntologyConflictError
+    before = model.export()
+    with pytest.raises(OntologyConflictError, match="properties.analytical_role"):
+        EntityResolutionWorkspace._apply_result(model, result)
+    assert model.export() == before
 
 
 def test_resolution_result_reuses_existing_relationship_before_endpoint_validation() -> None:
@@ -400,7 +395,7 @@ def test_two_resolution_domains_replay_shared_ontology_and_relationship_ids(tmp_
         )
         source = OntologyItem(
             item_id="shared-source",
-            item_type="entity" if not richer else "representation",
+            item_type="entity",
             label="Canonical source" if not richer else "Requirement wording",
             properties={
                 "columns": ["id"] if not richer else ["id", "created_at"],

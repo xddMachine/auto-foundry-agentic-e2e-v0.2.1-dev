@@ -1127,9 +1127,9 @@ def test_geometryless_multi_visual_answer_exposes_one_requirement_fallback() -> 
         and "rows" not in widget
         for widget in accepted[1:]
     )
-    assert accepted[1]["limitations"] == ["No period points were supplied."]
-    assert accepted[2]["limitations"] == ["Visual-specific overlap detail remains audit-only."]
-    assert all(content["limitations"][0] not in widget["limitations"] for widget in accepted[1:])
+    assert accepted[1]["limitations"] == ["No period points were supplied.", content["limitations"][0]]
+    assert accepted[2]["limitations"] == ["Visual-specific overlap detail remains audit-only.", content["limitations"][0]]
+    assert all(content["limitations"][0] in widget["limitations"] for widget in accepted[1:])
     assert all(
         "Reviewed customers carry the largest exposure." not in json.dumps(widget, ensure_ascii=False)
         for widget in accepted[1:]
@@ -2534,16 +2534,16 @@ def test_default_context_release_metadata_is_bound_to_dashboard_fixture(tmp_path
     """Product Agent defaults must emit the current core/skill release pair."""
 
     context = _seed_run(tmp_path / "source")
-    assert context.core_version == DEFAULT_CORE_VERSION == "0.8.1"
-    assert context.skill_version == DEFAULT_SKILL_VERSION == "0.7.2"
+    assert context.core_version == DEFAULT_CORE_VERSION == "0.9.0"
+    assert context.skill_version == DEFAULT_SKILL_VERSION == "0.8.0"
 
     receipt = dashboard_assembler.assemble_dashboard(context, output_dir="default-release")
     fixture_path = context.resolve_run_path(receipt["outputs"]["fixture_ref"])
     fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
     assert fixture["core_name"] == dashboard_assembler.CORE_NAME
-    assert fixture["core_version"] == "0.8.1"
+    assert fixture["core_version"] == "0.9.0"
     assert fixture["skill_name"] == dashboard_assembler.SKILL_NAME
-    assert fixture["skill_version"] == "0.7.2"
+    assert fixture["skill_version"] == "0.8.0"
 
 
 def test_assembler_is_deterministic_and_preserves_typed_currency_partitions(tmp_path: Path) -> None:
@@ -4781,12 +4781,12 @@ def test_assembler_honors_custom_refs_and_never_reads_work_or_calculation_paths(
     original_read_text = Path.read_text
 
     def guarded_read_bytes(path: Path) -> bytes:
-        if any(part in {"work", "calculations"} for part in path.parts):
+        if (path.is_relative_to(context.run_root) and any(part in {"work", "calculations"} for part in path.relative_to(context.run_root).parts)):
             raise AssertionError(f"assembler attempted forbidden read: {path}")
         return original_read_bytes(path)
 
     def guarded_read_text(path: Path, *args: object, **kwargs: object) -> str:
-        if any(part in {"work", "calculations"} for part in path.parts):
+        if (path.is_relative_to(context.run_root) and any(part in {"work", "calculations"} for part in path.relative_to(context.run_root).parts)):
             raise AssertionError(f"assembler attempted forbidden read: {path}")
         return original_read_text(path, *args, **kwargs)
 

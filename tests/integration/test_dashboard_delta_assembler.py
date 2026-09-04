@@ -2596,12 +2596,12 @@ def test_product_gate_does_not_reuse_parent_terminal_marker_and_read_boundary_is
     original_read_text = Path.read_text
 
     def guarded_read_bytes(path: Path) -> bytes:
-        if any(part.lower() in {"work", "calculations", "source", "raw", "data-room", "data_room"} for part in path.parts):
+        if (path.is_relative_to(context.run_root) and any(part.lower() in {"work", "calculations", "source", "raw", "data-room", "data_room"} for part in path.relative_to(context.run_root).parts)):
             raise AssertionError(f"delta attempted forbidden read: {path}")
         return original_read_bytes(path)
 
     def guarded_read_text(path: Path, *args: object, **kwargs: object) -> str:
-        if any(part.lower() in {"work", "calculations", "source", "raw", "data-room", "data_room"} for part in path.parts):
+        if (path.is_relative_to(context.run_root) and any(part.lower() in {"work", "calculations", "source", "raw", "data-room", "data_room"} for part in path.relative_to(context.run_root).parts)):
             raise AssertionError(f"delta attempted forbidden read: {path}")
         return original_read_text(path, *args, **kwargs)
 

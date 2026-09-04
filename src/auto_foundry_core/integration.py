@@ -1190,6 +1190,33 @@ class IntegrationSession:
             return cls._load_unlocked(context, item_workspace, prepared_registry, owner_id, invocation_id)
 
     @classmethod
+    def persisted_identity(cls, item_workspace: Any) -> tuple[str, str]:
+        """Read owner identity from the same validated authority used by load.
+
+        Snapshot publication precedes its session/records projections. A crash
+        in that window is recoverable, not an unknown owner. Reconciliation is
+        serialized under the ordinary session lock; never trust a stale session
+        projection or extract unvalidated nested values in the coordinator.
+        """
+        with cls._session_lock(item_workspace):
+            bundle = AcceptedAnalysisBundle.load(item_workspace)
+            staging = cls._staging_root(item_workspace)
+            snapshot = staging / _SNAPSHOT_FILENAME
+            projection = staging / _SESSION_FILENAME
+            if snapshot.exists() or snapshot.is_symlink() or projection.exists() or projection.is_symlink():
+                state, _records = cls._read_staging_snapshot(staging, bundle)
+            else:
+                state = cls._committed_manifest(item_workspace)
+                if state is None:
+                    raise FileNotFoundError("integration session identity is missing")
+                if (state.get("item_id") != bundle.item_id
+                    or state.get("accepted_content_hash") != bundle.content_hash
+                    or state.get("accepted_manifest_hash") != bundle.manifest_hash):
+                    raise ValueError("committed integration accepted binding is stale")
+            return (_safe_component(state.get("owner_id"), "owner_id"),
+                    _normalize_invocation_id(state.get("invocation_id")))
+
+    @classmethod
     def _load_unlocked(
         cls,
         context: RunContext,
@@ -4942,6 +4969,8 @@ class IntegrationSession:
         # known set grows as staged ontology/metric/relationship records are
         # encountered; a forward-only or unknown reference fails closed.
         known_ontology_ids = set(self.lem.ontology)
+        ontology_preflight = LivingEnterpriseModel(run_id=self.lem.run_id)
+        ontology_preflight.ontology = dict(self.lem.ontology)
         # Relationship IDs are checked before validating an incoming payload.
         # Existing authoritative edges are ordinary idempotent audit rows;
         # only genuinely new IDs need endpoint/analytical-shape validation.
@@ -4994,7 +5023,7 @@ class IntegrationSession:
                     analytical_artifact_ids[artifact.artifact_id] = identity
                     analytical_artifact_refs[str(artifact_ref)] = identity
                 elif record.kind == "ontology_item":
-                    item = LivingEnterpriseModel(run_id=self.lem.run_id).add_ontology_item(record.payload)
+                    item = ontology_preflight.add_ontology_item(record.payload)
                     known_ontology_ids.add(item.item_id)
                 elif record.kind == "metric":
                     self._preview_metric(record.payload, self.lem.run_id)

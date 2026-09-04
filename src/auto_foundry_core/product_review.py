@@ -1467,7 +1467,7 @@ class ProductReviewStore:
             if candidate.parent_lineage.get("root_generation") is True:
                 raise ValueError("product candidate root marker is invalid for an extension generation")
             expected_parent = metadata.parent_generation_id
-            expected_parent_ref = f"extensions/{expected_parent}/generation_manifest.json"
+            expected_parent_ref = "run_state.json" if expected_parent == "G-0001" else f"extensions/{expected_parent}/generation_manifest.json"
             parent_path = self.context.resolve_run_path(expected_parent_ref)
             expected_parent_hash = hashlib.sha256(parent_path.read_bytes()).hexdigest()
             supplied_parent = candidate.parent_lineage.get("parent_generation_id")

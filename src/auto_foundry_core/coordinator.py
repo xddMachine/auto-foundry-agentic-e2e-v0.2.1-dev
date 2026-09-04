@@ -251,14 +251,14 @@ _IDENTITY_EXECUTABLE_ACTIONS = frozenset(
 # provisioning the ZIP is deliberately outside the run path.
 PRODUCTION_SKILL_VERSION = DEFAULT_SKILL_VERSION
 PRODUCTION_CORE_VERSION = DEFAULT_CORE_VERSION
-# Updated to the deterministic v0.7.2 package after the release artifact is
+# Updated to the deterministic v0.8.0 package after the release artifact is
 # built.  Keeping this tracked manifest independent of ``dist/`` lets a fresh
 # checkout validate an already-installed skill without requiring ignored
 # package output.
-PRODUCTION_SKILL_SHA256 = "ab73f92778616f40908120cf0f711781417e6af5595a1c1f7d081dbd58c3e30b"
-PRODUCTION_SKILL_FILE_COUNT = 30
+PRODUCTION_SKILL_SHA256 = "320c6950a2d910beb3bf7f2e2986d1fd60bbb0a2601240a08b9b03bce4b384ab"
+PRODUCTION_SKILL_FILE_COUNT = 31
 PRODUCTION_SKILL_NAME = "auto-foundry-agentic-e2e"
-PRODUCTION_RELEASE = "universal-data-room-ingestion"
+PRODUCTION_RELEASE = "reliable-analytics-dashboard"
 
 # The only legacy control-plane shape accepted here is the G5 wrapper that
 # shipped before the deletion-first coordinator.  Its event hashes covered a
@@ -3089,180 +3089,45 @@ def _role_guidance(action: PlannerAction) -> str:
         )
     if name == "review_integration_fidelity" or role == "integration_fidelity_reviewer":
         return "Use IntegrationSession.load and record_fidelity_review only; an independent reviewer must not commit."
-    if name == "refresh_product_preview":
+    if role == "product_agent" and name != "publish_final_product":
         return (
-            "Product preview sequence: inspect the V2 design inventory and eligible chart recipes; compare "
-            "valid designs from each accepted question/requirement's grain, dimensions, measures, temporal "
-            "shape, coverage, and limitations. Research here means a grounded choice from the local chart "
-            "library and accepted business evidence only: never use network design research, recompute analytical "
-            "facts, or invent metrics. Use the metadata presentation_inventory_ref and presentation_plan_ref. "
-            "First call dashboard_assembler.business_presentation_preflight(context, item_ids=..., "
-            "generation_id=...) and verify its returned fixture/map/registry refs and hashes match the metadata; "
-            "read that deterministic inventory and choose one coherent multi-section business layout with explicit "
-            "recipe_id, layout, and renderer_type selections (funnel, table, callout, trend, or reviewed empty-state "
-            "as supported). If the presentation_plan_ref target is absent, create the initial plan with "
-            "dashboard_assembler.write_business_presentation_plan(...) and its complete ordered manager_entries. "
-            "If the target already contains a V2 plan, call dashboard_assembler.write_business_presentation_plan_v2(...) "
-            "with a complete new ordered manager_entries selection and then "
-            "dashboard_assembler.revise_business_presentation_plan_v2(...) using exact predecessor/successor SHA CAS, "
-            "even when preflight/input hashes are unchanged; presentation choices may change but accepted fact and "
-            "provenance bindings cannot. Do not inherit predecessor membership. Only "
-            "treat inventory candidates marked accepted_evidence=true as hash-bound accepted business inputs; use "
-            "their accepted_evidence_candidate_kind (table or fact_sheet), accepted_evidence_pointer, and source "
-            "ref/hash metadata directly, without interpreting opaque evidence IDs. Prefer substantive accepted-evidence "
-            "tables/fact sheets over unavailable or unbound placeholders, while varying chart count/type/layout "
-            "with the requirement and exact evidence shape. The Product Agent itself owns manager-only semantic "
-            "selection: read the requirement, accepted Analytical Owner business outputs (including outputs kept "
-            "after integration failure), and ontology context, then choose only decision-useful business information "
-            "for manager pages. Keep execution traces, files/inventory, pipeline/source-process diagnostics, "
-            "implementation details, and evidence IDs on the separate audit surface. No assembler or renderer code "
-            "may reinterpret that choice or infer meaning from titles, keys, values, roles, or types. Select one "
-            "semantic representative per requirement/business metric/scope; preserve exact selected rows/columns and "
-            "values. Use short manager-facing titles and never invent or recompute values. Only "
-            "after that plan is durably validated, call the public preview entry exactly once as: "
-            "dashboard_delta_assembler.assemble_generation_preview(context, "
-            "item_ids=..., presentation_plan_ref=metadata['presentation_plan_ref'], "
-            "output_dir='generations/<G>/preview'). This entry selects accepted answer visuals together with any "
-            "committed integration facts and never publishes "
-            "a terminal product; its low-level full assembler is program-owned. The preflight writes only its "
-            "deterministic extension inventory; the preview entry is the only writer for preview "
-            "dashboard_fixture_v4.json, dashboard_blueprint_v2.json, site/, and its receipt. Validate those outputs by calling "
-            "dashboard_delta_assembler.validate_generation_product(context, receipt=receipt); require validation['valid'] is True "
-            "and never manually recompute or compare site tree hashes. The receipt's complete site binding includes "
-            "site_manifest.json, while the manifest's internal binding excludes that self-referential file. Then call "
-            "persist_preview_manifest(context, generation_id, input_fingerprint=..., "
-            "item_ids=..., item_bindings=..., failed_items=..., limitations=...) so preview_manifest.json is "
-            "written atomically. The preview manifest must have schema_version dashboard.preview.v1, "
-            "finalizable=false, accepted/committed public refs and hashes only, and no ProductCandidate, review, "
-            "authorization, publication, freeze, raw/work refs, or volatile timestamps. Do not call ProductReviewStore, "
-            "authorize publication, or alter run lifecycle state. A preview failure is presentation-local and must "
-            "not block the next requirement or its analytical/integration work."
+            "Product sequence: read PRODUCT_AGENT_ASSEMBLER_CONTRACT.md once. Construct "
+            "product_workspace.ProductWorkspace(context, action) from the supplied action metadata. "
+            "Call workspace.feedback() first; correct the exact predecessor review when present. "
+            "Page through workspace.inventory(offset=...) until next_offset is null; use "
+            "workspace.detail(widget_id) only for selected candidates requiring exact source context. "
+            "Inspect every accepted answer visual and committed candidate visual fact, including "
+            "accepted evidence tables/fact sheets. Integration success is not a presentation prerequisite "
+            "for accepted previews; a semantic defect must go back to the Analytical Owner, never be "
+            "hidden by presentation. The Product Agent itself chooses only decision-useful business information. "
+            "Choose one semantic representative per requirement/business metric/scope; prefer substantive "
+            "accepted-evidence surfaces over unavailable or unbound placeholders. Use a variety of eligible "
+            "charts only where the exact evidence supports them (line, area, bar, pie, donut, scatter, "
+            "funnel, histogram, table or callout). Every accepted requirement needs a decision surface or "
+            "explicit limitation, including an explicit reviewed empty state when warranted. Preserve the "
+            "selected business meaning and exact rows/columns/values, units, period, population, denominator "
+            "and proxy status. Do not invent metrics or run new analytics. Keep execution traces, "
+            "files/inventory, pipeline/source-process diagnostics and technical join counts on the audit "
+            "surface, not as business KPIs. Select complete ordered choices with widget_id and explicit "
+            "recipe_id, layout, and renderer_type from the eligible inventory. Populate the executive "
+            "overview from the explicit manager selection; optional presentation.overview_widget_ids "
+            "selects a compact subset. Call workspace.build(choices, presentation={...}) once with concise "
+            "title, subtitle, section_titles and widget_titles as appropriate. It owns preflight, plan CAS, "
+            "generation routes, immutable revision paths, all hashes, rendering, output validation, preview "
+            "manifest and candidate registration. Never calculate these by hand. The same call is safe for "
+            "idempotent re-entry after a process interruption. No assembler or renderer code may reinterpret "
+            "the plan. Do not edit fixture, chart, or manifest bytes directly. Do not call index_repository "
+            "or search code, inspect git status or env, inventory/list the run root, or inspect Control Center "
+            "or launch manifests. Do not search control_plane/coordinator_events.jsonl, role_sessions.json, "
+            "~/.codex/sessions/history or perform recursive run-root searches. Use public metadata and the "
+            "contract/API definitions only. Return the workspace result; never accept your own product, "
+            "alter lifecycle, authorize publication, or repair repository source."
         )
-    if name == "build_product_candidate":
-        metadata = action.metadata if isinstance(action.metadata, Mapping) else {}
-        repair_feedback = ""
-        if (
-            isinstance(metadata.get("predecessor_product_review_ref"), str)
-            and metadata.get("predecessor_product_review_ref", "").strip()
-            and _is_sha256(metadata.get("predecessor_product_review_hash"))
-        ):
-            repair_feedback = (
-                "Repair-first: read the exact predecessor Product Review at metadata['predecessor_product_review_ref'] "
-                "and verify metadata['predecessor_product_review_hash'] before selecting or reusing a plan. "
-                "Correct its presentation findings in this new immutable revision, preserve accepted business facts, "
-                "do not rerun analytics, prefer substantive business decision surfaces over technical diagnostics or "
-                "support metrics, keep technical evidence in audit, and use concise portfolio/domain labels rather "
-                "than copied requirement prose; the active accepted review hash is lineage only, not repair feedback. "
-            )
-        return repair_feedback + (
-            "Product candidate sequence: read PRODUCT_AGENT_ASSEMBLER_CONTRACT.md once. This is artifact-assembly "
-            "execution, not code-discovery or repository-exploration: start immediately from supplied action metadata, "
-            "this one contract, and public accepted-artifact/assembler APIs. Do not call index_repository or search "
-            "code, inspect git status or env, inventory/list the run root, or inspect Control Center or launch manifests. "
-            "Use public metadata and the contract/API definitions only. Do not perform broad searches of "
-            "control_plane/coordinator_events.jsonl, role_sessions.json, ~/.codex/sessions/history, or "
-            "recursive run-root searches. Use metadata['presentation_inventory_ref'], "
-            "metadata['presentation_plan_ref'], item_ids, item_bindings, and input_fingerprint. For a fresh attempt, "
-            "call the public dashboard_assembler.business_presentation_preflight(context, item_ids=..., "
-            "generation_id=...) once, verify its generation-scoped fixture/map/registry refs and hashes, then "
-            "inventory business_presentation_inventory and business_presentation_visual_inventory once per attempt, "
-            "including every accepted answer visual and committed candidate visual fact with its "
-            "requirement/evidence binding. Treat candidates marked accepted_evidence=true as source-bound accepted "
-            "business inputs; identify table versus fact_sheet from accepted_evidence_candidate_kind and use the "
-            "accepted_evidence_pointer plus source ref/hash metadata directly, without interpreting opaque IDs. "
-            "Prefer substantive accepted-evidence surfaces over unavailable or unbound placeholders; accepted "
-            "Analytical Owner visuals remain eligible even when integration is terminally failed, and manager surfaces "
-            "must contain business information only. On idempotent re-entry after a process interruption, reuse or refresh public "
-            "preflight/inventory results as appropriate through those same APIs. The plan branch is state-based: "
-            "when the business presentation plan is absent or stale, compare eligible local recipes by question, "
-            "grain, dimensions, measures, temporal shape, coverage, and limitations, then choose explicit recipe_id, "
-            "layout, and renderer_type selections. If the target exists and is a V2 plan, build a complete new "
-            "ordered manager_entries selection (including every selected visual's explicit recipe_id, layout, and "
-            "renderer_type) with dashboard_assembler.write_business_presentation_plan_v2(...) and CAS-revise it with "
-            "dashboard_assembler.revise_business_presentation_plan_v2(..., expected_current_plan_sha256=..., "
-            "expected_successor_plan_sha256=...); do not call record_business_presentation_plan_v2 for an existing "
-            "target. If the target is absent, use the contract's public creation/record route only as required by "
-            "the API: call dashboard_assembler.write_business_presentation_plan(...) for direct creation, or use "
-            "write_business_presentation_plan_v2(...) followed by record_business_presentation_plan_v2(...) when "
-            "the supplied V2 hash-bound route is required. Never call both routes or all three plan APIs serially. "
-            "Pass the full manager selection/order on every V2 successor; do not rely on predecessor membership or "
-            "implicit auto-promotion. Use explicit recipe_id, layout, and renderer_type selections plus the supplied binding; do not edit "
-            "fixture, chart, or manifest bytes directly. For repair feedback, correct predecessor findings while "
-            "preserving accepted business facts and do not rerun analytics or run new analytics. Compose decision "
-            "surfaces from accepted facts by reading each requirement, accepted Analytical Owner business outputs "
-            "(including outputs retained after integration failure), and ontology context. The Product Agent itself "
-            "chooses only decision-useful business information for manager pages; keep execution traces, files/"
-            "inventory, pipeline/source-process diagnostics, implementation details, and evidence IDs on the separate "
-            "audit surface. Choose chart count, type, and layout freely per requirement and exact evidence shape; "
-            "preserve the selected business meaning and exact rows/columns/values. No assembler or renderer code may "
-            "reinterpret the plan or scan titles, keys, values, roles, or types. Use concise portfolio/domain labels "
-            "instead of copied requirement prose; choose one semantic representative per requirement/business metric/"
-            "scope when the Product Agent judges them duplicates. Populate the executive overview from the explicit "
-            "manager selection, use concise manager-facing titles, ensure every accepted requirement has a decision surface or explicit "
-            "limitation, and do not invent metrics; a funnel, table, callout, or explicit reviewed empty state is "
-            "valid, and integration success is not a presentation prerequisite. Then call exactly one canonical "
-            "dashboard generation entry point dashboard_delta_assembler.assemble_generation_product(context, ...) "
-            "per successful attempt with presentation_plan_ref; for a regeneration action pass exact "
-            "revision_id=metadata['product_revision_id'] "
-            "and output_root_ref=metadata['output_root_ref']; the target namespace is immutable and must never be "
-            "replaced with the generation root. It selects the full assembler for G-0001 and the successor-generation "
-            "path from lifecycle metadata; for a successor, pass the program-owned parent_receipt_ref and explicit "
-            "route. Do not call assemble_dashboard or assemble_dashboard_delta directly and never infer a route from "
-            "requirement prose. After an interruption, re-enter this same call with unchanged refs so a matching "
-            "public receipt is reused idempotently rather than rebuilt. Only after canonical assembly call "
-            "dashboard_delta_assembler.validate_generation_product(...), "
-            "require validation['valid'] is True, use validation['artifact_bindings'] verbatim, and never manually "
-            "recompute hashes or compare self-excluding manifest/site trees. Then create ProductCandidate and call "
-            "ProductReviewStore.record_candidate(..., revision_id=metadata['product_revision_id']) for regeneration; "
-            "discard_stale_product_candidate is only allowed at the legacy unreviewed root boundary and never "
-            "overwrite a reviewed revision."
-        )
-    if name in {"build_final_product", "publish_final_product"} or role == "product_agent":
+    if name == "publish_final_product":
         return (
-            "Product sequence: use the deterministic metadata presentation_inventory_ref and "
-            "presentation_plan_ref (plus item_ids, item_bindings, and input_fingerprint). Always call the "
-            "public dashboard_assembler.business_presentation_preflight(context, item_ids=..., "
-            "generation_id=...) before reading or writing a presentation plan, including when no incremental "
-            "preview exists. Verify that preflight returns the expected generation-scoped fixture/map/registry "
-            "refs and hashes, then inspect the V2 design inventory and eligible chart recipes and compare valid "
-            "designs by question, grain, dimensions, measures, temporal shape, coverage, and limitations; "
-            "research is a grounded choice from the local chart library and accepted business evidence only, "
-            "never network design research or recomputed analytical facts. Then read the public "
-            "business_presentation_inventory and "
-            "business_presentation_visual_inventory and inventory every accepted answer visual and committed "
-            "candidate visual fact with its requirement/evidence binding, rather than "
-            "defaulting to KPI cards. Treat candidates marked accepted_evidence=true as source-bound accepted business "
-            "inputs; use accepted_evidence_candidate_kind, accepted_evidence_pointer, and source ref/hash metadata "
-            "directly without interpreting opaque evidence IDs. Prefer substantive accepted-evidence tables/fact sheets "
-            "over unavailable or unbound placeholders. Include every accepted Analytical Owner visual even when integration is terminally failed; integration success is not a presentation prerequisite. Compose requirement-driven decision views from accepted answer visuals and "
-            "committed facts, choosing chart count, type, and layout per the requirements and exact evidence shape, "
-            "including a funnel, table, callout, or an explicit reviewed empty "
-            "state as supported. Ensure every accepted requirement has a decision surface or explicit limitation, populate the executive overview from the explicit manager selection, preserve exact selected rows/columns/values, and do not invent metrics or run new analytics. Keep execution traces, files/inventory, pipeline/source-process diagnostics, implementation details, and evidence IDs on the separate audit surface according to the Product Agent's semantic review. No assembler or renderer code may reinterpret the plan or scan titles, keys, values, roles, or types after it is written. Do not edit fixture, "
-            "chart, or manifest bytes directly. If the presentation-plan target is absent, create the initial plan "
-            "with dashboard_assembler.write_business_presentation_plan(...) and the complete ordered manager_entries "
-            "selection with explicit recipe_id, layout, and renderer_type (or use write_business_presentation_plan_v2(...) followed by "
-            "record_business_presentation_plan_v2(...) only for that absent-target route). If the target already "
-            "contains a V2 plan, call dashboard_assembler.write_business_presentation_plan_v2(...) with a complete "
-            "new ordered manager_entries selection and then dashboard_assembler.revise_business_presentation_plan_v2(...) "
-            "using exact predecessor/successor SHA CAS, even when preflight/input hashes are unchanged; presentation "
-            "audience, manager membership/order, recipe, layout, and renderer may change, but accepted facts and "
-            "provenance bindings cannot. record_business_presentation_plan_v2 is absent-target only; do not inherit "
-            "predecessor membership. Then invoke "
-            "exactly one public generation-aware entry point "
-            "dashboard_delta_assembler.assemble_generation_product(context, ...). For a regeneration action, pass "
-            "revision_id=metadata['product_revision_id'] and output_root_ref=metadata['output_root_ref'] so all "
-            "outputs remain inside that immutable target namespace. It selects the full assembler for G-0001 and the successor-generation path from lifecycle metadata; "
-            "for a successor, pass the program-owned parent_receipt_ref and explicit route. Do not "
-            "call assemble_dashboard or assemble_dashboard_delta directly, and never infer a route "
-            "from requirement prose. Call dashboard_delta_assembler.validate_generation_product(context, receipt=receipt, "
-            "product_manifest_ref=metadata['product_manifest_ref'], revision_id=metadata.get('product_revision_id'), "
-            "output_root_ref=metadata.get('output_root_ref')) and require validation['valid'] is True; use "
-            "validation['artifact_bindings'] verbatim and never manually recompute or compare the two site-tree domains. "
-            "At the legacy root boundary, use discard_stale_product_candidate only when the public contract explicitly "
-            "allows replacing an unreviewed root. For a regeneration action, create the ProductCandidate and call "
-            "ProductReviewStore.record_candidate(..., revision_id=metadata['product_revision_id']) so the target "
-            "revision is immutable; never discard or overwrite a reviewed revision. Publication uses authorize_publish "
-            "only with the supplied explicit policy."
+            "Publication is a mechanical policy-bound transition, not a new build. Use only the existing "
+            "independently reviewed ProductReviewStore candidate and explicitly supplied publication policy. "
+            "Never rebuild, self-review, change the policy or publish when authorization is absent."
         )
     if name == "review_final_product" or role == "product_reviewer":
         return (
@@ -7689,34 +7554,12 @@ class RunCoordinator:
 
     @staticmethod
     def _integration_identity(item_workspace: Any) -> tuple[str, str]:
-        """Read the durable IntegrationSession owner/invocation binding.
-
-        The commit action is a mechanical transition after fidelity has been
-        accepted.  Its identity therefore comes from the staged/committed
-        session artifacts, never from Planner metadata or a model prompt.
-        """
-
-        candidates = (
-            item_workspace.item_root / "integration" / "staging" / "session.json",
-            item_workspace.item_root / "integration" / "staging" / "snapshot.json",
-            item_workspace.item_root / "integration" / "committed" / "manifest.json",
-        )
-        for path in candidates:
-            if path.is_symlink():
-                raise CoordinatorIntegrityError("integration session identity cannot be a symlink")
-            if not path.exists():
-                continue
-            if not path.is_file():
-                raise CoordinatorIntegrityError("integration session identity is not a regular file")
-            value = _load_json(path)
-            if not isinstance(value, Mapping):
-                raise CoordinatorIntegrityError("integration session identity must be an object")
-            owner_id = value.get("owner_id")
-            invocation_id = value.get("invocation_id")
-            if isinstance(owner_id, str) and owner_id.strip() and isinstance(invocation_id, str) and invocation_id.strip():
-                return owner_id.strip(), invocation_id.strip()
-            raise CoordinatorIntegrityError("integration session owner/invocation binding is invalid")
-        raise CoordinatorIntegrityError("integration session identity is missing")
+        """Use IntegrationSession's validated snapshot/recovery authority."""
+        from .integration import IntegrationSession
+        try:
+            return IntegrationSession.persisted_identity(item_workspace)
+        except (OSError, ValueError, TypeError) as exc:
+            raise CoordinatorIntegrityError(str(exc)) from exc
 
     def _requirement_item_id(self, action: PlannerAction) -> str | None:
         """Resolve an action's bound requirement without trusting free text."""
@@ -7862,14 +7705,22 @@ class RunCoordinator:
             from .integration import IntegrationSession
             from .prepared import PreparedAssetRegistry
 
-            owner_id, invocation_id = self._integration_identity(workspace)
-            session = IntegrationSession.load(
-                self.context,
-                workspace,
-                PreparedAssetRegistry(self.context),
-                owner_id,
-                invocation_id,
-            )
+            integration_root = workspace.item_root / "integration"
+            identity_paths = tuple(integration_root / relative for relative in (
+                "staging/session.json", "staging/snapshot.json", "committed/manifest.json"))
+            never_started = not any(path.exists() or path.is_symlink() for path in identity_paths)
+            if never_started and name == "integrate_requirement":
+                # A failed transport may not have created a session. Create an
+                # empty mechanical failure boundary, not synthetic integration.
+                session = IntegrationSession.create(
+                    self.context, workspace, PreparedAssetRegistry(self.context),
+                    "coordinator-recovery", invocation_id=f"exhausted-{item_id}",
+                )
+            else:
+                owner_id, invocation_id = self._integration_identity(workspace)
+                session = IntegrationSession.load(
+                    self.context, workspace, PreparedAssetRegistry(self.context), owner_id, invocation_id,
+                )
             try:
                 session.finalize_technical_failure(reason)
             finally:

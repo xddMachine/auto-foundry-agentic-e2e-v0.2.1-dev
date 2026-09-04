@@ -1,5 +1,32 @@
 # Auto Foundry Agentic E2E v0.7.1 / core v0.8.0
 
+## Reliability and dashboard release (core 0.9.0 / skill 0.8.0)
+
+The `feat/reliable-analytics-dashboard` branch introduces one agent-facing
+`ProductWorkspace`: choose accepted views and presentation, while code owns
+source bindings, generations, revisions and rendering. It includes responsive
+KPI/chart layouts, real scatter/area/pie rendering, canonical integration recovery,
+conflict-safe ontology admission and a reproducible offline demonstration.
+
+**Start here:** [architecture, installation and verification](docs/RELIABLE_DASHBOARD_ARCHITECTURE.md).
+Stop existing processes and install the paired core **and** skill before a live
+trial. Saved runs are not edited or automatically restarted. Do not mix releases.
+The demonstration uses synthetic recorded decisions, not live-agent verification.
+
+```sh
+python3 -m pip install -e .
+python3 scripts/package_release.py
+python3 scripts/validate_release.py
+python3 scripts/install_skill_release.py --zip dist/auto-foundry-agentic-e2e-v0.8.0.zip --skills-root "$HOME/.codex/skills" --dry-run
+python3 scripts/build_dashboard_demo.py --output /tmp/af-synthetic-demo
+```
+
+Open the `html` path printed by the demo. Use a new output directory; no existing
+run is overwritten. After reviewing the installer dry-run, omit `--dry-run` to
+install the skill for your new live test. Publication remains separately disabled
+unless authorized through the normal application.
+
+
 This repository contains the v0.7.1 reviewed-analysis skill and the
 source-agnostic, deterministic `auto_foundry_core` v0.8.0 substrate. Its two
 user-visible goals are strong evidence-backed analysis and a clear offline

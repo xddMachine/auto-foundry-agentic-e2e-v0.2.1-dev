@@ -7,9 +7,9 @@ Record these current markers in program metadata:
 
 ```text
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.7.2
+skill_version: 0.8.0
 core_name: auto_foundry_core
-core_version: 0.8.1
+core_version: 0.9.0
 ```
 
 ## Question Mode: analytical-owner queue

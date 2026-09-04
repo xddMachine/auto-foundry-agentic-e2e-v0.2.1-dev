@@ -470,6 +470,7 @@ class RequirementRunExtension:
         *,
         plan: RequirementExecutionPlan | Mapping[str, Any],
         generation_id: str | None = None,
+        expected_parent_plan_hash: str | None = None,
     ) -> "RequirementRunExtension":
         """Publish an exact mutable portfolio revision.
 
@@ -492,6 +493,8 @@ class RequirementRunExtension:
             if parent.snapshot.mode != "requirement":
                 raise ValueError("RequirementRunExtension requires Requirement Mode")
             parent_plan = cls._load_plan(parent.plan_path)
+            if expected_parent_plan_hash is not None and _sha256_file(parent.plan_path) != expected_parent_plan_hash:
+                raise ValueError("expected parent plan hash is stale; reload the active portfolio")
             if candidate == parent_plan:
                 metadata = parent.generation_metadata
                 if metadata is None:

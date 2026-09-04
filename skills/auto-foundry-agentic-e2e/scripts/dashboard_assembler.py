@@ -410,7 +410,7 @@ def _rendering_identity(context: RunContext) -> dict[str, Any]:
     return {
         "schema_version": RENDERING_IDENTITY_SCHEMA,
         "skill_name": SKILL_NAME,
-        "skill_version": context.skill_version or "0.7.2",
+        "skill_version": context.skill_version or "0.8.0",
         "core_name": CORE_NAME,
         "core_version": str(context.core_version),
         "skill_tree_sha256": _json_hash(files),
@@ -1595,8 +1595,13 @@ def _validate_presentation_plan_v2_shape(plan: Mapping[str, Any]) -> None:
         "item_order", "input_items", "parent", "reviewer_ref", "manager_widget_ids", "manager_entries",
         "manager_visual_widget_ids", "audit_visual_widget_ids", "visual_entries", "source_bindings",
     }
-    if set(plan) != expected or plan.get("schema_version") != PRESENTATION_PLAN_V2_SCHEMA:
+    if set(plan) - {"presentation"} != expected or plan.get("schema_version") != PRESENTATION_PLAN_V2_SCHEMA:
         raise BusinessPresentationPlanError("v2 presentation plan fields are invalid")
+    if "presentation" in plan:
+        _dashboard_runtime().validate_presentation_copy(
+            plan["presentation"], widget_ids=plan.get("manager_widget_ids", []),
+            requirement_ids=plan.get("item_order", []),
+        )
     # Validate the immutable lifecycle/input envelope directly.  V2 manager
     # entries may carry visual projection fields, so only non-visual entries
     # use the pointer-bound manager record shape below.
@@ -1910,6 +1915,9 @@ def business_presentation_inventory(
         if not isinstance(widget, Mapping) or not _text(widget.get("id")):
             continue
         binding = _presentation_widget_binding(widget)
+        for field in ("title", "period", "as_of", "grain", "limitations", "x_label", "y_label"):
+            if field in widget:
+                binding[field] = copy.deepcopy(widget[field])
         binding["type"] = _text(widget.get("type") or widget.get("kind"))
         binding["value"] = widget.get("value") if "value" in widget else None
         binding["unit"] = widget.get("unit")
@@ -2385,8 +2393,6 @@ def business_presentation_visual_inventory(
         if isinstance(value, Mapping) and _text(value.get("widget_id"))
     }
     visual_ids = _true_visual_ids(widgets_by_id, charts_by_id)
-    if not visual_ids:
-        raise BusinessPresentationPlanError("v2 visual inventory has no supported visual charts")
     fixture_manager_visual = fixture.get("manager_visual_widget_ids")
     fixture_audit_visual = fixture.get("audit_visual_widget_ids")
     if (
@@ -2525,6 +2531,8 @@ def write_business_presentation_plan_v2(
     reviewer_ref: str,
     presentation_plan_ref: str | Path | None = None,
     _lock_held: bool = False,
+    presentation: Mapping[str, Any] | None = None,
+    item_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Build a canonical V2 plan candidate without mutating a live plan.
 
@@ -2538,7 +2546,7 @@ def write_business_presentation_plan_v2(
 
     generation_id, metadata = _presentation_generation_metadata(context, _lock_held=_lock_held)
     supervisor_ref, supervisor_plan, supervisor_hash = _presentation_supervisor_binding(context, generation_id, metadata)
-    current_item_order = _discover_item_ids(context, None, supervisor_plan)
+    current_item_order = _discover_item_ids(context, item_ids, supervisor_plan)
     current_input_items = _presentation_input_bindings(context, current_item_order)
     current_parent = _presentation_parent_binding(context, generation_id, metadata)
 
@@ -2548,6 +2556,7 @@ def write_business_presentation_plan_v2(
         context,
         fixture_ref=fixture_ref,
         generation_id=generation_id,
+        item_ids=item_ids,
     )
     visual_inventory = business_presentation_visual_inventory(
         context,
@@ -2625,6 +2634,11 @@ def write_business_presentation_plan_v2(
         "visual_entries": selection["visual_entries"],
         "source_bindings": source_bindings,
     }
+    if presentation is not None:
+        plan["presentation"] = _dashboard_runtime().validate_presentation_copy(
+            presentation, widget_ids=plan["manager_widget_ids"], requirement_ids=plan["item_order"])
+    elif "presentation" in old_plan:
+        plan["presentation"] = copy.deepcopy(old_plan["presentation"])
     _validate_presentation_plan_v2_shape(plan)
     return plan
 
@@ -3205,6 +3219,7 @@ def _write_business_presentation_blueprint_v2(
     item_ids: Sequence[str] | None,
     generation_id: str | None,
     presentation_plan_ref: str | Path | None,
+    presentation: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Record one V2 blueprint from exact inventory entries.
 
@@ -3259,6 +3274,9 @@ def _write_business_presentation_blueprint_v2(
         "visual_entries": selection["visual_entries"],
         "source_bindings": source,
     }
+    if presentation is not None:
+        plan["presentation"] = _dashboard_runtime().validate_presentation_copy(
+            presentation, widget_ids=plan["manager_widget_ids"], requirement_ids=plan["item_order"])
     _validate_presentation_plan_v2_shape(plan)
     reference = _presentation_plan_ref(context, generation, presentation_plan_ref)
     path = context.resolve_run_path(reference)
@@ -3309,6 +3327,7 @@ def write_business_presentation_plan(
     item_ids: Sequence[str] | None = None,
     generation_id: str | None = None,
     presentation_plan_ref: str | Path | None = None,
+    presentation: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Atomically record one explicit generation-scoped V2 manager admission."""
 
@@ -3330,6 +3349,7 @@ def write_business_presentation_plan(
         item_ids=item_ids,
         generation_id=generation_id,
         presentation_plan_ref=presentation_plan_ref,
+        presentation=presentation,
     )
 
 
@@ -4847,6 +4867,7 @@ def _table_widget(item_id: str, content: Mapping[str, Any], record: Mapping[str,
 # by that requirement's accepted manifest before any bytes are read.
 _ACCEPTED_VISUAL_REF_KEYS = ("source_ref", "artifact_ref", "evidence_ref")
 _ACCEPTED_VISUAL_TYPE_ALIASES = {
+    **{name: name for name in ("kpi", "area", "pie", "donut", "scatter", "histogram", "box_plot", "waterfall", "column", "stacked_bar", "lollipop")},
     "line": "line",
     "line_chart": "line",
     "dual_line": "line",
@@ -4870,7 +4891,7 @@ _ACCEPTED_VISUAL_TYPE_ALIASES = {
     "evidence_callout": "table",
 }
 _ACCEPTED_VISUAL_COLLECTION_KEYS = (
-    "rows", "values", "data", "points", "series", "cells", "stages", "bars", "panels",
+    "rows", "values", "data", "points", "series", "cells", "stages", "bars", "panels", "categories", "bins", "boxes", "steps",
 )
 
 
@@ -5930,6 +5951,9 @@ def _accepted_visual_widgets(
         # source/shape diagnostics are audit context and must not become
         # visible business claims when a visual has no geometry.
         limitations = _accepted_visual_limitations(visual, None)
+        for limitation in answer_limitations:
+            if limitation not in limitations:
+                limitations.append(limitation)
         audit_limitations = []
         if source_reason:
             audit_limitations.append(source_reason)
@@ -5942,6 +5966,7 @@ def _accepted_visual_widgets(
             "proxy", "proxy_or_limit", "limit", "descriptive", "descriptive_only",
             "causal_status", "as_of", "date_authority", "coverage", "coverage_note",
             "scope", "scope_note", "assumptions", "annotation", "scale_groups",
+            "denominator_value", "denominator_label", "x_label", "y_label", "columns",
             # Structural provenance is copied from the accepted origin when
             # present.  It is descriptive metadata only; Product plan
             # membership remains authoritative for manager visibility.
@@ -6008,7 +6033,28 @@ def _accepted_visual_widgets(
         # Copy only declared inline/source values.  Semantic normalization
         # below changes field names for the renderer but never changes the
         # supplied business values kept in ``audit_payload``.
-        if normalized_type == "funnel":
+        if normalized_type == "kpi":
+            if "value" in visual and visual["value"] is not None:
+                base["value"] = copy.deepcopy(visual["value"])
+            elif rows and len(rows) == 1 and "value" in rows[0]:
+                base["value"] = copy.deepcopy(rows[0]["value"])
+            else:
+                base["type"] = "table"
+                base["rows"] = rows
+        elif normalized_type in {"donut", "pie", "histogram", "box_plot", "waterfall", "scatter", "stacked_bar"}:
+            collection = {"donut": "categories", "pie": "categories", "histogram": "bins",
+                          "box_plot": "boxes", "waterfall": "steps", "scatter": "points", "stacked_bar": "segments"}[normalized_type]
+            base[collection] = copy.deepcopy(rows)
+            # Geometry is derived only from declared typed coordinates; raw
+            # values and denominators are never recalculated or rewritten.
+            if normalized_type == "histogram":
+                values = [row.get("count", row.get("value")) for row in rows]
+                for row in base[collection]:
+                    if "size" not in row:
+                        row["size"] = _accepted_visual_derived_size(row.get("count", row.get("value")), values)
+            if not rows:
+                base["type"] = "table"
+        elif normalized_type == "funnel":
             stages: list[dict[str, Any]] = []
             supplied_values = [row.get("count", row.get("population", row.get("value"))) for row in rows]
             denominator_number = _accepted_visual_numeric(visual.get("denominator"))
@@ -6040,7 +6086,7 @@ def _accepted_visual_widgets(
                 if rows:
                     base["rows"] = rows
                 audit_limitations.append("Accepted funnel specification lacks explicit stage geometry; reviewed values remain in a table.")
-        elif normalized_type == "line":
+        elif normalized_type in {"line", "area"}:
             points: list[dict[str, Any]] = []
             series_names = [value for value in _as_list(visual.get("series")) if isinstance(value, str) and value.strip()]
             if not series_names:
@@ -6054,10 +6100,10 @@ def _accepted_visual_widgets(
             for row in rows:
                 period = row.get("period") or row.get("time") or row.get("month") or row.get("date") or row.get("year") or row.get("x")
                 for name in series_names:
-                    if name not in row or row.get(name) in (None, "") or period in (None, ""):
+                    if name not in row or period in (None, ""):
                         continue
                     point = dict(row)
-                    point.update({"label": period, "period": period, "x": period, "value": row[name], "series": name})
+                    point.update({"label": period, "period": period, "x": period, "value": row[name], "series": row.get("series") if isinstance(row.get("series"), str) else name})
                     points.append(point)
             if len(points) >= 2:
                 base["points"] = points
@@ -6067,7 +6113,7 @@ def _accepted_visual_widgets(
                 if rows:
                     base["rows"] = rows
                 audit_limitations.append("Accepted line specification lacks at least two supplied points; reviewed values remain in a table.")
-        elif normalized_type in {"bar", "grouped_bar", "diverging_bar", "pareto", "heatmap"}:
+        elif normalized_type in {"bar", "column", "lollipop", "grouped_bar", "diverging_bar", "pareto", "heatmap"}:
             chart_rows: list[dict[str, Any]] = []
             source_values: list[Any] = []
             for source_row in rows:
@@ -6187,7 +6233,7 @@ def _accepted_visual_widgets(
                 if "size" not in copied:
                     share_value = copied.get("share") if copied.get("share") is not None else copied.get("percent")
                     copied["size"] = _accepted_visual_percent(share_value)
-                if copied.get("size") in (None, "") and normalized_type in {"bar", "grouped_bar", "diverging_bar", "pareto"}:
+                if copied.get("size") in (None, "") and normalized_type in {"bar", "column", "lollipop", "grouped_bar", "diverging_bar", "pareto"}:
                     copied["size"] = _accepted_visual_derived_size(copied.get("value"), source_values)
                 if normalized_type == "diverging_bar" and "signed_size" not in copied:
                     raw_signed = copied.get("signed_size")
@@ -6335,7 +6381,7 @@ def _accepted_visual_widgets(
         base["limitations"] = list(dict.fromkeys(value for value in limitations if _text(value).strip()))
         if audit_limitations:
             base["audit_limitations"] = list(dict.fromkeys(value for value in audit_limitations if _text(value).strip()))
-        if not base.get("rows") and not any(base.get(key) for key in ("bars", "points", "stages", "cells")):
+        if base.get("value") is None and not base.get("rows") and not any(base.get(key) for key in ("bars", "points", "stages", "cells", "categories", "bins", "boxes", "steps", "segments")):
             # A visual declaration may be accepted even when its optional
             # geometry source is unavailable/ambiguous.  Expose the exact
             # reviewed headline findings (or stated limits) once as a
@@ -7710,7 +7756,7 @@ def _chart_map_entry(widget: Mapping[str, Any], requirement_id: str, item: Mappi
         "histogram": "histogram_box", "box_plot": "histogram_box", "pareto": "pareto",
         "waterfall": "waterfall", "pie": "donut_pie",
     }.get(kind, "table")
-    fields: dict[str, Any] = {key: value for key, value in widget.items() if key in {"value", "manager_display_value", "bars", "tiles", "categories", "segments", "points", "series", "rows", "manager_rows", "stages", "bins", "boxes", "steps", "data", "values", "population", "denominator", "unit", "units", "period", "grain", "data_grain", "row_grain", "proxy", "proxy_or_limit", "limit", "descriptive", "descriptive_only", "causal_status", "as_of", "date_authority", "assumptions", "annotation", "dimensions", "measures", "time", "coverage", "coverage_note", "scope", "answer_scope", "scope_note", "limitations", "filters", "drilldown", "empty_state", "presentation_geometry_only", "geometry_basis", "denominator_value", "denominator_label", "grain", "integration_record_id", "integration_record_ids", "integration_record_ref", "integration_record_refs", "presentation_role", "presentation_tier", "technical_surface", "technical_surface_reason", "artifact_type", "artifact_ref", "analytical_artifact_id", "analytical_artifact_ref", "analytical_artifact_content_hash", "analytical_artifact_envelope_hash", "analytical_artifact_canonical_bytes_sha256", "artifact_provenance", "accepted_visual", "accepted_visual_index", "accepted_visual_pointer", "accepted_visual_type", "accepted_evidence", "accepted_evidence_id", "accepted_evidence_candidate_kind", "accepted_evidence_pointer", "accepted_evidence_source_pointer", "accepted_evidence_table_pointer", "accepted_evidence_ref", "accepted_evidence_sha256", "accepted_evidence_conclusion", "accepted_content_hash", "accepted_manifest_hash", "accepted_source_ref", "accepted_artifact_ref", "accepted_artifact_sha256", "source_bound", "scale_groups"}}
+    fields: dict[str, Any] = {key: value for key, value in widget.items() if key in {"value", "manager_display_value", "bars", "tiles", "categories", "segments", "points", "series", "rows", "manager_rows", "stages", "bins", "boxes", "steps", "data", "values", "population", "denominator", "unit", "units", "period", "grain", "data_grain", "row_grain", "proxy", "proxy_or_limit", "limit", "descriptive", "descriptive_only", "causal_status", "as_of", "date_authority", "assumptions", "annotation", "dimensions", "measures", "time", "coverage", "coverage_note", "scope", "answer_scope", "scope_note", "limitations", "filters", "drilldown", "empty_state", "presentation_geometry_only", "geometry_basis", "denominator_value", "denominator_label", "grain", "integration_record_id", "integration_record_ids", "integration_record_ref", "integration_record_refs", "presentation_role", "presentation_tier", "technical_surface", "technical_surface_reason", "artifact_type", "artifact_ref", "analytical_artifact_id", "analytical_artifact_ref", "analytical_artifact_content_hash", "analytical_artifact_envelope_hash", "analytical_artifact_canonical_bytes_sha256", "artifact_provenance", "accepted_visual", "accepted_visual_index", "accepted_visual_pointer", "accepted_visual_type", "accepted_evidence", "accepted_evidence_id", "accepted_evidence_candidate_kind", "accepted_evidence_pointer", "accepted_evidence_source_pointer", "accepted_evidence_table_pointer", "accepted_evidence_ref", "accepted_evidence_sha256", "accepted_evidence_conclusion", "accepted_content_hash", "accepted_manifest_hash", "accepted_source_ref", "accepted_artifact_ref", "accepted_artifact_sha256", "source_bound", "scale_groups", "x_label", "y_label", "columns"}}
     return {
         "id": _text(widget.get("id")),
         "type": kind,
@@ -8833,7 +8879,9 @@ def _assemble_dashboard_locked(
             limited_dashboard = True
         # Product plan order is authoritative for the manager overview; the
         # helper only projects those selected IDs and never chooses by shape.
-        overview_widget_ids = _apply_overview_selection(widgets, manager_widget_ids)
+        presentation_copy = copy.deepcopy((presentation_plan or {}).get("presentation", {}))
+        overview_widget_ids = _apply_overview_selection(
+            widgets, presentation_copy.get("overview_widget_ids", manager_widget_ids))
         audit_records = _audit_record_entries(
             {item_id: loaded[item_id]["records"] for item_id in selected_ids},
             widgets,
@@ -8845,12 +8893,13 @@ def _assemble_dashboard_locked(
             "schema_version": FIXTURE_SCHEMA,
             "dashboard_version": 4,
             "site_version": 4,
-            "title": "Reproducible reviewed decision workspace",
-            "subtitle": "Deterministic presentation of accepted and committed results; no new analytics are calculated.",
+            "title": presentation_copy.get("title", "Business dashboard"),
+            "presentation": presentation_copy,
+            "subtitle": presentation_copy.get("subtitle", "Reviewed business results with source context and limitations."),
             "run_id": context.run_id,
             "generation_id": generation_id,
             "skill_name": SKILL_NAME,
-            "skill_version": context.skill_version or "0.7.2",
+            "skill_version": context.skill_version or "0.8.0",
             "core_name": CORE_NAME,
             "core_version": context.core_version,
             "freeze_markers": dict(projection_metadata["freeze_markers"]),

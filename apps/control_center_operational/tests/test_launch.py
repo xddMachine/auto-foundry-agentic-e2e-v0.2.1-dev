@@ -5,6 +5,7 @@ import json
 import hashlib
 import os
 import signal
+import shutil
 import sqlite3
 import stat
 import struct
@@ -507,40 +508,11 @@ class LaunchTests(unittest.TestCase):
         source.mkdir(exist_ok=True)
         code_home = root / "codex-home"
         skill_path = code_home / "skills" / coordinator_module.PRODUCTION_SKILL_NAME
-        skill_path.mkdir(parents=True, exist_ok=True)
-        (skill_path / "SKILL.md").write_text(
-            "---\n"
-            f"name: {coordinator_module.PRODUCTION_SKILL_NAME}\n"
-            "description: synthetic test fixture\n"
-            "metadata:\n"
-            f"  version: \"{coordinator_module.PRODUCTION_SKILL_VERSION}\"\n"
-            "  core_name: auto_foundry_core\n"
-            f"  core_version: \"{coordinator_module.PRODUCTION_CORE_VERSION}\"\n"
-            f"  release: {coordinator_module.PRODUCTION_RELEASE}\n"
-            "---\n\n"
-            f"skill_name: {coordinator_module.PRODUCTION_SKILL_NAME}\n"
-            f"skill_version: {coordinator_module.PRODUCTION_SKILL_VERSION}\n"
-            "core_name: auto_foundry_core\n"
-            f"core_version: {coordinator_module.PRODUCTION_CORE_VERSION}\n",
-            encoding="utf-8",
-        )
-        (skill_path / "README.md").write_text("synthetic release fixture\n", encoding="utf-8")
-        coordinator_module.PRODUCTION_SKILL_SHA256 = hashlib.sha256(
-            coordinator_module._skill_release_bytes(skill_path)
-        ).hexdigest()
-        support_root = root / "test-support"
-        support_root.mkdir(parents=True, exist_ok=True)
-        (support_root / "sitecustomize.py").write_text(
-            "import os\n"
-            "import auto_foundry_core.coordinator as _coordinator\n"
-            "_value = os.environ.get('AUTO_FOUNDRY_TEST_SKILL_SHA256')\n"
-            "if _value:\n"
-            "    _coordinator.PRODUCTION_SKILL_SHA256 = _value\n",
-            encoding="utf-8",
-        )
-        os.environ["AUTO_FOUNDRY_TEST_SKILL_SHA256"] = coordinator_module.PRODUCTION_SKILL_SHA256
-        current_pythonpath = os.environ.get("PYTHONPATH", "")
-        os.environ["PYTHONPATH"] = str(support_root) + (os.pathsep + current_pythonpath if current_pythonpath else "")
+        # Use the actual paired skill. Real subprocess tests must not depend
+        # on sitecustomize replacing a production integrity hash in the child.
+        source_skill = Path(__file__).resolve().parents[3] / "skills" / coordinator_module.PRODUCTION_SKILL_NAME
+        shutil.copytree(source_skill, skill_path, dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store"))
         os.environ["CODEX_HOME"] = str(code_home)
         return LaunchSettings(
             runtime_root=root,
@@ -2505,8 +2477,8 @@ class LaunchTests(unittest.TestCase):
                 persisted["codex_exec"]["role_reasoning_efforts"]["foundry_supervisor"],
                 "high",
             )
-            self.assertEqual(persisted["codex_exec"]["skill_version"], "0.7.2")
-            self.assertEqual(persisted["codex_exec"]["core_version"], "0.8.1")
+            self.assertEqual(persisted["codex_exec"]["skill_version"], "0.8.0")
+            self.assertEqual(persisted["codex_exec"]["core_version"], "0.9.0")
             self.assertEqual(
                 persisted["codex_exec"]["skill_sha256"],
                 coordinator_module.PRODUCTION_SKILL_SHA256,

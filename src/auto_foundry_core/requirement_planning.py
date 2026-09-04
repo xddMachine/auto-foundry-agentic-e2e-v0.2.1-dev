@@ -2481,6 +2481,8 @@ class RequirementSupervisorWorkspace:
         current_path = RunLifecycle.active_plan_path(self.context)
         if current_path.exists() and not current_path.is_symlink():
             current = self._load_path(current_path)
+            if current != candidate and candidate.revision <= current.revision:
+                raise ValueError("a revised plan must have a higher revision; reload the active portfolio")
             if current.input_records != candidate.input_records:
                 from .run_extension import RequirementRunExtension
 
@@ -2492,7 +2494,7 @@ class RequirementSupervisorWorkspace:
                     # revise; save the latest requested portfolio directly.
                     pass
                 else:
-                    RequirementRunExtension.revise(self.context, plan=candidate)
+                    RequirementRunExtension.revise(self.context, plan=candidate, expected_parent_plan_hash=hashlib.sha256(_canonical_json_bytes(current.to_dict())).hexdigest())
                     return self.load()
 
         with RunLifecycle._run_lock(self.context):

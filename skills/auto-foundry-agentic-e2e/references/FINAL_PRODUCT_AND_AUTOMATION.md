@@ -1,88 +1,74 @@
 # Final product, dashboard, and optimizer
 
-## Product start condition
+The Product Agent owns business presentation choices, not infrastructure. Use
+`product_workspace.ProductWorkspace(context, action)` for both preview and final
+candidate actions. `context` and `action` come from the coordinator dispatch.
+No model call is made by this module. The agent remains responsible for interpreting
+which accepted results are useful; neither the renderer nor a title dictionary
+makes that decision.
 
-Start product work only after every supplied question or requirement has a
-terminal outcome, including limited, blocked, unsupported, or technical
-outcomes. Freeze the reviewed answer references, LEM snapshot, prepared-data
-registry, and closed telemetry before building products.
+```python
+from product_workspace import ProductWorkspace
+workspace = ProductWorkspace(context, action)
+page = workspace.inventory()          # paginate via next_offset
+candidate = workspace.detail(widget_id) # exact data for one view
+feedback = workspace.feedback()        # independently recorded repair findings
+result = workspace.build(choices, presentation={
+    "title": "Operations dashboard",
+    "subtitle": "Scope and reporting period",
+    "section_titles": {"REQ-001": "Sales performance"},
+})
+```
 
-While requirements are still running, the Planner may offer the separate
-low-priority `refresh_product_preview` action once one requirement has a
-validated committed integration boundary. It renders only that usable subset
-under `products/generations/<G>/preview` and never changes run lifecycle,
-freezes inputs, or gates later requirements. The Product Agent chooses a
-coherent multi-section layout by comparing valid local V2 chart designs across
-question, grain, dimensions, measures, temporal shape, coverage, and
-limitations; this grounded choice is not network design research and never
-recomputes analytical facts. The canonical `dashboard.preview.v1`
-`preview_manifest.json` binds only accepted/committed public refs and hashes,
-assembler receipt/blueprint/site refs and hashes, and the input fingerprint.
-Its `site_tree_sha256` is the assembler's direct sorted
-`{relative_path: sha256}` site-binding map hash, including `site_manifest.json`.
-Malformed or failed previews remain presentation-local; a changed committed
-input re-enables refresh. Once every requirement is terminal, incremental
-refresh is suppressed and the one-time candidate → independent review →
-publication flow below is authoritative.
+Each choice contains `widget_id` and, for visual entries, an eligible `recipe_id`,
+`renderer_type`, and `layout` from the inventory. Supply the complete ordered
+manager selection on every call. Do not copy values, hashes, evidence pointers,
+paths, or lineage into choices. These fields are owned by the workspace.
+Choose layouts compact, half, or full only where the recipe permits them.
+Optional `presentation` contains title/subtitle, `section_titles` by requirement,
+`widget_titles` by selected widget, and `overview_widget_ids` as a selected subset.
+These are escaped display fields, never new numerical or analytical authority.
 
-## Product Agent presentation flow
+Inspect all inventory pages. Ensure every accepted requirement has a meaningful
+decision surface or an explicit source-bound limitation. Charts should match the
+actual evidence shape: time series, comparisons, composition, distributions,
+relationships, or nested process stages. Do not force pie charts on overlapping
+categories or arbitrary numbers. Mix chart types when supported by the evidence,
+not to meet a visual quota. Inspect the exact rows and independent units first.
+No new analytics, causal interpretation, estimates, cross-requirement joins, or
+synthetic business facts are allowed at this boundary.
 
-Both `refresh_product_preview` and the final Product Agent actions use the same
-generation-scoped presentation sequence:
+## Progressive and final assembly
 
-1. Call the public
-   `dashboard_assembler.business_presentation_preflight(context,
-   item_ids=..., generation_id=...)` to build or validate the deterministic
-   accepted/committed V2 inventory under `extensions/<G>/dashboard_preflight/`.
-2. Compare valid local chart recipes by question, grain, dimensions, measures,
-   temporal shape, coverage, and limitations. Choose a coherent multi-section
-   layout with explicit `recipe_id`, `layout`, and `renderer_type`; this is
-   grounded selection from accepted business evidence, never network design
-   research or analytical recomputation.
-3. Distinguish initial creation from same-source regeneration. If the
-   `extensions/<G>/business_presentation_plan.json` target is absent, call
-   `dashboard_assembler.write_business_presentation_plan(...)` (or the
-   explicit V2 record route when required) with a complete ordered
-   `manager_entries` selection. If it already contains a V2 plan, call
-   `dashboard_assembler.write_business_presentation_plan_v2(...)` with a
-   complete new ordered selection, then
-   `dashboard_assembler.revise_business_presentation_plan_v2(...)` with exact
-   predecessor/successor SHA CAS, even when preflight/input hashes are
-   unchanged. Presentation audience, manager membership/order, recipe, layout,
-   and renderer may change; accepted facts, pointers, values, and provenance
-   bindings must remain exact. `record_business_presentation_plan_v2` is an
-   absent-target recorder only. This plan is the sole presentation-admission
-   authority.
-4. For `refresh_product_preview`, call
-   `dashboard_delta_assembler.assemble_generation_preview(context, item_ids=...,
-   presentation_plan_ref=..., output_dir="generations/<G>/preview")` exactly
-   once. This entry renders only the committed subset and never terminal-
-   publishes a product. For final actions, call
-   `dashboard_delta_assembler.assemble_generation_product(context, ...)` once
-   with the plan ref; successor generations pass the program-owned parent
-   receipt and explicit route. The final entry selects its internal full or
-   delta implementation from lifecycle metadata.
-5. Validate receipt, standalone Blueprint v2 binding, output hashes, site
-   manifest, offline links, and complete site-tree hash. A preview then writes
-   `preview_manifest.json`; a final build hands refs to the existing refs-only
-   candidate → independent review → publication flow. Candidate bytes are
-   never regenerated after review.
+Preview is a cumulative view of business-accepted answers. Ontology integration
+is a separate machine-reuse boundary; technical integration failure does not
+remove an accepted answer. A semantic contradiction is NOT a technical failure:
+it must go back to the owning analytical/review workflow, not be bypassed here.
+Preview is visibly nonfinal and does not authorize publication. The final product
+is assembled when all item boundaries are terminal, then independently reviewed.
+New inputs require a fresh workspace. Stale item bindings fail closed.
 
-The Product Agent never calls the low-level full/delta functions directly,
-edits fixture/chart/manifest bytes, infers routes from requirement prose, or
-freezes/authorizes/publishes outside the existing lifecycle.
+Terminal technical-failure and blocked-by-evidence items remain disclosed. A
+limited/empty-state view is valid when no supported result exists; never invent
+metrics to fill blank cards. Previous accepted generations remain immutable.
+A changed already-reviewed product requires the coordinator's product-revision
+action. The workspace consumes its output namespace and predecessor feedback.
+It cannot grant itself review acceptance or publishing authority.
 
-When a newly committed item grows the same active generation, its canonical
-input fingerprint changes. Re-run preflight and replace only the
-generation-scoped extension inventory/plan; stale item bindings, source hashes,
-or plan refs fail closed rather than being reused. The preview namespace may
-then be rebuilt atomically from the new plan. Once all requirements are
-terminal, no incremental refresh is offered.
+## Host-owned implementation, not an agent checklist
 
-Terminal technical-failure, blocked, unsupported, or no-record requirements are
-kept as explicit limitations. If all terminal requirements are limited, the
-preflight/plan chooses a reviewed limited/empty-state view so the dashboard is
-non-blank without fabricating analytical facts.
+The workspace calls `business_presentation_preflight`, prepares complete bound
+entries through `write_business_presentation_plan` or its versioned CAS successor,
+then chooses `assemble_generation_preview` or `assemble_generation_product`.
+It validates receipts and registers the existing ProductCandidate. Exact retries
+reuse the same bound result. The agent must not call these lower-level operations
+separately, edit JSON artifacts, calculate hashes, author revision IDs, or patch
+the engine while working on a business run.
+
+The independent Product Reviewer must check chart geometry and units, row/column
+fidelity, limitation visibility, broken links, overflow and actual useful content.
+Hashes prove identity, not analytical correctness. The coordinator retains final
+review, authorization, activation, and publication policy enforcement.
 
 ## Normal workflow boundary
 

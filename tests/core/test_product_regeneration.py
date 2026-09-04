@@ -497,28 +497,10 @@ def test_product_regeneration_guidance_reads_predecessor_review_first() -> None:
             },
         )
     )
-    assert guidance.startswith("Repair-first:")
-    for phrase in (
-        "read the exact predecessor Product Review",
-        "Correct its presentation findings",
-        "preserve accepted business facts",
-        "do not rerun analytics",
-        "substantive business decision surfaces over technical diagnostics",
-        "keep technical evidence in audit",
-        "concise portfolio/domain labels",
-        "active accepted review hash is lineage only",
-    ):
-        assert phrase in guidance
-
-    normal_guidance = coordinator_module._role_guidance(
-        PlannerAction(
-            "build_product_candidate",
-            "product_agent",
-            "RUN-PRODUCT-REGENERATION",
-            "build the reviewed Product candidate",
-        )
-    )
-    assert not normal_guidance.startswith("Repair-first:")
+    assert "feedback()" in guidance
+    assert "predecessor" in guidance
+    assert "Do not invent metrics or run new analytics" in guidance
+    assert "ProductWorkspace(context, action)" in guidance
 
 
 def test_product_regeneration_replacement_marker_launches_one_fresh_session(
@@ -1136,6 +1118,13 @@ def test_product_regeneration_projection_for_post_rebind_spec_is_read_only(tmp_p
     context = RunContext(run_id, tmp_path)
     RunLifecycle.create(context, ["REQ-001"], mode="requirement")
     _seed_reviewed_product(context)
+    import shutil
+    home = tmp_path / "isolated-home"
+    installed = home / ".codex" / "skills" / "auto-foundry-agentic-e2e"
+    shutil.copytree(Path(__file__).resolve().parents[2] / "skills" / installed.name, installed,
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CODEX_HOME", str(home / ".codex"))
     current_binding = coordinator_module.resolve_production_skill_binding(
         repo_root=tmp_path,
         role_cwd=tmp_path,
@@ -1185,12 +1174,19 @@ def test_product_regeneration_projection_for_post_rebind_spec_is_read_only(tmp_p
         coordinator.close(wait_for_roles=True)
 
 
-def test_post_rebind_projection_rejects_malformed_transport_intent(tmp_path: Path) -> None:
+def test_post_rebind_projection_rejects_malformed_transport_intent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A stale release cannot bypass a malformed transport recovery intent."""
 
     run_id = "RUN-PRODUCT-REGENERATION-MALFORMED-INTENT"
     context = RunContext(run_id, tmp_path)
     RunLifecycle.create(context, ["REQ-001"], mode="requirement")
+    import shutil
+    home = tmp_path / "isolated-home"
+    installed = home / ".codex" / "skills" / "auto-foundry-agentic-e2e"
+    shutil.copytree(Path(__file__).resolve().parents[2] / "skills" / installed.name, installed,
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CODEX_HOME", str(home / ".codex"))
     current_binding = coordinator_module.resolve_production_skill_binding(
         repo_root=tmp_path,
         role_cwd=tmp_path,
@@ -1582,7 +1578,7 @@ def test_product_regeneration_replays_after_registry_commit_crash_once(tmp_path:
             coordinator.regenerate_product(idempotency_key="regen-after-registry")
         state = coordinator._read_replay()[0]  # noqa: SLF001
         assert state is not None and state["product_regeneration"] is None
-        revisions = [path.name for path in store.revisions_root.iterdir() if path.is_dir()]
+        revisions = sorted(path.name for path in store.revisions_root.iterdir() if path.is_dir())
         assert revisions == ["rev-0001", "rev-0002"]
         owner = registry.get(f"product_agent:{coordinator.context.run_id}:G-0001")
         assert owner is not None

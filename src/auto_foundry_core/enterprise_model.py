@@ -440,48 +440,61 @@ def _ontology_collection_merge(existing: Any, incoming: Any) -> Any:
     return values
 
 
-def _ontology_value_merge(existing: Any, incoming: Any) -> Any:
-    """Merge reviewed ontology facts without replacing canonical values."""
+class OntologyConflictError(ValueError):
+    """Two accepted definitions disagree; no partial hybrid is publishable."""
 
+    def __init__(self, item_id: str, path: str) -> None:
+        self.item_id, self.path = item_id, path
+        super().__init__(
+            f"ontology definition conflict: {item_id} at {path}; "
+            "reuse the existing definition or submit an explicitly reviewed "
+            "KnowledgeDelta successor; do not invent a new ID to hide the conflict"
+        )
+
+
+def _ontology_value_merge(existing: Any, incoming: Any, *, item_id: str, path: str) -> Any:
+    """Merge compatible information only; disagreeing scalar facts are errors."""
     if _ontology_value_empty(existing):
         return _ontology_value_copy(incoming) if not _ontology_value_empty(incoming) else existing
     if _ontology_value_empty(incoming):
         return existing
+    if _ontology_value_key(existing) == _ontology_value_key(incoming):
+        return _ontology_value_copy(existing)
     if isinstance(existing, Mapping) and isinstance(incoming, Mapping):
         merged = {str(key): _ontology_value_copy(value) for key, value in existing.items()}
         for raw_key, value in incoming.items():
             key = str(raw_key)
             if key in merged:
-                merged[key] = _ontology_value_merge(merged[key], value)
+                merged[key] = _ontology_value_merge(merged[key], value, item_id=item_id, path=f"{path}.{key}")
             elif not _ontology_value_empty(value):
                 merged[key] = _ontology_value_copy(value)
         return merged
-    if (
-        isinstance(existing, (list, tuple, set, frozenset))
-        and not isinstance(existing, (str, bytes, bytearray))
-        and isinstance(incoming, (list, tuple, set, frozenset))
-        and not isinstance(incoming, (str, bytes, bytearray))
+    # Only explicitly additive contract fields are sets. A property list can
+    # encode an ordered composite key/schema/formula: union would change meaning.
+    if path in {"source_refs", "limitations"} or (
+        path == "properties.columns"
+        and isinstance(existing, (list, tuple)) and isinstance(incoming, (list, tuple))
+        and all(isinstance(column, str) for column in (*existing, *incoming))
     ):
         return _ontology_collection_merge(existing, incoming)
-    # The first accepted non-empty scalar (including identity/authority fields)
-    # is canonical.  Requirement-specific wording is retained as evidence in
-    # the accepted record rather than replacing the shared ontology fact.
-    return existing
+    if path == "label":
+        # Labels are display copy, not business identity. The incoming label is
+        # retained in its immutable integration record, not made canonical.
+        return existing
+    raise OntologyConflictError(item_id, path)
 
 
 def _merge_ontology_items(existing: OntologyItem, incoming: OntologyItem) -> OntologyItem:
-    """Return one deterministic canonical item from two same-ID facts."""
-
+    """Build the complete candidate before mutating the canonical dictionary."""
     if existing.item_id != incoming.item_id:
         raise ValueError("ontology item IDs must match for merge")
     values = {
         field.name: _ontology_value_merge(
-            getattr(existing, field.name),
-            getattr(incoming, field.name),
+            getattr(existing, field.name), getattr(incoming, field.name),
+            item_id=existing.item_id, path=field.name,
         )
         for field in fields(OntologyItem)
     }
-    values["item_id"] = existing.item_id
     return OntologyItem(**values)
 
 

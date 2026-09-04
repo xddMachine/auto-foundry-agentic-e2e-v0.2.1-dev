@@ -737,7 +737,7 @@ def _meta_lines(widget: Mapping[str, Any]) -> str:
     fields = (
         ("Period", widget.get("period")),
         ("Population", widget.get("population")),
-        ("Denominator", widget.get("denominator")),
+        ("Denominator", widget.get("denominator") if widget.get("denominator") is not None else widget.get("denominator_value")),
         ("Unit", widget.get("unit")),
         ("Proxy / limit", widget.get("proxy_or_limit") or widget.get("limit")),
     )
@@ -1175,7 +1175,7 @@ def _manager_meta_lines(widget: Mapping[str, Any]) -> str:
         ("Scope", first_value("scope", "answer_scope", "requirement_scope")),
         ("Period", widget.get("period")),
         ("Population", widget.get("population")),
-        ("Denominator", widget.get("denominator")),
+        ("Denominator", first_value("denominator", "denominator_value")),
         ("Unit", first_value("unit", "units", "distinct_unit")),
         ("Grain", first_value("grain", "data_grain", "row_grain")),
         ("Proxy / limit", first_value("proxy_or_limit", "proxy", "limit")),
@@ -1886,7 +1886,7 @@ def _render_line(widget: Mapping[str, Any]) -> str:
             "series": series_value(raw, declared_series[0] if len(declared_series) == 1 else None),
             "value": value_value(raw),
         })
-    points = [point for point in points if point.get("period") not in (None, "") and point.get("value") is not None]
+    points = [point for point in points if point.get("period") not in (None, "")]
 
     # A single supplied point is a snapshot, not a trend.  Keep the value
     # visible while explicitly declining to draw a misleading line.
@@ -1924,7 +1924,7 @@ def _render_line(widget: Mapping[str, Any]) -> str:
     # a caption only when the declaration supplied a unit; no unit is guessed.
     if unit_caption:
         data_table = data_table.replace("<table>", f"<table>{unit_caption}", 1)
-    data_table = f'<div class="line-data">{data_table}</div>'
+    data_table = f'<details class="line-data"><summary>View exact values</summary>{data_table}</details>'
     if len(numeric_values) < 2:
         return (
             '<div class="viz viz-line viz-line-table">'
@@ -1936,7 +1936,7 @@ def _render_line(widget: Mapping[str, Any]) -> str:
     # example when orders and order-lines use different units).  Honor that
     # declaration with one labelled panel per series; no index, ratio, or
     # other comparison is calculated here.
-    independent_axes = any(
+    independent_axes = bool(widget.get("scale_groups")) or any(
         re.search(r"\bseparate axes?\b", _text(value), flags=re.IGNORECASE)
         for value in _as_list(widget.get("limitations"))
     )
@@ -1945,6 +1945,9 @@ def _render_line(widget: Mapping[str, Any]) -> str:
     plot_width = width - left - right
     plot_height = height - top - bottom
     low, high = min(numeric_values), max(numeric_values)
+    is_area = _text(widget.get("type")) == "area"
+    if is_area:
+        low, high = min(0.0, low), max(0.0, high)
     if low == high:
         low -= 1.0
         high += 1.0
@@ -2008,13 +2011,18 @@ def _render_line(widget: Mapping[str, Any]) -> str:
                     f'<line x1="{left}" x2="{width - right}" y1="{y:.2f}" y2="{y:.2f}" stroke="#d9e1e8" stroke-width="1" />'
                     f'<text x="{left - 8}" y="{y + 4:.2f}" text-anchor="end" fill="#536170" font-size="11">{_escape(f"{grid_value:g}")}</text>'
                 )
-            coordinates = " ".join(
-                f"{panel_x(_text(point.get('period'))):.2f},{panel_y(numeric(point.get('value'))):.2f}"
-                for point in series_points
-            )
-            line_markup = (
-                f'<polyline class="line-series" points="{coordinates}" fill="none" stroke="{color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" data-series="{_escape(name)}" />'
-                if len(series_points) >= 2 else ""
+            by_period = {_text(point.get("period")): point for point in series_points}
+            segments: list[list[str]] = [[]]
+            for period in periods:
+                point = by_period.get(period)
+                if point is None:
+                    if segments[-1]:
+                        segments.append([])
+                    continue
+                segments[-1].append(f"{panel_x(period):.2f},{panel_y(numeric(point.get('value'))):.2f}")
+            line_markup = "".join(
+                f'<polyline class="line-series" points="{" ".join(segment)}" fill="none" stroke="{color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" data-series="{_escape(name)}" />'
+                for segment in segments if len(segment) >= 2
             )
             point_markup = "".join(
                 f'<circle class="line-point" cx="{panel_x(_text(point.get("period"))):.2f}" cy="{panel_y(numeric(point.get("value"))):.2f}" r="3.5" fill="{color}" data-series="{_escape(name)}" data-period="{_escape(point.get("period"))}" aria-label="{_escape(f"{name} · {_text(point.get('period'))}: {_display_value(point.get('value'))}")}"><title>{_escape(f"{name} · {_text(point.get('period'))}: {_display_value(point.get('value'))}")}</title></circle>'
@@ -2055,11 +2063,21 @@ def _render_line(widget: Mapping[str, Any]) -> str:
     for series_index, name in enumerate(series_names):
         color = palette[series_index % len(palette)]
         series_points = [point for point in points if _text(point.get("series"), "Value") == name and numeric(point.get("value")) is not None]
-        if len(series_points) >= 2:
-            coordinates = " ".join(f"{x_for(_text(point.get('period'))):.2f},{y_for(numeric(point.get('value'))):.2f}" for point in series_points)
-            geometry.append(
-                f'<polyline class="line-series" points="{coordinates}" fill="none" stroke="{color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" data-series="{_escape(name)}" />'
-            )
+        segments: list[list[Mapping[str, Any]]] = [[]]
+        for point in [p for p in points if _text(p.get("series"), "Value") == name]:
+            if numeric(point.get("value")) is None:
+                segments.append([])
+            else:
+                segments[-1].append(point)
+        for segment in segments:
+            if len(segment) < 2:
+                continue
+            coordinates = " ".join(f"{x_for(_text(point.get('period'))):.2f},{y_for(numeric(point.get('value'))):.2f}" for point in segment)
+            if is_area:
+                baseline = y_for(0.0)
+                polygon = f"{x_for(_text(segment[0]['period'])):.2f},{baseline:.2f} " + coordinates + f" {x_for(_text(segment[-1]['period'])):.2f},{baseline:.2f}"
+                geometry.append(f'<polygon class="area-fill" points="{polygon}" fill="{color}" fill-opacity="0.16" />')
+            geometry.append(f'<polyline class="line-series" points="{coordinates}" fill="none" stroke="{color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" data-series="{_escape(name)}" />')
         for point in series_points:
             x = x_for(_text(point.get("period")))
             y = y_for(numeric(point.get("value")))
@@ -2149,20 +2167,35 @@ def _render_heatmap(widget: Mapping[str, Any]) -> str:
 
 
 def _render_scatter(widget: Mapping[str, Any]) -> str:
+    """Render supplied x/y coordinates, never regress, aggregate or impute."""
     rows = _rows(widget.get("points") or widget.get("rows") or widget.get("data"))
     if not rows:
         return '<p class="viz-note">No reviewed points were supplied for this view.</p>'
-    rendered = []
+    points = []
     for row in rows:
-        rendered.append(
-            '<li><span class="scatter-dot" aria-hidden="true"></span>'
-            '<span>{label}</span><span>x={x}; y={y}</span></li>'.format(
-                label=_escape(row.get("label") or row.get("name")),
-                x=_escape(_display_value(row.get("x"))),
-                y=_escape(_display_value(row.get("y"))),
-            )
-        )
-    return '<ul class="viz viz-scatter">' + "".join(rendered) + "</ul>"
+        if any(isinstance(row.get(k), bool) or row.get(k) is None for k in ("x", "y")):
+            raise ValueError("scatter requires explicit numeric x/y")
+        x, y = float(row["x"]), float(row["y"])
+        if not math.isfinite(x) or not math.isfinite(y):
+            raise ValueError("scatter coordinates must be finite")
+        points.append((row, x, y))
+    xmin, xmax = min(x for _, x, _ in points), max(x for _, x, _ in points)
+    ymin, ymax = min(y for _, _, y in points), max(y for _, _, y in points)
+    if xmin == xmax: xmin, xmax = xmin - 1, xmax + 1
+    if ymin == ymax: ymin, ymax = ymin - 1, ymax + 1
+    left, top, width, height = 65, 20, 625, 235
+    px = lambda x: left + (x-xmin)/(xmax-xmin)*width
+    py = lambda y: top + (ymax-y)/(ymax-ymin)*height
+    marks=[]; grid=[]
+    for index in range(5):
+        x, y = xmin+(xmax-xmin)*index/4, ymin+(ymax-ymin)*index/4
+        grid.append(f'<line x1="{left}" x2="{left+width}" y1="{py(y):.2f}" y2="{py(y):.2f}" stroke="#e3e9ee"/><text x="{left-8}" y="{py(y)+4:.2f}" text-anchor="end">{y:g}</text><text x="{px(x):.2f}" y="{top+height+21}" text-anchor="middle">{x:g}</text>')
+    for row,x,y in points:
+        label = f"{_text(row.get('label') or row.get('name'))}: x={_display_value(row['x'])}; y={_display_value(row['y'])}"
+        marks.append(f'<circle class="scatter-point" cx="{px(x):.2f}" cy="{py(y):.2f}" r="5" fill="#076f75" fill-opacity="0.72" tabindex="0" aria-label="{_escape(label)}"><title>{_escape(label)}</title></circle>')
+    title=_escape(_text(widget.get('title'), 'Reviewed scatter'))
+    exact=_render_table({"rows": rows},rows_override=rows)
+    return f'<div class="viz viz-scatter"><svg viewBox="0 0 720 325" role="img" aria-label="{title}"><title>{title}</title><g class="axis-labels">{"".join(grid)}</g><line x1="{left}" x2="{left+width}" y1="{top+height}" y2="{top+height}" stroke="#aabac4"/>{"".join(marks)}<text x="375" y="310" text-anchor="middle">{_escape(widget.get("x_label", "x"))}</text><text transform="translate(15 140) rotate(-90)" text-anchor="middle">{_escape(widget.get("y_label", "y"))}</text></svg><details><summary>View exact values</summary>{exact}</details></div>'
 
 
 def _normalize_percent(value: Any, label: str, *, require_percent_string: bool = False) -> str:
@@ -2277,8 +2310,10 @@ def _render_donut(widget: Mapping[str, Any]) -> str:
     denominator, denominator_label, categories = _donut_categories(widget)
     radius = 44.0
     circumference = 2.0 * math.pi * radius
-    palette = ("#087f86", "#1f6f9d", "#b97811", "#168aa5", "#78909e")
+    palette = ("#076f75", "#7457a5", "#217452", "#c17125", "#b55c86")
     offset = 0.0
+    series_prefix = _slug(widget.get("id") or widget.get("title") or "composition")
+    is_pie = _text(widget.get("type")) == "pie"
     segments = []
     legend = []
     for index, (category, percent) in enumerate(categories):
@@ -2286,20 +2321,30 @@ def _render_donut(widget: Mapping[str, Any]) -> str:
         segments.append(
             f'<circle class="donut-segment donut-segment-{index}" cx="60" cy="60" r="{radius:g}" '
             f'stroke="{palette[index]}" stroke-dasharray="{length:.3f} {circumference:.3f}" '
-            f'stroke-dashoffset="{-offset:.3f}" data-series-key="donut-{index}"></circle>'
+            f'stroke-dashoffset="{-offset:.3f}" data-series-key="{_escape(series_prefix)}-donut-{index}"></circle>'
         )
+        if is_pie:
+            start_angle = offset / circumference * 2 * math.pi
+            end_angle = start_angle + percent / 100 * 2 * math.pi
+            x1, y1 = 60 + radius * math.cos(start_angle), 60 + radius * math.sin(start_angle)
+            x2, y2 = 60 + radius * math.cos(end_angle), 60 + radius * math.sin(end_angle)
+            if percent >= 100:
+                path = f"M 60 16 A 44 44 0 1 1 60 104 A 44 44 0 1 1 60 16 Z"
+            else:
+                path = f"M 60 60 L {x1:.3f} {y1:.3f} A 44 44 0 {1 if percent > 50 else 0} 1 {x2:.3f} {y2:.3f} Z"
+            segments[-1] = f'<path class="pie-segment" d="{path}" fill="{palette[index]}" data-series-key="{_escape(series_prefix)}-donut-{index}"><title>{_escape(category.get("label"))}: {_escape(category.get("value"))}</title></path>'
         label = _text(category.get("label"))
         value = _display_value(category.get("display_value", category.get("value")))
         size = _text(category.get("size"))
         legend.append(
             f'<li><span class="donut-key donut-key-{index}" aria-hidden="true"></span>'
-            f'<button type="button" class="series-toggle" data-series-toggle="donut-{index}" aria-pressed="true"><span class="donut-label">{_escape(label)}</span></button><strong>{_escape(value)}</strong>'
+            f'<button type="button" class="series-toggle" data-series-toggle="{_escape(series_prefix)}-donut-{index}" aria-pressed="true"><span class="donut-label">{_escape(label)}</span></button><strong>{_escape(value)}</strong>'
             f'<small>{_escape(size)}</small></li>'
         )
         offset += length
     aria = f"{_text(widget.get('title'), 'Reviewed composition')}: {denominator} {denominator_label}"
     return (
-        f'<div class="viz viz-donut" data-supplied="true">'
+        f'<div class="viz viz-donut {"viz-pie" if is_pie else ""}" data-supplied="true">'
         f'<div class="donut-visual"><svg class="donut-ring" viewBox="0 0 120 120" role="img" '
         f'aria-label="{_escape(aria)}"><title>{_escape(aria)}</title>'
         f'<circle class="donut-track" cx="60" cy="60" r="{radius:g}"></circle>'
@@ -2760,7 +2805,7 @@ def _render_visual(widget: Mapping[str, Any]) -> str:
     if kind == "area":
         return '<div class="viz viz-area">' + _render_line(widget) + "</div>"
     if kind == "stacked_area":
-        return '<div class="viz viz-stacked-area">' + _render_stacked(widget) + "</div>"
+        raise ValueError("stacked_area requires an implemented temporal renderer; composition strips are not area charts")
     if kind in {"grouped_bar", "stacked_bar", "normalized_stacked_bar"}:
         if kind == "grouped_bar":
             return _render_bar(widget)
@@ -3172,7 +3217,7 @@ def render_dashboard(
         "internal_links_checked": True,
         "freeze_markers": freeze_markers.to_dict(),
         "run_id": _text(fixture.get("run_id")),
-        "skill_version": _text(fixture.get("skill_version"), "0.7.2"),
+        "skill_version": _text(fixture.get("skill_version"), "0.8.0"),
         "domain_order": [domain["id"] for domain in domains],
         "decision_flow_order": [
             {"domain_id": domain["id"], "flow_id": flow["id"]}
@@ -3437,6 +3482,8 @@ def _validate_fixture_presentation_plan_v2(
         ).hexdigest()
 
     plan_hash = hashlib.sha256(plan_path.read_bytes()).hexdigest()
+    if fixture.get("presentation", {}) != plan.get("presentation", {}):
+        raise ValueError("presentation copy drifted from the reviewed plan")
     manager_ids = fixture.get("manager_widget_ids")
     if fixture.get("presentation_plan_sha256") != plan_hash or plan.get("manager_widget_ids") != manager_ids:
         raise ValueError("v2 presentation plan hash or manager IDs do not match")
@@ -3507,7 +3554,7 @@ def _validate_fixture_presentation_plan_v2(
         if "renderer_type" in entry and entry.get("renderer_type") not in {
             "kpi", "bar", "column", "grouped_bar", "stacked_bar", "diverging_bar", "waffle",
             "funnel", "histogram", "box_plot", "pareto", "waterfall", "heatmap", "scatter",
-            "line", "area", "stacked_area", "lollipop", "donut", "metric_grid", "table",
+            "line", "area", "stacked_area", "lollipop", "donut", "pie", "metric_grid", "table",
         }:
             raise ValueError(f"v2 visual entry renderer selection is invalid: {widget_id}")
         if snapshot_hash(widget) != entry.get("widget_snapshot_sha256") or chart_hash(chart) != entry.get("chart_entry_sha256"):
@@ -3729,6 +3776,8 @@ def _site_widget(
         f'<div class="runtime-detail" data-runtime-detail="{_escape(detail_key)}" hidden><p>Exact reviewed rows and provenance remain available in the technical audit.</p></div>'
     )
     requirement_data = f' data-runtime-requirement="{requirement_attr}"' if requirement_attr else ""
+    if manager_surface and records:
+        detail = f'<a class="evidence-link" href="../evidence.html#{_escape(records[0]["anchor"])}">Evidence and definitions</a>'
     return f'<article class="widget manager-widget widget-{_escape(kind)} role-{_escape(_slug(role))}{_layout_class(widget)}{panel_class}" data-runtime-card{requirement_data} data-runtime-domain="{domain_attr}" data-runtime-role="{_escape(_slug(role))}"{panel_attr}{data_widget} id="widget-{_escape(_slug(anchor))}"><h3>{_escape(title)}</h3>{panel_note}{note_html}{manager_meta}{visual}{detail}</article>'
 
 
@@ -4212,7 +4261,11 @@ def render_dashboard_site(
     title = _manager_prose_text(_text(fixture.get("title"), "Reviewed decision workspace"))
     # Keep pipeline/provenance wording out of the manager canvas. Technical
     # details remain available on the dedicated audit pages below.
-    subtitle = "Business signals and decisions."
+    presentation = fixture.get("presentation") or {}
+    subtitle = _text(presentation.get("subtitle"), "Business signals and decisions.")
+    title = _text(presentation.get("title"), title)
+    section_titles = presentation.get("section_titles") or {}
+    widget_titles = presentation.get("widget_titles") or {}
     accepted_review = fixture.get("accepted_final_product_review")
     surface_status = (
         "Reviewed"
@@ -4280,6 +4333,12 @@ def render_dashboard_site(
         for flow in domain["decision_flow"]:
             domain_widgets.extend(by_id[widget_id] for widget_id in flow["widget_ids"])
         groups = _requirement_groups(domain_widgets, domain)
+        for group in groups:
+            if group["id"] in section_titles:
+                group["title"] = section_titles[group["id"]]
+        explicit_titles = [section_titles[g["id"]] for g in groups if g["id"] in section_titles]
+        if explicit_titles:
+            domain["title"] = " · ".join(explicit_titles)
         manager_groups = [
             group for group in groups
             if any(_manager_widget_allowed(widget, strict=_is_v4_fixture(fixture)) for widget in group["widgets"])
@@ -4455,6 +4514,7 @@ def render_dashboard_site(
         + ("".join(technical_blocks) or '<p class="network-empty">No technical-only requirement records were supplied.</p>')
     )
     overview_cards = []
+    overview_charts = []
     portfolio_title = title
     for widget in overview_widgets:
         # Domain pages render the validated manager projection through
@@ -4469,11 +4529,13 @@ def render_dashboard_site(
             if display_widget.get("__explicit_plan_projection") is True
             else _manager_prose_text(_manager_title(display_widget))
         )
+        widget_title = widget_titles.get(_text(widget.get("id")), widget_title)
+        attributes = f'data-runtime-card data-runtime-domain="{_escape(_slug(widget.get("domain_id") or ""))}" data-widget-id="{_escape(widget.get("id"))}"'
         if kind == "kpi":
             value = display_widget.get("manager_display_value") or (display_widget.get("value") if display_widget.get("value") is not None else display_widget.get("display_value"))
             unit = _manager_prose_text(display_widget.get("unit"))
             unit_html = f'<small>{_escape(unit)}</small>' if unit else ""
-            card = f'<article class="overview-kpi"><span class="eyebrow">Signal</span><h2>{_escape(widget_title)}</h2><strong>{_escape(_compact_scalar_display(value))}</strong>{unit_html}'
+            card = f'<article class="overview-kpi" {attributes}><span class="eyebrow">Signal</span><h2>{_escape(widget_title)}</h2><strong>{_escape(_compact_scalar_display(value))}</strong>{unit_html}'
         else:
             try:
                 if kind in {"table", "status_table"}:
@@ -4482,12 +4544,24 @@ def render_dashboard_site(
                     visual = _render_visual(display_widget)
             except (KeyError, TypeError, ValueError, ZeroDivisionError):
                 visual = _render_visual_fallback(display_widget, manager_view=True)
-            card = f'<article class="overview-surface overview-{_escape(_slug(kind))}"><span class="eyebrow">Signal</span><h2>{_escape(widget_title)}</h2>{visual}'
+            card = f'<article class="overview-surface overview-{_escape(_slug(kind))}{_layout_class(widget)}" {attributes}><span class="eyebrow">Signal</span><h2>{_escape(widget_title)}</h2>{visual}'
+        context_lines = _manager_meta_lines(display_widget)
+        limits = [value for value in _as_list(display_widget.get("limitations")) if _text(value).strip()]
+        if context_lines or limits:
+            card += '<details class="chart-context"><summary>Scope, units and limitations</summary>' + context_lines
+            if limits:
+                card += '<ul>' + ''.join(f'<li>{_escape(value)}</li>' for value in limits) + '</ul>'
+            card += '</details>'
+        traces = _trace_records(widget)
+        if traces:
+            card += f'<a class="evidence-link" href="evidence.html#{_escape(traces[0]["anchor"])}">Evidence</a> '
         if target:
             card += f'<a href="{_escape(target)}">Open requirement →</a>'
         card += "</article>"
-        overview_cards.append(card)
+        (overview_cards if kind == "kpi" else overview_charts).append(card)
     overview_kpi_html = f'<section class="overview-kpis"><div class="section-head"><h2>Priority signals</h2><p>Explicitly selected reviewed business signals; details stay on requirement pages</p></div><div class="kpi-strip">{"".join(overview_cards)}</div></section>' if overview_cards else ""
+    if overview_charts:
+        overview_kpi_html += '<section class="overview-charts"><div class="section-head"><h2>Business performance</h2><p>Accepted evidence · exact values available on each view</p></div><div class="chart-grid">' + ''.join(overview_charts) + '</div></section>'
     overview = _site_page(
         title=portfolio_title,
         current="index.html",

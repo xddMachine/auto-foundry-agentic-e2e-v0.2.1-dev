@@ -4983,7 +4983,7 @@ def _assemble_dashboard_delta_locked(
         audit_records: list[dict[str, Any]] = []
         audit_widgets: list[dict[str, Any]] = []
     else:
-        candidate_overview_ids = assembler._apply_overview_selection(widgets)
+        candidate_overview_ids = assembler._apply_overview_selection(widgets, manager_widget_ids=(presentation_plan or {}).get("presentation", {}).get("overview_widget_ids"))
         audit_records = assembler._audit_record_entries(
             {item_id: loaded[item_id]["records"] for item_id in cumulative_ids},
             widgets,
@@ -4993,6 +4993,9 @@ def _assemble_dashboard_delta_locked(
     if not full_rebuild:
         candidate_fixture = copy.deepcopy(dict(parent_fixture))
     if not full_rebuild:
+        candidate_fixture["presentation"] = copy.deepcopy((presentation_plan or {}).get("presentation", {}))
+        candidate_fixture["title"] = candidate_fixture["presentation"].get("title", "Business dashboard")
+        candidate_fixture["subtitle"] = candidate_fixture["presentation"].get("subtitle", "Reviewed business results")
         candidate_fixture["domains"] = domains
         candidate_fixture["widgets"] = widgets
         candidate_fixture["audit_records"] = audit_records
@@ -5002,7 +5005,7 @@ def _assemble_dashboard_delta_locked(
         candidate_fixture["run_id"] = context.run_id
         candidate_fixture["generation_id"] = metadata.generation_id
         candidate_fixture["skill_name"] = getattr(assembler, "SKILL_NAME", "auto-foundry-agentic-e2e")
-        candidate_fixture["skill_version"] = context.skill_version or "0.7.2"
+        candidate_fixture["skill_version"] = context.skill_version or "0.8.0"
         candidate_fixture["core_name"] = getattr(assembler, "CORE_NAME", "auto_foundry_core")
         candidate_fixture["core_version"] = context.core_version
         candidate_fixture["lem_projection_hash"] = projection_metadata["projection_hash"]

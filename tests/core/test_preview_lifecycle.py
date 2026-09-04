@@ -382,13 +382,7 @@ def test_all_terminal_without_preview_offers_final_with_preflight_refs(tmp_path:
     assert not context.resolve_run_path(final_action.metadata["presentation_plan_ref"]).exists()
 
     guidance = coordinator_module._role_guidance(final_action).lower()
-    for phrase in (
-        "business_presentation_preflight",
-        "presentation_inventory_ref",
-        "presentation_plan_ref",
-        "assemble_generation_product(context, ...)",
-        "exactly one canonical dashboard generation entry point",
-    ):
+    for phrase in ("productworkspace(context, action)", "inventory", "build(choices", "hashes", "never accept your own product"):
         assert phrase in guidance, (phrase, guidance)
 
 
