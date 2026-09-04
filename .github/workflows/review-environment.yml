@@ -1,0 +1,62 @@
+name: Read-only review environment
+on:
+  push:
+    branches: [feat/reliable-analytics-dashboard]
+    paths: [.github/workflows/review-environment.yml]
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            runs/RUN-ef84410db47f4937.bundle
+          sparse-checkout-cone-mode: false
+      - name: Prepare dependencies for offline Python 3.13 review
+        run: |
+          mkdir -p review-export/wheels
+          python -m pip download --dest review-export/wheels --python-version 313 --platform manylinux_2_28_x86_64 --implementation cp --abi cp313 --only-binary=:all: --no-deps pyarrow==21.0.0
+      - name: Export selected persisted diagnostics without running the program
+        run: |
+          python - <<'PY'
+          import hashlib, json, pathlib, tarfile, zipfile
+          root = pathlib.Path('runs/RUN-ef84410db47f4937.bundle')
+          archive = pathlib.Path('review-export/run.tar.gz')
+          with archive.open('wb') as out:
+              for part in sorted(root.glob('run.tar.gz.part-*')):
+                  with part.open('rb') as stream:
+                      for chunk in iter(lambda: stream.read(1024*1024), b''):
+                          out.write(chunk)
+          expected = (root/'archive.sha256').read_text().split()[0]
+          assert hashlib.file_digest(archive.open('rb'), 'sha256').hexdigest() == expected
+          original = json.loads((root/'manifest.json').read_text())
+          hashes = {x['path']:x['sha256'] for x in original['files']}
+          selected = []
+          with tarfile.open(archive, 'r:gz') as source, zipfile.ZipFile('review-export/run-diagnostics.zip','w',zipfile.ZIP_DEFLATED) as out:
+              for member in source:
+                  if not member.isfile():
+                      continue
+                  name = pathlib.PurePosixPath(member.name)
+                  relative = pathlib.PurePosixPath(*name.parts[1:]).as_posix()
+                  selected_root = relative.startswith(('control_plane/','requirements/','extensions/','products/generations/')) or relative in {'run_state.json','active_generation.json','requirement_supervisor_plan.json','products/product_manifest.json'}
+                  include = selected_root and member.size <= 8_000_000 and name.suffix in {'.json','.jsonl','.log'} and '/site/' not in relative and '/work/' not in relative and 'dashboard_fixture' not in relative
+                  if include:
+                      data = source.extractfile(member).read()
+                      assert hashlib.sha256(data).hexdigest() == hashes[relative], relative
+                      out.writestr(relative, data)
+                      selected.append({'path':relative,'bytes':len(data),'sha256':hashes[relative]})
+              out.writestr('EXPORT_SCOPE.json',json.dumps({'source_archive_sha256':expected,'original_file_count':original['file_count'],'selected_files':selected,'read_only':True},indent=2))
+          archive.unlink()
+          pathlib.Path('review-export/original-manifest.json').write_text(json.dumps(original,indent=2))
+          print('Exported',len(selected),'persisted diagnostic files; no models or run code executed')
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: offline-review-environment
+          path: review-export/
+          retention-days: 3
+          compression-level: 0
