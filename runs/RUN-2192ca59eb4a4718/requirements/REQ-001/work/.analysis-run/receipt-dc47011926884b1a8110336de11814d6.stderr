@@ -1,0 +1,23 @@
+/Users/runner/work/crossbow/crossbow/arrow/cpp/src/arrow/util/cpu_info.cc:239: IOError: sysctlbyname failed for 'hw.l1dcachesize'. Detail: [errno 1] Operation not permitted
+/Users/runner/work/crossbow/crossbow/arrow/cpp/src/arrow/util/cpu_info.cc:239: IOError: sysctlbyname failed for 'hw.l2cachesize'. Detail: [errno 1] Operation not permitted
+/Users/runner/work/crossbow/crossbow/arrow/cpp/src/arrow/util/cpu_info.cc:239: IOError: sysctlbyname failed for 'hw.l3cachesize'. Detail: [errno 1] Operation not permitted
+/Users/runner/work/crossbow/crossbow/arrow/cpp/src/arrow/util/cpu_info.cc:239: IOError: sysctlbyname failed for 'hw.optional.neon'. Detail: [errno 1] Operation not permitted
+Traceback (most recent call last):
+  File "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-001/work/analysis_req001.py", line 140, in <module>
+    batch = bound.data_room.read_rows(ERP, limit=ERP_BATCH_SIZE, offset=erp_offset)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/src/auto_foundry_core/workbench.py", line 1715, in read_rows
+    return self._parquet_rows(resolved, limit=limit, offset=offset)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/src/auto_foundry_core/workbench.py", line 1598, in _parquet_rows
+    for value in batch.to_pylist():
+                 ^^^^^^^^^^^^^^^^^
+  File "pyarrow/table.pxi", line 2348, in pyarrow.lib._Tabular.to_pylist
+  File "pyarrow/table.pxi", line 2311, in pyarrow.lib._Tabular.to_pydict
+  File "pyarrow/array.pxi", line 1824, in pyarrow.lib.Array.to_pylist
+  File "pyarrow/scalar.pxi", line 766, in pyarrow.lib.TimestampScalar.as_py
+  File "pyarrow/scalar.pxi", line 653, in pyarrow.lib._datetime_from_int
+  File "pandas/_libs/tslibs/timestamps.pyx", line 1865, in pandas._libs.tslibs.timestamps.Timestamp.__new__
+  File "pandas/_libs/tslibs/conversion.pyx", line 392, in pandas._libs.tslibs.conversion.convert_to_tsobject
+  File "pandas/_libs/tslibs/conversion.pyx", line 228, in pandas._libs.tslibs.conversion.cast_from_unit
+KeyboardInterrupt

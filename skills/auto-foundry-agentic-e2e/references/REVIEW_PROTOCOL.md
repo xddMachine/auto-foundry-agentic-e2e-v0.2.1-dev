@@ -139,8 +139,13 @@ answer.
 
 The fidelity reviewer may identify affected record IDs and dependency IDs
 because those are the objects under review. The same Integration Agent may
-correct the authorized records once and receive one targeted recheck. It may
-not reopen or rewrite the accepted business answer.
+correct the authorized records once (or remove an authorized record) and
+receive one targeted recheck. The accepted business answer bytes and
+`accepted_content_hash` remain immutable; typed integration records are only a
+derived projection. Normalized typed fields may differ literally from the
+accepted prose/artifact without constituting a semantic conflict. The agent
+preserves the accepted business meaning, rebuilds the packet, and rechecks
+before commit; it may not reopen or rewrite the accepted business answer.
 
 The Analytical Owner must establish actual joins/relationships with
 `source_id`/`target_id`, `join_keys`, grain, cardinality, `matched_pairs` (the

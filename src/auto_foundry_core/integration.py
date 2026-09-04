@@ -21,7 +21,7 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path, PurePath
+from pathlib import Path, PurePath, PurePosixPath
 import re
 import shutil
 import tempfile
@@ -36,11 +36,17 @@ except ImportError:  # pragma: no cover - defensive fallback
 
 from .contracts import (
     CanonicalMapping,
+    IncidentRecord,
     IdentityDecision,
     KnowledgeDelta,
     LEMRef,
     OntologyItem,
     PreparedAssetDescriptor,
+)
+from .analytical_artifacts import (
+    ANALYTICAL_ARTIFACT_TYPES,
+    AnalyticalArtifact,
+    AnalyticalArtifactValidationError,
 )
 from .durable import _atomic_write_bytes, _atomic_write_json, _json_bytes, _sha256_bytes
 from .enterprise_model import LivingEnterpriseModel
@@ -98,7 +104,39 @@ _RECORD_KINDS = frozenset(
         "relationship",
         "identity_decision",
         "canonical_mapping",
+        "knowledge_delta",
         "dashboard_fact",
+        "analytical_artifact",
+    }
+)
+
+# ``analytical_artifact`` is a record-only integration output.  The typed
+# artifact remains the authority for analytical content; this small envelope
+# binds it to the accepted requirement and to the immutable committed copy.
+# Keep the field names explicit so a future renderer can consume the artifact
+# without mining answer prose or trusting a work/raw path.
+_ANALYTICAL_ARTIFACT_PAYLOAD_FIELDS = frozenset(
+    {
+        "artifact",
+        "artifact_id",
+        "artifact_type",
+        "schema_version",
+        "requirement_id",
+        "content_hash",
+        "envelope_hash",
+        "canonical_bytes_sha256",
+        "artifact_ref",
+    }
+)
+_ANALYTICAL_ARTIFACT_REF_PREFIX = "integration/committed/artifacts/"
+_ANALYTICAL_OUTPUT_DESCRIPTOR_FIELDS = frozenset(
+    {
+        "path",
+        "format",
+        "sha256",
+        "size_bytes",
+        "row_count",
+        "complete",
     }
 )
 
@@ -318,6 +356,280 @@ def _safe_relative_ref(value: Any, label: str = "reference") -> str:
     return path.as_posix()
 
 
+def _analytical_artifact_bytes(artifact: AnalyticalArtifact) -> bytes:
+    """Return the exact canonical bytes persisted for one analytical artifact.
+
+    ``AnalyticalArtifact.to_json`` is already the artifact contract's
+    canonical serialization (sorted keys, finite JSON, no observational
+    newline).  Persisting those bytes verbatim means the record can bind both
+    the typed content hashes and the actual file bytes without any renderer or
+    integration-side reserialization differences.
+    """
+
+    return artifact.to_json().encode("utf-8")
+
+
+def _analytical_artifact_ref(artifact_id: str, *, existing_ids: Iterable[str] = ()) -> str:
+    """Build a safe committed artifact reference from an artifact identity.
+
+    Simple IDs retain a readable ``<safe-id>.json`` filename.  If a second
+    artifact identity normalizes to the same filename, append a deterministic
+    digest of the original ID so distinct identities cannot alias one file.
+    """
+
+    safe = _slug_record_component(artifact_id)
+    existing = tuple(str(value) for value in existing_ids)
+    if safe != artifact_id or any(value != artifact_id and _slug_record_component(value) == safe for value in existing):
+        suffix = hashlib.sha256(str(artifact_id).encode("utf-8")).hexdigest()[:12]
+        safe = f"{safe}-{suffix}"
+    return f"{_ANALYTICAL_ARTIFACT_REF_PREFIX}{safe}.json"
+
+
+def _parse_analytical_artifact_payload(
+    payload: Mapping[str, Any],
+    *,
+    expected_item_id: str | None = None,
+    require_committed_ref: bool = True,
+) -> tuple[AnalyticalArtifact, bytes]:
+    """Validate and parse one canonical analytical-artifact record payload."""
+
+    if not isinstance(payload, Mapping) or set(payload) != _ANALYTICAL_ARTIFACT_PAYLOAD_FIELDS:
+        raise ValueError("analytical artifact integration payload fields are invalid")
+    raw_artifact = payload.get("artifact")
+    if not isinstance(raw_artifact, Mapping):
+        raise ValueError("analytical artifact payload artifact is invalid")
+    try:
+        artifact = AnalyticalArtifact.from_dict(raw_artifact)
+    except (AnalyticalArtifactValidationError, TypeError, ValueError) as exc:
+        raise ValueError("analytical artifact payload artifact is invalid") from exc
+    if payload.get("artifact_id") != artifact.artifact_id:
+        raise ValueError("analytical artifact payload artifact_id does not match artifact")
+    if payload.get("artifact_type") != artifact.artifact_type:
+        raise ValueError("analytical artifact payload artifact_type does not match artifact")
+    if payload.get("schema_version") != artifact.schema_version:
+        raise ValueError("analytical artifact payload schema_version does not match artifact")
+    if payload.get("requirement_id") != artifact.requirement_id:
+        raise ValueError("analytical artifact payload requirement_id does not match artifact")
+    if expected_item_id is not None and artifact.requirement_id != expected_item_id:
+        raise ValueError("analytical artifact requirement_id does not match integration item")
+    if payload.get("content_hash") != artifact.content_hash:
+        raise ValueError("analytical artifact payload content_hash does not match artifact")
+    if payload.get("envelope_hash") != artifact.envelope_hash:
+        raise ValueError("analytical artifact payload envelope_hash does not match artifact")
+    canonical_bytes = _analytical_artifact_bytes(artifact)
+    canonical_hash = payload.get("canonical_bytes_sha256")
+    if not _is_sha256(canonical_hash) or canonical_hash != _sha256_bytes(canonical_bytes):
+        raise ValueError("analytical artifact payload canonical bytes hash does not match artifact")
+    artifact_ref = payload.get("artifact_ref")
+    if require_committed_ref:
+        if not isinstance(artifact_ref, str) or not artifact_ref.startswith(_ANALYTICAL_ARTIFACT_REF_PREFIX) or not artifact_ref.endswith(".json"):
+            raise ValueError("analytical artifact committed reference is invalid")
+        relative = _safe_relative_ref(artifact_ref, "analytical artifact reference")
+        if relative != artifact_ref or PurePath(relative).parent.as_posix() != _ANALYTICAL_ARTIFACT_REF_PREFIX.rstrip("/"):
+            raise ValueError("analytical artifact committed reference is invalid")
+        filename = PurePath(relative).name
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+\.json", filename):
+            raise ValueError("analytical artifact committed reference is invalid")
+    elif artifact_ref is not None:
+        # Staging/fidelity records still carry the future reference; this
+        # branch is reserved for compatibility with a diagnostic parser.
+        _safe_relative_ref(artifact_ref, "analytical artifact reference")
+    return artifact, canonical_bytes
+
+
+def _analytical_output_relative_path(value: Any, *, label: str) -> str:
+    """Validate one output descriptor path relative to its admitted root.
+
+    Analytical toolkit output descriptors are intentionally root-relative.  A
+    descriptor must never be interpreted as a generic run path: absolute paths,
+    parent traversal, alternate separators, and dot components are all
+    rejected before any filesystem resolution.  The ``work/`` prefix is not a
+    valid alias here; callers pass paths relative to the explicit output root.
+    """
+
+    raw = value.get("path") if isinstance(value, Mapping) else None
+    if (
+        not isinstance(raw, str)
+        or not raw
+        or raw != raw.strip()
+        or "\\" in raw
+        or "\x00" in raw
+        or raw.startswith("~")
+        or re.match(r"^[A-Za-z]:", raw)
+    ):
+        raise ValueError(f"{label} path is invalid")
+    path = PurePosixPath(raw)
+    if (
+        path.is_absolute()
+        or path.as_posix() != raw
+        or not path.parts
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or path.parts[0] in {"work", "accepted", "integration", "questions", "requirements"}
+    ):
+        raise ValueError(f"{label} path is invalid")
+    return path.as_posix()
+
+
+def _jsonl_row_count(payload: bytes, *, label: str) -> int:
+    """Validate bounded JSONL syntax and return its exact row count."""
+
+    if not payload:
+        return 0
+    rows = payload.splitlines()
+    for index, line in enumerate(rows, 1):
+        if not line.strip():
+            raise ValueError(f"{label} contains an empty JSONL row at line {index}")
+        try:
+            json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"{label} contains invalid JSONL at line {index}") from exc
+    return len(rows)
+
+
+def _stream_jsonl_file(
+    path: Path,
+    *,
+    label: str,
+    sink: Any | None = None,
+) -> tuple[str, int, int]:
+    """Hash, copy (optionally), and validate JSONL in one bounded pass.
+
+    The output file is intentionally not read with ``Path.read_bytes``.  The
+    buffered binary iterator retains one JSONL line while computing the exact
+    byte count and row count required by the sealed descriptor.  There is no
+    arbitrary file or row-size cap: memory is proportional only to the row
+    currently being parsed.  A caller may provide a binary sink when
+    publishing a validated copy; the same bytes are hashed, parsed, and
+    written without a second whole-file buffer.
+    """
+
+    digest = hashlib.sha256()
+    observed_size = 0
+    rows = 0
+
+    def consume(raw_line: bytes) -> None:
+        nonlocal rows
+        # JSONL permits a CRLF terminator; do not treat the CR as part of the
+        # JSON value.  Blank lines remain invalid so row_count is unambiguous.
+        if raw_line.endswith(b"\r"):
+            raw_line = raw_line[:-1]
+        if not raw_line.strip():
+            raise ValueError(f"{label} contains an empty JSONL row at line {rows + 1}")
+        try:
+            json.loads(raw_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"{label} contains invalid JSONL at line {rows + 1}") from exc
+        rows += 1
+
+    try:
+        with path.open("rb") as stream:
+            for raw_line in stream:
+                digest.update(raw_line)
+                observed_size += len(raw_line)
+                if sink is not None:
+                    sink.write(raw_line)
+                consume(raw_line)
+    except OSError as exc:
+        raise ValueError(f"{label} output cannot be read") from exc
+    return digest.hexdigest(), observed_size, rows
+
+
+def _validate_analytical_output_descriptor(
+    descriptor: Any,
+    *,
+    output_root: Path,
+    accepted_hashes: Mapping[str, Any] | None,
+    label: str,
+) -> tuple[str, Path]:
+    """Re-verify one external analytical output against a sealed root.
+
+    ``accepted_hashes`` is the immutable item artifact-progress map during
+    staging/fidelity.  On committed reload the copied output lives under the
+    committed artifact root, so the record's descriptor hash is the authority
+    and no accepted-work map is needed.  Both paths retain the same lexical
+    path, symlink, SHA-256, byte-size, and JSONL row-count checks.
+    """
+
+    if not isinstance(descriptor, Mapping):
+        raise ValueError(f"{label} descriptor is invalid")
+    missing = _ANALYTICAL_OUTPUT_DESCRIPTOR_FIELDS - set(descriptor)
+    if missing:
+        raise ValueError(f"{label} descriptor is missing fields: {sorted(missing)!r}")
+    relative = _analytical_output_relative_path(descriptor, label=label)
+    if descriptor.get("format") != "jsonl":
+        raise ValueError(f"{label} format must be jsonl")
+    expected_hash = descriptor.get("sha256")
+    if not _is_sha256(expected_hash):
+        raise ValueError(f"{label} sha256 is invalid")
+    size_bytes = descriptor.get("size_bytes")
+    if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0:
+        raise ValueError(f"{label} size_bytes is invalid")
+    row_count = descriptor.get("row_count")
+    if isinstance(row_count, bool) or not isinstance(row_count, int) or row_count < 0:
+        raise ValueError(f"{label} row_count is invalid")
+    if descriptor.get("complete") is not True:
+        raise ValueError(f"{label} complete must be true")
+
+    root = Path(output_root)
+    _assert_no_symlink(root, label=f"{label} output root")
+    root_resolved = root.resolve(strict=False)
+    current = root
+    for component in PurePosixPath(relative).parts:
+        current = current / component
+        _assert_no_symlink(current, label=f"{label} output")
+    candidate = root / Path(relative)
+    try:
+        if candidate.resolve(strict=False).relative_to(root_resolved) != Path(relative):
+            raise ValueError(f"{label} path escapes output root")
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{label} path escapes output root") from exc
+    if not candidate.is_file() or candidate.is_symlink():
+        raise ValueError(f"{label} output is missing or not a regular file")
+
+    if accepted_hashes is not None:
+        sealed_ref = f"work/{relative}"
+        sealed_hash = accepted_hashes.get(sealed_ref)
+        if not _is_sha256(sealed_hash) or sealed_hash != expected_hash:
+            raise ValueError(f"{label} output is not bound by accepted artifact progress")
+
+    observed_hash, observed_size, observed_rows = _stream_jsonl_file(candidate, label=label)
+    if observed_size != size_bytes:
+        raise ValueError(f"{label} size_bytes does not match output")
+    if observed_hash != expected_hash:
+        raise ValueError(f"{label} sha256 does not match output")
+    if observed_rows != row_count:
+        raise ValueError(f"{label} row_count does not match JSONL output")
+    return relative, candidate
+
+
+def _validate_analytical_output_refs(
+    artifact: AnalyticalArtifact,
+    *,
+    output_root: Path,
+    accepted_hashes: Mapping[str, Any] | None,
+    label: str,
+) -> tuple[tuple[str, bytes], ...]:
+    """Verify every external output declared by one analytical artifact."""
+
+    refs = artifact.output_refs
+    if not isinstance(refs, (tuple, list)):
+        raise ValueError(f"{label} output_refs are invalid")
+    checked: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    for index, descriptor in enumerate(refs, 1):
+        relative, candidate = _validate_analytical_output_descriptor(
+            descriptor,
+            output_root=output_root,
+            accepted_hashes=accepted_hashes,
+            label=f"{label} output_ref[{index}]",
+        )
+        if relative in seen:
+            raise ValueError(f"{label} output_refs contain duplicate paths: {relative}")
+        seen.add(relative)
+        checked.append((relative, candidate))
+    return tuple(checked)
+
+
 def _validate_record_id(value: Any) -> str:
     if not isinstance(value, str):
         raise ValueError("integration record_id must be a string")
@@ -418,6 +730,28 @@ class AcceptedAnalysisBundle:
     @property
     def accepted_refs(self) -> tuple[str, ...]:
         return tuple(self.acceptance_envelope.get("accepted_refs", ()))
+
+    @property
+    def analytical_artifact_handoff(self) -> tuple[Mapping[str, Any], ...]:
+        """Return the immutable, manifest-bound typed artifact descriptors."""
+
+        handoff = self.acceptance_envelope.get("analytical_artifact_handoff")
+        if not isinstance(handoff, Mapping):
+            return ()
+        artifacts = handoff.get("artifacts", ())
+        if not isinstance(artifacts, (list, tuple)):
+            return ()
+        return tuple(item for item in artifacts if isinstance(item, Mapping))
+
+    # Descriptive aliases keep callers independent of the envelope's wire
+    # field name while preserving one canonical sealed representation.
+    @property
+    def accepted_analytical_artifacts(self) -> tuple[Mapping[str, Any], ...]:
+        return self.analytical_artifact_handoff
+
+    @property
+    def typed_analytical_artifacts(self) -> tuple[Mapping[str, Any], ...]:
+        return self.analytical_artifact_handoff
 
     @classmethod
     def load(cls, item_workspace: Any) -> "AcceptedAnalysisBundle":
@@ -602,6 +936,24 @@ class IntegrationRecord:
             json.dumps(_jsonable(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
         except (TypeError, ValueError) as exc:
             raise ValueError("integration record payload is not JSON-safe") from exc
+        if kind == "analytical_artifact":
+            # Record deserialization is intentionally strict but does not
+            # touch the filesystem: the committed reference is a future
+            # destination at staging/fidelity time.  The session-level
+            # validators bind it to this record's item and verify bytes on
+            # committed reload.
+            _parse_analytical_artifact_payload(payload)
+        if kind == "knowledge_delta":
+            try:
+                delta = KnowledgeDelta.from_dict(payload)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("knowledge delta integration record payload is invalid") from exc
+            if not delta.accepted:
+                raise ValueError("knowledge delta integration record must be accepted")
+            if delta.to_dict() != dict(payload):
+                raise ValueError("knowledge delta integration record payload is not canonical")
+            if tuple(delta.evidence_refs) != refs:
+                raise ValueError("knowledge delta evidence_refs must match integration evidence_refs")
         record_hash = value.get("record_hash")
         if not _is_sha256(record_hash):
             raise ValueError("integration record hash is invalid")
@@ -811,7 +1163,17 @@ class IntegrationSession:
         except Exception:
             lease.release()
             raise
-        return cls(context, item_workspace, prepared_registry, owner_id, invocation_id, bundle, state, (), lease)
+        session = cls(context, item_workspace, prepared_registry, owner_id, invocation_id, bundle, state, (), lease)
+        try:
+            session._auto_stage_sealed_analytical_artifacts()
+        except Exception:
+            # Acceptance has already committed the business result, so an
+            # internal handoff/staging fault is retryable.  Leave the open
+            # staging snapshot and pending item integration state intact for a
+            # subsequent create/load attempt.
+            lease.release()
+            raise
+        return session
 
     @classmethod
     def load(
@@ -871,8 +1233,20 @@ class IntegrationSession:
             raise ValueError("integration staging is owned by another invocation")
         lease = cls._acquire_invocation_lease(item_workspace, owner_id, invocation_id)
         session = cls(context, item_workspace, prepared_registry, owner_id, invocation_id, bundle, state, records, lease)
-        session._reconcile_fidelity_removal_unlocked()
+        try:
+            session._reconcile_fidelity_removal_unlocked()
+            if state.get("status") == "open":
+                session._auto_stage_sealed_analytical_artifacts()
+        except Exception:
+            lease.release()
+            raise
         if state.get("status") == "committed":
+            # A committed staging snapshot is a normal post-publication
+            # recovery path.  Validate its artifact files before rebuilding
+            # the projection; otherwise a missing/tampered/symlinked artifact
+            # could be bypassed whenever the staging snapshot still exists.
+            cls._validate_committed_artifacts(session.committed_root, records)
+            session._reproject_current()
             session.release()
         return session
 
@@ -893,6 +1267,10 @@ class IntegrationSession:
             raise ValueError("committed integration is owned by another invocation")
         committed = cls._integration_root(item_workspace) / _COMMITTED_DIR
         records = cls._read_records(committed / _RECORDS_FILENAME, manifest, bundle)
+        # Artifact files are part of the committed record contract.  Verify
+        # them before projecting or reusing a committed session so missing,
+        # tampered, and symlinked files fail closed on reload/recovery.
+        cls._validate_committed_artifacts(committed, records)
         state = {
             "schema_version": _SCHEMA_VERSION,
             "session_id": manifest["session_id"],
@@ -1162,7 +1540,11 @@ class IntegrationSession:
             self._records = removal_records
             self._by_id = {record.record_id: record for record in removal_records}
             try:
-                self._preflight_all()
+                # Recovery is validating the intermediate post-removal
+                # snapshot.  Permit it to be empty here while retaining the
+                # full analytical relationship checks; a required
+                # relationship removal still fails closed.
+                self._preflight_all(allow_empty_staging=True)
             except Exception:
                 # A validly-shaped journal can still describe a candidate
                 # rejected by full mechanical/LEM preflight (for example a
@@ -1174,7 +1556,11 @@ class IntegrationSession:
                 self.lem = prior_lem
                 raise
             candidate_validated = True
-            self._persist_state(self._state)
+            removed_hashes = dict(self._state.get(_UNREVIEWED_REMOVED_RECORD_HASHES, {}))
+            removed_hashes[target] = baseline
+            state = dict(self._state)
+            state[_UNREVIEWED_REMOVED_RECORD_HASHES] = dict(sorted(removed_hashes.items()))
+            self._persist_state(state)
             self._write_fidelity_removal_intent(
                 authorization,
                 target=target,
@@ -1208,7 +1594,14 @@ class IntegrationSession:
             # mechanical/registry/LEM preflight on reload so a forged or
             # otherwise unexpected post-removal state cannot advance repair
             # progress merely because its hashes line up.
-            self._preflight_all()
+            # A reviewed repair may legitimately remove its last affected
+            # record.  Validate the resulting empty snapshot as an
+            # intermediate transaction, but retain full analytical
+            # relationship completeness so removing a required relationship
+            # still rolls back byte-for-byte.  The durable removal progress
+            # written below records the explicit no-op history that makes the
+            # final public validation auditable.
+            self._preflight_all(allow_empty_staging=True)
         completed_removed = prior_removed | {target}
         if progress.current_records_hash == after_records_hash and target in progress.removed_record_ids:
             # The progress write already converged; only the journal cleanup
@@ -1225,6 +1618,15 @@ class IntegrationSession:
                 current_packet_hash=None,
                 removed_record_ids=completed_removed,
             )
+        # Persist the explicit removal marker even when this method is
+        # converging a crash journal whose pre-removal state did not yet carry
+        # it.  This makes the resulting empty snapshot distinguishable from a
+        # fresh, incomplete session at commit/reopen time.
+        removed_hashes = dict(self._state.get(_UNREVIEWED_REMOVED_RECORD_HASHES, {}))
+        removed_hashes[target] = baseline
+        state = dict(self._state)
+        state[_UNREVIEWED_REMOVED_RECORD_HASHES] = dict(sorted(removed_hashes.items()))
+        self._persist_state(state)
         self._write_fidelity_removal_intent(
             authorization,
             target=target,
@@ -1496,6 +1898,101 @@ class IntegrationSession:
     def _records_bytes(self) -> bytes:
         return b"".join(_canonical_bytes(record.to_dict()) for record in self._records)
 
+    @staticmethod
+    def _committed_artifact_path(committed_root: Path, artifact_ref: str) -> Path:
+        """Resolve one committed artifact ref without following symlinks."""
+
+        if not isinstance(artifact_ref, str) or not artifact_ref.startswith(_ANALYTICAL_ARTIFACT_REF_PREFIX):
+            raise ValueError("analytical artifact committed reference is invalid")
+        relative = _safe_relative_ref(artifact_ref, "analytical artifact reference")
+        if relative != artifact_ref or PurePath(relative).parent.as_posix() != _ANALYTICAL_ARTIFACT_REF_PREFIX.rstrip("/"):
+            raise ValueError("analytical artifact committed reference is invalid")
+        filename = PurePath(relative).name
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+\.json", filename):
+            raise ValueError("analytical artifact committed reference is invalid")
+        destination = committed_root / "artifacts" / filename
+        current = committed_root
+        for component in PurePath("artifacts", filename).parts:
+            current = current / component
+            _assert_no_symlink(current, label="committed analytical artifact")
+        return destination
+
+    def _accepted_artifact_progress_hashes(self) -> Mapping[str, Any]:
+        """Return the immutable work-artifact hashes sealed at acceptance."""
+
+        progress = self.bundle.manifest.get("artifact_progress")
+        hashes = progress.get("hashes") if isinstance(progress, Mapping) else None
+        if not isinstance(hashes, Mapping):
+            raise ValueError("accepted artifact progress hashes are invalid")
+        return hashes
+
+    def _validate_external_artifact_outputs(self, artifact: AnalyticalArtifact) -> tuple[tuple[str, Path], ...]:
+        """Re-verify external artifact outputs in the accepted work root."""
+
+        return _validate_analytical_output_refs(
+            artifact,
+            output_root=self.item_workspace.work_root,
+            accepted_hashes=self._accepted_artifact_progress_hashes(),
+            label=f"analytical artifact {artifact.artifact_id}",
+        )
+
+    @classmethod
+    def _validate_committed_artifacts(
+        cls,
+        committed_root: Path,
+        records: Sequence[IntegrationRecord],
+    ) -> None:
+        """Verify every record-bound artifact file in a committed tree."""
+
+        seen_refs: set[str] = set()
+        seen_ids: dict[str, tuple[str, str, str]] = {}
+        for record in records:
+            if record.kind != "analytical_artifact":
+                continue
+            artifact, canonical_bytes = _parse_analytical_artifact_payload(
+                record.payload,
+                expected_item_id=record.item_id,
+            )
+            ref = str(record.payload["artifact_ref"])
+            if ref in seen_refs:
+                raise ValueError(f"duplicate committed analytical artifact reference: {ref}")
+            seen_refs.add(ref)
+            identity = (
+                artifact.content_hash,
+                artifact.envelope_hash,
+                str(record.payload["canonical_bytes_sha256"]),
+                ref,
+            )
+            prior_identity = seen_ids.get(artifact.artifact_id)
+            if prior_identity is not None and prior_identity != identity:
+                raise ValueError(f"analytical artifact ID collision: {artifact.artifact_id}")
+            seen_ids[artifact.artifact_id] = identity
+            # External outputs are copied into the committed artifact root at
+            # commit.  Re-verify the copy before a committed session can be
+            # projected or reused; a missing/tampered/symlinked JSONL output
+            # therefore fails closed on every reload.
+            _validate_analytical_output_refs(
+                artifact,
+                output_root=committed_root / "artifacts",
+                accepted_hashes=None,
+                label=f"committed analytical artifact {artifact.artifact_id}",
+            )
+            path = cls._committed_artifact_path(committed_root, ref)
+            if not path.is_file() or path.is_symlink():
+                raise ValueError(f"committed analytical artifact is missing: {ref}")
+            try:
+                actual = path.read_bytes()
+            except OSError as exc:
+                raise ValueError(f"committed analytical artifact cannot be read: {ref}") from exc
+            if actual != canonical_bytes or _sha256_bytes(actual) != record.payload.get("canonical_bytes_sha256"):
+                raise ValueError(f"committed analytical artifact bytes do not match record: {ref}")
+            try:
+                restored = AnalyticalArtifact.from_json(actual.decode("utf-8"))
+            except (UnicodeDecodeError, AnalyticalArtifactValidationError, TypeError, ValueError) as exc:
+                raise ValueError(f"committed analytical artifact JSON is invalid: {ref}") from exc
+            if restored.to_dict() != artifact.to_dict():
+                raise ValueError(f"committed analytical artifact content does not match record: {ref}")
+
     def _current_record_hashes(self) -> dict[str, str]:
         return {record.record_id: record.record_hash for record in self._records}
 
@@ -1631,6 +2128,33 @@ class IntegrationSession:
             or packet.records_hash != _sha256_bytes(self._records_bytes())
         ):
             raise ValueError("integration fidelity packet is stale or bound to another item")
+        # ``IntegrationFidelityPacket`` validates its envelope and record
+        # bytes, but intentionally treats records as generic mappings.  Parse
+        # every packet record through the same strict IntegrationRecord
+        # contract used by staging/reload so an artifact payload cannot be
+        # smuggled through a recomputed packet hash.  The packet must also be
+        # an exact snapshot of the current durable records (including order).
+        packet_records: list[IntegrationRecord] = []
+        for line_number, value in enumerate(packet.records, 1):
+            try:
+                record = IntegrationRecord.from_dict(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"integration fidelity packet record {line_number} is invalid") from exc
+            packet_records.append(record)
+        if tuple(record.to_dict() for record in packet_records) != tuple(record.to_dict() for record in self._records):
+            raise ValueError("integration fidelity packet records do not match staging")
+        # The packet hash covers the artifact JSON record, not the separate
+        # external output bytes.  Re-verify those bytes on every fidelity
+        # read so a post-generation tamper cannot be hidden behind a valid
+        # packet hash.
+        for record in packet_records:
+            if record.kind != "analytical_artifact":
+                continue
+            artifact, _artifact_bytes = _parse_analytical_artifact_payload(
+                record.payload,
+                expected_item_id=self.item_id,
+            )
+            self._validate_external_artifact_outputs(artifact)
         return packet
 
     def _read_fidelity_packet_raw(self) -> IntegrationFidelityPacket | None:
@@ -1640,9 +2164,18 @@ class IntegrationSession:
         if not path.exists() or path.is_symlink():
             return None
         try:
-            return IntegrationFidelityPacket.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            packet = IntegrationFidelityPacket.from_dict(json.loads(path.read_text(encoding="utf-8")))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise ValueError("integration fidelity packet is invalid") from exc
+        # Even in the raw/recovery path, packet records are not opaque JSON:
+        # strict record parsing keeps analytical-artifact identity/hash
+        # validation active before a packet can seed a rebuilt fidelity view.
+        for line_number, value in enumerate(packet.records, 1):
+            try:
+                IntegrationRecord.from_dict(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"integration fidelity packet record {line_number} is invalid") from exc
+        return packet
 
     def _read_fidelity_result(self) -> FidelityResult | None:
         path = self.fidelity_result_path
@@ -1688,7 +2221,7 @@ class IntegrationSession:
         if result.review_kind == "initial":
             if set(result.baseline_record_hashes) != known_ids:
                 raise ValueError("integration fidelity result baseline record set is invalid")
-            if result.verdict in {"accept", "repair_once"} and set(result.checked_record_ids) != known_ids:
+            if result.verdict in {"accept", "accept_with_limits", "repair_once"} and set(result.checked_record_ids) != known_ids:
                 raise ValueError("initial fidelity result checked_record_ids are invalid")
             if result.verdict in {"unavailable", "fail"} and result.checked_record_ids:
                 raise ValueError("non-accepting initial fidelity result cannot claim checked records")
@@ -1967,7 +2500,7 @@ class IntegrationSession:
             current_hashes = self._current_record_hashes()
             known_ids = set(current_hashes)
             verdict = str(verdict).strip()
-            if verdict not in {"accept", "repair_once", "unavailable", "fail"}:
+            if verdict not in {"accept", "accept_with_limits", "repair_once", "unavailable", "fail"}:
                 raise ValueError("fidelity verdict is invalid")
             if review_kind is None:
                 review_kind = "targeted" if existing is not None and existing.verdict == "repair_once" else "initial"
@@ -1975,7 +2508,11 @@ class IntegrationSession:
                 raise ValueError("fidelity review kind is invalid")
             if review_kind == "initial":
                 if existing is not None:
-                    if existing.verdict == "accept" and existing.records_hash == current_records_hash and verdict == "accept":
+                    if (
+                        existing.verdict in {"accept", "accept_with_limits"}
+                        and existing.records_hash == current_records_hash
+                        and verdict == existing.verdict
+                    ):
                         packet = self._read_fidelity_packet()
                         self._exact_checked_record_ids(checked_record_ids, known_ids, label="initial fidelity")
                         return existing
@@ -1996,7 +2533,7 @@ class IntegrationSession:
                     raise ValueError("fidelity review affected and dependency record IDs overlap")
                 if any(value not in known_ids for value in (*affected, *dependencies)):
                     raise ValueError("fidelity review references unknown record")
-                if verdict in {"accept", "repair_once"}:
+                if verdict in {"accept", "accept_with_limits", "repair_once"}:
                     checked = self._exact_checked_record_ids(
                         checked_record_ids,
                         known_ids,
@@ -2119,7 +2656,7 @@ class IntegrationSession:
 
     def _require_fidelity_acceptance(self) -> None:
         result = self._read_fidelity_result()
-        if result is None or result.verdict != "accept":
+        if result is None or result.verdict not in {"accept", "accept_with_limits"}:
             raise ValueError("integration commit requires durable fidelity acceptance")
 
     def _assert_fidelity_correction_scope(
@@ -2618,6 +3155,42 @@ class IntegrationSession:
             raise FileNotFoundError(destination)
         return destination
 
+    def _ontology_preview(
+        self,
+        records: Sequence[IntegrationRecord] | None = None,
+    ) -> LivingEnterpriseModel:
+        """Build the authoritative prior-plus-staged ontology view."""
+
+        prior = self._reproject_prior()
+        preview = LivingEnterpriseModel.from_export(prior.export())
+        for record in self._records if records is None else records:
+            if record.kind == "ontology_item":
+                preview.ensure_ontology_item(record.payload)
+        return preview
+
+    def _canonical_ontology_payload(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        exclude_record_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Validate one ontology payload against the canonical ensure view.
+
+        The durable integration record keeps the requirement-specific payload
+        intact.  Canonical merging is performed by replay into the shared LEM;
+        replacing this payload with the merged view would erase later wording
+        and could collapse a distinct reviewed record into an earlier retry.
+        """
+
+        records = (
+            record
+            for record in self._records
+            if exclude_record_id is None or record.record_id != exclude_record_id
+        )
+        preview = self._ontology_preview(tuple(records))
+        preview.ensure_ontology_item(payload)
+        return dict(payload)
+
     def _stage(
         self,
         kind: str,
@@ -2649,7 +3222,63 @@ class IntegrationSession:
             raise ValueError("unsupported integration record kind")
         normalized_payload = self._payload(payload, kind)
         normalized_scope = self._scope(scope, normalized_payload)
+        if kind == "ontology_item":
+            normalized_payload = self._canonical_ontology_payload(normalized_payload)
         prepared_descriptor = None
+        existing_artifact_record: IntegrationRecord | None = None
+        if kind == "analytical_artifact":
+            # Re-parse at the staging boundary with the session item binding;
+            # IntegrationRecord.from_dict can only validate the self-contained
+            # payload and deliberately has no item context.
+            artifact, artifact_bytes = _parse_analytical_artifact_payload(
+                normalized_payload,
+                expected_item_id=self.item_id,
+            )
+            self._validate_external_artifact_outputs(artifact)
+            artifact_identity = (
+                artifact.artifact_id,
+                artifact.artifact_type,
+                artifact.schema_version,
+                artifact.requirement_id,
+                artifact.content_hash,
+                artifact.envelope_hash,
+                _sha256_bytes(artifact_bytes),
+                normalized_payload.get("artifact_ref"),
+            )
+            # One artifact identity and one committed reference are allowed
+            # within an item.  An exact retry is resolved to the original
+            # record below, even when a caller supplies a different record ID;
+            # it must never append a second record that can poison a later
+            # commit after LEM application.
+            for candidate_record in self._records:
+                if candidate_record.kind != "analytical_artifact":
+                    continue
+                existing_payload = candidate_record.payload
+                existing_artifact, existing_bytes = _parse_analytical_artifact_payload(
+                    existing_payload,
+                    expected_item_id=self.item_id,
+                )
+                existing_identity = (
+                    existing_artifact.artifact_id,
+                    existing_artifact.artifact_type,
+                    existing_artifact.schema_version,
+                    existing_artifact.requirement_id,
+                    existing_artifact.content_hash,
+                    existing_artifact.envelope_hash,
+                    _sha256_bytes(existing_bytes),
+                    existing_payload.get("artifact_ref"),
+                )
+                if existing_artifact.artifact_id == artifact.artifact_id:
+                    if existing_identity != artifact_identity or existing_bytes != artifact_bytes:
+                        raise ValueError(f"analytical artifact ID collision: {artifact.artifact_id}")
+                    if existing_artifact_record is not None:
+                        raise ValueError(f"analytical artifact ID is staged more than once: {artifact.artifact_id}")
+                    existing_artifact_record = candidate_record
+                elif existing_payload.get("artifact_ref") == normalized_payload.get("artifact_ref"):
+                    raise ValueError(
+                        "analytical artifact committed reference collision: "
+                        f"{normalized_payload.get('artifact_ref')}"
+                    )
         if kind == "prepared_asset":
             prepared_descriptor = PreparedAssetDescriptor.from_dict(normalized_payload)
             self._resolve_prepared_candidate(prepared_descriptor)
@@ -2659,6 +3288,18 @@ class IntegrationSession:
             required=kind != "prepared_asset",
             prepared_descriptor=prepared_descriptor,
         )
+        if kind == "knowledge_delta":
+            delta = self._knowledge_delta_from_payload(normalized_payload)
+            if tuple(delta.evidence_refs) != refs:
+                raise ValueError("knowledge delta evidence_refs must match integration evidence_refs")
+            if (
+                delta.operation == "add_relationship"
+                and _RELATIONSHIP_REUSE_FIELD in delta.payload
+            ):
+                raise ValueError(
+                    "knowledge delta add_relationship cannot use "
+                    "reuse_existing_relationship_id; use typed add_relationship"
+                )
         body = {
             "kind": kind,
             "item_id": self.item_id,
@@ -2676,6 +3317,7 @@ class IntegrationSession:
             or normalized_payload.get("analysis_relationship_id")
             or normalized_payload.get("decision_id")
             or normalized_payload.get("canonical_id")
+            or normalized_payload.get("delta_id")
             or normalized_payload.get("prepared_asset_id")
             or normalized_payload.get("claim_id")
             or normalized_payload.get("id")
@@ -2711,6 +3353,13 @@ class IntegrationSession:
                     state.pop(_UNREVIEWED_REMOVED_RECORD_HASHES, None)
                 self._persist_state(state)
             return normalized_id
+        if existing_artifact_record is not None:
+            # The immutable artifact was already staged under another caller
+            # record ID.  Return that durable ID rather than appending a
+            # duplicate record; this keeps the exact retry side-effect free
+            # and prevents a mixed LEM/artifact session from failing only at
+            # commit after applying other records.
+            return existing_artifact_record.record_id
         self._records.append(record)
         self._by_id[normalized_id] = record
         state = dict(self._state)
@@ -2736,6 +3385,233 @@ class IntegrationSession:
         self._preview_metric(payload, self.lem.run_id)
         return self._stage("metric", payload, scope=scope, evidence_refs=evidence_refs, record_id=metric_id)
 
+    def _add_analytical_artifact(
+        self,
+        artifact: AnalyticalArtifact | Mapping[str, Any],
+        *,
+        scope: str | None = None,
+        evidence_refs: Any = (),
+        artifact_record_id: str | None = None,
+    ) -> str:
+        """Stage one immutable typed analytical artifact internally.
+
+        This serializer/staging seam is used only by the accepted-ref handoff
+        and focused internal tests.  Public integration callers must use
+        :meth:`add_accepted_analytical_artifact`, which resolves the exact
+        business-accepted item-local bytes before reaching this method.  No
+        LEM or prepared-registry mutation occurs.
+        """
+
+        if isinstance(artifact, AnalyticalArtifact):
+            parsed = artifact
+        elif isinstance(artifact, Mapping):
+            try:
+                parsed = AnalyticalArtifact.from_dict(artifact)
+            except (AnalyticalArtifactValidationError, TypeError, ValueError) as exc:
+                raise ValueError("analytical artifact is invalid") from exc
+        else:
+            raise TypeError("analytical artifact must be an AnalyticalArtifact or mapping")
+        if parsed.requirement_id != self.item_id:
+            raise ValueError("analytical artifact requirement_id does not match integration item")
+        payload = self._analytical_artifact_payload(parsed)
+        return self._stage(
+            "analytical_artifact",
+            payload,
+            scope=scope,
+            evidence_refs=evidence_refs,
+            record_id=artifact_record_id,
+        )
+
+    def _analytical_artifact_payload(self, parsed: AnalyticalArtifact) -> dict[str, Any]:
+        """Build the canonical staged envelope for one typed artifact."""
+
+        artifact_bytes = _analytical_artifact_bytes(parsed)
+        # Existing refs are consulted only to avoid filename aliasing for
+        # distinct IDs that normalize to the same safe path.  Ordinary IDs
+        # retain the readable ``<artifact_id>.json`` form.
+        existing_ids = {
+            str(record.payload.get("artifact_id"))
+            for record in self._records
+            if record.kind == "analytical_artifact" and isinstance(record.payload, Mapping)
+        }
+        payload = {
+            "artifact": parsed.to_dict(),
+            "artifact_id": parsed.artifact_id,
+            "artifact_type": parsed.artifact_type,
+            "schema_version": parsed.schema_version,
+            "requirement_id": parsed.requirement_id,
+            "content_hash": parsed.content_hash,
+            "envelope_hash": parsed.envelope_hash,
+            "canonical_bytes_sha256": _sha256_bytes(artifact_bytes),
+            "artifact_ref": _analytical_artifact_ref(parsed.artifact_id, existing_ids=existing_ids),
+        }
+        return payload
+
+    def _sealed_analytical_artifact(
+        self,
+        descriptor: Mapping[str, Any],
+    ) -> tuple[AnalyticalArtifact, str]:
+        """Read one accepted handoff descriptor and verify exact bytes."""
+
+        ref = descriptor.get("ref")
+        if not isinstance(ref, str) or not ref.startswith("work/"):
+            raise ValueError("sealed analytical artifact reference is invalid")
+        # ``_evidence`` rechecks both accepted manifest hash and lexical path
+        # safety, including after a session has been resumed.
+        self._evidence((ref,), required=True)
+        path = self._resolve_item_ref(ref)
+        raw_bytes = path.read_bytes()
+        try:
+            artifact = AnalyticalArtifact.from_json(raw_bytes.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, AnalyticalArtifactValidationError, TypeError, ValueError) as exc:
+            raise ValueError("sealed analytical artifact JSON is invalid") from exc
+        canonical_bytes = _analytical_artifact_bytes(artifact)
+        if raw_bytes != canonical_bytes:
+            raise ValueError("sealed analytical artifact bytes are not canonical")
+        if artifact.artifact_type not in ANALYTICAL_ARTIFACT_TYPES:
+            raise ValueError("sealed analytical artifact type is unsupported")
+        if artifact.requirement_id != self.item_id:
+            raise ValueError("sealed analytical artifact requirement_id does not match item")
+        # External output refs are part of the typed artifact contract but
+        # live as separate JSONL files under the runner's admitted output
+        # root.  Verify them while the accepted handoff is first sealed so a
+        # generated output cannot be replaced before staging/fidelity.
+        self._validate_external_artifact_outputs(artifact)
+        expected = {
+            "hash": _sha256_bytes(raw_bytes),
+            "artifact_id": artifact.artifact_id,
+            "artifact_type": artifact.artifact_type,
+            "schema_version": artifact.schema_version,
+            "requirement_id": artifact.requirement_id,
+            "content_hash": artifact.content_hash,
+            "envelope_hash": artifact.envelope_hash,
+            "canonical_bytes_sha256": _sha256_bytes(canonical_bytes),
+        }
+        for name, value in expected.items():
+            if descriptor.get(name) != value:
+                raise ValueError(f"sealed analytical artifact descriptor {name} is stale")
+        return artifact, ref
+
+    def _auto_stage_sealed_analytical_artifacts(self) -> None:
+        """Stage every sealed typed artifact before Integration Agent work."""
+
+        for descriptor in self.bundle.analytical_artifact_handoff:
+            artifact, source_ref = self._sealed_analytical_artifact(descriptor)
+            payload = self._analytical_artifact_payload(artifact)
+            already_staged = False
+            for existing in self._records:
+                if existing.kind != "analytical_artifact" or source_ref not in existing.evidence_refs:
+                    continue
+                try:
+                    existing_artifact, existing_bytes = _parse_analytical_artifact_payload(
+                        existing.payload,
+                        expected_item_id=self.item_id,
+                        require_committed_ref=False,
+                    )
+                except ValueError:
+                    continue
+                if existing_artifact == artifact and existing_bytes == _analytical_artifact_bytes(artifact):
+                    already_staged = True
+                    break
+            if already_staged:
+                continue
+            # The source ref is the immutable accepted handoff binding.  A
+            # repeated create/load sees the same generated record and is an
+            # exact idempotent retry, not a second guessed declaration.
+            self._stage_unlocked(
+                "analytical_artifact",
+                payload,
+                scope="analytical_artifact",
+                evidence_refs=(source_ref,),
+            )
+
+    def add_accepted_analytical_artifact(
+        self,
+        artifact_ref: str,
+        *,
+        scope: str | None = None,
+        evidence_refs: Any = (),
+        artifact_record_id: str | None = None,
+    ) -> str:
+        """Stage one canonical typed artifact from an explicitly accepted ref.
+
+        The Analytical Owner publishes the artifact in the item work area and
+        the business reviewer accepts that exact ref.  Result Integration
+        resolves the accepted bytes, parses the strict typed envelope, and
+        delegates staging to its internal immutable-artifact serializer; it never
+        constructs or recomputes analytical content.  The accepted ref is
+        always retained as evidence on the staged record.
+        """
+
+        if not isinstance(artifact_ref, str):
+            raise TypeError("accepted analytical artifact reference must be a string")
+        relative = _safe_relative_ref(artifact_ref, "accepted analytical artifact reference")
+        if relative != artifact_ref:
+            raise ValueError("accepted analytical artifact reference must be canonical")
+        # Accepted analytical outputs are item-local work artifacts.  A
+        # semantic-store/global ref, answer alias, accepted envelope, or
+        # integration path is not an artifact handoff and must not be
+        # interpreted as one merely because it appears in accepted_refs.
+        if not relative.startswith("work/"):
+            raise ValueError("accepted analytical artifact reference must be under item work/")
+        sealed_refs = {str(descriptor.get("ref")) for descriptor in self.bundle.analytical_artifact_handoff}
+        if relative not in self.bundle.accepted_refs and relative not in sealed_refs:
+            raise ValueError("accepted analytical artifact reference is not in the accepted bundle")
+
+        lexical = self.item_workspace.item_root
+        for component in PurePath(relative).parts:
+            lexical = lexical / component
+            _assert_no_symlink(lexical, label="accepted analytical artifact")
+
+        # Resolve through the existing accepted-manifest evidence/hash checks
+        # before parsing.  This rejects post-acceptance tampering and all
+        # symlinked/non-regular paths using the same boundary as every other
+        # integration evidence reference.
+        self._evidence((relative,), required=True)
+        path = self._resolve_item_ref(relative)
+        try:
+            raw_bytes = path.read_bytes()
+            artifact = AnalyticalArtifact.from_json(raw_bytes.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, AnalyticalArtifactValidationError, TypeError, ValueError) as exc:
+            raise ValueError("accepted analytical artifact JSON is invalid") from exc
+
+        canonical_bytes = _analytical_artifact_bytes(artifact)
+        if raw_bytes != canonical_bytes:
+            raise ValueError("accepted analytical artifact bytes are not canonical")
+        if artifact.artifact_type not in ANALYTICAL_ARTIFACT_TYPES:
+            raise ValueError(f"accepted analytical artifact type is unsupported: {artifact.artifact_type!r}")
+        if artifact.requirement_id != self.item_id:
+            raise ValueError("accepted analytical artifact requirement_id does not match integration item")
+
+        if evidence_refs is None:
+            merged_evidence_refs: Any = (relative,)
+        elif isinstance(evidence_refs, (str, Mapping)):
+            merged_evidence_refs = (relative, evidence_refs)
+        else:
+            merged_evidence_refs = (relative, *tuple(evidence_refs))
+        # ``create``/``load`` may already have staged this sealed descriptor.
+        # Treat an explicit redeclaration as an exact idempotent retry even if
+        # the caller supplies additional evidence or a different record ID.
+        for existing in self._records:
+            if existing.kind != "analytical_artifact" or relative not in existing.evidence_refs:
+                continue
+            try:
+                existing_artifact, existing_bytes = _parse_analytical_artifact_payload(
+                    existing.payload,
+                    expected_item_id=self.item_id,
+                    require_committed_ref=False,
+                )
+            except ValueError:
+                continue
+            if existing_artifact == artifact and existing_bytes == canonical_bytes:
+                return existing.record_id
+        return self._add_analytical_artifact(
+            artifact,
+            scope=scope,
+            evidence_refs=merged_evidence_refs,
+            artifact_record_id=artifact_record_id,
+        )
+
     def add_metric_definition(
         self,
         definition: OntologyItem | Mapping[str, Any],
@@ -2756,6 +3632,96 @@ class IntegrationSession:
         payload = self._payload(limitation, "limitation")
         payload.update(_jsonable(values))
         return self._stage("limitation", payload, scope=scope, evidence_refs=evidence_refs, record_id=limitation_id)
+
+    def add_knowledge_delta(
+        self,
+        delta: KnowledgeDelta | Mapping[str, Any],
+        *,
+        scope: str | None = None,
+        evidence_refs: Any = None,
+        delta_record_id: str | None = None,
+    ) -> str:
+        """Stage one accepted, evidence-bound semantic successor delta.
+
+        The outer integration envelope remains the durable authority for the
+        accepted item, scope, evidence references, and content hashes.  The
+        payload is the exact canonical KnowledgeDelta representation replayed
+        through LivingEnterpriseModel.apply_delta.
+        """
+
+        if isinstance(delta, KnowledgeDelta):
+            candidate = delta
+        else:
+            raw = self._payload(delta, "knowledge_delta")
+            try:
+                candidate = KnowledgeDelta.from_dict(raw)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("knowledge delta payload is invalid") from exc
+        if not candidate.accepted:
+            raise ValueError("knowledge delta staging requires accepted=True")
+        # Validate the local semantic shape without resolving predecessor
+        # targets; target resolution remains an atomic commit/preflight rule.
+        semantic_payload = candidate.payload
+        if candidate.operation == "add_ontology_item":
+            LivingEnterpriseModel(run_id=self.lem.run_id).ensure_ontology_item(semantic_payload)
+        elif candidate.operation in {
+            "add_metric", "add_definition", "add_rule", "add_process",
+            "add_event", "add_dimension",
+        }:
+            preview = LivingEnterpriseModel(run_id=self.lem.run_id)
+            getattr(preview, candidate.operation)(semantic_payload)
+        elif candidate.operation == "add_relationship":
+            # KnowledgeDelta relationship rows are evidence/audit records,
+            # not a second analytical-edge contract.  Resolve the stable
+            # relationship identity before inspecting the requirement-local
+            # payload so a repeat can retain its exact raw wording even when
+            # endpoints/analytical fields are absent or malformed.
+            if _RELATIONSHIP_REUSE_FIELD in semantic_payload:
+                raise ValueError(
+                    "knowledge delta add_relationship cannot use "
+                    "reuse_existing_relationship_id; use typed add_relationship"
+                )
+            self._reproject_prior()
+            relationship_id = self._relationship_id_from_payload(semantic_payload)
+            existing_relationship = (
+                relationship_id is not None
+                and relationship_id in self._known_relationship_ids()
+            )
+            if not existing_relationship:
+                self._validate_relationship_payload(semantic_payload)
+                ontology_ids, mapping_ids = self._known_relationship_endpoint_ids()
+                self._preview_relationship(
+                    semantic_payload,
+                    self.lem.run_id,
+                    known_ontology_ids=ontology_ids,
+                    known_mapping_ids=mapping_ids,
+                )
+        elif candidate.operation == "add_prepared_asset":
+            PreparedAssetDescriptor.from_dict(semantic_payload)
+        elif candidate.operation == "add_canonical_mapping":
+            CanonicalMapping.from_dict(semantic_payload)
+        requested_refs = candidate.evidence_refs if evidence_refs is None else evidence_refs
+        refs, _hashes = self._evidence(requested_refs, required=True)
+        if candidate.evidence_refs and tuple(candidate.evidence_refs) != refs:
+            raise ValueError("knowledge delta evidence_refs must match staged evidence_refs")
+        canonical = KnowledgeDelta(
+            delta_id=candidate.delta_id,
+            operation=candidate.operation,
+            payload=candidate.payload,
+            evidence_refs=refs,
+            conflicts_with=candidate.conflicts_with,
+            supersedes=candidate.supersedes,
+            reviewer_note=candidate.reviewer_note,
+            accepted=True,
+            metadata=candidate.metadata,
+        )
+        return self._stage(
+            "knowledge_delta",
+            canonical.to_dict(),
+            scope=scope,
+            evidence_refs=refs,
+            record_id=delta_record_id,
+        )
 
     def link_evidence(self, record_id: str, evidence_refs: Any, *, scope: str | None = None, link_id: str | None = None) -> str:
         target = _validate_record_id(record_id)
@@ -2780,35 +3746,78 @@ class IntegrationSession:
         normalized_scope = self._scope(scope, value)
         if not value.get("scope"):
             value["scope"] = normalized_scope
-        preview = LivingEnterpriseModel(run_id=self.lem.run_id)
-        value = preview.add_ontology_item(value).to_dict()
         return self._stage("ontology_item", value, scope=normalized_scope, evidence_refs=evidence_refs, record_id=ontology_record_id)
+
+    @staticmethod
+    def _bind_analytical_relationship_evidence_refs(evidence_refs: Any) -> tuple[Any, ...]:
+        """Bind public analytical relationship staging to its AO artifact.
+
+        The relationship payload's ``analysis_relationship_id`` identifies a
+        row in the accepted Analytical Owner artifact.  Keep caller-supplied
+        evidence intact, but ensure the outer integration envelope carries
+        the artifact reference required by the mechanical validator.  The
+        normal ``_stage``/``_evidence`` path still authorizes the reference
+        against the accepted manifest and verifies its exact hash.
+        """
+
+        artifact_ref = "work/analytical_relationships.jsonl"
+        if evidence_refs is None:
+            values: tuple[Any, ...] = ()
+        elif isinstance(evidence_refs, (str, Mapping)):
+            values = (evidence_refs,)
+        else:
+            values = tuple(evidence_refs)
+
+        def reference(value: Any) -> Any:
+            if isinstance(value, Mapping):
+                return value.get("ref", value.get("path", value.get("evidence_ref")))
+            return value
+
+        if any(reference(value) == artifact_ref for value in values):
+            return values
+        return (*values, artifact_ref)
 
     def add_relationship(self, relationship: Mapping[str, Any], *, scope: str | None = None, evidence_refs: Any = (), relationship_record_id: str | None = None) -> str:
         value = self._payload(relationship, "relationship")
         if not value.get("relationship_id"):
             raise ValueError("relationship requires relationship_id")
-        if value.get("source_id") is None or value.get("target_id") is None:
-            raise ValueError("relationship requires explicit source_id and target_id")
-        self._validate_relationship_payload(value)
-        self._validate_relationship_reuse(value)
+        relationship_key = str(value["relationship_id"])
+        # Rebuild the authoritative prior projection before deciding whether
+        # this is a new edge.  A repeated ordinary ID is an idempotent audit
+        # row: retain the submitted payload and defer semantic authority to
+        # the stored relationship during replay.  Explicit reuse markers are
+        # a separate user-facing contract and remain fully validated.
+        prior = self._reproject_prior()
+        existing_relationship = relationship_key in prior.relationships
+        if not existing_relationship:
+            existing_relationship = relationship_key in self._known_relationship_ids()
+        explicit_reuse = _RELATIONSHIP_REUSE_FIELD in value
+        if explicit_reuse or not existing_relationship:
+            if value.get("source_id") is None or value.get("target_id") is None:
+                raise ValueError("relationship requires explicit source_id and target_id")
+            self._validate_relationship_payload(value)
+        if explicit_reuse:
+            self._validate_relationship_reuse(value)
         normalized_scope = self._scope(scope, value)
         if not value.get("scope"):
             value["scope"] = normalized_scope
-        ontology_ids, mapping_ids = self._known_relationship_endpoint_ids()
-        source_id = str(value["source_id"])
-        target_id = str(value["target_id"])
-        if _RELATIONSHIP_REUSE_FIELD not in value and (
-            source_id in ontology_ids or source_id in mapping_ids
-        ) and (
-            target_id in ontology_ids or target_id in mapping_ids
-        ):
-            self._preview_relationship(
-                value,
-                self.lem.run_id,
-                known_ontology_ids=ontology_ids,
-                known_mapping_ids=mapping_ids,
-            )
+        if not existing_relationship and not explicit_reuse:
+            ontology_ids, mapping_ids = self._known_relationship_endpoint_ids()
+            source_id = str(value["source_id"])
+            target_id = str(value["target_id"])
+            if (
+                source_id in ontology_ids or source_id in mapping_ids
+            ) and (
+                target_id in ontology_ids or target_id in mapping_ids
+            ):
+                self._preview_relationship(
+                    value,
+                    self.lem.run_id,
+                    known_ontology_ids=ontology_ids,
+                    known_mapping_ids=mapping_ids,
+                )
+        if value.get("analysis_relationship_id") and not existing_relationship:
+            evidence_refs = self._bind_analytical_relationship_evidence_refs(evidence_refs)
         return self._stage("relationship", value, scope=normalized_scope, evidence_refs=evidence_refs, record_id=relationship_record_id)
 
     def add_identity_decision(
@@ -2976,7 +3985,12 @@ class IntegrationSession:
         try:
             # This is the same validation, prepared-registry preflight, and
             # side-effect-free LEM simulation used immediately before commit.
-            self._preflight_all()
+            # A reviewed repair may legitimately remove its last affected
+            # record.  Validate that empty intermediate snapshot as a
+            # transaction while retaining full analytical relationship
+            # completeness; the durable removal progress below records the
+            # explicit no-op history for final public validation.
+            self._preflight_all(allow_empty_staging=True)
             durable_started = True
             self._write_fidelity_removal_intent(
                 authorization,
@@ -3005,6 +4019,16 @@ class IntegrationSession:
                 current_packet_hash=None,
                 removed_record_ids=(*progress.removed_record_ids, target),
             )
+            # Keep a compact, hash-bound marker in the session snapshot for
+            # the intentional empty-result case.  The targeted result replaces
+            # the initial ``repair_once`` result, so relying on that result
+            # alone would make a valid remove-all repair look like a fresh
+            # empty session at the subsequent commit preflight.
+            removed_hashes = dict(self._state.get(_UNREVIEWED_REMOVED_RECORD_HASHES, {}))
+            removed_hashes[target] = baseline
+            state = dict(self._state)
+            state[_UNREVIEWED_REMOVED_RECORD_HASHES] = dict(sorted(removed_hashes.items()))
+            self._persist_state(state)
             self._write_fidelity_removal_intent(
                 authorization,
                 target=target,
@@ -3086,7 +4110,7 @@ class IntegrationSession:
             # Keep the same semantic/prepared-registry checks used at commit;
             # removing a required endpoint or otherwise invalidating staging
             # must fail before any durable bytes change.
-            self._preflight_all(require_complete=False)
+            self._preflight_all(require_complete=False, allow_empty_staging=True)
             removed_hashes[target] = baseline
             state = dict(self._state)
             state[_UNREVIEWED_REMOVED_RECORD_HASHES] = dict(sorted(removed_hashes.items()))
@@ -3141,8 +4165,10 @@ class IntegrationSession:
             self._resolve_prepared_candidate(descriptor)
             self.prepared_registry.preflight_candidate(descriptor, self.item_workspace)
         elif existing.kind == "ontology_item":
-            preview = LivingEnterpriseModel(run_id=self.lem.run_id)
-            normalized_payload = preview.add_ontology_item(normalized_payload).to_dict()
+            normalized_payload = self._canonical_ontology_payload(
+                normalized_payload,
+                exclude_record_id=target,
+            )
         elif existing.kind == "metric":
             self._preview_metric(normalized_payload, self.lem.run_id)
         elif existing.kind == "relationship":
@@ -3172,6 +4198,27 @@ class IntegrationSession:
                     tuple(record for record in self._records if record.record_id != target)
                 ),
             )
+        elif existing.kind == "analytical_artifact":
+            # Corrections are still a durable record boundary.  Validate the
+            # complete typed envelope (including canonical bytes/ref hashes)
+            # before constructing a replacement record; a generic
+            # IntegrationRecord dataclass constructor intentionally does not
+            # perform this parser work itself.
+            artifact, artifact_bytes = _parse_analytical_artifact_payload(
+                normalized_payload,
+                expected_item_id=self.item_id,
+            )
+            for other in self._records:
+                if other.record_id == target or other.kind != "analytical_artifact":
+                    continue
+                if other.payload.get("artifact_id") != artifact.artifact_id:
+                    continue
+                if (
+                    other.payload.get("content_hash") != artifact.content_hash
+                    or other.payload.get("envelope_hash") != artifact.envelope_hash
+                    or other.payload.get("canonical_bytes_sha256") != _sha256_bytes(artifact_bytes)
+                ):
+                    raise ValueError(f"analytical artifact ID collision: {artifact.artifact_id}")
         normalized_scope = self._scope(scope if scope is not None else existing.scope, normalized_payload)
         refs = existing.evidence_refs if evidence_refs is None else evidence_refs
         normalized_refs, hashes = self._evidence(
@@ -3260,6 +4307,44 @@ class IntegrationSession:
                     pass
             raise
         return target
+
+    @staticmethod
+    def _relationship_id_from_payload(payload: Mapping[str, Any]) -> str | None:
+        """Derive one stable relationship identity without validating shape."""
+
+        value = payload.get("relationship_id") or payload.get("item_id") or payload.get("id")
+        return str(value) if value is not None else None
+
+    def _known_relationship_ids(
+        self,
+        records: Sequence[IntegrationRecord] | None = None,
+        *,
+        model: LivingEnterpriseModel | None = None,
+    ) -> set[str]:
+        """Collect authoritative and earlier same-session relationship IDs.
+
+        KnowledgeDelta ``add_relationship`` rows are deliberately included as
+        audit identities but are never promoted to an AO analytical edge.
+        Callers pass the session's already-staged prefix when order matters;
+        the default is the full current record list, which is all earlier
+        records at public staging boundaries.
+        """
+
+        source_model = self.lem if model is None else model
+        identifiers = {str(value) for value in source_model.relationships}
+        for record in records if records is not None else self._records:
+            if record.kind == "relationship":
+                relationship_id = self._relationship_id_from_payload(record.payload)
+            elif record.kind == "knowledge_delta":
+                delta = self._knowledge_delta_from_payload(record.payload)
+                if delta.operation != "add_relationship":
+                    continue
+                relationship_id = self._relationship_id_from_payload(delta.payload)
+            else:
+                continue
+            if relationship_id is not None:
+                identifiers.add(relationship_id)
+        return identifiers
 
     @staticmethod
     def _validate_relationship_payload(payload: Mapping[str, Any]) -> None:
@@ -3477,6 +4562,18 @@ class IntegrationSession:
         return decision
 
     @staticmethod
+    def _knowledge_delta_from_payload(payload: Mapping[str, Any]) -> KnowledgeDelta:
+        try:
+            delta = KnowledgeDelta.from_dict(payload)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("knowledge delta payload is invalid") from exc
+        if not delta.accepted:
+            raise ValueError("knowledge delta payload must be accepted")
+        if delta.to_dict() != dict(payload):
+            raise ValueError("knowledge delta payload is not canonical")
+        return delta
+
+    @staticmethod
     def _canonical_mapping_from_payload(payload: Mapping[str, Any]) -> CanonicalMapping:
         try:
             mapping = CanonicalMapping.from_dict(payload)
@@ -3633,7 +4730,47 @@ class IntegrationSession:
             invalid_record_ids=invalid_record_ids,
             errors=errors,
         )
-        staged = [record for record in self._records if record.kind == "relationship"]
+        # Existing ordinary relationship IDs are canonical no-op records.
+        # They must not be forced through this requirement's analytical
+        # artifact/shape contract; only new IDs (and explicit reuse-marker
+        # records) are checked here.  Fold same-session IDs in order so a
+        # repeated raw record is treated the same way as a prior committed
+        # edge.
+        known_relationship_ids = set(self.lem.relationships)
+        known_knowledge_delta_relationship_ids: set[str] = set()
+        known_relationship_analysis_ids = {
+            str(payload.get("analysis_relationship_id"))
+            for payload in self.lem.relationships.values()
+            if payload.get("analysis_relationship_id") is not None
+        }
+        staged: list[IntegrationRecord] = []
+        for record in self._records:
+            if record.kind == "knowledge_delta":
+                delta = self._knowledge_delta_from_payload(record.payload)
+                if delta.operation == "add_relationship":
+                    relationship_id = self._relationship_id_from_payload(delta.payload)
+                    if relationship_id is not None:
+                        # A KD relationship is an audit identity only.  It
+                        # still makes a later typed duplicate an ordinary
+                        # ID-first no-op, while never being treated as an AO
+                        # analytical edge itself.
+                        known_knowledge_delta_relationship_ids.add(relationship_id)
+                continue
+            if record.kind != "relationship":
+                continue
+            relationship_id = self._relationship_id_from_payload(record.payload)
+            if (
+                relationship_id is not None
+                and (
+                    relationship_id in known_relationship_ids
+                    or relationship_id in known_knowledge_delta_relationship_ids
+                )
+                and _RELATIONSHIP_REUSE_FIELD not in record.payload
+            ):
+                continue
+            staged.append(record)
+            if relationship_id is not None and _RELATIONSHIP_REUSE_FIELD not in record.payload:
+                known_relationship_ids.add(relationship_id)
         if not present:
             if staged:
                 message = "analytical_relationships.jsonl is required for staged relationships"
@@ -3734,6 +4871,12 @@ class IntegrationSession:
         for relationship_id, source in publishable.items():
             record = staged_by_analysis.get(relationship_id)
             if record is None:
+                # A publishable analytical row may describe an edge that was
+                # already committed by an earlier requirement.  Its ordinary
+                # duplicate is a no-op, so requiring a second staged payload
+                # here would reintroduce collision-producing validation.
+                if relationship_id in known_relationship_ids or relationship_id in known_relationship_analysis_ids:
+                    continue
                 if require_complete:
                     errors.append(
                         "publishable analytical relationship is not staged exactly once: "
@@ -3771,6 +4914,7 @@ class IntegrationSession:
         self,
         *,
         require_complete_analytical_relationships: bool = True,
+        allow_empty_staging: bool = False,
     ) -> tuple[IntegrationValidation, frozenset[str]]:
         self._ensure_bundle_current()
         counts = {kind: 0 for kind in sorted(_RECORD_KINDS)}
@@ -3778,10 +4922,33 @@ class IntegrationSession:
         errors: list[str] = []
         invalid_record_ids: set[str] = set()
         seen: set[str] = set()
+        analytical_artifact_ids: dict[str, tuple[Any, ...]] = {}
+        analytical_artifact_refs: dict[str, tuple[Any, ...]] = {}
+        # An untouched/partially materialized session has no integration
+        # result to review.  Keep the deliberate pre-publication removal path
+        # usable for an owner repairing a previously populated session, but a
+        # fresh empty snapshot is an explicit staging handoff defect rather
+        # than a successful no-op.  A caller that truly has no semantic
+        # change must stage a typed ``KnowledgeDelta(operation="no_change")``
+        # (or a limitation record), so the reviewer receives an auditable
+        # record instead of an empty checked set.
+        if not self._records and not allow_empty_staging and not self._has_explicit_empty_noop_history():
+            omissions.append("staging_incomplete")
+            errors.append(
+                "staging_incomplete: integration session has no records; "
+                "stage an explicit no_change or limitation record before fidelity review"
+            )
         # Relationship references are intentionally order-sensitive.  The
         # known set grows as staged ontology/metric/relationship records are
         # encountered; a forward-only or unknown reference fails closed.
         known_ontology_ids = set(self.lem.ontology)
+        # Relationship IDs are checked before validating an incoming payload.
+        # Existing authoritative edges are ordinary idempotent audit rows;
+        # only genuinely new IDs need endpoint/analytical-shape validation.
+        known_relationships: dict[str, Mapping[str, Any]] = {
+            str(relationship_id): payload
+            for relationship_id, payload in self.lem.relationships.items()
+        }
         known_decisions: dict[str, IdentityDecision] = dict(self.lem.identity_decisions)
         known_mappings: dict[str, CanonicalMapping] = dict(self.lem.canonical_mappings)
         for record in self._records:
@@ -3792,7 +4959,41 @@ class IntegrationSession:
             try:
                 IntegrationRecord.from_dict(record.to_dict())
                 self._scope(record.scope)
-                if record.kind == "ontology_item":
+                if record.kind == "analytical_artifact":
+                    artifact, artifact_bytes = _parse_analytical_artifact_payload(
+                        record.payload,
+                        expected_item_id=self.item_id,
+                    )
+                    # Re-read every external JSONL output at the fidelity
+                    # boundary.  The accepted artifact JSON hash alone is
+                    # insufficient because the output file is a separate
+                    # mutable work artifact that may have changed after
+                    # generation or packet creation.
+                    self._validate_external_artifact_outputs(artifact)
+                    artifact_ref = record.payload.get("artifact_ref")
+                    identity = (
+                        artifact.artifact_id,
+                        artifact.artifact_type,
+                        artifact.schema_version,
+                        artifact.requirement_id,
+                        artifact.content_hash,
+                        artifact.envelope_hash,
+                        _sha256_bytes(artifact_bytes),
+                        artifact_ref,
+                    )
+                    prior = analytical_artifact_ids.get(artifact.artifact_id)
+                    if prior is not None:
+                        if prior != identity:
+                            raise ValueError(f"analytical artifact ID collision: {artifact.artifact_id}")
+                        raise ValueError(f"analytical artifact ID is staged more than once: {artifact.artifact_id}")
+                    ref_prior = analytical_artifact_refs.get(str(artifact_ref))
+                    if ref_prior is not None and ref_prior != identity:
+                        raise ValueError(f"analytical artifact committed reference collision: {artifact_ref}")
+                    if ref_prior is not None:
+                        raise ValueError(f"analytical artifact committed reference is staged more than once: {artifact_ref}")
+                    analytical_artifact_ids[artifact.artifact_id] = identity
+                    analytical_artifact_refs[str(artifact_ref)] = identity
+                elif record.kind == "ontology_item":
                     item = LivingEnterpriseModel(run_id=self.lem.run_id).add_ontology_item(record.payload)
                     known_ontology_ids.add(item.item_id)
                 elif record.kind == "metric":
@@ -3812,15 +5013,100 @@ class IntegrationSession:
                     if existing_mapping is not None and existing_mapping != mapping:
                         raise ValueError(f"canonical mapping collision: {mapping.canonical_id}")
                     known_mappings[mapping.canonical_id] = mapping
+                elif record.kind == "knowledge_delta":
+                    delta = self._knowledge_delta_from_payload(record.payload)
+                    if tuple(delta.evidence_refs) != record.evidence_refs:
+                        raise ValueError("knowledge delta evidence_refs do not match integration envelope")
+                    delta_payload = delta.payload
+                    if delta.operation == "add_relationship":
+                        if _RELATIONSHIP_REUSE_FIELD in delta_payload:
+                            raise ValueError(
+                                "knowledge delta add_relationship cannot use "
+                                "reuse_existing_relationship_id; use typed add_relationship"
+                            )
+                        relationship_id = self._relationship_id_from_payload(delta_payload)
+                        existing_relationship = (
+                            relationship_id is not None
+                            and relationship_id in known_relationships
+                        )
+                        if not existing_relationship:
+                            self._validate_relationship_payload(delta_payload)
+                            source = str(delta_payload["source_id"])
+                            target = str(delta_payload["target_id"])
+                            if (
+                                source not in known_ontology_ids
+                                and source not in known_mappings
+                            ) or (
+                                target not in known_ontology_ids
+                                and target not in known_mappings
+                            ):
+                                raise ValueError(
+                                    "relationship references unknown ontology item or canonical mapping"
+                                )
+                            (
+                                preview_relationship_id,
+                                preview_payload,
+                                relationship_item,
+                            ) = self._preview_relationship(
+                                delta_payload,
+                                self.lem.run_id,
+                                known_ontology_ids=known_ontology_ids,
+                                known_mapping_ids=known_mappings,
+                            )
+                            known_ontology_ids.add(relationship_item.item_id)
+                            known_relationships[preview_relationship_id] = preview_payload
+                        elif relationship_id is not None:
+                            # Keep the generated companion visible to later
+                            # same-session endpoint references.  The raw KD
+                            # payload remains untouched and is not promoted
+                            # to an analytical relationship record.
+                            known_ontology_ids.add(relationship_id)
+                    elif delta.operation in {
+                        "add_ontology_item", "add_metric", "add_definition", "add_rule",
+                        "add_process", "add_event", "add_dimension",
+                    }:
+                        item_id = (
+                            delta_payload.get("item_id")
+                            or delta_payload.get("relationship_id")
+                            or delta_payload.get("metric_id")
+                            or delta_payload.get("definition_id")
+                            or delta_payload.get("rule_id")
+                            or delta_payload.get("process_id")
+                            or delta_payload.get("event_id")
+                            or delta_payload.get("dimension_id")
+                            or delta_payload.get("id")
+                        )
+                        if item_id is not None:
+                            known_ontology_ids.add(str(item_id))
+                    elif delta.operation == "add_canonical_mapping":
+                        mapping_id = delta_payload.get("canonical_id")
+                        if mapping_id is not None:
+                            known_mappings[str(mapping_id)] = CanonicalMapping.from_dict(delta_payload)
                 if record.kind == "relationship":
-                    self._validate_relationship_refs(
-                        record,
-                        known=known_ontology_ids,
-                        known_mappings=set(known_mappings),
+                    relationship_id_value = (
+                        record.payload.get("relationship_id")
+                        or record.payload.get("item_id")
+                        or record.payload.get("id")
                     )
+                    relationship_id = (
+                        str(relationship_id_value)
+                        if relationship_id_value is not None
+                        else None
+                    )
+                    existing_relationship = (
+                        relationship_id is not None
+                        and relationship_id in known_relationships
+                        and _RELATIONSHIP_REUSE_FIELD not in record.payload
+                    )
+                    if not existing_relationship:
+                        self._validate_relationship_refs(
+                            record,
+                            known=known_ontology_ids,
+                            known_mappings=set(known_mappings),
+                        )
                     if _RELATIONSHIP_REUSE_FIELD in record.payload:
                         self._validate_relationship_reuse(record.payload)
-                    else:
+                    elif not existing_relationship:
                         _relationship_id, _relationship_payload, relationship_item = self._preview_relationship(
                             record.payload,
                             self.lem.run_id,
@@ -3828,6 +5114,12 @@ class IntegrationSession:
                             known_mapping_ids=known_mappings,
                         )
                         known_ontology_ids.add(relationship_item.item_id)
+                        known_relationships[_relationship_id] = _relationship_payload
+                    elif relationship_id is not None:
+                        # Keep the generated ontology companion visible to
+                        # later staged references even when the stored edge
+                        # was only partially rehydrated.
+                        known_ontology_ids.add(relationship_id)
                 if record.kind == "prepared_asset":
                     self._validate_prepared_candidate(record)
             except Exception as exc:
@@ -3841,6 +5133,30 @@ class IntegrationSession:
         except Exception as exc:
             errors.append(f"analytical_relationships.jsonl: {exc}")
         return IntegrationValidation(not errors, counts, tuple(omissions), tuple(errors)), frozenset(invalid_record_ids)
+
+    def _has_explicit_empty_noop_history(self) -> bool:
+        """Return whether an empty session records an intentional no-op repair.
+
+        Removing every previously staged record is an explicit owner action,
+        and the durable removal maps/journal preserve that fact for exact
+        retries.  A newly-created empty session has no such history and must
+        remain ``staging_incomplete`` until a typed no-change/limitation record
+        is staged.
+        """
+
+        if self._records:
+            return False
+        removed = self._state.get(_UNREVIEWED_REMOVED_RECORD_HASHES)
+        if isinstance(removed, Mapping) and bool(removed):
+            return True
+        try:
+            result = self._read_fidelity_result_raw()
+            if result is None or result.verdict != "repair_once":
+                return False
+            progress = self._read_repair_progress(self._read_repair_authorization())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            return False
+        return bool(progress.removed_record_ids)
 
     def validate(self) -> IntegrationValidation:
         validation, _ = self._validate_with_invalid_record_ids()
@@ -3876,6 +5192,30 @@ class IntegrationSession:
                 mapping_id = payload.get("canonical_id")
                 if mapping_id is not None:
                     mapping_ids.add(str(mapping_id))
+            elif record.kind == "knowledge_delta":
+                delta = self._knowledge_delta_from_payload(payload)
+                delta_payload = delta.payload
+                if delta.operation in {
+                    "add_ontology_item", "add_metric", "add_definition", "add_rule",
+                    "add_process", "add_event", "add_dimension", "add_relationship",
+                }:
+                    item_id = (
+                        delta_payload.get("item_id")
+                        or delta_payload.get("relationship_id")
+                        or delta_payload.get("metric_id")
+                        or delta_payload.get("definition_id")
+                        or delta_payload.get("rule_id")
+                        or delta_payload.get("process_id")
+                        or delta_payload.get("event_id")
+                        or delta_payload.get("dimension_id")
+                        or delta_payload.get("id")
+                    )
+                    if item_id is not None:
+                        ontology_ids.add(str(item_id))
+                elif delta.operation == "add_canonical_mapping":
+                    mapping_id = delta_payload.get("canonical_id")
+                    if mapping_id is not None:
+                        mapping_ids.add(str(mapping_id))
             elif record.kind == "relationship" and _RELATIONSHIP_REUSE_FIELD not in payload:
                 relationship_id = payload.get("relationship_id") or payload.get("item_id") or payload.get("id")
                 if relationship_id is not None:
@@ -3922,98 +5262,60 @@ class IntegrationSession:
                 self.prepared_registry.preflight_register(descriptor, item_workspace=self.item_workspace)
 
     def _preflight_lem(self) -> None:
-        simulated_ontology = dict(self.lem.ontology)
-        simulated_assets = dict(self.lem.prepared_assets)
-        simulated_decisions = dict(self.lem.identity_decisions)
-        simulated_mappings = dict(self.lem.canonical_mappings)
-        simulated_relationships = copy.deepcopy(self.lem.relationships)
-        simulated_knowledge = copy.deepcopy(self.lem.knowledge)
+        # Replay the exact accepted-record primitive into an isolated model.
+        # This keeps successor target resolution and rollback semantics
+        # identical to commit/replay without mutating the projected authority.
+        simulated = LivingEnterpriseModel.from_export(self.lem.export())
         for record in self._records:
             payload = dict(record.payload)
-            if record.kind == "ontology_item":
-                item = LivingEnterpriseModel(run_id=self.lem.run_id).add_ontology_item(payload)
-                existing = simulated_ontology.get(item.item_id)
-                if existing is not None and existing != item:
-                    raise ValueError(f"ontology item collision: {item.item_id}")
-                if existing is None:
-                    simulated_ontology[item.item_id] = item
-            elif record.kind == "metric":
+            if record.kind == "metric":
                 self._preview_metric(payload, self.lem.run_id)
-            elif record.kind == "identity_decision":
-                decision = self._identity_decision_from_payload(payload)
-                existing_decision = simulated_decisions.get(decision.decision_id)
-                if existing_decision is not None and existing_decision != decision:
-                    raise ValueError(f"identity decision collision: {decision.decision_id}")
-                simulated_decisions[decision.decision_id] = decision
-            elif record.kind == "canonical_mapping":
-                mapping = self._validate_canonical_mapping_payload(
-                    payload,
-                    known_decisions=simulated_decisions,
-                )
-                existing_mapping = simulated_mappings.get(mapping.canonical_id)
-                if existing_mapping is not None and existing_mapping != mapping:
-                    raise ValueError(f"canonical mapping collision: {mapping.canonical_id}")
-                simulated_mappings[mapping.canonical_id] = mapping
-            elif record.kind == "prepared_asset":
-                descriptor = PreparedAssetDescriptor.from_dict(payload)
-                existing = simulated_assets.get(descriptor.prepared_asset_id)
-                if existing is not None and existing != descriptor:
-                    raise ValueError(f"prepared asset collision: {descriptor.prepared_asset_id}")
-                if existing is None:
-                    simulated_assets[descriptor.prepared_asset_id] = descriptor
-            elif record.kind == "relationship":
-                self._validate_relationship_refs(
+            elif record.kind == "relationship" and _RELATIONSHIP_REUSE_FIELD in payload:
+                self._validate_relationship_reuse(payload, model=simulated)
+            elif record.kind in {
+                "ontology_item",
+                "relationship",
+                "identity_decision",
+                "canonical_mapping",
+                "prepared_asset",
+                "limitation",
+                "knowledge_delta",
+            }:
+                self._apply_lem_record_to_model(
+                    simulated,
                     record,
-                    known=set(simulated_ontology),
-                    known_mappings=set(simulated_mappings),
+                    applied_at="preflight",
                 )
-                if _RELATIONSHIP_REUSE_FIELD in payload:
-                    self._validate_relationship_reuse(payload)
-                else:
-                    relationship_id, expected_relationship, ontology_item = self._preview_relationship(
-                        payload,
-                        self.lem.run_id,
-                        known_ontology_ids=simulated_ontology,
-                        known_mapping_ids=simulated_mappings,
-                    )
-                    existing_relationship = simulated_relationships.get(relationship_id)
-                    if existing_relationship is not None and existing_relationship != expected_relationship:
-                        raise ValueError(f"relationship collision: {relationship_id}")
-                    if existing_relationship is None:
-                        # add_relationship also creates a typed ontology item.
-                        existing_ontology = simulated_ontology.get(ontology_item.item_id)
-                        if existing_ontology is not None:
-                            raise ValueError(f"relationship ontology collision: {ontology_item.item_id}")
-                        simulated_relationships[relationship_id] = expected_relationship
-                        simulated_ontology[ontology_item.item_id] = ontology_item
-            elif record.kind == "limitation":
-                existing = simulated_knowledge.get(record.record_id)
-                expected_payload = payload
-                if existing is not None and (
-                    existing.get("operation") != "record_limitation" or existing.get("payload") != expected_payload
-                ):
-                    raise ValueError(f"knowledge delta collision: {record.record_id}")
-                if existing is None:
-                    simulated_knowledge[record.record_id] = {
-                        "operation": "record_limitation",
-                        "payload": expected_payload,
-                    }
 
     def _validate_partial_staging(self) -> IntegrationValidation:
         """Validate a mechanically consistent but not-yet-complete candidate."""
 
         validation, _ = self._validate_with_invalid_record_ids(
             require_complete_analytical_relationships=False,
+            # The only current partial-preflight caller is the owner-bound
+            # pre-publication removal transaction.  It must be able to
+            # validate the intermediate empty snapshot before persisting the
+            # explicit removal history; public ``validate()`` remains strict
+            # and reports ``staging_incomplete`` for a fresh empty session.
+            allow_empty_staging=True,
         )
         return validation
 
-    def _preflight_all(self, *, require_complete: bool = True) -> None:
+    def _preflight_all(
+        self,
+        *,
+        require_complete: bool = True,
+        allow_empty_staging: bool = False,
+    ) -> None:
         # The caller-visible model is a convenience view, never commit
         # authority. Rebuild from durable prior commits immediately before
         # every commit preflight so caller mutation cannot poison publication.
         self._reproject_prior()
         self._ensure_bundle_current()
-        validation = self.validate() if require_complete else self._validate_partial_staging()
+        validation, _ = self._validate_with_invalid_record_ids(
+            require_complete_analytical_relationships=require_complete,
+            allow_empty_staging=allow_empty_staging,
+        )
         if not validation.valid:
             raise ValueError(f"integration validation failed: {list(validation.errors)}")
         self._preflight_registry()
@@ -4073,11 +5375,7 @@ class IntegrationSession:
         payload = dict(record.payload)
         if record.kind == "ontology_item":
             item = OntologyItem.from_dict(payload)
-            existing = model.ontology.get(item.item_id)
-            if existing is None:
-                model.add_ontology_item(item)
-            elif existing != item:
-                raise ValueError(f"ontology item collision: {item.item_id}")
+            model.ensure_ontology_item(item)
         elif record.kind == "identity_decision":
             decision = IntegrationSession._identity_decision_from_payload(payload)
             existing = model.identity_decisions.get(decision.decision_id)
@@ -4099,28 +5397,48 @@ class IntegrationSession:
             # transient value.
             IntegrationSession._preview_metric(payload, model.run_id)
         elif record.kind == "relationship":
-            IntegrationSession._validate_relationship_payload(payload)
-            source = payload.get("source_id")
-            target = payload.get("target_id")
-            model._validate_relationship_endpoints(source, target)
+            relationship_id_value = (
+                payload.get("relationship_id")
+                or payload.get("item_id")
+                or payload.get("id")
+            )
+            relationship_id = (
+                str(relationship_id_value)
+                if relationship_id_value is not None
+                else None
+            )
             if _RELATIONSHIP_REUSE_FIELD in payload:
                 # The relationship is already authoritative in the
                 # cumulative model.  Validate the full semantic payload and
                 # deliberately do not call add_relationship: that operation
                 # would create a second ontology item/edge.
+                IntegrationSession._validate_relationship_payload(payload)
+                source = payload.get("source_id")
+                target = payload.get("target_id")
+                model._validate_relationship_endpoints(source, target)
                 IntegrationSession._validate_relationship_reuse_on_model(model, payload)
                 return
-            relationship_id, expected_relationship, _ontology_item = IntegrationSession._preview_relationship(
+            if relationship_id is not None and relationship_id in model.relationships:
+                # Relationship IDs are canonical edge identities.  A normal
+                # repeated add is an idempotent reuse; delegate to the model so
+                # a partially rehydrated edge can regain its missing generated
+                # ontology companion.  Only the explicit reuse marker above
+                # performs the stricter semantic/evidence check.
+                model.add_relationship(payload)
+                return
+            # Only a genuinely new relationship receives full endpoint and
+            # analytical-shape validation.
+            IntegrationSession._validate_relationship_payload(payload)
+            source = payload.get("source_id")
+            target = payload.get("target_id")
+            model._validate_relationship_endpoints(source, target)
+            relationship_id, _expected_relationship, _ontology_item = IntegrationSession._preview_relationship(
                 payload,
                 model.run_id,
                 known_ontology_ids=model.ontology,
                 known_mapping_ids=model.canonical_mappings,
             )
-            existing = model.relationships.get(relationship_id)
-            if existing is None:
-                model.add_relationship(payload)
-            elif existing != expected_relationship:
-                raise ValueError(f"relationship collision: {relationship_id}")
+            model.add_relationship(payload)
         elif record.kind == "prepared_asset":
             descriptor = PreparedAssetDescriptor.from_dict(payload)
             existing = model.prepared_assets.get(descriptor.prepared_asset_id)
@@ -4128,6 +5446,46 @@ class IntegrationSession:
                 model.register_prepared_asset(descriptor)
             elif existing != descriptor:
                 raise ValueError(f"prepared asset collision: {descriptor.prepared_asset_id}")
+        elif record.kind == "knowledge_delta":
+            delta = IntegrationSession._knowledge_delta_from_payload(payload)
+            if tuple(delta.evidence_refs) != record.evidence_refs:
+                raise ValueError("knowledge delta evidence_refs do not match integration envelope")
+            if (
+                delta.operation == "add_relationship"
+                and _RELATIONSHIP_REUSE_FIELD in delta.payload
+            ):
+                raise ValueError(
+                    "knowledge delta add_relationship cannot use "
+                    "reuse_existing_relationship_id; use typed add_relationship"
+                )
+            existing = model.knowledge.get(delta.delta_id)
+            if existing is None:
+                model.apply_delta(delta, accepted=True)
+                # Direct application records wall-clock time.  Replay binds the
+                # revision to the durable integration commit for deterministic
+                # exports and exact projection comparisons.
+                model.revisions[-1]["applied_at"] = applied_at
+            else:
+                expected = {
+                    "ref": LEMRef("knowledge_delta", delta.delta_id).to_dict(),
+                    "operation": delta.operation,
+                    "payload": dict(delta.payload),
+                    "evidence_refs": list(delta.evidence_refs),
+                    "conflicts_with": list(delta.conflicts_with),
+                    "supersedes": [ref.to_dict() for ref in delta.supersedes],
+                    "unresolved": model.conflict_state.get(delta.delta_id, {}).get(
+                        "unresolved",
+                        delta.operation == "record_conflict",
+                    ),
+                    "working_definition": delta.payload.get("working_definition"),
+                }
+                comparable = {
+                    key: existing.get(key)
+                    for key in expected
+                    if key in existing
+                }
+                if comparable != expected:
+                    raise ValueError(f"knowledge delta collision: {delta.delta_id}")
         elif record.kind == "limitation":
             delta = KnowledgeDelta(
                 delta_id=record.record_id,
@@ -4204,7 +5562,8 @@ class IntegrationSession:
             "schema_version", "session_id", "item_id", "owner_id", "status",
             "accepted_content_hash", "reason", "created_at", "manifest_hash",
         }
-        if not isinstance(value, Mapping) or set(value) != expected:
+        optional = {"recovery_exhausted"}
+        if not isinstance(value, Mapping) or not expected.issubset(set(value)) or set(value) - expected - optional:
             raise ValueError("technical failure manifest fields are invalid")
         if value.get("schema_version") != _SCHEMA_VERSION or value.get("status") != "technical_failure":
             raise ValueError("technical failure manifest fields are invalid")
@@ -4212,6 +5571,8 @@ class IntegrationSession:
             raise ValueError("technical failure manifest accepted bundle binding is invalid")
         if any(not isinstance(value.get(key), str) or not str(value[key]).strip() for key in ("session_id", "owner_id", "reason", "created_at")):
             raise ValueError("technical failure manifest identity is invalid")
+        if "recovery_exhausted" in value and not isinstance(value.get("recovery_exhausted"), bool):
+            raise ValueError("technical failure manifest recovery marker is invalid")
         unsigned = {key: item for key, item in value.items() if key != "manifest_hash"}
         if not _is_sha256(value.get("manifest_hash")) or value["manifest_hash"] != _sha256_value(unsigned):
             raise ValueError("technical failure manifest hash does not match content")
@@ -4326,13 +5687,90 @@ class IntegrationSession:
             existing = self._committed_manifest(self.item_workspace)
             if existing is None or existing.get("manifest_hash") != manifest.get("manifest_hash"):
                 raise ValueError("committed integration collision")
+            existing_records = self._read_records(committed / _RECORDS_FILENAME, existing, self.bundle)
+            self._validate_committed_artifacts(committed, existing_records)
             return
         integration_root = self._integration_root(self.item_workspace)
         self._ensure_safe_dir(integration_root)
         temporary = Path(tempfile.mkdtemp(prefix=".committed.tmp-", dir=integration_root))
         try:
             _atomic_write_bytes(temporary / _RECORDS_FILENAME, records_bytes)
+            external_outputs: dict[str, Mapping[str, Any]] = {}
+            external_artifact_paths: set[str] = set()
+            for record in self._records:
+                if record.kind != "analytical_artifact":
+                    continue
+                artifact, artifact_bytes = _parse_analytical_artifact_payload(
+                    record.payload,
+                    expected_item_id=self.item_id,
+                )
+                for relative, _source_path in self._validate_external_artifact_outputs(artifact):
+                    descriptor = next(
+                        (
+                            value
+                            for value in artifact.output_refs
+                            if isinstance(value, Mapping) and value.get("path") == relative
+                        ),
+                        None,
+                    )
+                    if descriptor is None:  # pragma: no cover - validator already enforces this
+                        raise ValueError(f"committed analytical output descriptor is missing: {relative}")
+                    prior = external_outputs.get(relative)
+                    if prior is not None and any(
+                        prior.get(name) != descriptor.get(name)
+                        for name in ("format", "sha256", "size_bytes", "row_count", "complete")
+                    ):
+                        raise ValueError(f"committed analytical output path collision: {relative}")
+                    external_outputs[relative] = dict(descriptor)
+                destination = self._committed_artifact_path(
+                    temporary,
+                    str(record.payload["artifact_ref"]),
+                )
+                artifact_relative = destination.relative_to(temporary / "artifacts").as_posix()
+                external_artifact_paths.add(artifact_relative)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                _atomic_write_bytes(destination, artifact_bytes)
+            for relative, descriptor in sorted(external_outputs.items()):
+                if relative in external_artifact_paths:
+                    raise ValueError(f"committed analytical output collides with artifact file: {relative}")
+                source_root = self.item_workspace.work_root
+                _assert_no_symlink(source_root, label="accepted analytical output root")
+                source = source_root / Path(relative)
+                current_source = source_root
+                for component in PurePosixPath(relative).parts:
+                    current_source = current_source / component
+                    _assert_no_symlink(current_source, label="accepted analytical output")
+                if not source.is_file() or source.is_symlink():
+                    raise ValueError(f"accepted analytical output is missing or not a regular file: {relative}")
+
+                destination = temporary / "artifacts" / Path(relative)
+                current = temporary / "artifacts"
+                _assert_no_symlink(current, label="committed analytical artifact output root")
+                for component in PurePosixPath(relative).parts:
+                    current = current / component
+                    _assert_no_symlink(current, label="committed analytical artifact output")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    with destination.open("wb") as sink:
+                        observed_hash, observed_size, observed_rows = _stream_jsonl_file(
+                            source,
+                            label=f"accepted analytical output {relative}",
+                            sink=sink,
+                        )
+                        sink.flush()
+                        os.fsync(sink.fileno())
+                except OSError as exc:
+                    raise ValueError(f"committed analytical output cannot be copied: {relative}") from exc
+                if (
+                    observed_hash != descriptor.get("sha256")
+                    or observed_size != descriptor.get("size_bytes")
+                    or observed_rows != descriptor.get("row_count")
+                    or descriptor.get("complete") is not True
+                    or descriptor.get("format") != "jsonl"
+                ):
+                    raise ValueError(f"accepted analytical output changed during commit: {relative}")
             _atomic_write_json(temporary / _MANIFEST_FILENAME, manifest)
+            self._validate_committed_artifacts(temporary, self._records)
             os.replace(temporary, committed)
             _fsync_directory(integration_root)
         except Exception:
@@ -4365,6 +5803,7 @@ class IntegrationSession:
                 "prepared_asset",
                 "identity_decision",
                 "canonical_mapping",
+                "knowledge_delta",
             }:
                 self._apply_lem_record_to_model(candidate, record, applied_at=committed_at)
         return candidate
@@ -4390,6 +5829,7 @@ class IntegrationSession:
             if manifest is None:
                 raise ValueError("committed integration manifest is missing")
             existing_records = self._read_records(self.committed_root / _RECORDS_FILENAME, manifest, self.bundle)
+            self._validate_committed_artifacts(self.committed_root, existing_records)
             if tuple(existing_records) != tuple(self._records):
                 raise ValueError("committed integration records differ from staging")
             candidate = self._candidate_lem(committed_at=str(manifest["committed_at"]))
@@ -4420,6 +5860,7 @@ class IntegrationSession:
                 existing_manifest,
                 self.bundle,
             )
+            self._validate_committed_artifacts(self.committed_root, existing_records)
             if tuple(existing_records) != tuple(self._records):
                 raise ValueError("committed integration records differ from staging")
             candidate = self._candidate_lem(committed_at=str(existing_manifest["committed_at"]))
@@ -4476,13 +5917,142 @@ class IntegrationSession:
         self._finish_committed(manifest)
         return dict(manifest)
 
-    def mark_technical_failure(self, reason: str) -> Mapping[str, Any]:
+    def mark_technical_failure(
+        self,
+        reason: str,
+        *,
+        recovery_exhausted: bool = False,
+    ) -> Mapping[str, Any]:
         with self._session_lock(self.item_workspace):
             self._refresh_authoritative()
-            return self._mark_technical_failure_unlocked(reason)
+            return self._mark_technical_failure_unlocked(
+                reason,
+                recovery_exhausted=recovery_exhausted,
+            )
 
-    def _mark_technical_failure_unlocked(self, reason: str) -> Mapping[str, Any]:
-        """Terminalize only an explicitly unrecoverable integration failure."""
+    def _record_incident_unlocked(self, reason: str) -> Mapping[str, Any]:
+        """Record an accepted-integration fault without terminalizing it.
+
+        Business acceptance is already sealed in ``accepted/``.  Handoff,
+        staging, and post-fidelity transport faults therefore remain positive,
+        same-session recovery work: a typed run incident is durable and
+        idempotent while the item/session stay ``pending``/``open``.  The
+        incident identity is derived from the exact session, accepted content,
+        and reason so replaying the same compatibility call converges on the
+        original record rather than appending duplicates.
+        """
+
+        from .requirement_planning import RequirementSupervisorWorkspace
+
+        incident_id = "INC-" + _sha256_value(
+            {
+                "kind": "accepted_integration_recovery",
+                "session_id": self.session_id,
+                "item_id": self.item_id,
+                "accepted_content_hash": self.bundle.content_hash,
+                "reason": reason,
+            }
+        )[:24]
+        incident = IncidentRecord(
+            incident_id=incident_id,
+            category="recovery",
+            disposition="pending_same_session",
+            admissible=False,
+            item_id=self.item_id,
+            scope=("integration", self.item_id),
+            source="integration_session",
+            facts={
+                "session_id": self.session_id,
+                "accepted_content_hash": self.bundle.content_hash,
+                "reason": reason,
+                "continuation": "same_session",
+            },
+        )
+        recorded = RequirementSupervisorWorkspace(self.context).record_incident(incident)
+        return {
+            "status": "pending",
+            "recoverable": True,
+            "continuation": "same_session",
+            "session_id": self.session_id,
+            "item_id": self.item_id,
+            "accepted_content_hash": self.bundle.content_hash,
+            "incident": dict(recorded),
+        }
+
+    def record_incident(
+        self,
+        incident: IncidentRecord | Mapping[str, Any] | str,
+    ) -> Mapping[str, Any]:
+        """Persist a typed recoverable incident and reoffer this session.
+
+        ``record_incident`` is the positive API.  A plain reason is accepted
+        only as the narrow compatibility form used by older callers; typed
+        ``IncidentRecord`` values remain authoritative for new integrations.
+        All accepted-item incidents are constrained to this item/session and
+        are idempotent through the run-level incident ledger.
+        """
+
+        with self._session_lock(self.item_workspace):
+            self._refresh_authoritative()
+            if self.status != "open" or self.item_workspace.integration_state != "pending":
+                raise ValueError("integration incident requires an open pending session")
+            if isinstance(incident, str):
+                reason = incident.strip()
+                if not reason:
+                    raise ValueError("integration incident reason is required")
+                return self._record_incident_unlocked(reason)
+            value = incident if isinstance(incident, IncidentRecord) else IncidentRecord.from_dict(incident)
+            if value.item_id not in {None, self.item_id}:
+                raise ValueError("integration incident item_id does not match the session")
+            if value.category != "recovery":
+                raise ValueError("accepted integration incidents must use recovery category")
+            facts = dict(value.facts)
+            reason = facts.get("reason") or value.disposition
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError("integration incident reason is required")
+            facts.update(
+                {
+                    "session_id": self.session_id,
+                    "accepted_content_hash": self.bundle.content_hash,
+                    "continuation": "same_session",
+                }
+            )
+            normalized = IncidentRecord(
+                incident_id=value.incident_id,
+                category="recovery",
+                disposition=value.disposition,
+                admissible=False,
+                item_id=self.item_id,
+                scope=value.scope or ("integration", self.item_id),
+                source=value.source or "integration_session",
+                facts=facts,
+            )
+            from .requirement_planning import RequirementSupervisorWorkspace
+
+            recorded = RequirementSupervisorWorkspace(self.context).record_incident(normalized)
+            return {
+                "status": "pending",
+                "recoverable": True,
+                "continuation": "same_session",
+                "session_id": self.session_id,
+                "item_id": self.item_id,
+                "accepted_content_hash": self.bundle.content_hash,
+                "incident": dict(recorded),
+            }
+
+    def _mark_technical_failure_unlocked(
+        self,
+        reason: str,
+        *,
+        recovery_exhausted: bool = False,
+    ) -> Mapping[str, Any]:
+        """Normalize failure-shaped calls into positive recovery incidents.
+
+        ``IntegrationSession`` exists only after analytical acceptance.  A
+        technical failure at this boundary must preserve that accepted content
+        and leave the same session available for staging/fidelity continuation;
+        it is never a new terminal item outcome.
+        """
 
         reason = str(reason).strip()
         if not reason:
@@ -4495,6 +6065,8 @@ class IntegrationSession:
         # recovery must instead retry the exact intent to convergence.
         if (self.staging_root / _INTENT_FILENAME).exists() or (self.staging_root / _INTENT_FILENAME).is_symlink():
             raise ValueError("integration commit intent exists; retry commit instead of technical failure")
+        if self.status == "open" and self.item_workspace.integration_state == "pending" and not recovery_exhausted:
+            return self._record_incident_unlocked(reason)
         failure_root = self._integration_root(self.item_workspace) / _TECHNICAL_FAILURE_DIR
         failure_path = failure_root / _MANIFEST_FILENAME
         manifest: dict[str, Any] | None = None
@@ -4505,6 +6077,9 @@ class IntegrationSession:
             if loaded.get("session_id") != self.session_id or loaded.get("owner_id") != self.owner_id:
                 raise ValueError("technical failure manifest identity is invalid")
             manifest = dict(loaded)
+        # Historical terminal manifests remain readable for old runs, but no
+        # current accepted/pending call reaches this branch: the positive
+        # incident path above handles it before any terminal write.
         if manifest is None:
             if self.status != "open":
                 raise ValueError("integration session is terminal")
@@ -4521,14 +6096,25 @@ class IntegrationSession:
                 "reason": reason,
                 "created_at": _now(),
             }
+            if recovery_exhausted:
+                # This marker is covered by the manifest hash and lets the
+                # Planner distinguish an explicit exhausted terminal boundary
+                # from historical/recoverable failure evidence.
+                manifest["recovery_exhausted"] = True
             manifest["manifest_hash"] = _sha256_value(manifest)
             _atomic_write_json(failure_path, manifest)
         elif reason and manifest.get("reason") != reason:
             # A retry must converge on the first durable reason, never rewrite
             # a terminal failure with a competing explanation.
             raise ValueError("technical failure reason differs from durable manifest")
+        if recovery_exhausted and manifest.get("recovery_exhausted") is not True:
+            raise ValueError("historical technical failure is recoverable; exhaustion marker is missing")
         if self.item_workspace.integration_state == "pending":
-            self.item_workspace.mark_integration_failed(manifest["manifest_hash"], "integration/technical_failure/manifest.json")
+            self.item_workspace.mark_integration_failed(
+                manifest["manifest_hash"],
+                "integration/technical_failure/manifest.json",
+                recovery_exhausted=recovery_exhausted,
+            )
         elif self.item_workspace.integration_state == "technical_failure":
             if self.item_workspace.integration_manifest_hash != manifest["manifest_hash"]:
                 raise ValueError("item integration state does not match technical failure manifest")
@@ -4541,7 +6127,18 @@ class IntegrationSession:
         self.release()
         return dict(manifest)
 
+    def finalize_technical_failure(self, reason: str) -> Mapping[str, Any]:
+        """Settle accepted integration only after retry exhaustion.
+
+        The default ``mark_technical_failure`` call remains recoverable and
+        reoffers the same session.  Coordinator recovery invokes this explicit
+        terminal path; accepted business bytes are never rewritten.
+        """
+
+        return self.mark_technical_failure(reason, recovery_exhausted=True)
+
     technical_failure = mark_technical_failure
+    record_failure = mark_technical_failure
 
 
 __all__ = ["AcceptedAnalysisBundle", "IntegrationRecord", "IntegrationSession", "IntegrationValidation"]

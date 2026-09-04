@@ -1,0 +1,194 @@
+{
+  "catalog": {
+    "catalog_key": "6170bb45a6f9253f8593746e97a44d779d867f29e10da83775aaf74fff2781b4",
+    "catalog_schema_version": "2",
+    "content_hash": "6370477c7bc17bffd37a287a3c4078aa5ed0b8e3083fa2c87da10be76c6c0c2a",
+    "core_version": "0.8.0",
+    "counts": {
+      "archive_members": 15,
+      "catalog_entries": 18,
+      "sheet_entries": 0,
+      "table_members": 7
+    },
+    "path": "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/data_room/revisions/D-0001/catalog.json",
+    "source_hash": "86e1f0e5c443ac4fa9049f538aa671d9fbca183368bfa355be80a17fe880c3d4"
+  },
+  "context_payload": null,
+  "core_version": "0.8.0",
+  "implementation_sha": "f03a495f95b575f283e172bd56d41d15edfbc242",
+  "implementation_tree": "fa5c40f5623770c5ca56d53099ab9b79e304bec8",
+  "input_roots": [],
+  "item_id": "REQ-001",
+  "item_mode": "requirement",
+  "kind": "bound_analysis_context",
+  "manifest_hash": "4710e8f7b623f2121ae92cb453dcf331dbd8331db104fda00b817dc9c283f849",
+  "manifest_path": "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-001/work/analysis_context.json",
+  "physical_inventory": {
+    "central_directory_fingerprint": {
+      "entry_count": 15,
+      "offset": 71850067,
+      "sha256": "bbf78f297e1f07b7fb6d76e9f012bbc623cbffeab41b2c8908a2800f18180256",
+      "size_bytes": 998
+    },
+    "inventory_hash": "d1a0092c44795fee0cc7325ce7fb900e92123b7d2f2ec9172052afc7efc17e3f",
+    "members": [
+      {
+        "compressed_size_bytes": 684,
+        "content_hash": "ef00ad22529cacb88c9eb7fc3bf8506052b2baa1eab4cbcea484dc3a114251e4",
+        "format": "binary",
+        "kind": "opaque",
+        "path": "LICENSE",
+        "size_bytes": 1166
+      },
+      {
+        "compressed_size_bytes": 2785,
+        "content_hash": "e6b78b8cd744425c1ead15e6fde2c9d47ac7079d198310ac6165c593b1052e20",
+        "format": "md",
+        "kind": "document",
+        "path": "README.md",
+        "size_bytes": 6856
+      },
+      {
+        "compressed_size_bytes": 5632095,
+        "content_hash": "61a6e518985262a05b4d2e06dd1ca3f0fd5e708475d021a57a64385c35a240e1",
+        "format": "parquet",
+        "kind": "table",
+        "path": "all_communications.parquet",
+        "size_bytes": 7267329
+      },
+      {
+        "compressed_size_bytes": 3520,
+        "content_hash": "a40ec895dc1c135cd52c0b9f5cc5d71b181ce39a0f2cf589937e0ef46a151ae0",
+        "format": "md",
+        "kind": "document",
+        "path": "business_docs.md",
+        "size_bytes": 10273
+      },
+      {
+        "compressed_size_bytes": 11713,
+        "content_hash": "f8171d62b57d050ad025f18a3c201b932564abf391515c089fb6abfa06871a35",
+        "format": "parquet",
+        "kind": "table",
+        "path": "business_documents.parquet",
+        "size_bytes": 22760
+      },
+      {
+        "compressed_size_bytes": 1033,
+        "content_hash": "11882a3b2978f10803d4a679ba07aff8be1ba4df7f2450be2f5621c7426874d2",
+        "format": "md",
+        "kind": "document",
+        "path": "columns.md",
+        "size_bytes": 2444
+      },
+      {
+        "compressed_size_bytes": 28971705,
+        "content_hash": "fef9791965f886793754b7ce21d6538566623b2d2d7bb24ee1ea40feb7e9032c",
+        "format": "parquet",
+        "kind": "table",
+        "path": "erp_transactions.parquet",
+        "size_bytes": 42805059
+      },
+      {
+        "compressed_size_bytes": 3845,
+        "content_hash": "12a75d094271bd96c86f959bf0cf31c40d183f470ec3aaccab631ad8c5c19920",
+        "format": "md",
+        "kind": "document",
+        "path": "provenance.md",
+        "size_bytes": 8509
+      },
+      {
+        "compressed_size_bytes": 1108,
+        "content_hash": "04f828a1c04ecbd0c88aa54db54a3a43e95a142f6aeb0ee765a4ae4347cf5eb9",
+        "format": "md",
+        "kind": "document",
+        "path": "quickstart.md",
+        "size_bytes": 2797
+      },
+      {
+        "compressed_size_bytes": 3967075,
+        "content_hash": "4ad070b586db6d7acd611f9dca1b6d9126f1f1664a383768e5629cc96d0eaa6b",
+        "format": "parquet",
+        "kind": "table",
+        "path": "sales_documents.parquet",
+        "size_bytes": 7477675
+      },
+      {
+        "compressed_size_bytes": 17706438,
+        "content_hash": "123b6c00bcd9f012b569e4676ba0fab146272c63fb4bf67303df729a604fdbb5",
+        "format": "parquet",
+        "kind": "table",
+        "path": "sales_items.parquet",
+        "size_bytes": 29792520
+      },
+      {
+        "compressed_size_bytes": 2977,
+        "content_hash": "eccbfd1e9dbaf6399cd13c8ab20a098167757a4c306bc141acb274eee11f793e",
+        "format": "md",
+        "kind": "document",
+        "path": "sample_communications.md",
+        "size_bytes": 5863
+      },
+      {
+        "compressed_size_bytes": 106354,
+        "content_hash": "fffbd339a30f417fd5ffb1b815e37d4f01132df6d1b4b588b202be8fe52eeb0e",
+        "format": "parquet",
+        "kind": "table",
+        "path": "supporting_documents.parquet",
+        "size_bytes": 148370
+      },
+      {
+        "compressed_size_bytes": 779220,
+        "content_hash": "4d83f33931c4dabac52dfb2328ba132d715005d725eb624282e7a3ed8968a594",
+        "format": "ipynb",
+        "kind": "opaque",
+        "path": "uberjugaad-gmbh-notebook-for-data-exploration.ipynb",
+        "size_bytes": 1066861
+      },
+      {
+        "compressed_size_bytes": 14658757,
+        "content_hash": "ded6dee654a1326b27e427317af06193f5e9b8ee69809d760c8013865327f5b4",
+        "format": "sqlite",
+        "kind": "table",
+        "path": "uberjugaad_email.db",
+        "size_bytes": 78741504
+      }
+    ],
+    "source_stat": {
+      "device": 16777233,
+      "inode": 136334814,
+      "mtime_ns": 1788187476282331269,
+      "size_bytes": 71851087
+    }
+  },
+  "run_id": "RUN-2192ca59eb4a4718",
+  "run_root": "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718",
+  "runner_config": {
+    "default_output_bytes": 262144,
+    "default_timeout_seconds": 3600.0
+  },
+  "schema_version": "3",
+  "semantic_snapshot": null,
+  "skill_version": "0.7.2",
+  "source_identity": {
+    "__auto_foundry_ref__": "data_asset",
+    "content_hash": "86e1f0e5c443ac4fa9049f538aa671d9fbca183368bfa355be80a17fe880c3d4",
+    "format": "zip",
+    "metadata": {
+      "central_directory_fingerprint": {
+        "entry_count": 15,
+        "offset": 71850067,
+        "sha256": "bbf78f297e1f07b7fb6d76e9f012bbc623cbffeab41b2c8908a2800f18180256",
+        "size_bytes": 998
+      },
+      "read_only": true,
+      "source_stat": {
+        "device": 16777233,
+        "inode": 136334814,
+        "mtime_ns": 1788187476282331269,
+        "size_bytes": 71851087
+      }
+    },
+    "size_bytes": 71851087,
+    "uri": "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/inputs/data_room.zip"
+  }
+}

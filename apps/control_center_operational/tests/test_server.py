@@ -1,21 +1,34 @@
 from __future__ import annotations
 
 import http.client
+import hashlib
 import io
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
-from apps.control_center_operational.launch import LaunchManager, LaunchSettings
+import auto_foundry_core.coordinator as coordinator_module
+from auto_foundry_core.coordinator import CoordinatorIntegrityError
+from auto_foundry_core.coordinator import RoleSessionRegistry
+from auto_foundry_core import PlannerAction, RunCoordinator
+from auto_foundry_core.lifecycle import RunLifecycle, _manifest_hash
+from auto_foundry_core.workspace import RunContext
+from apps.control_center_operational.launch import LaunchConflictError, LaunchManager, LaunchSettings
+from apps.control_center_operational.tests.test_run_control import _public_preview_fixture
 from apps.control_center_operational.server import OperationalRepository, OperationalServer, render_index
 
 
 class FakeRunControl:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, bool]] = []
+        self.regeneration_calls: list[tuple[str, str, bool, str | None]] = []
 
     def status(self, run_id: str):
         return {"runId": run_id, "lifecycleStatus": "running", "action": "pause", "canPause": True}
@@ -27,6 +40,16 @@ class FakeRunControl:
     def resume(self, run_id: str, *, confirmed: bool):
         self.calls.append(("resume", run_id, confirmed))
         return {"runId": run_id, "lifecycleStatus": "running", "action": "pause", "canPause": True}
+
+    def regenerate_product(self, run_id: str, *, confirmed: bool, reason: str, idempotency_key: str | None = None):
+        self.regeneration_calls.append((run_id, reason, confirmed, idempotency_key))
+        return {
+            "runId": run_id,
+            "operation": "regenerate_product",
+            "requested": True,
+            "coordinatorStatus": "ready",
+            "coordinatorPhase": "product_regeneration_requested",
+        }
 
 
 class ServerTests(unittest.TestCase):
@@ -57,13 +80,14 @@ class ServerTests(unittest.TestCase):
 
     def test_render_layers_operational_assets_and_copy(self) -> None:
         html = render_index().decode()
-        self.assertIn('/base.css', html)
+        self.assertIn('/styles.css', html)
         self.assertIn('/theme.css', html)
         self.assertIn('/operational.css', html)
         self.assertIn('/operational.js', html)
         self.assertIn('max="64"', html)
         self.assertIn("Prepare launch", html)
         self.assertIn('id="runControlButton"', html)
+        self.assertIn('id="regenerateProductButton"', html)
         self.assertNotIn('<em>deferred</em>', html)
 
     def test_run_pause_resume_endpoints_use_same_token_and_confirmation_boundary(self) -> None:
@@ -92,12 +116,171 @@ class ServerTests(unittest.TestCase):
         status, _ = self.request("POST", "/api/run/pause", body=payload, headers=bad_headers)
         self.assertEqual(status, 403)
 
+    def test_product_regeneration_endpoint_is_allowlisted_and_idempotency_bound(self) -> None:
+        fake = FakeRunControl()
+        self.server.run_control = fake
+        payload = json.dumps(
+            {
+                "runId": "run-test",
+                "confirmed": True,
+                "reason": "operator requested a fresh dashboard",
+                "idempotencyKey": "regen-request-1",
+            }
+        ).encode()
+        headers = {
+            "Content-Length": str(len(payload)),
+            "Content-Type": "application/json",
+            "X-Control-Center-Token": "server-token",
+            "Origin": f"http://127.0.0.1:{self.port}",
+        }
+        status, body = self.request("POST", "/api/run/regenerate-product", body=payload, headers=headers)
+        self.assertEqual(status, 202)
+        response = json.loads(body)
+        self.assertEqual(response["operation"], "regenerate_product")
+        self.assertTrue(response["requested"])
+        self.assertEqual(
+            fake.regeneration_calls,
+            [("run-test", "operator requested a fresh dashboard", True, "regen-request-1")],
+        )
+        status, _ = self.request("POST", "/api/run/regenerate-product", body=payload, headers={**headers, "X-Control-Center-Token": "wrong"})
+        self.assertEqual(status, 403)
+
+    def test_product_regeneration_conflict_is_http_409(self) -> None:
+        fake = FakeRunControl()
+        self.server.run_control = fake
+        payload = json.dumps(
+            {
+                "runId": "run-test",
+                "confirmed": True,
+                "reason": "duplicate request",
+                "idempotencyKey": "regen-request-1",
+            }
+        ).encode()
+        headers = {
+            "Content-Length": str(len(payload)),
+            "Content-Type": "application/json",
+            "X-Control-Center-Token": "server-token",
+            "Origin": f"http://127.0.0.1:{self.port}",
+        }
+        with patch.object(fake, "regenerate_product", side_effect=LaunchConflictError("a different Product regeneration request is already recorded")):
+            status, body = self.request("POST", "/api/run/regenerate-product", body=payload, headers=headers)
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(body)["error"], "a different Product regeneration request is already recorded")
+
+    def test_product_regeneration_http_409_preflight_leaves_real_product_tree_unchanged(self) -> None:
+        """The HTTP boundary surfaces a real admission conflict before Product writes."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = _public_preview_fixture(Path(directory))
+            context = fixture["context"]
+            persisted = fixture["persisted"]
+            manager = fixture["manager"]
+            launch_manager = fixture["launch_manager"]
+            controller = fixture["controller"]
+            runner = fixture["runner"]
+            phase = fixture["phase"]
+            code_home = fixture["code_home"]
+            skill_hash = fixture["skill_hash"]
+            registry = RoleSessionRegistry(context)
+            seed = PlannerAction(
+                "build_product_candidate",
+                "product_agent",
+                context.run_id,
+                "active Product owner blocks regeneration",
+            )
+            reservation = registry.prepare(
+                seed,
+                generation_id="G-0001",
+                idempotency_key="active-http-product-owner",
+            )
+            self.assertEqual(reservation["mode"], "new")
+
+            # The fixture starts with a prior binding.  Rebind once before the
+            # snapshot so the 409 under test is solely Product owner
+            # admission, not a transport-rebind side effect.
+            with (
+                patch.object(coordinator_module, "PRODUCTION_SKILL_SHA256", skill_hash),
+                patch.dict(os.environ, {"CODEX_HOME": str(code_home)}, clear=False),
+            ):
+                desired = launch_manager.preview_resume_coordinator(fixture["run_id"], context.run_root)["spec"]
+                persisted.rebind_transport(desired)
+
+            real_server = OperationalServer(
+                ("127.0.0.1", 0),
+                fixture["repository"],
+                launch_manager,
+                run_control=manager,
+            )
+            thread = threading.Thread(target=real_server.serve_forever, daemon=True)
+            thread.start()
+            host, port = real_server.server_address
+            connection = http.client.HTTPConnection(host, port, timeout=4)
+            try:
+                with (
+                    patch.object(RunCoordinator, "_phase_snapshot", return_value=phase),
+                    patch.object(coordinator_module, "PRODUCTION_SKILL_SHA256", skill_hash),
+                    patch.dict(os.environ, {"CODEX_HOME": str(code_home)}, clear=False),
+                ):
+                    connection.request("GET", f"/api/run/status?run_id={fixture['browser_run_id']}")
+                    status_response = connection.getresponse()
+                    status_body = json.loads(status_response.read())
+                    self.assertEqual(status_response.status, 200)
+                    intent = status_body["productRegenerationIdempotencyKey"]
+                    self.assertIsInstance(intent, str)
+
+                    before = {
+                        str(path.relative_to(context.run_root)): hashlib.sha256(path.read_bytes()).hexdigest()
+                        for path in context.run_root.rglob("*")
+                        if path.is_file() and not path.is_symlink()
+                    }
+                    payload = json.dumps(
+                        {
+                            "runId": fixture["browser_run_id"],
+                            "confirmed": True,
+                            "reason": "active owner must reject before revision creation",
+                            "idempotencyKey": intent,
+                        }
+                    ).encode()
+                    headers = {
+                        "Content-Length": str(len(payload)),
+                        "Content-Type": "application/json",
+                        "X-Control-Center-Token": fixture["settings"].launch_token,
+                        "Origin": f"http://127.0.0.1:{port}",
+                    }
+                    connection.request("POST", "/api/run/regenerate-product", body=payload, headers=headers)
+                    response = connection.getresponse()
+                    body = json.loads(response.read())
+                self.assertEqual(response.status, 409)
+                self.assertIn("reservation is active", body["error"])
+                after = {
+                    str(path.relative_to(context.run_root)): hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in context.run_root.rglob("*")
+                    if path.is_file() and not path.is_symlink()
+                }
+                self.assertEqual(after, before)
+                self.assertEqual(runner.calls, [])
+                self.assertEqual(registry.read()["sessions"][f"product_agent:{context.run_id}:G-0001"]["status"], "reserved")
+            finally:
+                connection.close()
+                real_server.shutdown()
+                real_server.server_close()
+                thread.join(timeout=2)
+                registry.release_reservation(
+                    f"product_agent:{context.run_id}:G-0001",
+                    "active-http-product-owner",
+                )
+                persisted.close(wait_for_roles=True)
+
     def test_config_and_token_origin_guards(self) -> None:
         status, body = self.request("GET", "/api/config")
         self.assertEqual(status, 200)
         config = json.loads(body)
         self.assertEqual(config["maxAgents"], 64)
         self.assertFalse(config["commandsEnabled"])
+        self.assertEqual(config["sourcePolicy"]["admission"], "any_safe_regular_file")
+        self.assertEqual(config["sourcePolicy"]["resourceChecks"], "streamed_with_available_disk_space")
+        self.assertIsNone(config["sourcePolicy"]["maxUploadBytes"])
+        self.assertIsNone(config["sourcePolicy"]["maxZipMemberBytes"])
         payload = json.dumps({"mode": "new", "projectName": "X", "intakeBlocks": ["r"], "sources": [], "maxAgents": 1, "capacity": {"total": 1, "entityResolution": 0, "analyticalOwner": 1, "specialist": 0}}).encode()
         status, _ = self.request("POST", "/api/launch/prepare", body=payload, headers={"Content-Length": str(len(payload)), "X-Control-Center-Token": "wrong"})
         self.assertEqual(status, 403)
@@ -106,6 +289,35 @@ class ServerTests(unittest.TestCase):
         status, body = self.request("POST", "/api/launch/prepare", body=payload, headers={"Content-Length": str(len(payload)), "X-Control-Center-Token": "server-token", "Origin": f"http://127.0.0.1:{self.port}"})
         self.assertEqual(status, 200)
         self.assertTrue(json.loads(body)["prepared"])
+
+    def test_launch_execute_integrity_failure_returns_json_instead_of_aborting_connection(self) -> None:
+        """Program-owned integrity failures remain visible at the HTTP boundary."""
+
+        payload = json.dumps(
+            {"draftId": "D-integrity", "fingerprint": "f" * 64, "confirmed": True}
+        ).encode()
+        headers = {
+            "Content-Length": str(len(payload)),
+            "Content-Type": "application/json",
+            "X-Control-Center-Token": "server-token",
+            "Origin": f"http://127.0.0.1:{self.port}",
+        }
+        failures = (
+            CoordinatorIntegrityError("bound skill bytes do not match the active release"),
+            RuntimeError("program-owned launch admission failed"),
+        )
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__), patch.object(
+                self.server.manager,
+                "execute",
+                side_effect=failure,
+            ):
+                status, body = self.request("POST", "/api/launch/execute", body=payload, headers=headers)
+
+            self.assertEqual(status, 422)
+            response = json.loads(body)
+            self.assertEqual(response["error"], str(failure))
+            self.assertEqual(response["message"], "Operational request failed.")
 
     def test_zip_policy_upload_and_ui_contract(self) -> None:
         status, body = self.request("GET", "/api/config")
@@ -130,18 +342,24 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(uploaded["relativePath"], "folder/dataset.zip")
 
         repository_root = Path(__file__).resolve().parents[2]
-        index = (repository_root / "control_center" / "static" / "index.html").read_text()
-        base_script = (repository_root / "control_center" / "static" / "app.js").read_text()
+        index = (repository_root / "control_center_operational" / "static" / "index.html").read_text()
+        base_script = (repository_root / "control_center_operational" / "static" / "app.js").read_text()
         operational_script = (repository_root / "control_center_operational" / "static" / "operational.js").read_text()
-        self.assertIn(".zip", index)
-        self.assertIn("ZIP", index)
+        self.assertIn('accept="*/*"', index)
+        self.assertNotIn('accept=".csv', index)
         self.assertIn('"zip"', base_script)
-        self.assertIn('"zip"', operational_script)
+        self.assertIn("valid: true", operational_script)
+        self.assertNotIn("const allowed = new Set", operational_script)
         self.assertIn("validationError", operational_script)
         self.assertIn("operationalValidationDetails", operational_script)
         self.assertIn("const remoteUrlIndex = localPathIndex + (sourcePath ? 1 : 0);", operational_script)
         self.assertIn("index === remoteUrlIndex", operational_script)
         self.assertIn("error.errors", base_script)
+        self.assertIn("value.productRegenerationIdempotencyKey", operational_script)
+        self.assertIn("value?.productRegenerationPending", operational_script)
+        self.assertIn("regenerationButton.disabled = regenerationPending", operational_script)
+        self.assertNotIn("Date.now()", operational_script[operational_script.index("async function operationalApplyProductRegeneration"):operational_script.index("function operationalFileKey")])
+        self.assertNotIn("Math.random()", operational_script[operational_script.index("async function operationalApplyProductRegeneration"):operational_script.index("function operationalFileKey")])
 
     def test_host_header_must_be_explicit_loopback_endpoint(self) -> None:
         hostile = {"Host": f"evil.example:{self.port}", "Origin": f"http://evil.example:{self.port}"}
@@ -165,6 +383,19 @@ class ServerTests(unittest.TestCase):
         result = json.loads(response)
         self.assertEqual(result["relativePath"], "folder/x.csv")
         self.assertEqual(len(result["sha256"]), 64)
+
+    def test_upload_stream_endpoint_accepts_sqlite_unknown_and_extensionless_names(self) -> None:
+        headers = {"X-Control-Center-Token": "server-token"}
+        for filename in ("dataset.sqlite3", "payload.bin", "README"):
+            body = f"payload for {filename}\n".encode()
+            status, response = self.request(
+                "POST",
+                f"/api/launch/upload?filename={filename}&relative_path={filename}",
+                body=body,
+                headers={**headers, "Content-Length": str(len(body))},
+            )
+            self.assertEqual(status, 201, filename)
+            self.assertEqual(json.loads(response)["relativePath"], filename)
 
     def test_runs_api_exposes_persisted_launch_placeholder_and_snapshot(self) -> None:
         settings = self.server.manager.settings
@@ -202,6 +433,118 @@ class ServerTests(unittest.TestCase):
         snapshot = json.loads(body)
         self.assertEqual(snapshot["run"]["id"], placeholder["id"])
         self.assertEqual(snapshot["projection"]["source"], "launch_placeholder")
+
+    def test_cold_server_bootstraps_checkout_core_before_run_discovery(self) -> None:
+        """A documented launch without PYTHONPATH still validates durable state."""
+
+        repository_root = Path(__file__).resolve().parents[3]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs_root = root / "runs"
+            state_root = root / "state"
+            drafts_root = state_root / "drafts"
+            statuses_root = state_root / "statuses"
+            drafts_root.mkdir(parents=True)
+            statuses_root.mkdir(parents=True)
+
+            run_root = runs_root / "RUN-COLD-START"
+            lifecycle = RunLifecycle.create(
+                RunContext("RUN-COLD-START", run_root),
+                ["REQ-COLD-001"],
+                mode="requirement",
+            )
+            lifecycle.pause("paused for cold-start projection")
+            state_path = run_root / "run_state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["updated_at"] = "2026-01-01T00:00:00Z"
+            state["manifest_hash"] = _manifest_hash(state)
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            draft = {
+                "draftId": "D-cold-start",
+                "runId": "RUN-COLD-START",
+                "runRoot": str(run_root),
+                "projectName": "Cold-start target",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "status": "failed",
+            }
+            draft["fingerprint"] = LaunchManager._fingerprint(
+                {key: value for key, value in draft.items() if key not in {"fingerprint", "status"}}
+            )
+            (drafts_root / "D-cold-start.json").write_text(json.dumps(draft), encoding="utf-8")
+            (statuses_root / "D-cold-start.json").write_text(
+                json.dumps(
+                    {
+                        "draftId": draft["draftId"],
+                        "fingerprint": draft["fingerprint"],
+                        "runId": draft["runId"],
+                        "runRoot": draft["runRoot"],
+                        "status": "failed",
+                        "updatedAt": "2026-01-01T00:00:01Z",
+                        "message": "Launch failed before durable state was observed.",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            # Run a fresh interpreter from the checkout root with PYTHONPATH
+            # removed.  The patched serve loop performs the first projection
+            # request after server.main's startup bootstrap, without opening a
+            # listener or starting a run process.
+            script = """
+import json
+import sys
+from pathlib import Path
+
+from apps.control_center_operational import server
+
+runs_root, state_root, fixture = sys.argv[1:]
+
+def inspect_once(instance):
+    rows = [
+        row
+        for row in instance.repository.list_runs()
+        if row.get("authoritativeRunId") == "RUN-COLD-START"
+    ]
+    print("COLD_CORE=" + str(sys.modules["auto_foundry_core"].__file__), flush=True)
+    print("COLD_RESULT=" + json.dumps(rows), flush=True)
+
+server.OperationalServer.serve_forever = inspect_once
+raise SystemExit(
+    server.main(
+        [
+            "--host", "127.0.0.1",
+            "--port", "0",
+            "--runtime-root", str(Path(runs_root).parent),
+            "--runs-root", runs_root,
+            "--state-root", state_root,
+            "--fixture", fixture,
+        ]
+    )
+)
+"""
+            environment = os.environ.copy()
+            environment.pop("PYTHONPATH", None)
+            completed = subprocess.run(
+                [sys.executable, "-c", script, str(runs_root), str(state_root), str(root / "missing-fixture.json")],
+                cwd=repository_root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+            core_line = next(line for line in completed.stdout.splitlines() if line.startswith("COLD_CORE="))
+            core_path = Path(core_line.removeprefix("COLD_CORE=")).resolve()
+            self.assertTrue(core_path.is_relative_to(repository_root / "src"), core_path)
+            result_line = next(line for line in completed.stdout.splitlines() if line.startswith("COLD_RESULT="))
+            rows = json.loads(result_line.removeprefix("COLD_RESULT="))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["authoritativeRunId"], "RUN-COLD-START")
+            self.assertEqual(rows[0]["source"], "filesystem")
+            self.assertFalse(rows[0].get("placeholder", False))
+            self.assertEqual(rows[0]["status"], "paused")
 
 
 if __name__ == "__main__":

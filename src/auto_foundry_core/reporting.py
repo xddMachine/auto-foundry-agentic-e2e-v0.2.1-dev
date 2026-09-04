@@ -873,15 +873,27 @@ class RunReportProjector:
                     raise ValueError(f"item {item_id} record-kind count is invalid")
                 record_kind_totals[str(kind)] += count
             implementation = _implementation({**(implementation_map.get(item_id, {}) if isinstance(implementation_map.get(item_id), Mapping) else {}), **dict(report)})
-            normalized_items.append(
-                {
-                    "item_id": item_id,
-                    "outcome": outcome,
-                    "lifecycle_state": lifecycle,
-                    "record_kind_totals": dict(sorted((str(k), int(v)) for k, v in report_kinds.items())),
-                    "implementation": implementation,
-                }
-            )
+            normalized_item = {
+                "item_id": item_id,
+                "outcome": outcome,
+                "lifecycle_state": lifecycle,
+                "record_kind_totals": dict(sorted((str(k), int(v)) for k, v in report_kinds.items())),
+                "implementation": implementation,
+            }
+            # Preserve item-local failure boundaries in the cumulative report
+            # without changing the accepted business outcome.  These fields
+            # are deliberately copied only from the authoritative item report
+            # supplied by ``gather_from_run``.
+            integration_state = report.get("integration_state")
+            if integration_state is not None:
+                normalized_item["integration_state"] = str(integration_state)
+            for failure_key in ("integration_failure", "failure"):
+                failure = report.get(failure_key)
+                if failure is not None:
+                    if not isinstance(failure, Mapping):
+                        raise TypeError(f"item {item_id} {failure_key} must be a mapping")
+                    normalized_item[failure_key] = _jsonable(failure)
+            normalized_items.append(normalized_item)
         if by_manifest and set(by_manifest) != seen_items:
             raise ValueError("item manifests and reports are stale or incomplete")
 
@@ -1152,15 +1164,31 @@ class RunReportInputGatherer:
             raise ReportPreflightError("report preflight item_manifests are explicitly empty for terminal items")
         item_ids = set(str(item.get("item_id", "")).strip() for item in reports)
         item_ids.discard("")
+        # Requirement-scoped technical failures are terminal even when they
+        # never produced a script receipt or independent review artifact.
+        # Accepted integration failures retain their business review but do
+        # not require a committed/integration receipt.  Fully successful
+        # items keep the strict authoritative-input requirement.
+        receipt_item_ids = {
+            str(item.get("item_id"))
+            for item in reports
+            if item.get("integration_state") != "technical_failure"
+            and item.get("lifecycle_state") != "technical_failure"
+        }
+        review_item_ids = {
+            str(item.get("item_id"))
+            for item in reports
+            if item.get("lifecycle_state") != "technical_failure"
+        }
         receipts = projected.get("receipts", ())
         receipt_items = {str(item.get("item_id", "")) for item in receipts if isinstance(item, Mapping)}
-        if not receipt_items.issuperset(item_ids):
+        if not receipt_items.issuperset(receipt_item_ids):
             raise ReportPreflightError("report preflight is missing invocation receipts for terminal items")
-        if not projected.get("timings"):
+        if receipt_item_ids and not projected.get("timings"):
             raise ReportPreflightError("report preflight has no authoritative phase timings")
         reviews = [*projected.get("business_reviews", ()), *projected.get("fidelity_reviews", ())]
         review_items = {str(item.get("item_id", "")) for item in reviews if isinstance(item, Mapping)}
-        if not review_items.issuperset(item_ids):
+        if not review_items.issuperset(review_item_ids):
             raise ReportPreflightError("report preflight is missing independent review records")
         metadata = projected.get("implementation_metadata")
         if not isinstance(metadata, Mapping) or not metadata:
@@ -1453,6 +1481,7 @@ class RunReportInputGatherer:
         from .lifecycle import RunLifecycle, current_implementation_identity
         from .prepared import PreparedAssetRegistry
         from .durable import ItemWorkspace
+        from .requirement_planning import inspect_committed_integration
         from .workspace import RunContext
 
         if not isinstance(context, RunContext):
@@ -1531,6 +1560,264 @@ class RunReportInputGatherer:
         for item_id in sorted(lifecycle.item_ids):
             item_prefix = f"requirements/{item_id}"
             _state_path, state = cls._collector_json(context, f"{item_prefix}/item_state.json", label=f"{item_id} item state")
+
+            # A requirement may be terminally failed before analytical
+            # acceptance.  Its durable technical-failure snapshot is the
+            # complete item boundary; there is intentionally no acceptance
+            # envelope, business review, script receipt, or integration
+            # session to fabricate for the report.
+            if state.get("lifecycle_state") == "technical_failure":
+                try:
+                    integration_validation = inspect_committed_integration(
+                        context,
+                        item_id,
+                        raise_on_error=True,
+                    )
+                except Exception as exc:
+                    raise ReportPreflightError(
+                        f"{item_id} terminal failure integration boundary is invalid"
+                    ) from exc
+                if (
+                    not isinstance(integration_validation, Mapping)
+                    or integration_validation.get("valid") is not True
+                    or integration_validation.get("stage") != "technical_failure"
+                    or integration_validation.get("pre_acceptance") is not True
+                    or integration_validation.get("recovery_exhausted") is not True
+                ):
+                    raise ReportPreflightError(
+                        f"{item_id} terminal failure integration boundary is not a validated pre-acceptance boundary"
+                    )
+                accepted_path, accepted_manifest = cls._collector_json(
+                    context,
+                    f"{item_prefix}/accepted/manifest.json",
+                    label=f"{item_id} terminal failure manifest",
+                )
+                if (
+                    state.get("integration_state") != "pending"
+                    or state.get("integration_manifest_hash") is not None
+                    or state.get("integration_manifest_ref") is not None
+                    or accepted_manifest.get("item_id") != item_id
+                    or accepted_manifest.get("manifest_hash") != integration_validation.get("manifest_hash")
+                    or accepted_manifest.get("content_hash") != integration_validation.get("accepted_content_hash")
+                ):
+                    raise ReportPreflightError(f"{item_id} terminal failure state/manifest binding is stale")
+                terminal_intent = state.get("terminal_intent")
+                terminal_outcome = state.get("terminal_outcome")
+                if (
+                    not isinstance(terminal_intent, Mapping)
+                    or terminal_intent.get("outcome") != "technical_failure"
+                    or terminal_intent.get("manifest_hash") != accepted_manifest.get("manifest_hash")
+                    or not isinstance(terminal_outcome, Mapping)
+                    or terminal_outcome.get("status") != "technical_failure"
+                    or terminal_outcome.get("item_id") != item_id
+                    or terminal_outcome.get("outcome") != "technical_failure"
+                    or terminal_outcome.get("content_hash") != accepted_manifest.get("content_hash")
+                ):
+                    raise ReportPreflightError(f"{item_id} terminal failure state binding is stale")
+                terminal_manifest_path = cls._collector_path(
+                    context,
+                    terminal_outcome.get("manifest_path"),
+                    label=f"{item_id} terminal failure manifest",
+                )
+                if terminal_manifest_path != accepted_path:
+                    raise ReportPreflightError(f"{item_id} terminal failure manifest reference is stale")
+                failure = {
+                    "status": "technical_failure",
+                    "recovery_exhausted": True,
+                    "manifest_hash": integration_validation["manifest_hash"],
+                    "manifest_ref": f"{item_prefix}/accepted/manifest.json",
+                    # Avoid copying role/provider exception text into the
+                    # report while retaining a stable incident correlation.
+                    "reason_hash": hashlib.sha256(str(accepted_manifest.get("reason")).encode("utf-8")).hexdigest(),
+                }
+                item_reports.append(
+                    {
+                        "item_id": item_id,
+                        "outcome": "technical_failure",
+                        "lifecycle_state": "technical_failure",
+                        "integration_state": "pending",
+                        "record_kind_totals": {},
+                        "failure": failure,
+                    }
+                )
+                item_manifest = dict(accepted_manifest)
+                item_manifest["record_kind_totals"] = {}
+                item_manifests.append(item_manifest)
+                # No accepted bundle exists, so no script receipt hashes can
+                # be used for this failed item.
+                accepted_hashes[item_id] = {}
+                continue
+
+            # Accepted business output remains immutable when integration or
+            # fidelity recovery is exhausted.  Validate the accepted bundle
+            # and business review, then settle only the integration boundary;
+            # committed records/fidelity/session artifacts are deliberately
+            # absent and contribute no analytics.
+            if state.get("integration_state") == "technical_failure":
+                accepted_path, accepted_manifest = cls._collector_json(
+                    context,
+                    f"{item_prefix}/accepted/manifest.json",
+                    label=f"{item_id} accepted manifest",
+                )
+                envelope_path, envelope = cls._collector_json(
+                    context,
+                    f"{item_prefix}/accepted/acceptance_envelope.json",
+                    label=f"{item_id} acceptance envelope",
+                )
+                business_path, _business_raw = cls._collector_json(
+                    context,
+                    f"{item_prefix}/work/business_review.json",
+                    label=f"{item_id} business review",
+                )
+                try:
+                    business_workspace = ItemWorkspace(
+                        context,
+                        item_id,
+                        mode="requirement",
+                        original_text=str(state.get("original_text", "")),
+                        state=state,
+                    )
+                    business = business_workspace._read_business_review()
+                except Exception as exc:
+                    raise ReportPreflightError(f"{item_id} business review is invalid: {exc}") from exc
+                if not isinstance(business, Mapping):
+                    raise ReportPreflightError(f"{item_id} business review is missing")
+                if (
+                    state.get("item_id") != item_id
+                    or accepted_manifest.get("item_id") != item_id
+                    or envelope.get("item_id") != item_id
+                    or business.get("item_id") != item_id
+                ):
+                    raise ReportPreflightError(f"{item_id} artifact identity is stale")
+                if accepted_manifest.get("manifest_hash") != _hash_mapping(accepted_manifest, "manifest_hash"):
+                    raise ReportPreflightError(f"{item_id} accepted manifest is tampered")
+                content_path = cls._collector_path(
+                    context,
+                    f"{item_prefix}/accepted/{accepted_manifest.get('content_path', 'answer_content.json')}",
+                    label=f"{item_id} accepted content",
+                )
+                if accepted_manifest.get("content_hash") != cls._collector_digest(content_path):
+                    raise ReportPreflightError(f"{item_id} accepted content is tampered")
+                if accepted_manifest.get("envelope_hash") != cls._collector_digest(envelope_path):
+                    raise ReportPreflightError(f"{item_id} acceptance envelope is tampered")
+                terminal_intent = state.get("terminal_intent")
+                terminal_outcome = state.get("terminal_outcome")
+                if (
+                    not isinstance(terminal_intent, Mapping)
+                    or terminal_intent.get("outcome") != accepted_manifest.get("outcome")
+                    or terminal_intent.get("manifest_hash") != accepted_manifest.get("manifest_hash")
+                    or not isinstance(terminal_outcome, Mapping)
+                    or terminal_outcome.get("status") != accepted_manifest.get("outcome")
+                    or terminal_outcome.get("item_id") != item_id
+                    or terminal_outcome.get("outcome") != accepted_manifest.get("outcome")
+                    or terminal_outcome.get("content_hash") != accepted_manifest.get("content_hash")
+                ):
+                    raise ReportPreflightError(f"{item_id} terminal acceptance binding is stale")
+                terminal_manifest_path = cls._collector_path(
+                    context,
+                    terminal_outcome.get("manifest_path"),
+                    label=f"{item_id} terminal manifest",
+                )
+                if terminal_manifest_path != accepted_path:
+                    raise ReportPreflightError(f"{item_id} terminal manifest reference is stale")
+                review = state.get("review")
+                if not isinstance(review, Mapping):
+                    raise ReportPreflightError(f"{item_id} item review is missing")
+                if (
+                    any(field not in envelope for field in ("outcome", "reviewer_ref", "draft_hash", "content_hash"))
+                    or any(field not in review for field in ("reviewer_ref", "draft_hash"))
+                    or envelope.get("outcome") != accepted_manifest.get("outcome")
+                    or envelope.get("content_hash") != accepted_manifest.get("content_hash")
+                    or envelope.get("draft_hash") != accepted_manifest.get("content_hash")
+                    or envelope.get("reviewer_ref") != review.get("reviewer_ref")
+                    or envelope.get("draft_hash") != review.get("draft_hash")
+                ):
+                    raise ReportPreflightError(f"{item_id} acceptance envelope binding is stale")
+                failure_path, failure_manifest = cls._collector_json(
+                    context,
+                    f"{item_prefix}/integration/technical_failure/manifest.json",
+                    label=f"{item_id} technical failure manifest",
+                )
+                required_failure_fields = {
+                    "schema_version",
+                    "session_id",
+                    "item_id",
+                    "owner_id",
+                    "status",
+                    "accepted_content_hash",
+                    "reason",
+                    "created_at",
+                    "recovery_exhausted",
+                    "manifest_hash",
+                }
+                if (
+                    set(failure_manifest) != required_failure_fields
+                    or failure_manifest.get("schema_version") != "1"
+                    or failure_manifest.get("status") != "technical_failure"
+                    or failure_manifest.get("recovery_exhausted") is not True
+                    or failure_manifest.get("item_id") != item_id
+                    or failure_manifest.get("accepted_content_hash") != accepted_manifest.get("content_hash")
+                    or failure_manifest.get("manifest_hash") != _hash_mapping(failure_manifest, "manifest_hash")
+                    or state.get("integration_manifest_hash") != failure_manifest.get("manifest_hash")
+                    or state.get("integration_manifest_ref") != "integration/technical_failure/manifest.json"
+                ):
+                    raise ReportPreflightError(f"{item_id} technical failure boundary is invalid")
+                outcome = str(terminal_outcome.get("outcome", ""))
+                lifecycle_state = str(state.get("lifecycle_state", ""))
+                item_reports.append(
+                    {
+                        "item_id": item_id,
+                        # Preserve the accepted business outcome while
+                        # exposing the downstream integration boundary.
+                        "outcome": outcome,
+                        "lifecycle_state": lifecycle_state,
+                        "integration_state": "technical_failure",
+                        "record_kind_totals": {},
+                        "integration_failure": {
+                            "status": "technical_failure",
+                            "recovery_exhausted": True,
+                            "manifest_hash": failure_manifest["manifest_hash"],
+                            "manifest_ref": f"{item_prefix}/integration/technical_failure/manifest.json",
+                            "reason_hash": hashlib.sha256(str(failure_manifest.get("reason")).encode("utf-8")).hexdigest(),
+                        },
+                    }
+                )
+                item_manifest = dict(accepted_manifest)
+                item_manifest["record_kind_totals"] = {}
+                item_manifests.append(item_manifest)
+                accepted_hashes[item_id] = (
+                    accepted_manifest.get("artifact_progress", {}).get("hashes", {})
+                    if isinstance(accepted_manifest.get("artifact_progress"), Mapping)
+                    else {}
+                )
+                reviewed_hash = business.get("reviewed_draft_hash")
+                draft_hash = state.get("review", {}).get("draft_hash") if isinstance(state.get("review"), Mapping) else None
+                if draft_hash is not None and reviewed_hash is not None and draft_hash != reviewed_hash:
+                    raise ReportPreflightError(f"{item_id} business review draft binding is stale")
+                business_findings = business.get("findings", [])
+                if not isinstance(business_findings, list):
+                    raise ReportPreflightError(f"{item_id} business review findings are invalid")
+                business_reviews.append(
+                    {
+                        "review_id": f"BR-{item_id}",
+                        "item_id": item_id,
+                        "review_kind": "business",
+                        "reviewer_ref": envelope.get("reviewer_ref") or (state.get("review", {}) or {}).get("reviewer_ref"),
+                        "verdict": envelope.get("review_verdict") or (state.get("review", {}) or {}).get("verdict"),
+                        "review_scope": business.get("review_scope"),
+                        "reviewed_draft_hash": reviewed_hash,
+                        "findings": business_findings,
+                        "repairs": [],
+                        "targeted_rechecks": (
+                            [{"recheck_id": f"RR-{item_id}", "scope": business.get("changed_pointers", [])}]
+                            if business.get("targeted_recheck")
+                            else []
+                        ),
+                        "artifact_ref": business_path.relative_to(context.run_root).as_posix(),
+                    }
+                )
+                continue
+
             accepted_path, accepted_manifest = cls._collector_json(context, f"{item_prefix}/accepted/manifest.json", label=f"{item_id} accepted manifest")
             envelope_path, envelope = cls._collector_json(context, f"{item_prefix}/accepted/acceptance_envelope.json", label=f"{item_id} acceptance envelope")
             committed_path, committed_manifest = cls._collector_json(context, f"{item_prefix}/integration/committed/manifest.json", label=f"{item_id} integration manifest")
@@ -1726,7 +2013,17 @@ class RunReportInputGatherer:
                 "artifact_ref": review_path.relative_to(context.run_root).as_posix(),
             })
 
-        receipts, timings = cls._collector_receipts_and_timings(context, lifecycle.item_ids, accepted_hashes)
+        # Receipts/timings are authoritative for fully integrated items. A
+        # requirement-local failure may have no accepted execution receipt,
+        # and an exhausted integration boundary must not be padded with a
+        # fabricated one.
+        receipt_item_ids = tuple(
+            item["item_id"]
+            for item in item_reports
+            if item.get("integration_state") != "technical_failure"
+            and item.get("lifecycle_state") != "technical_failure"
+        )
+        receipts, timings = cls._collector_receipts_and_timings(context, receipt_item_ids, accepted_hashes)
         incidents: list[dict[str, Any]] = []
         telemetry_path, telemetry_rows = cls._collector_jsonl(context, "telemetry/events.jsonl", label="telemetry events")
         for event in telemetry_rows:
@@ -1946,6 +2243,34 @@ class RunReportFinalizer:
     @property
     def intent_path(self) -> Path | None:
         return None if self.root is None else self.root / _FINALIZE_INTENT_FILENAME
+
+    def recover(self) -> dict[str, Any]:
+        """Converge an interrupted report transaction in a fresh process.
+
+        Recovery is deliberately a public, deterministic operation.  A
+        transaction residue without this finalizer's hash-bound intent cannot
+        be attributed safely, so it is surfaced as explicit operator repair
+        instead of being retried through a model role.  Intent-bound staging
+        and backup paths are reconciled by the same transaction code used by
+        :meth:`finalize`, after which the pure artifact inspection is returned.
+        """
+
+        if self.root is None:
+            raise ValueError("report finalization recovery has no persistence root")
+
+        # Check for unbound residue before the private preflight recovery
+        # helper.  The helper raises the same error, but doing this explicit
+        # check gives callers a stable fail-closed contract even when no
+        # preflight/report input is available yet.
+        initial = inspect_report_artifacts(self.root)
+        if initial.get("stage") == "transaction_pending":
+            raise ValueError("unbound report finalization transaction residue requires operator repair")
+
+        self._recover_preflight_transaction()
+        recovered = inspect_report_artifacts(self.root)
+        if recovered.get("stage") == "transaction_pending":
+            raise ValueError("unbound report finalization transaction residue requires operator repair")
+        return recovered
 
     @staticmethod
     def _triplet_paths(directory: Path) -> tuple[Path, Path, Path]:

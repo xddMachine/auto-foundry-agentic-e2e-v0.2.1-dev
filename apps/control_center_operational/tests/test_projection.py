@@ -1,20 +1,35 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import tempfile
+import threading
 import unittest
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
+from apps.control_center_operational import projection as projection_module
 from apps.control_center_operational.launch import LaunchManager
 from apps.control_center_operational.projection import (
+    MAX_DISCOVERED_PLACEHOLDERS,
+    MAX_DISCOVERED_RUNS,
+    MAX_REQUIREMENTS,
     MAX_TRACE,
     OperationalRepository,
+    _read_verified_product_asset,
     parse_coordinator_line,
     parse_lifecycle_line,
 )
-from auto_foundry_core.lifecycle import RunLifecycle
+from apps.control_center_operational.tests.test_projection_sidecars import (
+    _repository,
+    _run,
+    _write_valid_product,
+)
+from auto_foundry_core.analytical_artifacts import DataProfileArtifact
+from auto_foundry_core.lifecycle import RunLifecycle, _manifest_hash
 from auto_foundry_core.workspace import RunContext
 
 
@@ -203,11 +218,416 @@ class ProjectionTests(unittest.TestCase):
                 ["REQ-001"],
                 mode="requirement",
             )
+            # Discovery is intentionally cached briefly for concurrent tabs;
+            # force this fixture mutation past that window so the assertion
+            # remains about identity reconciliation rather than cache timing.
+            repository._records_cache = None
             summaries = repository.list_runs()
             self.assertEqual(len(summaries), 1)
             self.assertFalse(summaries[0].get("placeholder", False))
             self.assertEqual(summaries[0]["id"], placeholder["id"])
             self.assertEqual(summaries[0]["requirementCount"], 1)
+
+    def test_records_cache_singleflight_and_returns_independent_copies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_root = root / "run-a"
+            run_root.mkdir(parents=True)
+            (run_root / "run_state.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "RUN-A",
+                        "run_root": str(run_root),
+                        "status": "paused",
+                        "updated_at": "2026-08-30T00:00:00Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            repository = OperationalRepository(None, [root])
+            seed = repository.records()
+            run_id = seed[0].summary["id"]
+            repository._records_cache = None
+
+            calls: list[None] = []
+            started = threading.Event()
+            release = threading.Event()
+            original_uncached = repository._records_uncached
+
+            def uncached_once() -> list:
+                calls.append(None)
+                started.set()
+                self.assertTrue(release.wait(timeout=5))
+                return original_uncached()
+
+            repository._records_uncached = uncached_once  # type: ignore[method-assign]
+            operations = [repository.records, lambda: repository.get(run_id)] * 3
+            with ThreadPoolExecutor(max_workers=len(operations)) as executor:
+                futures = [executor.submit(operation) for operation in operations]
+                self.assertTrue(started.wait(timeout=5))
+                release.set()
+                results = [future.result(timeout=10) for future in futures]
+
+            self.assertEqual(len(calls), 1)
+            records_result = next(result for result in results if isinstance(result, list))
+            record_result = next(result for result in results if result is not None and not isinstance(result, list))
+            self.assertIsNot(records_result, seed)
+            self.assertIsNot(records_result[0], record_result)
+            records_result[0].summary["status"] = "mutated"
+            fresh = repository.get(run_id)
+            self.assertIsNotNone(fresh)
+            self.assertEqual(fresh.summary["status"], "paused")
+
+    def test_records_cache_expires_and_discovers_new_durable_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first_root = root / "run-a"
+            first_root.mkdir(parents=True)
+            (first_root / "run_state.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "RUN-A",
+                        "run_root": str(first_root),
+                        "status": "paused",
+                        "updated_at": "2026-08-30T00:00:00Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            repository = OperationalRepository(None, [root])
+            calls: list[None] = []
+            original_uncached = repository._records_uncached
+
+            def counted_uncached() -> list:
+                calls.append(None)
+                return original_uncached()
+
+            repository._records_uncached = counted_uncached  # type: ignore[method-assign]
+            clock = [100.0]
+            with patch.object(projection_module, "monotonic", side_effect=lambda: clock[0]):
+                initial = repository.list_runs()
+                self.assertEqual({summary["authoritativeRunId"] for summary in initial}, {"RUN-A"})
+
+                successor_root = root / "run-successor"
+                successor_root.mkdir(parents=True)
+                (successor_root / "run_state.json").write_text(
+                    json.dumps(
+                        {
+                            "run_id": "RUN-SUCCESSOR",
+                            "run_root": str(successor_root),
+                            "status": "running",
+                            "updated_at": "2026-08-30T00:01:00Z",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                cached = repository.list_runs()
+                self.assertEqual({summary["authoritativeRunId"] for summary in cached}, {"RUN-A"})
+
+                clock[0] = 102.1
+                refreshed = repository.list_runs()
+
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(
+                {summary["authoritativeRunId"] for summary in refreshed},
+                {"RUN-A", "RUN-SUCCESSOR"},
+            )
+
+    def test_records_cache_expiry_is_anchored_to_scan_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_root = root / "run-a"
+            run_root.mkdir(parents=True)
+            (run_root / "run_state.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "RUN-A",
+                        "run_root": str(run_root),
+                        "status": "paused",
+                        "updated_at": "2026-08-30T00:00:00Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            repository = OperationalRepository(None, [root])
+            original_uncached = repository._records_uncached
+            calls: list[None] = []
+            clock = [100.0]
+
+            def slow_uncached() -> list:
+                calls.append(None)
+                # Simulate a discovery that consumes most of the two-second
+                # window before the result can be published.
+                clock[0] = 101.5
+                return original_uncached()
+
+            repository._records_uncached = slow_uncached  # type: ignore[method-assign]
+            with patch.object(projection_module, "monotonic", side_effect=lambda: clock[0]):
+                repository.records()
+                self.assertIsNotNone(repository._records_cache)
+                expires_at = repository._records_cache[0]
+                scan_start = 100.0
+                self.assertEqual(expires_at, scan_start + projection_module.RECORDS_CACHE_TTL_SECONDS)
+                self.assertLessEqual(expires_at, scan_start + projection_module.RECORDS_CACHE_TTL_SECONDS)
+                clock[0] = 101.9
+                repository.records()
+                self.assertEqual(len(calls), 1)
+                clock[0] = 102.1
+                repository.records()
+
+            self.assertEqual(len(calls), 2)
+
+    def test_placeholder_discovery_sorts_before_bounded_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "runs"
+            state_root = root / "state"
+            drafts = state_root / "drafts"
+            drafts.mkdir(parents=True)
+            newest_at = datetime(2027, 1, 1, tzinfo=timezone.utc)
+            for index in range(MAX_DISCOVERED_PLACEHOLDERS):
+                draft_id = f"D-{index:04d}"
+                draft = _with_draft_fingerprint(
+                    {
+                        "draftId": draft_id,
+                        "runId": f"RUN-{index:04d}",
+                        "runRoot": str(runs / f"RUN-{index:04d}"),
+                        "projectName": f"Older {index}",
+                        "createdAt": (newest_at - timedelta(minutes=index + 1)).isoformat().replace("+00:00", "Z"),
+                        "status": "prepared",
+                    }
+                )
+                (drafts / f"{draft_id}.json").write_text(json.dumps(draft), encoding="utf-8")
+            newest_id = "D-zzzz"
+            newest = _with_draft_fingerprint(
+                {
+                    "draftId": newest_id,
+                    "runId": "RUN-NEWEST",
+                    "runRoot": str(runs / "RUN-NEWEST"),
+                    "projectName": "Newest launch",
+                    "createdAt": newest_at.isoformat().replace("+00:00", "Z"),
+                    "status": "prepared",
+                }
+            )
+            (drafts / f"{newest_id}.json").write_text(json.dumps(newest), encoding="utf-8")
+
+            summaries = OperationalRepository(None, [runs], launch_state_root=state_root).list_runs()
+
+            self.assertEqual(len(summaries), MAX_DISCOVERED_PLACEHOLDERS)
+            self.assertEqual(summaries[0]["draftId"], newest_id)
+            self.assertNotIn("D-0499", {summary["draftId"] for summary in summaries})
+
+    def test_duplicate_placeholders_share_one_path_derived_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "runs"
+            state_root = root / "state"
+            drafts = state_root / "drafts"
+            drafts.mkdir(parents=True)
+            run_root = runs / "RUN-SAME-ROOT"
+            older = _with_draft_fingerprint(
+                {
+                    "draftId": "D-old",
+                    "runId": "RUN-SAME-ROOT",
+                    "runRoot": str(run_root),
+                    "projectName": "Older launch",
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "status": "prepared",
+                }
+            )
+            newer = _with_draft_fingerprint(
+                {
+                    "draftId": "D-new",
+                    "runId": "RUN-SAME-ROOT",
+                    "runRoot": str(run_root),
+                    "projectName": "Newer launch",
+                    "createdAt": "2026-01-01T00:01:00Z",
+                    "status": "prepared",
+                }
+            )
+            (drafts / "D-old.json").write_text(json.dumps(older), encoding="utf-8")
+            (drafts / "D-new.json").write_text(json.dumps(newer), encoding="utf-8")
+
+            summaries = OperationalRepository(None, [runs], launch_state_root=state_root).list_runs()
+
+            self.assertEqual(len(summaries), 1)
+            self.assertEqual(summaries[0]["draftId"], "D-new")
+            self.assertEqual(summaries[0]["name"], "Newer launch")
+
+    def test_durable_run_discovery_sorts_before_bounded_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            newest_at = datetime(2027, 1, 1, tzinfo=timezone.utc)
+            for index in range(MAX_DISCOVERED_RUNS):
+                run_root = root / f"run-{index:04d}"
+                run_root.mkdir()
+                (run_root / "run_state.json").write_text(
+                    json.dumps(
+                        {
+                            "run_id": f"RUN-{index:04d}",
+                            "status": "running",
+                            "updated_at": (newest_at - timedelta(minutes=index + 1)).isoformat().replace("+00:00", "Z"),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            newest_root = root / "run-zzzz"
+            newest_root.mkdir()
+            (newest_root / "run_state.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "RUN-NEWEST",
+                        "status": "running",
+                        "updated_at": newest_at.isoformat().replace("+00:00", "Z"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summaries = OperationalRepository(None, [root]).list_runs()
+
+            self.assertEqual(len(summaries), MAX_DISCOVERED_RUNS)
+            self.assertEqual(summaries[0]["authoritativeRunId"], "RUN-NEWEST")
+            self.assertNotIn("RUN-0499", {summary["authoritativeRunId"] for summary in summaries})
+
+    def test_authoritative_durable_state_beyond_generic_cap_replaces_placeholder(self) -> None:
+        """A real run beyond the production cap still replaces its placeholder."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "runs"
+            state_root = root / "launch-state"
+            drafts = state_root / "drafts"
+            statuses = state_root / "statuses"
+            drafts.mkdir(parents=True)
+            statuses.mkdir(parents=True)
+
+            target_root = runs / "run-target"
+            target_context = RunContext("RUN-TARGET", target_root)
+            lifecycle = RunLifecycle.create(
+                target_context,
+                [f"REQ-{index:03d}" for index in range(1, 10)],
+                mode="requirement",
+            )
+            lifecycle.pause("paused for projection test")
+            target_state_path = target_root / "run_state.json"
+            target_state = json.loads(target_state_path.read_text(encoding="utf-8"))
+            target_state["updated_at"] = "2026-01-01T00:00:00Z"
+            target_state["manifest_hash"] = _manifest_hash(target_state)
+            target_state_path.write_text(json.dumps(target_state), encoding="utf-8")
+
+            # Fill the production discovery window with newer, parseable state
+            # files.  These need not be lifecycle-authoritative; only the
+            # target's validated state is eligible to replace the launch
+            # placeholder.  Keep one more candidate than the real cap so the
+            # target is outside the bounded history by timestamp.
+            newest_at = datetime(2027, 1, 1, tzinfo=timezone.utc)
+            for index in range(MAX_DISCOVERED_RUNS + 1):
+                filler_root = runs / f"filler-{index:04d}"
+                filler_root.mkdir(parents=True)
+                (filler_root / "run_state.json").write_text(
+                    json.dumps(
+                        {
+                            "run_id": f"RUN-FILLER-{index:04d}",
+                            "run_root": str(filler_root),
+                            "status": "running",
+                            "updated_at": (
+                                newest_at - timedelta(minutes=index)
+                            ).isoformat().replace("+00:00", "Z"),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            draft = _with_draft_fingerprint(
+                {
+                    "draftId": "D-target",
+                    "runId": "RUN-TARGET",
+                    "runRoot": str(target_root),
+                    "projectName": "Target launch",
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "status": "failed",
+                }
+            )
+            (drafts / "D-target.json").write_text(json.dumps(draft), encoding="utf-8")
+            (statuses / "D-target.json").write_text(
+                json.dumps(
+                    {
+                        "draftId": "D-target",
+                        "fingerprint": draft["fingerprint"],
+                        "status": "failed",
+                        "runId": "RUN-TARGET",
+                        "runRoot": str(target_root),
+                        "updatedAt": "2026-01-01T00:00:01Z",
+                        "message": "Launch failed before durable state was observed.",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            repository = OperationalRepository(None, [runs], launch_state_root=state_root)
+            summaries = repository.list_runs()
+
+            target_records = [
+                summary
+                for summary in summaries
+                if summary.get("authoritativeRunId") == "RUN-TARGET"
+            ]
+            self.assertEqual(len(target_records), 1)
+            self.assertEqual(target_records[0]["source"], "filesystem")
+            self.assertFalse(target_records[0].get("placeholder", False))
+            self.assertEqual(target_records[0]["status"], "paused")
+            self.assertEqual(target_records[0]["requirementCount"], 9)
+            self.assertEqual(len(summaries), MAX_DISCOVERED_RUNS)
+            self.assertEqual(summaries[0]["authoritativeRunId"], "RUN-FILLER-0000")
+            self.assertEqual(summaries[-1]["authoritativeRunId"], "RUN-TARGET")
+            ids = [str(summary["id"]) for summary in summaries]
+            self.assertEqual(len(ids), len(set(ids)))
+            self.assertEqual([str(summary["id"]) for summary in repository.list_runs()], ids)
+
+    def test_launch_manifest_discovery_sorts_before_bounded_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "run"
+            launches = root / "control_center" / "launches"
+            launches.mkdir(parents=True)
+            newest_at = datetime(2027, 1, 1, tzinfo=timezone.utc)
+            (root / "run_state.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "RUN-MANIFESTS",
+                        "status": "running",
+                        "updated_at": newest_at.isoformat().replace("+00:00", "Z"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            for index in range(MAX_REQUIREMENTS):
+                child = launches / f"D-{index:04d}"
+                child.mkdir()
+                (child / "launch_manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "projectName": f"Older manifest {index}",
+                            "createdAt": (newest_at - timedelta(minutes=index + 1)).isoformat().replace("+00:00", "Z"),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            newest = launches / "D-zzzz"
+            newest.mkdir()
+            (newest / "launch_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "projectName": "Newest manifest",
+                        "createdAt": newest_at.isoformat().replace("+00:00", "Z"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summaries = OperationalRepository(None, [root.parent]).list_runs()
+
+            self.assertEqual(summaries[0]["name"], "Newest manifest")
 
     def test_placeholder_rejects_mismatched_status_binding(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -807,7 +1227,7 @@ class ProjectionTests(unittest.TestCase):
 
     def test_frontend_dispatcher_and_progress_render_contract(self) -> None:
         repository_root = Path(__file__).resolve().parents[3]
-        app_source = (repository_root / "apps" / "control_center" / "static" / "app.js").read_text(encoding="utf-8")
+        app_source = (repository_root / "apps" / "control_center_operational" / "static" / "app.js").read_text(encoding="utf-8")
         operational_source = (repository_root / "apps" / "control_center_operational" / "static" / "operational.js").read_text(encoding="utf-8")
 
         self.assertIn('node.active && node.id !== "planner"', app_source)
@@ -824,6 +1244,8 @@ class ProjectionTests(unittest.TestCase):
         self.assertIn('run.placeholder ? "Semantic intake"', app_source)
         self.assertIn('function operationalRefreshRuns()', operational_source)
         self.assertIn('function operationalPlaceholderIsOpen(run)', operational_source)
+        refresh_needed_block = operational_source.split("function operationalRefreshIsNeeded()", 1)[1].split("function operationalMaybeStopRunsRefresh", 1)[0]
+        self.assertIn("Boolean(selected?.placeholder)", refresh_needed_block)
         self.assertIn('await operationalRefreshRuns();', operational_source)
         self.assertIn('operationalBeginPendingLaunchRefresh();', operational_source)
         self.assertIn('operationalPendingLaunchTimer', operational_source)
@@ -844,6 +1266,9 @@ class ProjectionTests(unittest.TestCase):
         self.assertIn('foot.append(progress);', progress_block)
         self.assertNotIn('Number.isFinite(progressValue) ? `${Math.max(0, Math.min(100, progressValue))}%` : "0%"', progress_block)
 
+        bootstrap_block = app_source.split("async function bootstrap()", 1)[1].split("function bindNavigation", 1)[0]
+        self.assertLess(bootstrap_block.index("route();"), bootstrap_block.index("await selectRun("))
+
     def test_frontend_selection_race_cannot_commit_old_snapshot_or_cache(self) -> None:
         test_script = Path(__file__).with_name("test_selection_race.js")
         completed = subprocess.run(
@@ -855,6 +1280,28 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
         self.assertIn("production selection race: OK", completed.stdout)
 
+    def test_frontend_selected_failed_placeholder_refreshes_until_durable_successor(self) -> None:
+        test_script = Path(__file__).with_name("test_operational_refresh.js")
+        completed = subprocess.run(
+            ["node", str(test_script)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertIn("operational placeholder refresh: OK", completed.stdout)
+
+    def test_frontend_operational_poll_guard_refreshes_only_when_needed(self) -> None:
+        test_script = Path(__file__).with_name("test_operational_poll.js")
+        completed = subprocess.run(
+            ["node", str(test_script)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertIn("operational poll guard: OK", completed.stdout)
+
     def test_frontend_graph_columns_are_bounded_and_reviewers_follow_owners(self) -> None:
         test_script = Path(__file__).with_name("test_graph_layout.js")
         completed = subprocess.run(
@@ -865,6 +1312,40 @@ class ProjectionTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
         self.assertIn("bounded staged graph layout: OK", completed.stdout)
+
+    def test_product_asset_reader_has_no_default_legacy_8mib_ceiling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "large.css"
+            path.write_bytes(b"x" * (8 * 1024 * 1024 + 1))
+            expected = hashlib.sha256(path.read_bytes()).hexdigest()
+
+            self.assertEqual(_read_verified_product_asset(path, expected), path.read_bytes())
+            self.assertIsNone(_read_verified_product_asset(path, expected, max_bytes=8 * 1024 * 1024))
+
+    def test_product_projection_accepts_more_than_legacy_specialist_record_limit(self) -> None:
+        artifacts = tuple(
+            DataProfileArtifact(
+                artifact_id=f"artifact-{index:04d}",
+                requirement_id="REQ-001",
+                dataset_fingerprint="b" * 64,
+                source_refs=("data_room.zip",),
+                population={"rows": 2},
+                grain="row",
+                period="2026",
+                method="profile",
+                profile={"columns": [{"name": "value", "dtype": "integer"}]},
+                created_at="2026-08-30T00:00:00+00:00",
+            )
+            for index in range(513)
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            run_root = _run(Path(directory) / "RUN-SIDECAR")
+            _write_valid_product(run_root, artifacts)
+            repository, run_id = _repository(run_root)
+            product = repository.snapshot(run_id)["productDashboard"]
+
+        self.assertTrue(product["valid"])
+        self.assertEqual(len(product["artifacts"]), 513)
 
 
 if __name__ == "__main__":

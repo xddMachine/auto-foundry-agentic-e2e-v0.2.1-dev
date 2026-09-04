@@ -1,0 +1,596 @@
+{
+  "archive": {
+    "__auto_foundry_ref__": "data_asset",
+    "content_hash": "86e1f0e5c443ac4fa9049f538aa671d9fbca183368bfa355be80a17fe880c3d4",
+    "format": "zip",
+    "metadata": {
+      "central_directory_fingerprint": {
+        "entry_count": 15,
+        "offset": 71850067,
+        "sha256": "bbf78f297e1f07b7fb6d76e9f012bbc623cbffeab41b2c8908a2800f18180256",
+        "size_bytes": 998
+      },
+      "read_only": true
+    },
+    "size_bytes": 71851087,
+    "uri": "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/inputs/data_room.zip"
+  },
+  "catalog_key": "6170bb45a6f9253f8593746e97a44d779d867f29e10da83775aaf74fff2781b4",
+  "catalog_schema_version": "2",
+  "core_version": "0.8.0",
+  "counts": {
+    "archive_members": 15,
+    "catalog_entries": 18,
+    "sheet_entries": 0,
+    "table_members": 7
+  },
+  "entries": [
+    {
+      "columns": [],
+      "member": {
+        "compressed_size_bytes": 684,
+        "content_hash": "ef00ad22529cacb88c9eb7fc3bf8506052b2baa1eab4cbcea484dc3a114251e4",
+        "format": "binary",
+        "kind": "opaque",
+        "path": "LICENSE",
+        "size_bytes": 1166
+      },
+      "metadata": {
+        "extraction": "opaque",
+        "requires_custom_code": true
+      },
+      "row_count": null,
+      "row_count_exact": false,
+      "row_count_lower_bound": null,
+      "sample_rows": [],
+      "sample_values": {},
+      "sheet_name": null,
+      "source_id": "LICENSE",
+      "table_name": null
+    },
+    {
+      "columns": [],
+      "member": {
+        "compressed_size_bytes": 2785,
+        "content_hash": "e6b78b8cd744425c1ead15e6fde2c9d47ac7079d198310ac6165c593b1052e20",
+        "format": "md",
+        "kind": "document",
+        "path": "README.md",
+        "size_bytes": 6856
+      },
+      "metadata": {},
+      "row_count": null,
+      "row_count_exact": false,
+      "row_count_lower_bound": null,
+      "sample_rows": [],
+      "sample_values": {},
+      "sheet_name": null,
+      "source_id": "README.md",
+      "table_name": null
+    },
+    {
+      "columns": [
+        "message_id",
+        "timestamp",
+        "from",
+        "from_name",
+        "from_role",
+        "from_company",
+        "to",
+        "to_name",
+        "to_role",
+        "subject",
+        "body",
+        "customer_id",
+        "customer_name",
+        "cc",
+        "triggered_by",
+        "department_from",
+        "department_to",
+        "department",
+        "vendor"
+      ],
+      "member": {
+        "compressed_size_bytes": 5632095,
+        "content_hash": "61a6e518985262a05b4d2e06dd1ca3f0fd5e708475d021a57a64385c35a240e1",
+        "format": "parquet",
+        "kind": "table",
+        "path": "all_communications.parquet",
+        "size_bytes": 7267329
+      },
+      "metadata": {
+        "extraction": "pyarrow",
+        "row_groups": 1
+      },
+      "row_count": 151673,
+      "row_count_exact": true,
+      "row_count_lower_bound": 151673,
+      "sample_rows": [],
+      "sample_values": {},
+      "sheet_name": null,
+      "source_id": "all_communications.parquet",
+      "table_name": "all_communications"
+    },
+    {
+      "columns": [],
+      "member": {
+        "compressed_size_bytes": 3520,
+        "content_hash": "a40ec895dc1c135cd52c0b9f5cc5d71b181ce39a0f2cf589937e0ef46a151ae0",
+        "format": "md",
+        "kind": "document",
+        "path": "business_docs.md",
+        "size_bytes": 10273
+      },
+      "metadata": {},
+      "row_count": null,
+      "row_count_exact": false,
+      "row_count_lower_bound": null,
+      "sample_rows": [],
+      "sample_values": {},
+      "sheet_name": null,
+      "source_id": "business_docs.md",
+      "table_name": null
+    },
+    {
+      "columns": [
+        "document_type",
+        "document_id",
+        "created_date",
+        "created_by",
+        "title",
+        "content"
+      ],
+      "member": {
+        "compressed_size_bytes": 11713,
+        "content_hash": "f8171d62b57d050ad025f18a3c201b932564abf391515c089fb6abfa06871a35",
+        "format": "parquet",
+        "kind": "table",
+        "path": "business_documents.parquet",
+        "size_bytes": 22760
+      },
+      "metadata": {
+        "extraction": "pyarrow",
+        "row_groups": 1
+      },
+      "row_count": 32,
+      "row_count_exact": true,
+      "row_count_lower_bound": 32,
+      "sample_rows": [],
+      "sample_values": {},
+      "sheet_name": null,
+      "source_id": "business_documents.parquet",
+      "table_name": "business_documents"
+    },
+    {
+      "columns": [],
+      "member": {
+        "compressed_size_bytes": 1033,
+        "content_hash": "11882a3b2978f10803d4a679ba07aff8be1ba4df7f2450be2f5621c7426874d2",
+        "format": "md",
+        "kind": "document",
+        "path": "columns.md",
+        "size_bytes": 2444
+      },
+      "metadata": {},
+      "row_count": null,
+      "row_count_exact": false,
+      "row_count_lower_bound": null,
+      "sample_rows": [],
+      "sample_values": {},
+      "sheet_name": null,
+      "source_id": "columns.md",
+      "table_name": null
+    },
+    {
+      "columns": [
+        "SALESDOCUMENT",
+        "SALESOFFICE",
+        "SALESGROUP",
+        "CUSTOMERPAYMENTTERMS",
+        "SHIPPINGCONDITION",
+        "SALESDOCUMENTTYPE",
+        "SALESORGANIZATION",
+        "DISTRIBUTIONCHANNEL",
+        "ORGANIZATIONDIVISION",
+        "BILLINGCOMPANYCODE",
+        "TRANSACTIONCURRENCY",
+        "CREATIONDATE",
+        "CREATIONTIME",
+        "HEADERINCOTERMSCLASSIFICATION",
+        "SALESDOCUMENTITEM",
+        "PLANT",
+        "SHIPPINGPOINT",
+        "SALESDOCUMENTITEMCATEGORY",
+        "PRODUCT",
+        "SOLDTOPARTY",
+        "SHIPTOPARTY",
+        "BILLTOPARTY",
+        "PAYERPARTY",
+        "ITEMINCOTERMSCLASSIFICATION",
+        "ADDRESSID_SOLDTOPARTY",
+        "ADDRESSID_BILLTOPARTY",
+        "ADDRESSID_PAYERPARTY",
+        "ADDRESSID_SHIPTOPARTY",
+        "__index_level_0__"
+      ],
+      "member": {
+        "compressed_size_bytes": 28971705,
+        "content_hash": "fef9791965f886793754b7ce21d6538566623b2d2d7bb24ee1ea40feb7e9032c",
+        "format": "parquet",
+        "kind": "table",
+        "path": "erp_transactions.parquet",
+        "size_bytes": 42805059
+      },
+      "metadata": {
+        "extraction": "pyarrow",
+        "row_groups": 2
+      },
+      "row_count": 1916685,
+      "row_count_exact": true,
+      "row_count_lower_bound": 1916685,
+      "sample_rows": [],
+      "sample_values": {},
+      "sheet_name": null,
+      "source_id": "erp_transactions.parquet",
+      "table_name": "erp_transactions"
+    },
+    {
+      "columns": [],
+      "member": {
+        "compressed_size_bytes": 3845,
+        "content_hash": "12a75d094271bd96c86f959bf0cf31c40d183f470ec3aaccab631ad8c5c19920",
+        "format": "md",
+        "kind": "document",
+        "path": "provenance.md",
+        "size_bytes": 8509
+      },
+      "metadata": {},
+      "row_count": null,
+      "row_count_exact": false,
+      "row_count_lower_bound": null,
+      "sample_rows": [],
+      "sample_values": {},
+      "sheet_name": null,
+      "source_id": "provenance.md",
+      "table_name": null
+    },
+    {
+      "columns": [],
+      "member": {
+        "compressed_size_bytes": 1108,
+        "content_hash": "04f828a1c04ecbd0c88aa54db54a3a43e95a142f6aeb0ee765a4ae4347cf5eb9",
+        "format": "md",
+        "kind": "document",
+        "path": "quickstart.md",
+        "size_bytes": 2797
+      },
+      "metadata": {},
+      "row_count": null,
+      "row_count_exact": false,
+      "row_count_lower_bound": null,
+      "sample_rows": [],
+      "sample_values": {},
+      "sheet_name": null,
+      "source_id": "quickstart.md",
+      "table_name": null
+    },
+    {
+      "columns": [
+        "SALESDOCUMENT",
+        "SALESOFFICE",
+        "SALESGROUP",
+        "CUSTOMERPAYMENTTERMS",
+        "SHIPPINGCONDITION",
+        "SALESDOCUMENTTYPE",
+        "SALESORGANIZATION",
+        "DISTRIBUTIONCHANNEL",
+        "ORGANIZATIONDIVISION",
+        "BILLINGCOMPANYCODE",
+        "TRANSACTIONCURRENCY",
+        "INCOTERMSCLASSIFICATION",
+        "CREATIONDATE",
+        "CREATIONTIME",
+        "__index_level_0__"
+      ],
+      "member": {
+        "compressed_size_bytes": 3967075,
+        "content_hash": "4ad070b586db6d7acd611f9dca1b6d9126f1f1664a383768e5629cc96d0eaa6b",
+        "format": "parquet",
+        "kind": "table",
+        "path": "sales_documents.parquet",
+        "size_bytes": 7477675
+      },
+      "metadata": {
+        "extraction": "pyarrow",
+        "row_groups": 1
+      },
+      "row_count": 411966,
+      "row_count_exact": true,
+      "row_count_lower_bound": 411966,
+      "sample_rows": [],
+      "sample_values": {},
+      "sheet_name": null,
+      "source_id": "sales_documents.parquet",
+      "table_name": "sales_documents"
+    },
+    {
+      "columns": [
+        "SALESDOCUMENT",
+        "SALESDOCUMENTITEM",
+        "PLANT",
+        "SHIPPINGPOINT",
+        "SALESDOCUMENTITEMCATEGORY",
+        "PRODUCT",
+        "SOLDTOPARTY",
+        "SHIPTOPARTY",
+        "BILLTOPARTY",
+        "PAYERPARTY",
+        "INCOTERMSCLASSIFICATION",
+        "__index_level_0__"
+      ],
+      "member": {
+        "compressed_size_bytes": 17706438,
+        "content_hash": "123b6c00bcd9f012b569e4676ba0fab146272c63fb4bf67303df729a604fdbb5",
+        "format": "parquet",
+        "kind": "table",
+        "path": "sales_items.parquet",
+        "size_bytes": 29792520
+      },
+      "metadata": {
+        "extraction": "pyarrow",
+        "row_groups": 2
+      },
+      "row_count": 1916685,
+      "row_count_exact": true,
+      "row_count_lower_bound": 1916685,
+      "sample_rows": [],
+      "sample_values": {},
+      "sheet_name": null,
+      "source_id": "sales_items.parquet",
+      "table_name": "sales_items"
+    },
+    {
+      "columns": [],
+      "member": {
+        "compressed_size_bytes": 2977,
+        "content_hash": "eccbfd1e9dbaf6399cd13c8ab20a098167757a4c306bc141acb274eee11f793e",
+        "format": "md",
+        "kind": "document",
+        "path": "sample_communications.md",
+        "size_bytes": 5863
+      },
+      "metadata": {},
+      "row_count": null,
+      "row_count_exact": false,
+      "row_count_lower_bound": null,
+      "sample_rows": [],
+      "sample_values": {},
+      "sheet_name": null,
+      "source_id": "sample_communications.md",
+      "table_name": null
+    },
+    {
+      "columns": [
+        "document_type",
+        "document_id",
+        "order_number",
+        "customer_id",
+        "customer_name",
+        "order_date",
+        "requested_delivery",
+        "product",
+        "quantity",
+        "unit_price",
+        "total_amount",
+        "currency",
+        "plant",
+        "invoice_number",
+        "invoice_date",
+        "due_date",
+        "billed_amount",
+        "shipment_number",
+        "ship_date",
+        "expected_delivery",
+        "actual_delivery",
+        "carrier",
+        "tracking_number",
+        "report_number",
+        "inspection_date",
+        "quantity_received",
+        "credit_number",
+        "issue_date",
+        "original_amount",
+        "credit_amount",
+        "expedite_fee",
+        "shipping_method",
+        "expedite_cost",
+        "quality_requirements"
+      ],
+      "member": {
+        "compressed_size_bytes": 106354,
+        "content_hash": "fffbd339a30f417fd5ffb1b815e37d4f01132df6d1b4b588b202be8fe52eeb0e",
+        "format": "parquet",
+        "kind": "table",
+        "path": "supporting_documents.parquet",
+        "size_bytes": 148370
+      },
+      "metadata": {
+        "extraction": "pyarrow",
+        "row_groups": 1
+      },
+      "row_count": 3467,
+      "row_count_exact": true,
+      "row_count_lower_bound": 3467,
+      "sample_rows": [],
+      "sample_values": {},
+      "sheet_name": null,
+      "source_id": "supporting_documents.parquet",
+      "table_name": "supporting_documents"
+    },
+    {
+      "columns": [],
+      "member": {
+        "compressed_size_bytes": 779220,
+        "content_hash": "4d83f33931c4dabac52dfb2328ba132d715005d725eb624282e7a3ed8968a594",
+        "format": "ipynb",
+        "kind": "opaque",
+        "path": "uberjugaad-gmbh-notebook-for-data-exploration.ipynb",
+        "size_bytes": 1066861
+      },
+      "metadata": {
+        "extraction": "opaque",
+        "requires_custom_code": true
+      },
+      "row_count": null,
+      "row_count_exact": false,
+      "row_count_lower_bound": null,
+      "sample_rows": [],
+      "sample_values": {},
+      "sheet_name": null,
+      "source_id": "uberjugaad-gmbh-notebook-for-data-exploration.ipynb",
+      "table_name": null
+    },
+    {
+      "columns": [
+        "email_address",
+        "display_name",
+        "role",
+        "company",
+        "department",
+        "customer_id",
+        "contact_type",
+        "first_seen",
+        "last_seen",
+        "email_count"
+      ],
+      "member": {
+        "compressed_size_bytes": 14658757,
+        "content_hash": "ded6dee654a1326b27e427317af06193f5e9b8ee69809d760c8013865327f5b4",
+        "format": "sqlite",
+        "kind": "table",
+        "path": "uberjugaad_email.db",
+        "size_bytes": 78741504
+      },
+      "metadata": {
+        "extraction": "sqlite",
+        "query_only": true,
+        "read_only": true,
+        "row_count_kind": "unknown"
+      },
+      "row_count": null,
+      "row_count_exact": false,
+      "row_count_lower_bound": null,
+      "sample_rows": [],
+      "sample_values": {},
+      "sheet_name": null,
+      "source_id": "uberjugaad_email.db::table=contacts",
+      "table_name": "contacts"
+    },
+    {
+      "columns": [
+        "message_id",
+        "timestamp",
+        "sender_address",
+        "sender_name",
+        "sender_role",
+        "sender_company",
+        "recipient_address",
+        "recipient_name",
+        "recipient_role",
+        "cc",
+        "subject",
+        "body",
+        "customer_id",
+        "customer_name",
+        "triggered_by",
+        "department",
+        "department_from",
+        "department_to",
+        "vendor",
+        "size_bytes",
+        "has_attachment"
+      ],
+      "member": {
+        "compressed_size_bytes": 14658757,
+        "content_hash": "ded6dee654a1326b27e427317af06193f5e9b8ee69809d760c8013865327f5b4",
+        "format": "sqlite",
+        "kind": "table",
+        "path": "uberjugaad_email.db",
+        "size_bytes": 78741504
+      },
+      "metadata": {
+        "extraction": "sqlite",
+        "query_only": true,
+        "read_only": true,
+        "row_count_kind": "unknown"
+      },
+      "row_count": null,
+      "row_count_exact": false,
+      "row_count_lower_bound": null,
+      "sample_rows": [],
+      "sample_values": {},
+      "sheet_name": null,
+      "source_id": "uberjugaad_email.db::table=emails",
+      "table_name": "emails"
+    },
+    {
+      "columns": [
+        "folder_id",
+        "folder_name",
+        "parent_folder_id",
+        "message_count"
+      ],
+      "member": {
+        "compressed_size_bytes": 14658757,
+        "content_hash": "ded6dee654a1326b27e427317af06193f5e9b8ee69809d760c8013865327f5b4",
+        "format": "sqlite",
+        "kind": "table",
+        "path": "uberjugaad_email.db",
+        "size_bytes": 78741504
+      },
+      "metadata": {
+        "extraction": "sqlite",
+        "query_only": true,
+        "read_only": true,
+        "row_count_kind": "unknown"
+      },
+      "row_count": null,
+      "row_count_exact": false,
+      "row_count_lower_bound": null,
+      "sample_rows": [],
+      "sample_values": {},
+      "sheet_name": null,
+      "source_id": "uberjugaad_email.db::table=folders",
+      "table_name": "folders"
+    },
+    {
+      "columns": [
+        "key",
+        "value"
+      ],
+      "member": {
+        "compressed_size_bytes": 14658757,
+        "content_hash": "ded6dee654a1326b27e427317af06193f5e9b8ee69809d760c8013865327f5b4",
+        "format": "sqlite",
+        "kind": "table",
+        "path": "uberjugaad_email.db",
+        "size_bytes": 78741504
+      },
+      "metadata": {
+        "extraction": "sqlite",
+        "query_only": true,
+        "read_only": true,
+        "row_count_kind": "unknown"
+      },
+      "row_count": null,
+      "row_count_exact": false,
+      "row_count_lower_bound": null,
+      "sample_rows": [],
+      "sample_values": {},
+      "sheet_name": null,
+      "source_id": "uberjugaad_email.db::table=metadata",
+      "table_name": "metadata"
+    }
+  ],
+  "source_hash": "86e1f0e5c443ac4fa9049f538aa671d9fbca183368bfa355be80a17fe880c3d4"
+}

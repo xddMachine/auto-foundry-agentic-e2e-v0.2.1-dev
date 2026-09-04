@@ -1,0 +1,811 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Data quality &amp; model audit</title><link rel="stylesheet" href="assets/dashboard.css"><link rel="icon" href="assets/favicon.svg" type="image/svg+xml"></head>
+<body><div class="shell"><aside class="rail"><a class="brand" href="index.html"><strong>DECISION//ROOM</strong><small>reviewed business analytics</small></a><nav class="nav" aria-label="Dashboard pages"><a href="index.html">Overview</a><a href="domains/group-01.html">Window-stable customer watchlist</a><a href="data-quality-audit.html" aria-current="page">Data quality &amp; model audit</a><a href="evidence.html">Evidence &amp; audit</a></nav><p class="rail-note">Offline · reviewed outputs only<br>Manager decisions and evidence</p></aside><main class="content"><header class="hero"><div><span class="eyebrow">Decision workspace</span><h1>Data quality &amp; model audit</h1><p>Technical mechanics remain exact, collapsed, and traceable outside the business manager surface.</p></div><span class="status">Reviewed</span></header><section class="section-head"><h2>Technical audit records</h2><p>Data quality, model, mapping, coverage, and ontology mechanics remain exact and traceable here; they are not business conclusions.</p></section><section class="visual-gallery" id="technical-visual-gallery"><div class="section-head"><h2>Technical visual gallery</h2><p>Exact reviewed charts retained for model and data-quality review.</p></div><div class="chart-grid"><article class="audit-visual-card widget widget-kpi" data-widget-id="REQ-001-metric-req001-customer-key-join" id="audit-visual-REQ-001-metric-req001-customer-key-join"><span class="eyebrow">REQ-001</span><h3>Exact customer-key join coverage</h3><div class="kpi-value">13155</div><dl class="widget-meta"><dt>Unit</dt><dd>matched customers</dd></dl></article></div></section><details class="technical-audit"><summary>Committed integration records (exact)</summary><article class="audit-entry audit-record-entry"><h4>metric-req001-main-watchlist-180d</h4><div class="audit-record-meta">REQ-001 · metric · REQ-001-metric-req001-main-watchlist-180d · <a class="trace-link" href="evidence.html#trace-answer_content.json">answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-answer_content.json">requirements/REQ-001/accepted/answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-manifest.json">requirements/REQ-001/accepted/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-manifest.json">requirements/REQ-001/integration/committed/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-records.jsonl">requirements/REQ-001/integration/committed/records.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-evidence.jsonl">work/evidence.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-watchlist_analysis.json">work/watchlist_analysis.json</a> <a class="trace-link" href="evidence.html#trace-work-watchlist_projection.json">work/watchlist_projection.json</a></div><h5>Committed record payload (exact)</h5><pre class="raw-audit committed-record-payload">{
+  &quot;as_of&quot;: &quot;2020-06-29&quot;,
+  &quot;complaint_led_customers&quot;: 83,
+  &quot;criteria&quot;: &quot;prior_orders &gt; 0; recent_orders &lt; prior_orders; at least one adverse component increase&quot;,
+  &quot;delay_or_expedite_led_customers&quot;: 100,
+  &quot;grain&quot;: &quot;customer&quot;,
+  &quot;label&quot;: &quot;Main 180-day adverse/order-decline watchlist&quot;,
+  &quot;late_shipment_growth_led_customers&quot;: 0,
+  &quot;metric_id&quot;: &quot;metric-req001-main-watchlist-180d&quot;,
+  &quot;payment_reminder_led_customers&quot;: 0,
+  &quot;prior_period&quot;: {
+    &quot;end&quot;: &quot;2020-01-01&quot;,
+    &quot;start&quot;: &quot;2019-07-06&quot;
+  },
+  &quot;recent_period&quot;: {
+    &quot;end&quot;: &quot;2020-06-29&quot;,
+    &quot;start&quot;: &quot;2020-01-02&quot;
+  },
+  &quot;unit&quot;: &quot;customers&quot;,
+  &quot;value&quot;: 183,
+  &quot;window_days&quot;: 180
+}</pre></article><article class="audit-entry audit-record-entry"><h4>metric-req001-stable-core-90d</h4><div class="audit-record-meta">REQ-001 · metric · REQ-001-metric-req001-stable-core-90d · <a class="trace-link" href="evidence.html#trace-answer_content.json">answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-answer_content.json">requirements/REQ-001/accepted/answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-manifest.json">requirements/REQ-001/accepted/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-manifest.json">requirements/REQ-001/integration/committed/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-records.jsonl">requirements/REQ-001/integration/committed/records.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-evidence.jsonl">work/evidence.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-watchlist_analysis.json">work/watchlist_analysis.json</a> <a class="trace-link" href="evidence.html#trace-work-watchlist_projection.json">work/watchlist_projection.json</a></div><h5>Committed record payload (exact)</h5><pre class="raw-audit committed-record-payload">{
+  &quot;as_of&quot;: &quot;2020-06-29&quot;,
+  &quot;grain&quot;: &quot;customer&quot;,
+  &quot;interpretation&quot;: &quot;descriptive stability under a shorter horizon, not validated future churn&quot;,
+  &quot;label&quot;: &quot;90-day window-stable core watchlist&quot;,
+  &quot;main_retained_share&quot;: 0.20765,
+  &quot;main_watchlist_customers&quot;: 183,
+  &quot;metric_id&quot;: &quot;metric-req001-stable-core-90d&quot;,
+  &quot;stable_high_priority_customers&quot;: 11,
+  &quot;unit&quot;: &quot;customers&quot;,
+  &quot;value&quot;: 38,
+  &quot;window_days&quot;: 90
+}</pre></article><article class="audit-entry audit-record-entry"><h4>metric-req001-customer-key-join</h4><div class="audit-record-meta">REQ-001 · metric · REQ-001-metric-req001-customer-key-join · <a class="trace-link" href="evidence.html#trace-answer_content.json">answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-answer_content.json">requirements/REQ-001/accepted/answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-manifest.json">requirements/REQ-001/accepted/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-manifest.json">requirements/REQ-001/integration/committed/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-records.jsonl">requirements/REQ-001/integration/committed/records.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-analytical_relationships.jsonl">work/analytical_relationships.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-evidence.jsonl">work/evidence.jsonl</a></div><h5>Committed record payload (exact)</h5><pre class="raw-audit committed-record-payload">{
+  &quot;ambiguous_sales_documents_excluded&quot;: 0,
+  &quot;as_of&quot;: &quot;2020-06-29&quot;,
+  &quot;grain&quot;: &quot;customer key&quot;,
+  &quot;join_rule&quot;: &quot;all_communications.customer_id = erp_transactions.SOLDTOPARTY&quot;,
+  &quot;label&quot;: &quot;Exact customer-key join coverage&quot;,
+  &quot;metric_id&quot;: &quot;metric-req001-customer-key-join&quot;,
+  &quot;source_coverage&quot;: 1.0,
+  &quot;source_population&quot;: 13155,
+  &quot;target_coverage&quot;: 1.0,
+  &quot;target_population&quot;: 13155,
+  &quot;unit&quot;: &quot;matched customers&quot;,
+  &quot;value&quot;: 13155
+}</pre></article><article class="audit-entry audit-record-entry"><h4>relationship-req001-customer-communication-erp</h4><div class="audit-record-meta">REQ-001 · relationship · REQ-001-relationship-coverage · <a class="trace-link" href="evidence.html#trace-answer_content.json">answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-answer_content.json">requirements/REQ-001/accepted/answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-manifest.json">requirements/REQ-001/accepted/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-manifest.json">requirements/REQ-001/integration/committed/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-records.jsonl">requirements/REQ-001/integration/committed/records.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-analytical_relationships.jsonl">work/analytical_relationships.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-evidence.jsonl">work/evidence.jsonl</a></div><h5>Committed record payload (exact)</h5><pre class="raw-audit committed-record-payload">{
+  &quot;analysis_relationship_id&quot;: &quot;REQ001-CUSTOMER-COMMUNICATION-ERP-EXACT&quot;,
+  &quot;as_of&quot;: &quot;2020-06-29&quot;,
+  &quot;audit_id&quot;: null,
+  &quot;cardinality&quot;: &quot;one_to_one&quot;,
+  &quot;date_authority&quot;: &quot;Communications timestamp for communication events; ERP CREATIONDATE for distinct sales-document activity; common analytical as-of is the earlier observed maximum.&quot;,
+  &quot;evidence_refs&quot;: [
+    &quot;REQ001-E1&quot;,
+    &quot;watchlist_analysis.json&quot;
+  ],
+  &quot;join_keys&quot;: [
+    {
+      &quot;source_field&quot;: &quot;customer_id&quot;,
+      &quot;target_field&quot;: &quot;SOLDTOPARTY&quot;
+    }
+  ],
+  &quot;limitations&quot;: [
+    &quot;This is an exact source-local customer-key relationship for REQ-001, not a canonical identity mapping beyond the selected sources.&quot;,
+    &quot;Underlying event rows are many-to-customer and line-item-to-customer; one-to-one cardinality refers to the tested unique customer-key endpoints.&quot;
+  ],
+  &quot;matched_pairs&quot;: 13155,
+  &quot;matched_source_count&quot;: 13155,
+  &quot;matched_target_count&quot;: 13155,
+  &quot;owner_ref&quot;: &quot;5bd9ba337c942b8ad2492a3b960ff8589955a4d14e94bea3952a66a9cc3a6b9a&quot;,
+  &quot;relationship_id&quot;: &quot;REQ001-CUSTOMER-COMMUNICATION-ERP-EXACT&quot;,
+  &quot;scope&quot;: &quot;requirement&quot;,
+  &quot;source_coverage&quot;: 1.0,
+  &quot;source_id&quot;: &quot;all_communications.parquet&quot;,
+  &quot;source_population&quot;: 13155,
+  &quot;target_coverage&quot;: 1.0,
+  &quot;target_id&quot;: &quot;erp_transactions.parquet&quot;,
+  &quot;target_population&quot;: 13155
+}</pre></article><article class="audit-entry audit-record-entry"><h4>fact-req001-watchlist-overview</h4><div class="audit-record-meta">REQ-001 · dashboard_fact · REQ-001-fact-req001-watchlist-overview · <a class="trace-link" href="evidence.html#trace-answer_content.json">answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-answer_content.json">requirements/REQ-001/accepted/answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-manifest.json">requirements/REQ-001/accepted/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-manifest.json">requirements/REQ-001/integration/committed/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-records.jsonl">requirements/REQ-001/integration/committed/records.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-evidence.jsonl">work/evidence.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-watchlist_analysis.json">work/watchlist_analysis.json</a> <a class="trace-link" href="evidence.html#trace-work-watchlist_projection.json">work/watchlist_projection.json</a></div><h5>Committed record payload (exact)</h5><pre class="raw-audit committed-record-payload">{
+  &quot;as_of&quot;: &quot;2020-06-29&quot;,
+  &quot;fact_id&quot;: &quot;fact-req001-watchlist-overview&quot;,
+  &quot;fact_type&quot;: &quot;watchlist_overview&quot;,
+  &quot;main_watchlist_customers&quot;: 183,
+  &quot;metric_ids&quot;: [
+    &quot;metric-req001-main-watchlist-180d&quot;,
+    &quot;metric-req001-stable-core-90d&quot;
+  ],
+  &quot;secondary_review_pool_customers&quot;: 145,
+  &quot;stable_core_customers&quot;: 38,
+  &quot;stable_high_priority_customers&quot;: 11,
+  &quot;title&quot;: &quot;Window-stable customer watchlist&quot;,
+  &quot;visual_id&quot;: &quot;REQ001-V3&quot;
+}</pre></article><article class="audit-entry audit-record-entry"><h4>fact-req001-signal-breakdown</h4><div class="audit-record-meta">REQ-001 · dashboard_fact · REQ-001-fact-req001-signal-breakdown · <a class="trace-link" href="evidence.html#trace-answer_content.json">answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-answer_content.json">requirements/REQ-001/accepted/answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-manifest.json">requirements/REQ-001/accepted/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-manifest.json">requirements/REQ-001/integration/committed/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-records.jsonl">requirements/REQ-001/integration/committed/records.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-evidence.jsonl">work/evidence.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-watchlist_analysis.json">work/watchlist_analysis.json</a></div><h5>Committed record payload (exact)</h5><pre class="raw-audit committed-record-payload">{
+  &quot;as_of&quot;: &quot;2020-06-29&quot;,
+  &quot;complaint_led_customers&quot;: 83,
+  &quot;delay_or_expedite_led_customers&quot;: 100,
+  &quot;fact_id&quot;: &quot;fact-req001-signal-breakdown&quot;,
+  &quot;fact_type&quot;: &quot;signal_breakdown&quot;,
+  &quot;late_shipment_growth_led_customers&quot;: 0,
+  &quot;metric_ids&quot;: [
+    &quot;metric-req001-main-watchlist-180d&quot;
+  ],
+  &quot;payment_reminder_led_customers&quot;: 0,
+  &quot;title&quot;: &quot;Order decline versus adverse-signal growth&quot;,
+  &quot;visual_id&quot;: &quot;REQ001-V2&quot;
+}</pre></article><article class="audit-entry audit-record-entry"><h4>fact-req001-join-coverage</h4><div class="audit-record-meta">REQ-001 · dashboard_fact · REQ-001-fact-req001-join-coverage · <a class="trace-link" href="evidence.html#trace-answer_content.json">answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-answer_content.json">requirements/REQ-001/accepted/answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-manifest.json">requirements/REQ-001/accepted/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-manifest.json">requirements/REQ-001/integration/committed/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-records.jsonl">requirements/REQ-001/integration/committed/records.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-analytical_relationships.jsonl">work/analytical_relationships.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-evidence.jsonl">work/evidence.jsonl</a></div><h5>Committed record payload (exact)</h5><pre class="raw-audit committed-record-payload">{
+  &quot;as_of&quot;: &quot;2020-06-29&quot;,
+  &quot;fact_id&quot;: &quot;fact-req001-join-coverage&quot;,
+  &quot;fact_type&quot;: &quot;join_quality&quot;,
+  &quot;join_rule&quot;: &quot;customer_id = SOLDTOPARTY&quot;,
+  &quot;matched_customers&quot;: 13155,
+  &quot;metric_ids&quot;: [
+    &quot;metric-req001-customer-key-join&quot;
+  ],
+  &quot;source_coverage&quot;: 1.0,
+  &quot;source_customers&quot;: 13155,
+  &quot;target_coverage&quot;: 1.0,
+  &quot;target_customers&quot;: 13155,
+  &quot;title&quot;: &quot;Exact customer-key join coverage&quot;
+}</pre></article></details><details class="technical-audit"><summary>Dashboard widgets (exact)</summary><article class="audit-entry audit-widget-entry" id="audit-widget-REQ-001-fact-req001-join-coverage"><h4>REQ-001-fact-req001-join-coverage</h4><div class="audit-record-meta">Requirement: REQ-001 · Records: fact-req001-join-coverage · <a class="trace-link" href="evidence.html#trace-answer_content.json">answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-answer_content.json">requirements/REQ-001/accepted/answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-manifest.json">requirements/REQ-001/accepted/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-manifest.json">requirements/REQ-001/integration/committed/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-records.jsonl">requirements/REQ-001/integration/committed/records.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-analytical_relationships.jsonl">work/analytical_relationships.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-evidence.jsonl">work/evidence.jsonl</a></div><h5>Widget snapshot (exact)</h5><pre class="raw-audit widget-snapshot">{
+  &quot;accepted_content_hash&quot;: &quot;83d7d776b699042b95e5a42f44dc95bf51a080c16cc308af6a38d12ab42c7e18&quot;,
+  &quot;as_of&quot;: &quot;2020-06-29&quot;,
+  &quot;audit_payload&quot;: {
+    &quot;as_of&quot;: &quot;2020-06-29&quot;,
+    &quot;fact_id&quot;: &quot;fact-req001-join-coverage&quot;,
+    &quot;fact_type&quot;: &quot;join_quality&quot;,
+    &quot;join_rule&quot;: &quot;customer_id = SOLDTOPARTY&quot;,
+    &quot;matched_customers&quot;: 13155,
+    &quot;metric_ids&quot;: [
+      &quot;metric-req001-customer-key-join&quot;
+    ],
+    &quot;source_coverage&quot;: 1.0,
+    &quot;source_customers&quot;: 13155,
+    &quot;target_coverage&quot;: 1.0,
+    &quot;target_customers&quot;: 13155,
+    &quot;title&quot;: &quot;Exact customer-key join coverage&quot;
+  },
+  &quot;dashboard_fact&quot;: true,
+  &quot;domain_id&quot;: &quot;group-01&quot;,
+  &quot;evidence_refs&quot;: [
+    &quot;work/evidence.jsonl&quot;,
+    &quot;work/analytical_relationships.jsonl&quot;,
+    &quot;answer_content.json&quot;
+  ],
+  &quot;id&quot;: &quot;REQ-001-fact-req001-join-coverage&quot;,
+  &quot;integration_record_hash&quot;: &quot;b3212c61625d087d2185a54b8fa51494f6c3fddc16aca34807eada8d38e018a4&quot;,
+  &quot;integration_record_id&quot;: &quot;fact-req001-join-coverage&quot;,
+  &quot;integration_record_ref&quot;: &quot;requirements/REQ-001/integration/committed/records.jsonl&quot;,
+  &quot;limitations&quot;: [
+    &quot;Delay/expedite communications are an operational-risk proxy and do not prove an actual late delivery.&quot;,
+    &quot;Communication keyword rules can create false positives and false negatives.&quot;,
+    &quot;Only 38 of 183 main-window customers remain under the 90-day sensitivity window.&quot;,
+    &quot;The high tier is a prioritization rule (&gt;=25% order decline and &gt;=3 positive adverse growth points), not a probability.&quot;,
+    &quot;Message IDs are reused in the synthetic source; exact event rows, not message_id alone, were deduplicated.&quot;
+  ],
+  &quot;manager_admission&quot;: {
+    &quot;plan_membership&quot;: false,
+    &quot;policy&quot;: &quot;explicit_business_presentation_plan&quot;,
+    &quot;presentation_audience&quot;: &quot;technical_audit&quot;,
+    &quot;requirement_status&quot;: &quot;admitted&quot;,
+    &quot;role&quot;: &quot;technical_audit&quot;,
+    &quot;status&quot;: &quot;audit_only&quot;
+  },
+  &quot;manager_anchor&quot;: &quot;REQ-001-support_metric-1&quot;,
+  &quot;manager_rows&quot;: [
+    {
+      &quot;Label&quot;: &quot;Reviewed detail&quot;,
+      &quot;Value&quot;: &quot;See technical audit&quot;
+    }
+  ],
+  &quot;presentation_audience&quot;: &quot;technical_audit&quot;,
+  &quot;presentation_role&quot;: &quot;support_metric&quot;,
+  &quot;presentation_tier&quot;: &quot;audit&quot;,
+  &quot;requirement_id&quot;: &quot;REQ-001&quot;,
+  &quot;requirement_limitations&quot;: [
+    &quot;Delay/expedite communications are an operational-risk proxy and do not prove an actual late delivery&quot;,
+    &quot;Urgent expedite messages are an operational-risk proxy, not proof of late delivery&quot;
+  ],
+  &quot;requirement_order&quot;: 1,
+  &quot;requirement_scope&quot;: &quot;Какие клиенты одновременно демонстрируют снижение заказной активности и рост жалоб, задержек или payment-reminder communications? Сформируй объяснимый watchlist, но не называй его доказанным churn prediction.\n\n│   ├── all_communications.parquet     [151,673 emails - 6.9 MB]\n\n│   ├── erp_transactions.parquet       [1.9M transactions - 40.8 MB]\n\n│   ├── sales_documents.parquet        [243K headers - 7.1 MB]\n\n│   ├── sales_items.parquet            [1.9M line items - 28.4 MB]\n\n- **Linked data**: All files connected via SALESDOCUMENT and customer_id\n\n- **Time-synchronized**: Chronologically consistent 2019-2020 data\n\n- **Discovery-oriented**: Patterns embedded in content, not labels\n\nAll enhancements are synthetic but modeled on real-world communication and ERP logic.&quot;,
+  &quot;requirement_title&quot;: &quot;Window-stable customer watchlist&quot;,
+  &quot;review_status&quot;: &quot;accepted_and_integrated&quot;,
+  &quot;reviewed_item_ref&quot;: &quot;requirements/REQ-001/accepted/manifest.json&quot;,
+  &quot;reviewed_output_ref&quot;: &quot;requirements/REQ-001/accepted/answer_content.json&quot;,
+  &quot;rows&quot;: [
+    {
+      &quot;Label&quot;: &quot;Reviewed detail&quot;,
+      &quot;Value&quot;: &quot;See technical audit&quot;
+    }
+  ],
+  &quot;takeaway&quot;: &quot;Устойчивый основной watchlist: 38 клиентов&quot;,
+  &quot;title&quot;: &quot;Exact customer-key join coverage&quot;,
+  &quot;trace_refs&quot;: [
+    &quot;requirements/REQ-001/accepted/manifest.json&quot;,
+    &quot;requirements/REQ-001/accepted/answer_content.json&quot;,
+    &quot;requirements/REQ-001/integration/committed/manifest.json&quot;,
+    &quot;requirements/REQ-001/integration/committed/records.jsonl&quot;
+  ],
+  &quot;type&quot;: &quot;status_table&quot;
+}</pre></article><article class="audit-entry audit-widget-entry" id="audit-widget-REQ-001-fact-req001-signal-breakdown"><h4>REQ-001-fact-req001-signal-breakdown</h4><div class="audit-record-meta">Requirement: REQ-001 · Records: fact-req001-signal-breakdown · <a class="trace-link" href="evidence.html#trace-answer_content.json">answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-answer_content.json">requirements/REQ-001/accepted/answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-manifest.json">requirements/REQ-001/accepted/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-manifest.json">requirements/REQ-001/integration/committed/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-records.jsonl">requirements/REQ-001/integration/committed/records.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-evidence.jsonl">work/evidence.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-watchlist_analysis.json">work/watchlist_analysis.json</a></div><h5>Widget snapshot (exact)</h5><pre class="raw-audit widget-snapshot">{
+  &quot;accepted_content_hash&quot;: &quot;83d7d776b699042b95e5a42f44dc95bf51a080c16cc308af6a38d12ab42c7e18&quot;,
+  &quot;as_of&quot;: &quot;2020-06-29&quot;,
+  &quot;audit_payload&quot;: {
+    &quot;as_of&quot;: &quot;2020-06-29&quot;,
+    &quot;complaint_led_customers&quot;: 83,
+    &quot;delay_or_expedite_led_customers&quot;: 100,
+    &quot;fact_id&quot;: &quot;fact-req001-signal-breakdown&quot;,
+    &quot;fact_type&quot;: &quot;signal_breakdown&quot;,
+    &quot;late_shipment_growth_led_customers&quot;: 0,
+    &quot;metric_ids&quot;: [
+      &quot;metric-req001-main-watchlist-180d&quot;
+    ],
+    &quot;payment_reminder_led_customers&quot;: 0,
+    &quot;title&quot;: &quot;Order decline versus adverse-signal growth&quot;,
+    &quot;visual_id&quot;: &quot;REQ001-V2&quot;
+  },
+  &quot;dashboard_fact&quot;: true,
+  &quot;domain_id&quot;: &quot;group-01&quot;,
+  &quot;evidence_refs&quot;: [
+    &quot;work/evidence.jsonl&quot;,
+    &quot;work/watchlist_analysis.json&quot;,
+    &quot;answer_content.json&quot;
+  ],
+  &quot;id&quot;: &quot;REQ-001-fact-req001-signal-breakdown&quot;,
+  &quot;integration_record_hash&quot;: &quot;7645f6d502d3b6269ae8d7789670292e72b556eba83c47b1a9f108e6934973e3&quot;,
+  &quot;integration_record_id&quot;: &quot;fact-req001-signal-breakdown&quot;,
+  &quot;integration_record_ref&quot;: &quot;requirements/REQ-001/integration/committed/records.jsonl&quot;,
+  &quot;limitations&quot;: [
+    &quot;Delay/expedite communications are an operational-risk proxy and do not prove an actual late delivery.&quot;,
+    &quot;Communication keyword rules can create false positives and false negatives.&quot;,
+    &quot;Only 38 of 183 main-window customers remain under the 90-day sensitivity window.&quot;,
+    &quot;The high tier is a prioritization rule (&gt;=25% order decline and &gt;=3 positive adverse growth points), not a probability.&quot;,
+    &quot;Message IDs are reused in the synthetic source; exact event rows, not message_id alone, were deduplicated.&quot;
+  ],
+  &quot;manager_admission&quot;: {
+    &quot;plan_membership&quot;: false,
+    &quot;policy&quot;: &quot;explicit_business_presentation_plan&quot;,
+    &quot;presentation_audience&quot;: &quot;technical_audit&quot;,
+    &quot;requirement_status&quot;: &quot;admitted&quot;,
+    &quot;role&quot;: &quot;technical_audit&quot;,
+    &quot;status&quot;: &quot;audit_only&quot;
+  },
+  &quot;manager_anchor&quot;: &quot;REQ-001-support_metric-2&quot;,
+  &quot;manager_rows&quot;: [
+    {
+      &quot;Label&quot;: &quot;Reviewed detail&quot;,
+      &quot;Value&quot;: &quot;See technical audit&quot;
+    }
+  ],
+  &quot;presentation_audience&quot;: &quot;technical_audit&quot;,
+  &quot;presentation_role&quot;: &quot;support_metric&quot;,
+  &quot;presentation_tier&quot;: &quot;audit&quot;,
+  &quot;requirement_id&quot;: &quot;REQ-001&quot;,
+  &quot;requirement_limitations&quot;: [
+    &quot;Delay/expedite communications are an operational-risk proxy and do not prove an actual late delivery&quot;,
+    &quot;Urgent expedite messages are an operational-risk proxy, not proof of late delivery&quot;
+  ],
+  &quot;requirement_order&quot;: 1,
+  &quot;requirement_scope&quot;: &quot;Какие клиенты одновременно демонстрируют снижение заказной активности и рост жалоб, задержек или payment-reminder communications? Сформируй объяснимый watchlist, но не называй его доказанным churn prediction.\n\n│   ├── all_communications.parquet     [151,673 emails - 6.9 MB]\n\n│   ├── erp_transactions.parquet       [1.9M transactions - 40.8 MB]\n\n│   ├── sales_documents.parquet        [243K headers - 7.1 MB]\n\n│   ├── sales_items.parquet            [1.9M line items - 28.4 MB]\n\n- **Linked data**: All files connected via SALESDOCUMENT and customer_id\n\n- **Time-synchronized**: Chronologically consistent 2019-2020 data\n\n- **Discovery-oriented**: Patterns embedded in content, not labels\n\nAll enhancements are synthetic but modeled on real-world communication and ERP logic.&quot;,
+  &quot;requirement_title&quot;: &quot;Window-stable customer watchlist&quot;,
+  &quot;review_status&quot;: &quot;accepted_and_integrated&quot;,
+  &quot;reviewed_item_ref&quot;: &quot;requirements/REQ-001/accepted/manifest.json&quot;,
+  &quot;reviewed_output_ref&quot;: &quot;requirements/REQ-001/accepted/answer_content.json&quot;,
+  &quot;rows&quot;: [
+    {
+      &quot;Label&quot;: &quot;Reviewed detail&quot;,
+      &quot;Value&quot;: &quot;See technical audit&quot;
+    }
+  ],
+  &quot;takeaway&quot;: &quot;Устойчивый основной watchlist: 38 клиентов&quot;,
+  &quot;title&quot;: &quot;Order decline versus adverse-signal growth&quot;,
+  &quot;trace_refs&quot;: [
+    &quot;requirements/REQ-001/accepted/manifest.json&quot;,
+    &quot;requirements/REQ-001/accepted/answer_content.json&quot;,
+    &quot;requirements/REQ-001/integration/committed/manifest.json&quot;,
+    &quot;requirements/REQ-001/integration/committed/records.jsonl&quot;
+  ],
+  &quot;type&quot;: &quot;status_table&quot;,
+  &quot;visual_id&quot;: &quot;REQ001-V2&quot;
+}</pre></article><article class="audit-entry audit-widget-entry" id="audit-widget-REQ-001-fact-req001-watchlist-overview"><h4>REQ-001-fact-req001-watchlist-overview</h4><div class="audit-record-meta">Requirement: REQ-001 · Records: fact-req001-watchlist-overview · <a class="trace-link" href="evidence.html#trace-answer_content.json">answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-answer_content.json">requirements/REQ-001/accepted/answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-manifest.json">requirements/REQ-001/accepted/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-manifest.json">requirements/REQ-001/integration/committed/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-records.jsonl">requirements/REQ-001/integration/committed/records.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-evidence.jsonl">work/evidence.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-watchlist_analysis.json">work/watchlist_analysis.json</a> <a class="trace-link" href="evidence.html#trace-work-watchlist_projection.json">work/watchlist_projection.json</a></div><h5>Widget snapshot (exact)</h5><pre class="raw-audit widget-snapshot">{
+  &quot;accepted_content_hash&quot;: &quot;83d7d776b699042b95e5a42f44dc95bf51a080c16cc308af6a38d12ab42c7e18&quot;,
+  &quot;as_of&quot;: &quot;2020-06-29&quot;,
+  &quot;audit_payload&quot;: {
+    &quot;as_of&quot;: &quot;2020-06-29&quot;,
+    &quot;fact_id&quot;: &quot;fact-req001-watchlist-overview&quot;,
+    &quot;fact_type&quot;: &quot;watchlist_overview&quot;,
+    &quot;main_watchlist_customers&quot;: 183,
+    &quot;metric_ids&quot;: [
+      &quot;metric-req001-main-watchlist-180d&quot;,
+      &quot;metric-req001-stable-core-90d&quot;
+    ],
+    &quot;secondary_review_pool_customers&quot;: 145,
+    &quot;stable_core_customers&quot;: 38,
+    &quot;stable_high_priority_customers&quot;: 11,
+    &quot;title&quot;: &quot;Window-stable customer watchlist&quot;,
+    &quot;visual_id&quot;: &quot;REQ001-V3&quot;
+  },
+  &quot;dashboard_fact&quot;: true,
+  &quot;domain_id&quot;: &quot;group-01&quot;,
+  &quot;evidence_refs&quot;: [
+    &quot;work/evidence.jsonl&quot;,
+    &quot;work/watchlist_analysis.json&quot;,
+    &quot;work/watchlist_projection.json&quot;,
+    &quot;answer_content.json&quot;
+  ],
+  &quot;id&quot;: &quot;REQ-001-fact-req001-watchlist-overview&quot;,
+  &quot;integration_record_hash&quot;: &quot;ca69ecf2474bae609e545dcaec9765d503d394d1397e9eb2a527443ea8ef6eb7&quot;,
+  &quot;integration_record_id&quot;: &quot;fact-req001-watchlist-overview&quot;,
+  &quot;integration_record_ref&quot;: &quot;requirements/REQ-001/integration/committed/records.jsonl&quot;,
+  &quot;limitations&quot;: [
+    &quot;Delay/expedite communications are an operational-risk proxy and do not prove an actual late delivery.&quot;,
+    &quot;Communication keyword rules can create false positives and false negatives.&quot;,
+    &quot;Only 38 of 183 main-window customers remain under the 90-day sensitivity window.&quot;,
+    &quot;The high tier is a prioritization rule (&gt;=25% order decline and &gt;=3 positive adverse growth points), not a probability.&quot;,
+    &quot;Message IDs are reused in the synthetic source; exact event rows, not message_id alone, were deduplicated.&quot;
+  ],
+  &quot;manager_admission&quot;: {
+    &quot;plan_membership&quot;: true,
+    &quot;policy&quot;: &quot;explicit_business_presentation_plan&quot;,
+    &quot;presentation_audience&quot;: &quot;business_manager&quot;,
+    &quot;requirement_status&quot;: &quot;admitted&quot;,
+    &quot;role&quot;: &quot;decision_view&quot;,
+    &quot;status&quot;: &quot;admitted&quot;
+  },
+  &quot;manager_anchor&quot;: &quot;REQ-001-decision_view-3&quot;,
+  &quot;manager_presentation&quot;: {
+    &quot;canonical_payload_sha256&quot;: &quot;5e8cae8f4b8df273d76a8c319ac85976816ddb07097b8f543eee8e1174d5fb6d&quot;,
+    &quot;display_projection&quot;: {
+      &quot;body&quot;: {
+        &quot;pointer&quot;: &quot;/accepted/answer&quot;,
+        &quot;value&quot;: &quot;Короткий вывод: использовать один список из 183 клиентов как «прогноз оттока» нельзя. Корректный основной watchlist — 38 клиентов, которые одновременно показывают снижение количества уникальных заказов и рост негативного сигнала и в 180-дневном, и в 90-дневном сравнении. Из них 11 имеют наиболее сильное сочетание сигналов по прозрачному правилу приоритета. Остальные 145 клиентов из широкого 180-дневного списка следует считать менее устойчивым пулом для ручной проверки, а не подтвержденным риском churn.\n\nПериод и правило. Основное сравнение: 2019-07-06—2020-01-01 против 2020-01-02—2020-06-29, два равных окна по 180 дней. Активность — число уникальных SALESDOCUMENT на SOLDTOPARTY, поэтому строки позиций не раздувают число заказов. В список попадает клиент с хотя бы одним заказом в предыдущем окне, меньшим числом заказов в последнем окне и ростом хотя бы одного сигнала: жалобы в коммуникациях, сообщения о задержке/срочной экспедиции, payment reminder или наблюдаемая поздняя доставка. Срочная экспедиция — только proxy операционного риска, а не доказанная задержка.\n\nПервая очередь внутри устойчивого списка (11 клиентов):\n\n1. 1496685531 — Boston Industrial Company: заказы 167→53 (-68.3%); delay/expedite communications 0→3.\n2. 0643955685 — Chicago Supply &amp; Sons: 104→35 (-66.3%); delay/expedite 0→24.\n3. 5428040290 — Brown Industrial: 89→36 (-59.6%); delay/expedite 0→5.\n4. 4925749318 — Houston Hardware: 149→96 (-35.6%); delay/expedite 0→4.\n5. 6878245861 — United Trading Group: 133→86 (-35.3%); delay/expedite 0→4.\n6. 1541754675 — National Industrial Company: 135→89 (-34.1%); delay/expedite 0→8.\n7. 3861309655 — Modern Industries Ltd: 352→244 (-30.7%); delay/expedite 0→4.\n8. 8146909609 — Austin Equipment Inc: 88→63 (-28.4%); delay/expedite 0→5.\n9. 6259385027 — Davis Industrial &amp; Sons: 509→368 (-27.7%); delay/expedite 0→8.\n10. 4891725657 — Regional Industrial Partners: 215→158 (-26.5%); delay/expedite 0→4.\n11. 6296018319 — National Wholesale Company: 70→52 (-25.7%); delay/expedite 0→8.\n\nПолный устойчивый watchlist (38): 0268191126 Modern Industries Corp; 0318092256 Dallas Supply; 0643955685 Chicago Supply &amp; Sons; 0659139242 Modern Technologies GmbH; 1496685531 Boston Industrial Company; 1541754675 National Industrial Company; 1645578337 Professional Field Services; 1975864095 Dallas Supply; 2298745536 Davis Equipment LLC; 2863370440 Smith Equipment LLC; 3183089052 Premier Industrial Partners; 3215557007 Houston Hardware Inc; 3743005992 National Supply Company; 3861309655 Modern Industries Ltd; 4447128549 Advanced Industries Ltd; 4891725657 Regional Industrial Partners; 4925749318 Houston Hardware; 5373907527 Boston Industrial Inc; 5428040290 Brown Industrial; 5544628950 Denver Hardware LLC; 5830915004 Premier Distribution Group; 6087538991 National Industrial Company; 6259385027 Davis Industrial &amp; Sons; 6296018319 National Wholesale Company; 6638797984 Advanced Systems AG; 6720425242 Brown Tools; 6726809660 Premier Industrial Partners; 6817382620 Industrial Production Ltd; 6878245861 United Trading Group; 7889923890 Smith Supply Inc; 7996166544 Brown Industrial &amp; Sons; 8146909609 Austin Equipment Inc; 8510559347 Austin Equipment Inc; 8817470417 Johnson Hardware Inc; 9032110575 Expert Technical LLC; 9058393281 Smith Equipment Company; 9427687889 Austin Tools LLC; 9544612311 Quality Service Solutions.\n\nМасштаб результата. Из 6,374 клиентов с заказами в предыдущем 180-дневном окне у 3,823 активность снизилась; у 490 вырос хотя бы один негативный компонент; пересечение — 183. В нем 83 клиента complaint-led и 100 delay/expedite-communication-led. Явных payment-reminder matches по выбранным правилам не найдено, и ни один клиент не попал в список только из-за роста подтвержденных поздних доставок; supporting documents охватывают лишь 235 клиентов, поэтому отсутствие там нельзя трактовать как отсутствие задержек.\n\nКачество и ограничения. Все 13,155 customer_id из communications точно совпали с 13,155 SOLDTOPARTY в ERP; покрытие обеих сторон 100%, неоднозначных владельцев sales document не найдено. Но коммуникации классифицированы объяснимыми keyword/regex-правилами, а не размеченной моделью, поэтому возможны false positives/negatives. Только 38 из 183 клиентов сохраняются при 90-дневном окне (20.765%), что показывает существенную чувствительность к горизонту. Список не является доказательством будущего churn, причинности или вероятности ухода.\n\nРекомендуемое действие: сначала передать 11 клиентов первой очереди customer-success/operations команде для ручной проверки контекста сообщений, открытых заказов и фактических задержек; затем рассмотреть остальные 27 устойчивых клиентов. Широкий пул из 145 нестабильных кандидатов использовать только как вторичный triage.&quot;
+      },
+      &quot;title&quot;: {
+        &quot;pointer&quot;: &quot;/payload/title&quot;,
+        &quot;value&quot;: &quot;Window-stable customer watchlist&quot;
+      }
+    },
+    &quot;file_sha256&quot;: &quot;ddab3a9850c1a95d6a74f8ebb482d17a6e81dbab20354ae18d6cb06785205f8d&quot;,
+    &quot;presentation_role&quot;: &quot;decision_view&quot;,
+    &quot;record_id&quot;: &quot;fact-req001-watchlist-overview&quot;,
+    &quot;requirement_id&quot;: &quot;REQ-001&quot;,
+    &quot;widget_id&quot;: &quot;REQ-001-fact-req001-watchlist-overview&quot;
+  },
+  &quot;manager_rows&quot;: [
+    {
+      &quot;Label&quot;: &quot;Reviewed detail&quot;,
+      &quot;Value&quot;: &quot;See technical audit&quot;
+    }
+  ],
+  &quot;presentation_audience&quot;: &quot;business_manager&quot;,
+  &quot;presentation_role&quot;: &quot;decision_view&quot;,
+  &quot;presentation_tier&quot;: &quot;primary&quot;,
+  &quot;requirement_id&quot;: &quot;REQ-001&quot;,
+  &quot;requirement_limitations&quot;: [
+    &quot;Delay/expedite communications are an operational-risk proxy and do not prove an actual late delivery&quot;,
+    &quot;Urgent expedite messages are an operational-risk proxy, not proof of late delivery&quot;
+  ],
+  &quot;requirement_order&quot;: 1,
+  &quot;requirement_scope&quot;: &quot;Какие клиенты одновременно демонстрируют снижение заказной активности и рост жалоб, задержек или payment-reminder communications? Сформируй объяснимый watchlist, но не называй его доказанным churn prediction.\n\n│   ├── all_communications.parquet     [151,673 emails - 6.9 MB]\n\n│   ├── erp_transactions.parquet       [1.9M transactions - 40.8 MB]\n\n│   ├── sales_documents.parquet        [243K headers - 7.1 MB]\n\n│   ├── sales_items.parquet            [1.9M line items - 28.4 MB]\n\n- **Linked data**: All files connected via SALESDOCUMENT and customer_id\n\n- **Time-synchronized**: Chronologically consistent 2019-2020 data\n\n- **Discovery-oriented**: Patterns embedded in content, not labels\n\nAll enhancements are synthetic but modeled on real-world communication and ERP logic.&quot;,
+  &quot;requirement_title&quot;: &quot;Window-stable customer watchlist&quot;,
+  &quot;review_status&quot;: &quot;accepted_and_integrated&quot;,
+  &quot;reviewed_item_ref&quot;: &quot;requirements/REQ-001/accepted/manifest.json&quot;,
+  &quot;reviewed_output_ref&quot;: &quot;requirements/REQ-001/accepted/answer_content.json&quot;,
+  &quot;rows&quot;: [
+    {
+      &quot;Label&quot;: &quot;Reviewed detail&quot;,
+      &quot;Value&quot;: &quot;See technical audit&quot;
+    }
+  ],
+  &quot;takeaway&quot;: &quot;Устойчивый основной watchlist: 38 клиентов&quot;,
+  &quot;title&quot;: &quot;Window-stable customer watchlist&quot;,
+  &quot;trace_refs&quot;: [
+    &quot;requirements/REQ-001/accepted/manifest.json&quot;,
+    &quot;requirements/REQ-001/accepted/answer_content.json&quot;,
+    &quot;requirements/REQ-001/integration/committed/manifest.json&quot;,
+    &quot;requirements/REQ-001/integration/committed/records.jsonl&quot;
+  ],
+  &quot;type&quot;: &quot;status_table&quot;,
+  &quot;visual_id&quot;: &quot;REQ001-V3&quot;
+}</pre></article><article class="audit-entry audit-widget-entry" id="audit-widget-REQ-001-metric-req001-customer-key-join"><h4>REQ-001-metric-req001-customer-key-join</h4><div class="audit-record-meta">Requirement: REQ-001 · Records: metric-req001-customer-key-join · <a class="trace-link" href="evidence.html#trace-answer_content.json">answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-answer_content.json">requirements/REQ-001/accepted/answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-manifest.json">requirements/REQ-001/accepted/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-manifest.json">requirements/REQ-001/integration/committed/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-records.jsonl">requirements/REQ-001/integration/committed/records.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-analytical_relationships.jsonl">work/analytical_relationships.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-evidence.jsonl">work/evidence.jsonl</a></div><h5>Widget snapshot (exact)</h5><pre class="raw-audit widget-snapshot">{
+  &quot;accepted_content_hash&quot;: &quot;83d7d776b699042b95e5a42f44dc95bf51a080c16cc308af6a38d12ab42c7e18&quot;,
+  &quot;as_of&quot;: &quot;2020-06-29&quot;,
+  &quot;audit_payload&quot;: {
+    &quot;ambiguous_sales_documents_excluded&quot;: 0,
+    &quot;as_of&quot;: &quot;2020-06-29&quot;,
+    &quot;grain&quot;: &quot;customer key&quot;,
+    &quot;join_rule&quot;: &quot;all_communications.customer_id = erp_transactions.SOLDTOPARTY&quot;,
+    &quot;label&quot;: &quot;Exact customer-key join coverage&quot;,
+    &quot;metric_id&quot;: &quot;metric-req001-customer-key-join&quot;,
+    &quot;source_coverage&quot;: 1.0,
+    &quot;source_population&quot;: 13155,
+    &quot;target_coverage&quot;: 1.0,
+    &quot;target_population&quot;: 13155,
+    &quot;unit&quot;: &quot;matched customers&quot;,
+    &quot;value&quot;: 13155
+  },
+  &quot;domain_id&quot;: &quot;group-01&quot;,
+  &quot;evidence_refs&quot;: [
+    &quot;work/evidence.jsonl&quot;,
+    &quot;work/analytical_relationships.jsonl&quot;,
+    &quot;answer_content.json&quot;
+  ],
+  &quot;grain&quot;: &quot;customer key&quot;,
+  &quot;id&quot;: &quot;REQ-001-metric-req001-customer-key-join&quot;,
+  &quot;integration_record_hash&quot;: &quot;0bf5e2cc74b5c37275b06c7a256a5a7c40993745d2a08b5e13ee932fb0b11cbc&quot;,
+  &quot;integration_record_id&quot;: &quot;metric-req001-customer-key-join&quot;,
+  &quot;integration_record_ref&quot;: &quot;requirements/REQ-001/integration/committed/records.jsonl&quot;,
+  &quot;limitations&quot;: [
+    &quot;Delay/expedite communications are an operational-risk proxy and do not prove an actual late delivery.&quot;,
+    &quot;Communication keyword rules can create false positives and false negatives.&quot;,
+    &quot;Only 38 of 183 main-window customers remain under the 90-day sensitivity window.&quot;,
+    &quot;The high tier is a prioritization rule (&gt;=25% order decline and &gt;=3 positive adverse growth points), not a probability.&quot;,
+    &quot;Message IDs are reused in the synthetic source; exact event rows, not message_id alone, were deduplicated.&quot;
+  ],
+  &quot;manager_admission&quot;: {
+    &quot;plan_membership&quot;: false,
+    &quot;policy&quot;: &quot;explicit_business_presentation_plan&quot;,
+    &quot;presentation_audience&quot;: &quot;technical_audit&quot;,
+    &quot;requirement_status&quot;: &quot;admitted&quot;,
+    &quot;role&quot;: &quot;technical_audit&quot;,
+    &quot;status&quot;: &quot;audit_only&quot;
+  },
+  &quot;manager_anchor&quot;: &quot;REQ-001-support_metric-4&quot;,
+  &quot;presentation_audience&quot;: &quot;technical_audit&quot;,
+  &quot;presentation_role&quot;: &quot;support_metric&quot;,
+  &quot;presentation_tier&quot;: &quot;audit&quot;,
+  &quot;requirement_id&quot;: &quot;REQ-001&quot;,
+  &quot;requirement_limitations&quot;: [
+    &quot;Delay/expedite communications are an operational-risk proxy and do not prove an actual late delivery&quot;,
+    &quot;Urgent expedite messages are an operational-risk proxy, not proof of late delivery&quot;
+  ],
+  &quot;requirement_order&quot;: 1,
+  &quot;requirement_scope&quot;: &quot;Какие клиенты одновременно демонстрируют снижение заказной активности и рост жалоб, задержек или payment-reminder communications? Сформируй объяснимый watchlist, но не называй его доказанным churn prediction.\n\n│   ├── all_communications.parquet     [151,673 emails - 6.9 MB]\n\n│   ├── erp_transactions.parquet       [1.9M transactions - 40.8 MB]\n\n│   ├── sales_documents.parquet        [243K headers - 7.1 MB]\n\n│   ├── sales_items.parquet            [1.9M line items - 28.4 MB]\n\n- **Linked data**: All files connected via SALESDOCUMENT and customer_id\n\n- **Time-synchronized**: Chronologically consistent 2019-2020 data\n\n- **Discovery-oriented**: Patterns embedded in content, not labels\n\nAll enhancements are synthetic but modeled on real-world communication and ERP logic.&quot;,
+  &quot;requirement_title&quot;: &quot;Window-stable customer watchlist&quot;,
+  &quot;review_status&quot;: &quot;accepted_and_integrated&quot;,
+  &quot;reviewed_item_ref&quot;: &quot;requirements/REQ-001/accepted/manifest.json&quot;,
+  &quot;reviewed_output_ref&quot;: &quot;requirements/REQ-001/accepted/answer_content.json&quot;,
+  &quot;takeaway&quot;: &quot;Устойчивый основной watchlist: 38 клиентов&quot;,
+  &quot;title&quot;: &quot;Exact customer-key join coverage&quot;,
+  &quot;trace_refs&quot;: [
+    &quot;requirements/REQ-001/accepted/manifest.json&quot;,
+    &quot;requirements/REQ-001/accepted/answer_content.json&quot;,
+    &quot;requirements/REQ-001/integration/committed/manifest.json&quot;,
+    &quot;requirements/REQ-001/integration/committed/records.jsonl&quot;
+  ],
+  &quot;type&quot;: &quot;kpi&quot;,
+  &quot;unit&quot;: &quot;matched customers&quot;,
+  &quot;value&quot;: 13155
+}</pre></article><article class="audit-entry audit-widget-entry" id="audit-widget-REQ-001-metric-req001-main-watchlist-180d"><h4>REQ-001-metric-req001-main-watchlist-180d</h4><div class="audit-record-meta">Requirement: REQ-001 · Records: metric-req001-main-watchlist-180d · <a class="trace-link" href="evidence.html#trace-answer_content.json">answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-answer_content.json">requirements/REQ-001/accepted/answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-manifest.json">requirements/REQ-001/accepted/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-manifest.json">requirements/REQ-001/integration/committed/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-records.jsonl">requirements/REQ-001/integration/committed/records.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-evidence.jsonl">work/evidence.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-watchlist_analysis.json">work/watchlist_analysis.json</a> <a class="trace-link" href="evidence.html#trace-work-watchlist_projection.json">work/watchlist_projection.json</a></div><h5>Widget snapshot (exact)</h5><pre class="raw-audit widget-snapshot">{
+  &quot;accepted_content_hash&quot;: &quot;83d7d776b699042b95e5a42f44dc95bf51a080c16cc308af6a38d12ab42c7e18&quot;,
+  &quot;as_of&quot;: &quot;2020-06-29&quot;,
+  &quot;audit_payload&quot;: {
+    &quot;as_of&quot;: &quot;2020-06-29&quot;,
+    &quot;complaint_led_customers&quot;: 83,
+    &quot;criteria&quot;: &quot;prior_orders &gt; 0; recent_orders &lt; prior_orders; at least one adverse component increase&quot;,
+    &quot;delay_or_expedite_led_customers&quot;: 100,
+    &quot;grain&quot;: &quot;customer&quot;,
+    &quot;label&quot;: &quot;Main 180-day adverse/order-decline watchlist&quot;,
+    &quot;late_shipment_growth_led_customers&quot;: 0,
+    &quot;metric_id&quot;: &quot;metric-req001-main-watchlist-180d&quot;,
+    &quot;payment_reminder_led_customers&quot;: 0,
+    &quot;prior_period&quot;: {
+      &quot;end&quot;: &quot;2020-01-01&quot;,
+      &quot;start&quot;: &quot;2019-07-06&quot;
+    },
+    &quot;recent_period&quot;: {
+      &quot;end&quot;: &quot;2020-06-29&quot;,
+      &quot;start&quot;: &quot;2020-01-02&quot;
+    },
+    &quot;unit&quot;: &quot;customers&quot;,
+    &quot;value&quot;: 183,
+    &quot;window_days&quot;: 180
+  },
+  &quot;domain_id&quot;: &quot;group-01&quot;,
+  &quot;evidence_refs&quot;: [
+    &quot;work/evidence.jsonl&quot;,
+    &quot;work/watchlist_analysis.json&quot;,
+    &quot;work/watchlist_projection.json&quot;,
+    &quot;answer_content.json&quot;
+  ],
+  &quot;grain&quot;: &quot;customer&quot;,
+  &quot;id&quot;: &quot;REQ-001-metric-req001-main-watchlist-180d&quot;,
+  &quot;integration_record_hash&quot;: &quot;db438a176906687c437688743ae9cba793d841e503937b626791e12d13eb2019&quot;,
+  &quot;integration_record_id&quot;: &quot;metric-req001-main-watchlist-180d&quot;,
+  &quot;integration_record_ref&quot;: &quot;requirements/REQ-001/integration/committed/records.jsonl&quot;,
+  &quot;limitations&quot;: [
+    &quot;Delay/expedite communications are an operational-risk proxy and do not prove an actual late delivery.&quot;,
+    &quot;Communication keyword rules can create false positives and false negatives.&quot;,
+    &quot;Only 38 of 183 main-window customers remain under the 90-day sensitivity window.&quot;,
+    &quot;The high tier is a prioritization rule (&gt;=25% order decline and &gt;=3 positive adverse growth points), not a probability.&quot;,
+    &quot;Message IDs are reused in the synthetic source; exact event rows, not message_id alone, were deduplicated.&quot;
+  ],
+  &quot;manager_admission&quot;: {
+    &quot;plan_membership&quot;: false,
+    &quot;policy&quot;: &quot;explicit_business_presentation_plan&quot;,
+    &quot;presentation_audience&quot;: &quot;technical_audit&quot;,
+    &quot;requirement_status&quot;: &quot;admitted&quot;,
+    &quot;role&quot;: &quot;technical_audit&quot;,
+    &quot;status&quot;: &quot;audit_only&quot;
+  },
+  &quot;manager_anchor&quot;: &quot;REQ-001-support_metric-5&quot;,
+  &quot;manager_rows&quot;: [
+    {
+      &quot;Label&quot;: &quot;Label&quot;,
+      &quot;Value&quot;: &quot;Main 180-day adverse/order-decline watchlist&quot;
+    },
+    {
+      &quot;Label&quot;: &quot;As Of&quot;,
+      &quot;Value&quot;: &quot;2020-06-29&quot;
+    },
+    {
+      &quot;Label&quot;: &quot;Unit&quot;,
+      &quot;Value&quot;: &quot;customers&quot;
+    },
+    {
+      &quot;Label&quot;: &quot;Value&quot;,
+      &quot;Value&quot;: 183
+    }
+  ],
+  &quot;presentation_audience&quot;: &quot;technical_audit&quot;,
+  &quot;presentation_role&quot;: &quot;support_metric&quot;,
+  &quot;presentation_tier&quot;: &quot;audit&quot;,
+  &quot;requirement_id&quot;: &quot;REQ-001&quot;,
+  &quot;requirement_limitations&quot;: [
+    &quot;Delay/expedite communications are an operational-risk proxy and do not prove an actual late delivery&quot;,
+    &quot;Urgent expedite messages are an operational-risk proxy, not proof of late delivery&quot;
+  ],
+  &quot;requirement_order&quot;: 1,
+  &quot;requirement_scope&quot;: &quot;Какие клиенты одновременно демонстрируют снижение заказной активности и рост жалоб, задержек или payment-reminder communications? Сформируй объяснимый watchlist, но не называй его доказанным churn prediction.\n\n│   ├── all_communications.parquet     [151,673 emails - 6.9 MB]\n\n│   ├── erp_transactions.parquet       [1.9M transactions - 40.8 MB]\n\n│   ├── sales_documents.parquet        [243K headers - 7.1 MB]\n\n│   ├── sales_items.parquet            [1.9M line items - 28.4 MB]\n\n- **Linked data**: All files connected via SALESDOCUMENT and customer_id\n\n- **Time-synchronized**: Chronologically consistent 2019-2020 data\n\n- **Discovery-oriented**: Patterns embedded in content, not labels\n\nAll enhancements are synthetic but modeled on real-world communication and ERP logic.&quot;,
+  &quot;requirement_title&quot;: &quot;Window-stable customer watchlist&quot;,
+  &quot;review_status&quot;: &quot;accepted_and_integrated&quot;,
+  &quot;reviewed_item_ref&quot;: &quot;requirements/REQ-001/accepted/manifest.json&quot;,
+  &quot;reviewed_output_ref&quot;: &quot;requirements/REQ-001/accepted/answer_content.json&quot;,
+  &quot;rows&quot;: [],
+  &quot;takeaway&quot;: &quot;Устойчивый основной watchlist: 38 клиентов&quot;,
+  &quot;title&quot;: &quot;Main 180-day adverse/order-decline watchlist&quot;,
+  &quot;trace_refs&quot;: [
+    &quot;requirements/REQ-001/accepted/manifest.json&quot;,
+    &quot;requirements/REQ-001/accepted/answer_content.json&quot;,
+    &quot;requirements/REQ-001/integration/committed/manifest.json&quot;,
+    &quot;requirements/REQ-001/integration/committed/records.jsonl&quot;
+  ],
+  &quot;type&quot;: &quot;table&quot;,
+  &quot;unit&quot;: &quot;customers&quot;
+}</pre></article><article class="audit-entry audit-widget-entry" id="audit-widget-REQ-001-metric-req001-stable-core-90d"><h4>REQ-001-metric-req001-stable-core-90d</h4><div class="audit-record-meta">Requirement: REQ-001 · Records: metric-req001-stable-core-90d · <a class="trace-link" href="evidence.html#trace-answer_content.json">answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-answer_content.json">requirements/REQ-001/accepted/answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-manifest.json">requirements/REQ-001/accepted/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-manifest.json">requirements/REQ-001/integration/committed/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-records.jsonl">requirements/REQ-001/integration/committed/records.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-evidence.jsonl">work/evidence.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-watchlist_analysis.json">work/watchlist_analysis.json</a> <a class="trace-link" href="evidence.html#trace-work-watchlist_projection.json">work/watchlist_projection.json</a></div><h5>Widget snapshot (exact)</h5><pre class="raw-audit widget-snapshot">{
+  &quot;accepted_content_hash&quot;: &quot;83d7d776b699042b95e5a42f44dc95bf51a080c16cc308af6a38d12ab42c7e18&quot;,
+  &quot;aggregated_metric_ids&quot;: [
+    &quot;REQ-001-metric-req001-stable-core-90d&quot;
+  ],
+  &quot;as_of&quot;: &quot;2020-06-29&quot;,
+  &quot;audit_payload&quot;: [
+    {
+      &quot;as_of&quot;: &quot;2020-06-29&quot;,
+      &quot;grain&quot;: &quot;customer&quot;,
+      &quot;interpretation&quot;: &quot;descriptive stability under a shorter horizon, not validated future churn&quot;,
+      &quot;label&quot;: &quot;90-day window-stable core watchlist&quot;,
+      &quot;main_retained_share&quot;: 0.20765,
+      &quot;main_watchlist_customers&quot;: 183,
+      &quot;metric_id&quot;: &quot;metric-req001-stable-core-90d&quot;,
+      &quot;stable_high_priority_customers&quot;: 11,
+      &quot;unit&quot;: &quot;customers&quot;,
+      &quot;value&quot;: 38,
+      &quot;window_days&quot;: 90
+    }
+  ],
+  &quot;domain_id&quot;: &quot;group-01&quot;,
+  &quot;evidence_refs&quot;: [
+    &quot;work/evidence.jsonl&quot;,
+    &quot;work/watchlist_analysis.json&quot;,
+    &quot;work/watchlist_projection.json&quot;,
+    &quot;answer_content.json&quot;
+  ],
+  &quot;grain&quot;: &quot;customer&quot;,
+  &quot;id&quot;: &quot;REQ-001-metric-req001-stable-core-90d&quot;,
+  &quot;integration_record_hash&quot;: &quot;e527c7eb18e734cf9e2b36ec7e64a65daa5357bb2e5ba6c1dca9de81d0cc6f4c&quot;,
+  &quot;integration_record_hashes&quot;: [
+    &quot;e527c7eb18e734cf9e2b36ec7e64a65daa5357bb2e5ba6c1dca9de81d0cc6f4c&quot;
+  ],
+  &quot;integration_record_id&quot;: &quot;metric-req001-stable-core-90d&quot;,
+  &quot;integration_record_ids&quot;: [
+    &quot;metric-req001-stable-core-90d&quot;
+  ],
+  &quot;integration_record_ref&quot;: &quot;requirements/REQ-001/integration/committed/records.jsonl&quot;,
+  &quot;integration_record_refs&quot;: [
+    &quot;requirements/REQ-001/integration/committed/records.jsonl&quot;
+  ],
+  &quot;limitations&quot;: [
+    &quot;Delay/expedite communications are an operational-risk proxy and do not prove an actual late delivery.&quot;,
+    &quot;Communication keyword rules can create false positives and false negatives.&quot;,
+    &quot;Only 38 of 183 main-window customers remain under the 90-day sensitivity window.&quot;,
+    &quot;The high tier is a prioritization rule (&gt;=25% order decline and &gt;=3 positive adverse growth points), not a probability.&quot;,
+    &quot;Message IDs are reused in the synthetic source; exact event rows, not message_id alone, were deduplicated.&quot;
+  ],
+  &quot;manager_admission&quot;: {
+    &quot;plan_membership&quot;: true,
+    &quot;policy&quot;: &quot;explicit_business_presentation_plan&quot;,
+    &quot;presentation_audience&quot;: &quot;business_manager&quot;,
+    &quot;requirement_status&quot;: &quot;admitted&quot;,
+    &quot;role&quot;: &quot;decision_view&quot;,
+    &quot;status&quot;: &quot;admitted&quot;
+  },
+  &quot;manager_anchor&quot;: &quot;REQ-001-decision_view-6&quot;,
+  &quot;manager_presentation&quot;: {
+    &quot;allowed_visual_fields&quot;: [
+      &quot;type&quot;,
+      &quot;family&quot;,
+      &quot;grain&quot;,
+      &quot;integration_record_id&quot;,
+      &quot;integration_record_ids&quot;,
+      &quot;integration_record_ref&quot;,
+      &quot;integration_record_refs&quot;,
+      &quot;tiles&quot;,
+      &quot;unit&quot;
+    ],
+    &quot;chart_entry_sha256&quot;: &quot;0f1264e3a6e14985ffa2c89fd285c296dea011b4a5efd08467d4359d6c254eb7&quot;,
+    &quot;chart_family&quot;: &quot;metric_grid&quot;,
+    &quot;presentation_role&quot;: &quot;decision_view&quot;,
+    &quot;record_ids&quot;: [
+      &quot;metric-req001-stable-core-90d&quot;
+    ],
+    &quot;requirement_id&quot;: &quot;REQ-001&quot;,
+    &quot;title_projection&quot;: {
+      &quot;pointer&quot;: &quot;/widget_snapshot/title&quot;,
+      &quot;value&quot;: &quot;Key signals&quot;
+    },
+    &quot;visual_projection&quot;: {
+      &quot;family&quot;: {
+        &quot;pointer&quot;: &quot;/chart_entry/family&quot;,
+        &quot;value&quot;: &quot;metric_grid&quot;
+      },
+      &quot;grain&quot;: {
+        &quot;pointer&quot;: &quot;/chart_entry/fields_or_values_used/grain&quot;,
+        &quot;value&quot;: &quot;customer&quot;
+      },
+      &quot;integration_record_id&quot;: {
+        &quot;pointer&quot;: &quot;/chart_entry/fields_or_values_used/integration_record_id&quot;,
+        &quot;value&quot;: &quot;metric-req001-stable-core-90d&quot;
+      },
+      &quot;integration_record_ids&quot;: {
+        &quot;pointer&quot;: &quot;/chart_entry/fields_or_values_used/integration_record_ids&quot;,
+        &quot;value&quot;: [
+          &quot;metric-req001-stable-core-90d&quot;
+        ]
+      },
+      &quot;integration_record_ref&quot;: {
+        &quot;pointer&quot;: &quot;/chart_entry/fields_or_values_used/integration_record_ref&quot;,
+        &quot;value&quot;: &quot;requirements/REQ-001/integration/committed/records.jsonl&quot;
+      },
+      &quot;integration_record_refs&quot;: {
+        &quot;pointer&quot;: &quot;/chart_entry/fields_or_values_used/integration_record_refs&quot;,
+        &quot;value&quot;: [
+          &quot;requirements/REQ-001/integration/committed/records.jsonl&quot;
+        ]
+      },
+      &quot;tiles&quot;: {
+        &quot;pointer&quot;: &quot;/chart_entry/fields_or_values_used/tiles&quot;,
+        &quot;value&quot;: [
+          {
+            &quot;as_of&quot;: &quot;2020-06-29&quot;,
+            &quot;label&quot;: &quot;90-day window-stable core watchlist&quot;,
+            &quot;unit&quot;: &quot;customers&quot;,
+            &quot;value&quot;: 38
+          }
+        ]
+      },
+      &quot;type&quot;: {
+        &quot;pointer&quot;: &quot;/chart_entry/type&quot;,
+        &quot;value&quot;: &quot;metric_grid&quot;
+      },
+      &quot;unit&quot;: {
+        &quot;pointer&quot;: &quot;/chart_entry/fields_or_values_used/unit&quot;,
+        &quot;value&quot;: &quot;customers&quot;
+      }
+    },
+    &quot;visual_type&quot;: &quot;metric_grid&quot;,
+    &quot;widget_id&quot;: &quot;REQ-001-metric-req001-stable-core-90d&quot;,
+    &quot;widget_snapshot_sha256&quot;: &quot;e56ebd4c359f47f0b09b4a3659f490200e6acb39402fd046b46786bdf1e91ff6&quot;
+  },
+  &quot;presentation_audience&quot;: &quot;business_manager&quot;,
+  &quot;presentation_role&quot;: &quot;decision_view&quot;,
+  &quot;presentation_tier&quot;: &quot;primary&quot;,
+  &quot;requirement_id&quot;: &quot;REQ-001&quot;,
+  &quot;requirement_limitations&quot;: [
+    &quot;Delay/expedite communications are an operational-risk proxy and do not prove an actual late delivery&quot;,
+    &quot;Urgent expedite messages are an operational-risk proxy, not proof of late delivery&quot;
+  ],
+  &quot;requirement_order&quot;: 1,
+  &quot;requirement_scope&quot;: &quot;Какие клиенты одновременно демонстрируют снижение заказной активности и рост жалоб, задержек или payment-reminder communications? Сформируй объяснимый watchlist, но не называй его доказанным churn prediction.\n\n│   ├── all_communications.parquet     [151,673 emails - 6.9 MB]\n\n│   ├── erp_transactions.parquet       [1.9M transactions - 40.8 MB]\n\n│   ├── sales_documents.parquet        [243K headers - 7.1 MB]\n\n│   ├── sales_items.parquet            [1.9M line items - 28.4 MB]\n\n- **Linked data**: All files connected via SALESDOCUMENT and customer_id\n\n- **Time-synchronized**: Chronologically consistent 2019-2020 data\n\n- **Discovery-oriented**: Patterns embedded in content, not labels\n\nAll enhancements are synthetic but modeled on real-world communication and ERP logic.&quot;,
+  &quot;requirement_title&quot;: &quot;Window-stable customer watchlist&quot;,
+  &quot;review_status&quot;: &quot;accepted_and_integrated&quot;,
+  &quot;reviewed_item_ref&quot;: &quot;requirements/REQ-001/accepted/manifest.json&quot;,
+  &quot;reviewed_output_ref&quot;: &quot;requirements/REQ-001/accepted/answer_content.json&quot;,
+  &quot;takeaway&quot;: &quot;Устойчивый основной watchlist: 38 клиентов&quot;,
+  &quot;tiles&quot;: [
+    {
+      &quot;as_of&quot;: &quot;2020-06-29&quot;,
+      &quot;label&quot;: &quot;90-day window-stable core watchlist&quot;,
+      &quot;unit&quot;: &quot;customers&quot;,
+      &quot;value&quot;: 38
+    }
+  ],
+  &quot;title&quot;: &quot;Key signals&quot;,
+  &quot;trace_refs&quot;: [
+    &quot;requirements/REQ-001/accepted/manifest.json&quot;,
+    &quot;requirements/REQ-001/accepted/answer_content.json&quot;,
+    &quot;requirements/REQ-001/integration/committed/manifest.json&quot;,
+    &quot;requirements/REQ-001/integration/committed/records.jsonl&quot;
+  ],
+  &quot;type&quot;: &quot;metric_grid&quot;,
+  &quot;unit&quot;: &quot;customers&quot;
+}</pre></article><article class="audit-entry audit-widget-entry" id="audit-widget-REQ-001-relationship-coverage"><h4>REQ-001-relationship-coverage</h4><div class="audit-record-meta">Requirement: REQ-001 · Records: relationship-req001-customer-communication-erp · <a class="trace-link" href="evidence.html#trace-answer_content.json">answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-answer_content.json">requirements/REQ-001/accepted/answer_content.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-accepted-manifest.json">requirements/REQ-001/accepted/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-manifest.json">requirements/REQ-001/integration/committed/manifest.json</a> <a class="trace-link" href="evidence.html#trace-requirements-REQ-001-integration-committed-records.jsonl">requirements/REQ-001/integration/committed/records.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-analytical_relationships.jsonl">work/analytical_relationships.jsonl</a> <a class="trace-link" href="evidence.html#trace-work-evidence.jsonl">work/evidence.jsonl</a></div><h5>Widget snapshot (exact)</h5><pre class="raw-audit widget-snapshot">{
+  &quot;accepted_content_hash&quot;: &quot;83d7d776b699042b95e5a42f44dc95bf51a080c16cc308af6a38d12ab42c7e18&quot;,
+  &quot;as_of&quot;: &quot;2020-06-29&quot;,
+  &quot;audit_payload&quot;: [
+    {
+      &quot;analysis_relationship_id&quot;: &quot;REQ001-CUSTOMER-COMMUNICATION-ERP-EXACT&quot;,
+      &quot;as_of&quot;: &quot;2020-06-29&quot;,
+      &quot;audit_id&quot;: null,
+      &quot;cardinality&quot;: &quot;one_to_one&quot;,
+      &quot;date_authority&quot;: &quot;Communications timestamp for communication events; ERP CREATIONDATE for distinct sales-document activity; common analytical as-of is the earlier observed maximum.&quot;,
+      &quot;evidence_refs&quot;: [
+        &quot;REQ001-E1&quot;,
+        &quot;watchlist_analysis.json&quot;
+      ],
+      &quot;join_keys&quot;: [
+        {
+          &quot;source_field&quot;: &quot;customer_id&quot;,
+          &quot;target_field&quot;: &quot;SOLDTOPARTY&quot;
+        }
+      ],
+      &quot;limitations&quot;: [
+        &quot;This is an exact source-local customer-key relationship for REQ-001, not a canonical identity mapping beyond the selected sources.&quot;,
+        &quot;Underlying event rows are many-to-customer and line-item-to-customer; one-to-one cardinality refers to the tested unique customer-key endpoints.&quot;
+      ],
+      &quot;matched_pairs&quot;: 13155,
+      &quot;matched_source_count&quot;: 13155,
+      &quot;matched_target_count&quot;: 13155,
+      &quot;owner_ref&quot;: &quot;5bd9ba337c942b8ad2492a3b960ff8589955a4d14e94bea3952a66a9cc3a6b9a&quot;,
+      &quot;relationship_id&quot;: &quot;REQ001-CUSTOMER-COMMUNICATION-ERP-EXACT&quot;,
+      &quot;scope&quot;: &quot;requirement&quot;,
+      &quot;source_coverage&quot;: 1.0,
+      &quot;source_id&quot;: &quot;all_communications.parquet&quot;,
+      &quot;source_population&quot;: 13155,
+      &quot;target_coverage&quot;: 1.0,
+      &quot;target_id&quot;: &quot;erp_transactions.parquet&quot;,
+      &quot;target_population&quot;: 13155
+    }
+  ],
+  &quot;date_authority&quot;: &quot;Communications timestamp for communication events; ERP CREATIONDATE for distinct sales-document activity; common analytical as-of is the earlier observed maximum.&quot;,
+  &quot;domain_id&quot;: &quot;group-01&quot;,
+  &quot;evidence_refs&quot;: [
+    &quot;answer_content.json&quot;,
+    &quot;work/analytical_relationships.jsonl&quot;,
+    &quot;work/evidence.jsonl&quot;
+  ],
+  &quot;id&quot;: &quot;REQ-001-relationship-coverage&quot;,
+  &quot;integration_record_hash&quot;: &quot;cd0ce45e2627abaa643b6d20b24e1a3fa8a25f799b81aa818cce9a63e37cba43&quot;,
+  &quot;integration_record_id&quot;: &quot;relationship-req001-customer-communication-erp&quot;,
+  &quot;integration_record_ids&quot;: [
+    &quot;relationship-req001-customer-communication-erp&quot;
+  ],
+  &quot;integration_record_ref&quot;: &quot;requirements/REQ-001/integration/committed/records.jsonl&quot;,
+  &quot;integration_record_refs&quot;: [
+    &quot;requirements/REQ-001/integration/committed/records.jsonl&quot;
+  ],
+  &quot;limitations&quot;: [
+    &quot;Delay/expedite communications are an operational-risk proxy and do not prove an actual late delivery.&quot;,
+    &quot;Communication keyword rules can create false positives and false negatives.&quot;,
+    &quot;Only 38 of 183 main-window customers remain under the 90-day sensitivity window.&quot;,
+    &quot;The high tier is a prioritization rule (&gt;=25% order decline and &gt;=3 positive adverse growth points), not a probability.&quot;,
+    &quot;Message IDs are reused in the synthetic source; exact event rows, not message_id alone, were deduplicated.&quot;,
+    &quot;This is an exact source-local customer-key relationship for REQ-001, not a canonical identity mapping beyond the selected sources.&quot;,
+    &quot;Underlying event rows are many-to-customer and line-item-to-customer; one-to-one cardinality refers to the tested unique customer-key endpoints.&quot;
+  ],
+  &quot;manager_admission&quot;: {
+    &quot;plan_membership&quot;: false,
+    &quot;policy&quot;: &quot;explicit_business_presentation_plan&quot;,
+    &quot;presentation_audience&quot;: &quot;technical_audit&quot;,
+    &quot;requirement_status&quot;: &quot;admitted&quot;,
+    &quot;role&quot;: &quot;technical_audit&quot;,
+    &quot;status&quot;: &quot;audit_only&quot;
+  },
+  &quot;manager_anchor&quot;: &quot;REQ-001-relationship_matrix-7&quot;,
+  &quot;manager_rows&quot;: [],
+  &quot;presentation_audience&quot;: &quot;technical_audit&quot;,
+  &quot;presentation_role&quot;: &quot;relationship_matrix&quot;,
+  &quot;presentation_tier&quot;: &quot;audit&quot;,
+  &quot;requirement_id&quot;: &quot;REQ-001&quot;,
+  &quot;requirement_limitations&quot;: [
+    &quot;Delay/expedite communications are an operational-risk proxy and do not prove an actual late delivery&quot;,
+    &quot;Urgent expedite messages are an operational-risk proxy, not proof of late delivery&quot;
+  ],
+  &quot;requirement_order&quot;: 1,
+  &quot;requirement_scope&quot;: &quot;Какие клиенты одновременно демонстрируют снижение заказной активности и рост жалоб, задержек или payment-reminder communications? Сформируй объяснимый watchlist, но не называй его доказанным churn prediction.\n\n│   ├── all_communications.parquet     [151,673 emails - 6.9 MB]\n\n│   ├── erp_transactions.parquet       [1.9M transactions - 40.8 MB]\n\n│   ├── sales_documents.parquet        [243K headers - 7.1 MB]\n\n│   ├── sales_items.parquet            [1.9M line items - 28.4 MB]\n\n- **Linked data**: All files connected via SALESDOCUMENT and customer_id\n\n- **Time-synchronized**: Chronologically consistent 2019-2020 data\n\n- **Discovery-oriented**: Patterns embedded in content, not labels\n\nAll enhancements are synthetic but modeled on real-world communication and ERP logic.&quot;,
+  &quot;requirement_title&quot;: &quot;Window-stable customer watchlist&quot;,
+  &quot;review_status&quot;: &quot;accepted_and_integrated&quot;,
+  &quot;reviewed_item_ref&quot;: &quot;requirements/REQ-001/accepted/manifest.json&quot;,
+  &quot;reviewed_output_ref&quot;: &quot;requirements/REQ-001/accepted/answer_content.json&quot;,
+  &quot;rows&quot;: [],
+  &quot;takeaway&quot;: &quot;Устойчивый основной watchlist: 38 клиентов&quot;,
+  &quot;title&quot;: &quot;Relationship coverage&quot;,
+  &quot;trace_refs&quot;: [
+    &quot;requirements/REQ-001/accepted/answer_content.json&quot;,
+    &quot;requirements/REQ-001/accepted/manifest.json&quot;,
+    &quot;requirements/REQ-001/integration/committed/manifest.json&quot;,
+    &quot;requirements/REQ-001/integration/committed/records.jsonl&quot;
+  ],
+  &quot;type&quot;: &quot;table&quot;
+}</pre></article></details><p class="network-empty">No technical-only requirement records were supplied.</p><footer class="footer">Static local product · reviewed manager workspace.</footer></main></div></body></html>

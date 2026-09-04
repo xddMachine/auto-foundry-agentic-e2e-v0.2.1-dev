@@ -1,0 +1,89 @@
+{
+  "assets": [
+    {
+      "ref": "products/repro_dashboard_v4_product/dashboard_fixture_v4.json",
+      "role": "reviewed_dashboard_fixture",
+      "sha256": "5e060c5317b0657e06690b31ecb0d8ff5aee554fbc7127f560902d610673527c"
+    },
+    {
+      "ref": "products/repro_dashboard_v4_product/dashboard_chart_map_v4.json",
+      "role": "dashboard_chart_map",
+      "sha256": "19e6c4caef5feaecad054a9cccacfbc350ab4312fd75d4ae0b8fe873b10174c1"
+    },
+    {
+      "ref": "products/repro_dashboard_v4_product/dashboard_chart_registry_v4.json",
+      "role": "dashboard_chart_registry",
+      "sha256": "14fcb858ed9aafbf7131c9489e524b21a2a6118ab8aca1db454b234c8e5b8fe8"
+    },
+    {
+      "ref": "products/repro_dashboard_v4_product/site/site_manifest.json",
+      "role": "dashboard_site_manifest",
+      "sha256": "c533b2a7e46720e672a284af9f99c1f7c91b25490b23ab0ce47df89d4d591e1b"
+    },
+    {
+      "ref": "products/repro_dashboard_v4_product/build_receipt.json",
+      "role": "dashboard_receipt",
+      "sha256": "8f4ccb1be6a80d317ab9a1bf08acd19b796fae130b8a50cea8b96481eef683b6"
+    }
+  ],
+  "dashboard": {
+    "assets_local": true,
+    "domain_count": 1,
+    "external_asset_refs": 0,
+    "internal_links_checked": true,
+    "missing_evidence_refs": 0,
+    "receipt_ref": "products/repro_dashboard_v4_product/build_receipt.json",
+    "receipt_sha256": "8f4ccb1be6a80d317ab9a1bf08acd19b796fae130b8a50cea8b96481eef683b6",
+    "widget_count": 7
+  },
+  "freeze_markers": {
+    "answers_frozen": true,
+    "dashboard_frozen": true,
+    "living_enterprise_model_frozen": true,
+    "prepared_data_registry_frozen": true,
+    "telemetry_frozen": true
+  },
+  "lem": {
+    "canonical_mappings": 0,
+    "identity_decisions": 0,
+    "item_bindings": 1,
+    "knowledge": 0,
+    "ontology_items": 7,
+    "prepared_asset_count": 0,
+    "prepared_assets": 0,
+    "projection_hash": "9685f52835d8d0b2eb1b845e982169d63bef8f6163f49a93599b140b8a86b5f6",
+    "relationships": 1,
+    "resolution_bindings": 0
+  },
+  "lifecycle": {
+    "all_items_integrated": true,
+    "all_items_terminal": true,
+    "generation_id": "G-0001",
+    "generation_ordinal": 1,
+    "state_at_product_freeze": "integration_complete"
+  },
+  "limitations": [
+    "Presentation values are copied from accepted answer/integration records only.",
+    "Prepared asset registry is empty; no prepared assets were introduced."
+  ],
+  "lineage": {
+    "delta_receipt_ref": "products/repro_dashboard_v4_product/build_receipt.json",
+    "parent_generation_id": null,
+    "parent_product_manifest_ref": null,
+    "parent_product_manifest_sha256": null,
+    "root_generation": true
+  },
+  "manager_widget_ids": [
+    "REQ-001-fact-req001-watchlist-overview",
+    "REQ-001-metric-req001-stable-core-90d"
+  ],
+  "new_analytics": false,
+  "presentation_plan_ref": "extensions/G-0001/business_presentation_plan.json",
+  "presentation_plan_sha256": "07fe8c3dc0c9d70dafa8e54b0d1988a5c43d98d28851d1b5a52c9f488d0da849",
+  "product_type": "reviewed_run_product_bundle",
+  "run_id": "RUN-2192ca59eb4a4718",
+  "schema_version": "1",
+  "source_status": "reviewed_outputs_only",
+  "status": "complete",
+  "terminal": true
+}

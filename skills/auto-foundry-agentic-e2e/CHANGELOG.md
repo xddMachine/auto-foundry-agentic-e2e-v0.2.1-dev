@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.2 / core 0.8.1 — universal Data Room ingestion
+
+This release binds skill `0.7.2` to core `0.8.1` under the
+`universal-data-room-ingestion` release slug.
+
+1. The normal Data Room now admits every safe regular file without an
+   extension or arbitrary aggregate-size gate. Parquet is cataloged and read
+   natively through bounded Arrow batches; SQLite databases are opened
+   read-only and contribute one deterministic catalog entry per user table.
+2. Unknown, extensionless, notebook, and auxiliary files remain safe opaque
+   members for explicit materialization. The core does not claim to parse
+   unknown formats analytically. Selected archive members are streamed through
+   resource and disk checks, while traversal, symlink, special-file,
+   encryption, corruption, and compression-bomb defenses remain active.
+3. PyArrow is now a base core dependency for the native Parquet path; only
+   XLSX support remains in the optional `io` extra. No benchmark or run success
+   claim is made. No new run was launched.
+
 ## 0.7.1 / core 0.8.0 — production skill binding and scouting contract
 
 1. This patch advances the active skill marker to `0.7.1` while retaining core

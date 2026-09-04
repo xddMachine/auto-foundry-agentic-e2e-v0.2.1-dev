@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import zipfile
 
 import pytest
@@ -69,6 +70,22 @@ def test_saved_analysis_loads_under_different_core_and_skill_versions(tmp_path: 
     assert counters.stat().st_mtime_ns == counter_mtime
     assert not (current_item.work_root / "analysis_context_repair_upgrades.jsonl").exists()
     assert not (current_item.work_root / "analysis_context_transitions.jsonl").exists()
+
+
+def test_historical_catalog_lineage_does_not_require_transition_for_new_core() -> None:
+    lifecycle = SimpleNamespace(item_ids=("REQ-01",))
+
+    assert (
+        analysis_module._implementation_transition_chain(
+            (),
+            lifecycle,
+            catalog_core="core0.8.0",
+            target_core="0.8.1",
+            target_skill="new-skill",
+            target_item_id="REQ-01",
+        )
+        == {}
+    )
 
 
 def test_saved_analysis_still_rejects_corrupted_durable_catalog(tmp_path: Path) -> None:

@@ -23,6 +23,7 @@ import copy
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import hashlib
 import html
+import importlib.util
 import json
 import math
 import posixpath
@@ -63,15 +64,26 @@ SUPPORTED_WIDGETS = {
     "kpi_grid",
     "status_table",
     "table",
+    # Declarative V2 chart-family variants.  Each variant consumes only the
+    # geometry/rows supplied by the fixture; unsupported exotic families stay
+    # unavailable in the design inventory instead of being faked here.
+    "area",
+    "stacked_area",
+    "grouped_bar",
+    "stacked_bar",
+    "normalized_stacked_bar",
+    "funnel",
+    "histogram",
+    "box_plot",
+    "pareto",
+    "waterfall",
+    "pie",
 }
 
-# A presentation-plan visual is any reviewed chart-family widget whose chart
-# map entry agrees with the widget type.  This intentionally derives the
-# universe from the current fixture rather than freezing one generation's
-# counts (G3 happened to contain 75 such entries).  Raw/table projections are
-# still retained in the authoritative audit inventory, but are not chart
-# gallery entries.
-_VISUAL_WIDGET_TYPES = frozenset(SUPPORTED_WIDGETS - {"table", "status_table"})
+# Partition membership is delegated to the shared dashboard runtime.  The
+# helper derives the universe from the current fixture rather than freezing
+# one generation's counts, while retaining ordinary table/status-table
+# projections in the authoritative audit inventory.
 
 _V4_REGISTRY_SCHEMA = "dashboard.chart_registry.v1"
 _V4_SMALL_MULTIPLE_IDS = frozenset({"req02-ecom-channel-bars", "req02-erp-channel-bars"})
@@ -97,9 +109,71 @@ _V4_REGISTRY_FAMILY_BY_TYPE = {
     "kpi_grid": "metric_grid",
     "status_table": "table",
     "table": "table",
+    "area": "line_area_slope",
+    "stacked_area": "line_area_slope",
+    "grouped_bar": "grouped_bar",
+    "stacked_bar": "stacked_bar",
+    "normalized_stacked_bar": "stacked_bar",
+    "funnel": "funnel",
+    "histogram": "histogram_box",
+    "box_plot": "histogram_box",
+    "pareto": "pareto",
+    "waterfall": "waterfall",
+    "pie": "donut_pie",
 }
 
-_OFFLINE_FAVICON_SVG = b'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Decision room"><rect width="64" height="64" rx="12" fill="#0e1b2a"/><path d="M16 43V21h9v22h-9Zm12 0V14h9v29h-9Zm12 0V27h9v16h-9Z" fill="#087f86"/></svg>\n'''
+# A V2 Product Agent selection names a registry recipe.  The raw widget type
+# and chart-map family remain immutable source bindings; this bounded map
+# tells the manager-only renderer which existing supplied-value renderer to
+# use for the selected recipe.
+_RECIPE_RENDER_TYPE = {
+    "kpi_card": "kpi",
+    "horizontal_bar": "bar",
+    "column": "column",
+    "grouped_bar": "grouped_bar",
+    "stacked_bar": "stacked_bar",
+    "diverging_bar": "diverging_bar",
+    "waffle": "waffle",
+    "funnel": "funnel",
+    "histogram": "histogram",
+    "histogram_box": "histogram",
+    "box_plot": "box_plot",
+    "pareto": "pareto",
+    "waterfall": "waterfall",
+    "heatmap_matrix": "heatmap",
+    "scatter_bubble": "scatter",
+    "line_area_slope": "line",
+    "lollipop": "lollipop",
+    "donut_pie": "donut",
+    "metric_grid": "metric_grid",
+    "table": "table",
+}
+
+_DASHBOARD_RUNTIME_MODULE: Any | None = None
+
+
+def _dashboard_runtime_module() -> Any:
+    """Load the canonical V2 eligibility runtime lazily.
+
+    The renderer remains directly executable as a standalone skill script, so
+    importing the sibling module through a small cached loader keeps the
+    renderer and Product Agent on one family/shape contract without requiring
+    a package install or a second implementation of eligibility predicates.
+    """
+
+    global _DASHBOARD_RUNTIME_MODULE
+    if _DASHBOARD_RUNTIME_MODULE is not None:
+        return _DASHBOARD_RUNTIME_MODULE
+    runtime_path = Path(__file__).resolve().with_name("dashboard_runtime.py")
+    spec = importlib.util.spec_from_file_location("dashboard_runtime_for_renderer", runtime_path)
+    if spec is None or spec.loader is None:
+        raise ValueError("canonical dashboard runtime cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _DASHBOARD_RUNTIME_MODULE = module
+    return module
+
+_OFFLINE_FAVICON_SVG = b'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Auto Foundry"><rect width="64" height="64" rx="12" fill="#0e1b2a"/><path d="M16 43V21h9v22h-9Zm12 0V14h9v29h-9Zm12 0V27h9v16h-9Z" fill="#076f75"/></svg>\n'''
 
 
 def _text(value: Any, default: str = "") -> str:
@@ -130,6 +204,15 @@ def _as_list(value: Any) -> list[Any]:
     if isinstance(value, tuple):
         return list(value)
     return [value]
+
+
+def _is_partition_visual(
+    widget: Mapping[str, Any],
+    chart: Mapping[str, Any],
+) -> bool:
+    """Delegate partition membership to the shared dashboard runtime."""
+
+    return _dashboard_runtime_module().is_partition_visual(widget, chart)
 
 
 def _trace_records(widget: Mapping[str, Any]) -> list[dict[str, str]]:
@@ -313,9 +396,20 @@ def _required_visual_row(row: Mapping[str, Any], prefix: str) -> tuple[str, str]
     label = row.get("label")
     if label is None or not _text(label).strip():
         raise ValueError(f"{prefix} requires non-empty label")
-    if "value" not in row or row.get("value") is None or not _text(row.get("value")).strip():
+    # Chart families use a few explicit, source-local names for the same
+    # displayed fact (for example ``count`` for a histogram/funnel bin).  Do
+    # not derive a value; accept only a field that the fixture supplied.
+    value_key = next(
+        (
+            key
+            for key in ("value", "display_value", "count", "amount", "measure")
+            if key in row and row.get(key) is not None and _text(row.get(key)).strip()
+        ),
+        None,
+    )
+    if value_key is None:
         raise ValueError(f"{prefix} requires non-empty value")
-    return _text(label), _display_value(row.get("display_value", row.get("value")))
+    return _text(label), _display_value(row.get("display_value", row.get(value_key)))
 
 
 def _fact_row_label(row: Mapping[str, Any], index: int) -> str:
@@ -386,18 +480,134 @@ def _fact_series_markup(row: Mapping[str, Any]) -> tuple[str, str] | None:
     return "".join(rendered), "; ".join(aria)
 
 
-def _fact_series_geometry_markup(row: Mapping[str, Any], *, column: bool = False) -> tuple[str, str] | None:
+def _fact_series_geometry_markup(
+    row: Mapping[str, Any],
+    *,
+    column: bool = False,
+    raw_values: bool = False,
+    scale_groups: Any = None,
+) -> tuple[str, str] | None:
     """Render explicit series tracks from assembler-bound geometry.
 
     Series values are never recalculated here.  The assembler supplies a
     bounded ``size`` (and, for signed measures, ``signed_size``) for every
     numeric series item; absence is a contract error rather than permission
-    to fall back to a text-only row.
+    to fall back to a text-only row.  A typed artifact column may opt into
+    ``raw_values`` when its supplied counts exceed the bounded percent domain.
+    In that mode the exact values remain labels on the column tracks and no
+    ratio, maximum, or other derived geometry is introduced by the renderer.
     """
 
     series = row.get("series")
     if not isinstance(series, list) or not series:
         return None
+    if scale_groups is None:
+        scale_groups = row.get("scale_groups")
+
+    # A mixed reviewed series carries the assembler's explicit scale group on
+    # each item.  Keep those units visibly separate instead of placing unlike
+    # measures on one shared track.  ``scale_groups`` is an optional
+    # declaration map for payloads that bind group membership by exact series
+    # label; it is never interpreted as a value or used to derive geometry.
+    def declared_group(item: Mapping[str, Any]) -> str:
+        value = _text(item.get("scale_group")).strip()
+        if value:
+            return value
+        label = _text(item.get("label") or item.get("name")).strip()
+        if not label or not isinstance(scale_groups, Mapping):
+            return ""
+        for raw_group, members in scale_groups.items():
+            group = _text(raw_group).strip()
+            if not group:
+                continue
+            if isinstance(members, Mapping):
+                members = (
+                    members.get("series")
+                    or members.get("labels")
+                    or members.get("measures")
+                    or members.get("fields")
+                    or []
+                )
+            if isinstance(members, (list, tuple, set, frozenset)):
+                if any(label == _text(member).strip() for member in members):
+                    return group
+            elif label == _text(members).strip():
+                return group
+        return ""
+
+    def declared_context(group: str) -> list[str]:
+        """Read optional domain/basis labels from the exact group declaration."""
+
+        if not isinstance(scale_groups, Mapping):
+            return []
+        raw = scale_groups.get(group)
+        if raw is None:
+            raw = next(
+                (value for key, value in scale_groups.items() if _text(key).casefold() == group.casefold()),
+                None,
+            )
+        if not isinstance(raw, Mapping):
+            return []
+        context: list[str] = []
+        for key, label in (("scale_domain", "Domain"), ("domain", "Domain"), ("scale_basis", "Basis"), ("basis", "Basis")):
+            value = _text(raw.get(key)).strip()
+            if value and f"{label}: {value}" not in context:
+                context.append(f"{label}: {value}")
+        return context
+
+    grouped: dict[str, list[Mapping[str, Any]]] = {}
+    for item in series:
+        if not isinstance(item, Mapping):
+            raise ValueError("fact series items must be objects")
+        group = declared_group(item)
+        if group:
+            grouped.setdefault(group, []).append(item)
+    if len(grouped) > 1:
+        # Preserve an item that lacks an explicit group without silently
+        # dropping it.  The neutral label makes the missing declaration
+        # visible while retaining the exact supplied value.
+        ungrouped = [item for item in series if not declared_group(item)]
+        if ungrouped:
+            grouped.setdefault("Unspecified scale", []).extend(ungrouped)
+        panels: list[str] = []
+        panel_aria: list[str] = []
+        for group, items in grouped.items():
+            group_markup = _fact_series_geometry_markup(
+                {"series": items},
+                column=column,
+                raw_values=raw_values,
+                scale_groups=scale_groups,
+            )
+            if group_markup is None:
+                continue
+            markup, aria_value = group_markup
+            group_label = _humanize_label(group)
+            context: list[str] = declared_context(group)
+            for key, label in (("scale_domain", "Domain"), ("scale_basis", "Basis")):
+                values = []
+                for item in items:
+                    value = _text(item.get(key)).strip()
+                    if value and value not in values:
+                        values.append(value)
+                if values:
+                    rendered = f"{label}: {', '.join(values)}"
+                    if rendered not in context:
+                        context.append(rendered)
+            context_html = (
+                f'<small class="viz-series-panel-context">{_escape(" · ".join(context))}</small>'
+                if context else ""
+            )
+            panels.append(
+                f'<span class="viz-series-panel scale-group-panel" role="group" '
+                f'data-scale-group="{_escape(group)}" aria-label="{_escape(f"Scale group: {group_label}")}">'
+                f'<span class="viz-series-panel-title"><b>{_escape(group_label)}</b>'
+                f'<small>Independent scale</small>{context_html}</span>'
+                f'<span class="viz-series-panel-values">{markup}</span></span>'
+            )
+            panel_aria.append(f"{group_label}: {aria_value}")
+        if panels:
+            return "".join(panels), "; ".join(panel_aria)
+
     rendered: list[str] = []
     aria: list[str] = []
     for index, item in enumerate(series, 1):
@@ -408,7 +618,29 @@ def _fact_series_geometry_markup(row: Mapping[str, Any], *, column: bool = False
         if not label or value is None:
             raise ValueError(f"fact series item {index} requires label and value")
         if "size" not in item:
-            raise ValueError(f"fact series item {index} requires supplied size")
+            if not raw_values or not column:
+                raise ValueError(f"fact series item {index} requires supplied size")
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0
+            ):
+                raise ValueError(f"fact series item {index} raw value must be a finite non-negative number")
+            escaped_label = _escape(label)
+            escaped_value = _escape(_display_value(value))
+            # Keep the column-family geometry and exact count visible without
+            # pretending the count is a percentage.  The track is deliberately
+            # unfilled; its data attribute/ARIA label carries the raw supplied
+            # value for accessible and deterministic inspection.
+            rendered.append(
+                f'<span class="column-series-item column-series-item-raw"><b>{escaped_label}</b>'
+                f'<span class="column-track column-series-track column-series-track-raw" '
+                f'data-raw-value="{escaped_value}" aria-label="{escaped_label}: {escaped_value}" aria-hidden="true"></span>'
+                f'<span class="column-series-value">{escaped_value}</span></span>'
+            )
+            aria.append(f"{label}: {_display_value(value)}")
+            continue
         normalized_size = _normalize_percent(item.get("size"), f"fact series item {index}")
         signed = item.get("signed_size")
         negative = False
@@ -583,29 +815,6 @@ _MANAGER_ENTITY_REF_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
-# Technical mechanics are useful in the collapsed audit, but they are not
-# manager-facing conclusions.  This is a presentation guard only: the
-# assembler's explicit ``manager_admission`` remains authoritative and the
-# raw row/payload is retained unchanged in the audit surface.
-_MANAGER_SURFACE_TECHNICAL_RE = re.compile(
-    r"\b(?:mapping|mapped|mappings|coverage|covered|source|sources|source[- ]local|"
-    r"schema|schemas|row|rows|distinct|identity|identities|id|ids|identifier|identifiers|key|keys|join|joins|"
-    r"namespace|namespaces|ontology|ontologies|connectivity|connected|relationship|"
-    r"relationships|diagnostic|diagnostics|method|methodology|model|models|"
-    r"lineage|provenance|evidence|record|records|field|fields|column|columns|"
-    r"endpoint|endpoints|edge|edges|fanout|population|populations|reference|references|"
-    r"path|paths|value_json|row_kind|data[- ]?quality|source[- ]?local|"
-    r"canonical|normalization|normalisation|raw|parse|parsed|numeric|non[- ]?negative|"
-    r"closed[_ ]at|case[_ ]status|source[_ ]population|source[_ ]coverage|"
-    r"target[_ ]population|target[_ ]coverage|watchlist[_ ]rows|order[_ ]created[_ ]at|"
-    r"promised[_ ]ship[_ ]by|qty[_ ]delta|start[_ ]date|end[_ ]date|"
-    r"distinct[_ ](?:id|ids|reference|references|key|keys)|"
-    r"available[_ ](?:gt|lt|eq|gte|lte)[_ ]\d+|"
-    r"(?:field|row|column)[_ ](?:count|name|value|type))\b",
-    flags=re.IGNORECASE,
-)
-
-
 def _manager_cell_value(value: Any) -> str:
     """Humanize short schema tokens on the manager surface only.
 
@@ -713,8 +922,11 @@ _MANAGER_PROJECTION_RAW_VALUE_KEYS = frozenset({
 _MANAGER_PROJECTION_CONTROL_KEYS = frozenset({
     "type", "kind", "presentation_role", "presentation_tier", "presentation_audience",
     "manager_admission", "manager_anchor", "visual_type", "chart_family",
-    "manager_presentation", "explicit_plan_projection", "explicit_visual_projection",
+    "recipe_id", "layout", "renderer_type", "manager_presentation", "explicit_plan_projection", "explicit_visual_projection",
     "explicit_projection_fields", "allowed_visual_fields", "family",
+    # Scope is reviewed prose, not a schema token. Preserve it exactly in the
+    # manager projection so the context beside a chart remains faithful.
+    "scope", "answer_scope", "requirement_scope",
 })
 
 
@@ -754,13 +966,6 @@ def _humanize_manager_projection(value: Any, *, key: str = "") -> Any:
     return _manager_prose_text(value)
 
 
-def _manager_surface_technical(value: Any) -> bool:
-    """Return whether a visible label/value names audit-only mechanics."""
-
-    semantic = re.sub(r"[_./:]+", " ", _text(value))
-    return bool(_MANAGER_SURFACE_TECHNICAL_RE.search(semantic))
-
-
 def _manager_surface_widget(widget: Mapping[str, Any]) -> dict[str, Any]:
     """Copy manager-facing labels without changing the raw audit widget."""
 
@@ -779,6 +984,8 @@ def _manager_surface_widget(widget: Mapping[str, Any]) -> dict[str, Any]:
             "integration_record_id", "integration_record_ids",
             "integration_record_ref", "integration_record_refs", "evidence_refs",
             "trace_refs", "manager_presentation", "dashboard_fact",
+            "accepted_evidence_fact_sheet", "technical_surface",
+            "technical_surface_reason", "accepted_visual", "accepted_evidence",
         }
         display = {key: copy.deepcopy(widget[key]) for key in envelope_keys if key in widget}
     else:
@@ -812,9 +1019,38 @@ def _manager_surface_widget(widget: Mapping[str, Any]) -> dict[str, Any]:
                 display[field] = value
             display["visual_type"] = manager_presentation.get("visual_type")
             display["chart_family"] = manager_presentation.get("chart_family")
+            recipe_id = _text(manager_presentation.get("recipe_id")).strip()
+            renderer_type = _text(manager_presentation.get("renderer_type")).strip()
+            if recipe_id:
+                display["recipe_id"] = recipe_id
+                display["type"] = renderer_type or _RECIPE_RENDER_TYPE.get(recipe_id, display.get("type"))
+            if renderer_type:
+                display["renderer_type"] = renderer_type
+            if _text(manager_presentation.get("layout")).strip():
+                display["layout"] = _text(manager_presentation.get("layout"))
+            # A table recipe may be selected for a chart whose exact
+            # projection is still represented by bars/categories/points.
+            # Reuse that supplied collection as rows for the table renderer;
+            # this is a presentation copy and never changes the source widget.
+            if display.get("type") == "table" and not display.get("rows"):
+                for collection in (
+                    "bars", "categories", "segments", "points", "series", "values", "data",
+                    "cells", "tiles", "stages", "bins", "boxes", "steps",
+                ):
+                    if isinstance(display.get(collection), list):
+                        display["rows"] = copy.deepcopy(display[collection])
+                        break
             # A visual projection carries exact chart fields directly (bars,
             # tiles, values, etc.), so no unbound raw collection may leak in.
-            return _humanize_manager_projection(display)
+            # Fact-sheet manager rows already carry syntactic labels and
+            # canonical JSON text.  Keep those exact presentation values
+            # intact; normalizing JSON keys would make a lossless container
+            # unreadable and would no longer match its source projection.
+            # The Product plan's pointer-bound projection is already the
+            # reviewed manager copy.  Keep titles, columns, rows, values, and
+            # geometry byte-for-byte; the renderer may only apply the chosen
+            # recipe/layout envelope.
+            return display
         projection = manager_presentation.get("display_projection")
         if isinstance(projection, Mapping):
             display["__explicit_plan_projection"] = True
@@ -829,7 +1065,7 @@ def _manager_surface_widget(widget: Mapping[str, Any]) -> dict[str, Any]:
                 elif field == "body":
                     display["manager_findings"] = [{"finding": value}]
                     display["rows"] = [{"claim": value}]
-                elif field in {"value", "display_value", "denominator", "unit", "period", "as_of", "status", "subtitle", "note", "label", "rows"}:
+                elif field in {"value", "display_value", "denominator", "unit", "period", "as_of", "status", "subtitle", "note", "label", "rows", "scope", "answer_scope"}:
                     display[field] = value
             # A denominator is displayed only when it is explicitly supplied
             # by the selected projection.  This is a direct presentation of
@@ -845,10 +1081,17 @@ def _manager_surface_widget(widget: Mapping[str, Any]) -> dict[str, Any]:
             isinstance(projection, Mapping) and "rows" in projection
         ):
             display["type"] = "kpi"
-        # Explicit plan fields are authoritative, but their manager copy still
-        # follows the centralized presentation normalizer.  The raw widget,
-        # chart map and audit snapshot are never modified.
-        display = _humanize_manager_projection(display)
+        recipe_id = _text(manager_presentation.get("recipe_id")).strip()
+        renderer_type = _text(manager_presentation.get("renderer_type")).strip()
+        if recipe_id:
+            display["recipe_id"] = recipe_id
+            display["type"] = renderer_type or _RECIPE_RENDER_TYPE.get(recipe_id, display.get("type"))
+        if renderer_type:
+            display["renderer_type"] = renderer_type
+        if _text(manager_presentation.get("layout")).strip():
+            display["layout"] = _text(manager_presentation.get("layout"))
+        # Explicit plan fields are authoritative and remain exact.  The raw
+        # widget, chart map, and audit snapshot are never modified.
     kind = _text(display.get("type") or display.get("kind")).lower()
     if not explicit_projection and kind not in {"table", "status_table"}:
         # Legacy chart envelopes sometimes carry the raw Label/Name/Units
@@ -879,16 +1122,6 @@ def _manager_surface_widget(widget: Mapping[str, Any]) -> dict[str, Any]:
         raw = display.get(key)
         if not isinstance(raw, list):
             continue
-        if key == "tiles" and _text(display.get("title")).strip().lower() == "key signals":
-            # The aggregate strip is a manager projection over scalar
-            # records.  Remove only tiles whose reviewed label is explicitly
-            # a source/mapping/row/identity mechanic; legacy chart metric
-            # grids retain their supplied geometry and values unchanged.
-            raw = [
-                row for row in raw
-                if isinstance(row, Mapping)
-                and not _manager_surface_technical(row.get("label") or row.get("name") or row.get("title"))
-            ]
         copied: list[Any] = []
         for row in raw:
             if not isinstance(row, Mapping):
@@ -906,14 +1139,12 @@ def _manager_surface_widget(widget: Mapping[str, Any]) -> dict[str, Any]:
 def _manager_title(widget: Mapping[str, Any]) -> str:
     """Return a short human heading; internal IDs remain audit-only."""
 
-    role = _text(widget.get("presentation_role")).lower()
     supplied = _text(widget.get("display_title") or widget.get("title") or widget.get("label")).strip()
-    if role == "finding_list" or role == "finding_record":
-        return "Reviewed findings"
-    if role == "relationship_matrix":
-        return "Relationship coverage"
-    if supplied and re.search(r"(?:claim|relationship)[_.-]", supplied, flags=re.IGNORECASE):
-        return "Reviewed decision view"
+    # Requirement identifiers are audit keys, not manager copy.  Strip only a
+    # leading identifier plus its separator; preserve the reviewed title text.
+    supplied = re.sub(r"^\s*REQ[-_]?\d+\s*(?:[·:|/-]\s*)?", "", supplied, flags=re.IGNORECASE).strip()
+    if widget.get("__explicit_plan_projection") is True:
+        return supplied or "Reviewed decision view"
     # Preserve an already human-authored phrase (including intentional
     # punctuation/casing such as ``Source-local native cost distribution``).
     # Only normalize schema-like labels below; this keeps reviewed titles
@@ -923,13 +1154,32 @@ def _manager_title(widget: Mapping[str, Any]) -> str:
     return _humanize_label(supplied or "Reviewed decision view")
 
 
+def _manager_heading_text(value: Any, default: str = "Decision") -> str:
+    """Humanize a visible heading while keeping requirement IDs audit-only."""
+
+    text = _manager_prose_text(value).strip()
+    text = re.sub(r"^\s*REQ[-_]?\d+\s*(?:[·:|/-]\s*)?", "", text, flags=re.IGNORECASE).strip()
+    return text or default
+
+
 def _manager_meta_lines(widget: Mapping[str, Any]) -> str:
     explicit_projection = bool(widget.get("__explicit_plan_projection"))
+    def first_value(*keys: str) -> Any:
+        for key in keys:
+            value = widget.get(key)
+            if value not in (None, ""):
+                return value
+        return None
+
     fields = (
+        ("Scope", first_value("scope", "answer_scope", "requirement_scope")),
         ("Period", widget.get("period")),
         ("Population", widget.get("population")),
         ("Denominator", widget.get("denominator")),
-        ("Unit", widget.get("unit") or widget.get("distinct_unit")),
+        ("Unit", first_value("unit", "units", "distinct_unit")),
+        ("Grain", first_value("grain", "data_grain", "row_grain")),
+        ("Proxy / limit", first_value("proxy_or_limit", "proxy", "limit")),
+        ("Descriptive", first_value("descriptive", "descriptive_only", "causal_status")),
         ("As of", widget.get("as_of")),
         ("Date authority", widget.get("date_authority")),
     )
@@ -942,19 +1192,27 @@ def _manager_meta_lines(widget: Mapping[str, Any]) -> str:
             # belong to the audit surface.  ``Period``/``As of`` remain the
             # compact manager context when explicitly supplied.
             continue
-        # Period/as-of are useful manager context even when their supplied
-        # text contains a date qualifier.  Other metadata fields must not
-        # expose populations, source/coverage mechanics, row counts, or
-        # internal schema vocabulary on the default business card.
-        if not explicit_projection and label not in {"Period", "As of"} and _manager_surface_technical(value):
-            continue
-        text = (
-            _text(value)
-            if explicit_projection
-            else _manager_prose_text(_manager_cell_value(_manager_public_text(value)))
-        )
+        if label == "Scope":
+            text = _text(value)
+        else:
+            text = (
+                _text(value)
+                if explicit_projection
+                else _manager_prose_text(_manager_cell_value(_manager_public_text(value)))
+            )
         if text:
             rows.append(f'<span class="manager-meta-item"><b>{_escape(label)}</b> {_escape(text)}</span>')
+    limitations: list[str] = []
+    for value in _as_list(first_value("limitations", "business_limitations", "limitation")):
+        if value in (None, ""):
+            continue
+        text = _text(value) if explicit_projection else _manager_prose_text(_manager_public_text(value))
+        if text and text not in limitations:
+            limitations.append(text)
+    if limitations:
+        rows.append(
+            f'<span class="manager-meta-item manager-meta-limitations"><b>Limitations</b> {_escape(" · ".join(limitations))}</span>'
+        )
     if not rows:
         return ""
     return '<div class="manager-meta">' + "".join(rows) + "</div>"
@@ -965,8 +1223,11 @@ def _render_finding_list(widget: Mapping[str, Any]) -> str:
     if not isinstance(findings, list):
         findings = []
         for row in _rows(widget.get("rows")):
-            if row.get("claim") is not None:
-                findings.append({"finding": row.get("claim"), "status": row.get("status"), "period": row.get("period")})
+            claim = row.get("claim")
+            if claim is None:
+                claim = row.get("finding")
+            if claim is not None:
+                findings.append({"finding": claim, "status": row.get("status"), "period": row.get("period")})
     rendered = []
     for finding in findings:
         if not isinstance(finding, Mapping) or not _text(finding.get("finding")).strip():
@@ -976,7 +1237,7 @@ def _render_finding_list(widget: Mapping[str, Any]) -> str:
             if value in (None, "") or isinstance(value, (Mapping, list, tuple)):
                 continue
             rendered_meta = _manager_prose_text(_manager_cell_value(value))
-            if rendered_meta and not _manager_surface_technical(rendered_meta):
+            if rendered_meta:
                 meta_values.append(rendered_meta)
         meta = " · ".join(meta_values)
         meta_html = f'<small>{_escape(meta)}</small>' if meta else ""
@@ -1008,6 +1269,12 @@ def _manager_key_visible(key: Any) -> bool:
 
     normalized = re.sub(r"[_-]+", " ", _text(key)).strip().lower()
     if not normalized:
+        return False
+    # Entity/identity keys are mechanics, even when the business entity name
+    # itself is useful context.  Do not rely on the broad technical prose
+    # matcher for this bounded schema check: a legitimate business field such
+    # as ``Order source mix`` must remain eligible.
+    if re.search(r"(?:^|\s)(?:id|ids|identifier|identifiers)(?:$|\s)", normalized):
         return False
     return normalized not in {
         "field",
@@ -1047,10 +1314,6 @@ def _manager_row_projection(row: Mapping[str, Any]) -> dict[str, Any]:
     for key, value in row.items():
         if not _manager_key_visible(key) or not _manager_value_visible(value):
             continue
-        # Keep exact business columns while suppressing source/schema/row and
-        # identity mechanics.  Full values remain in ``audit_payload``.
-        if _manager_surface_technical(key) or _manager_surface_technical(value):
-            continue
         if value is not None:
             projected[_humanize_label(key)] = value
     return projected
@@ -1059,8 +1322,35 @@ def _manager_row_projection(row: Mapping[str, Any]) -> dict[str, Any]:
 def _manager_table_rows(widget: Mapping[str, Any]) -> list[Mapping[str, Any]] | None:
     """Return an explicit manager projection or sanitize legacy raw rows."""
 
+    # V2 plan projections are source-bound and already selected by the
+    # Product Agent.  Return their rows unchanged so no renderer-side field,
+    # key, value, or technical-word filter can alter the admitted table.
+    if widget.get("__explicit_plan_projection") is True:
+        explicit_rows = widget.get("manager_rows")
+        if not isinstance(explicit_rows, list):
+            explicit_rows = widget.get("rows") or widget.get("data")
+        if isinstance(explicit_rows, list):
+            return [row if isinstance(row, Mapping) else {"value": row} for row in explicit_rows]
+        return None
+
     explicit = widget.get("manager_rows")
     if isinstance(explicit, list):
+        if widget.get("accepted_evidence_fact_sheet") is True:
+            rows: list[dict[str, Any]] = []
+            for raw in explicit:
+                if not isinstance(raw, Mapping):
+                    continue
+                label = raw.get("label") if "label" in raw else raw.get("Label")
+                if label in (None, ""):
+                    continue
+                if "value" in raw:
+                    value = raw.get("value")
+                elif "Value" in raw:
+                    value = raw.get("Value")
+                else:
+                    continue
+                rows.append({"Label": _humanize_label(label), "Value": value})
+            return rows or None
         rows = [_manager_row_projection(row) for row in _rows(explicit)]
         return [row for row in rows if row]
     raw = _rows(widget.get("rows") or widget.get("data"))
@@ -1081,8 +1371,6 @@ def _manager_table_rows(widget: Mapping[str, Any]) -> list[Mapping[str, Any]] | 
                 or not _manager_key_visible(field)
                 or not _manager_value_visible(value)
                 or isinstance(value, (Mapping, list, tuple))
-                or _manager_surface_technical(field)
-                or _manager_surface_technical(value)
             ):
                 continue
             field_text = _text(field)
@@ -1257,11 +1545,14 @@ def _render_visual_gallery(
         seen.add(widget_id)
         display = _visual_gallery_widget(by_id[widget_id], entry)
         title = _text(entry.get("title_projection", {}).get("value"), widget_id)
-        content = _render_visual(display)
+        try:
+            content = _render_visual(display)
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            content = _render_visual_fallback(display)
         meta = _meta_lines(display)
         cards.append(
             f'<article class="audit-visual-card widget widget-{_escape(_text(entry.get("visual_type")))}" '
-            f'data-widget-id="{_escape(widget_id)}" id="audit-visual-{_escape(_slug(widget_id))}"><span class="eyebrow">{_escape(_text(entry.get("requirement_id")))}</span>'
+            f'data-runtime-card data-runtime-requirement="{_escape(_text(entry.get("requirement_id")))}" data-runtime-domain="{_escape(_slug(display.get("domain_id") or ""))}" data-widget-id="{_escape(widget_id)}" id="audit-visual-{_escape(_slug(widget_id))}"><span class="eyebrow">{_escape(_text(entry.get("requirement_id")))}</span>'
             f'<h3>{_escape(title)}</h3>{content}{meta}</article>'
         )
     if not cards:
@@ -1369,12 +1660,19 @@ def _render_kpi(widget: Mapping[str, Any]) -> str:
 
 
 def _render_bar(widget: Mapping[str, Any]) -> str:
-    rows = _rows(widget.get("bars") or widget.get("values") or widget.get("data"))
+    rows = _rows(widget.get("bars") or widget.get("rows") or widget.get("values") or widget.get("data"))
     if not rows:
         return '<p class="viz-note">No reviewed values were supplied for this bar view.</p>'
     rendered = []
     for index, row in enumerate(rows):
-        series_geometry = _fact_series_geometry_markup(row) if isinstance(row.get("series"), list) else None
+        series_geometry = (
+            _fact_series_geometry_markup(
+                row,
+                scale_groups=widget.get("scale_groups"),
+            )
+            if isinstance(row.get("series"), list)
+            else None
+        )
         if series_geometry is not None:
             label = _fact_row_label(row, index + 1)
             series_html, aria_value = series_geometry
@@ -1412,7 +1710,7 @@ def _render_bar(widget: Mapping[str, Any]) -> str:
 
 
 def _render_column(widget: Mapping[str, Any]) -> str:
-    raw_rows = _as_list(widget.get("bars") or widget.get("categories") or widget.get("values") or widget.get("data"))
+    raw_rows = _as_list(widget.get("bars") or widget.get("rows") or widget.get("categories") or widget.get("values") or widget.get("data"))
     if any(not isinstance(row, Mapping) for row in raw_rows):
         raise ValueError("column rows must be objects")
     rows = [row for row in raw_rows if isinstance(row, Mapping)]
@@ -1420,7 +1718,16 @@ def _render_column(widget: Mapping[str, Any]) -> str:
         raise ValueError("column requires non-empty rows")
     rendered = []
     for index, row in enumerate(rows):
-        series_geometry = _fact_series_geometry_markup(row, column=True) if isinstance(row.get("series"), list) else None
+        series_geometry = (
+            _fact_series_geometry_markup(
+                row,
+                column=True,
+                raw_values=_text(widget.get("geometry_mode")).strip().lower() == "raw_counts",
+                scale_groups=widget.get("scale_groups"),
+            )
+            if isinstance(row.get("series"), list)
+            else None
+        )
         if series_geometry is not None:
             label = _fact_row_label(row, index + 1)
             series_html, aria_value = series_geometry
@@ -1451,7 +1758,7 @@ def _render_column(widget: Mapping[str, Any]) -> str:
 
 
 def _render_lollipop(widget: Mapping[str, Any]) -> str:
-    raw_rows = _as_list(widget.get("bars") or widget.get("values") or widget.get("data"))
+    raw_rows = _as_list(widget.get("bars") or widget.get("rows") or widget.get("values") or widget.get("data"))
     if any(not isinstance(row, Mapping) for row in raw_rows):
         raise ValueError("lollipop rows must be objects")
     rows = [row for row in raw_rows if isinstance(row, Mapping)]
@@ -1474,30 +1781,314 @@ def _render_lollipop(widget: Mapping[str, Any]) -> str:
 
 
 def _render_line(widget: Mapping[str, Any]) -> str:
-    rows = _rows(widget.get("points") or widget.get("series") or widget.get("values") or widget.get("data"))
+    """Render supplied temporal points as a labelled, accessible SVG chart.
+
+    Accepted visual rows are deliberately kept flat and lossless.  The small
+    amount of normalization below only identifies the period/series/value
+    fields that the declaration already supplied; numeric conversion is used
+    solely for SVG coordinates.  The exact values remain in the adjacent data
+    table so a multi-series chart never becomes an unlabeled list or silently
+    drops a period.
+    """
+
+    def numeric(value: Any) -> float | None:
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value) if math.isfinite(float(value)) else None
+        text = _text(value).strip().replace(",", "")
+        if text.endswith("%"):
+            text = text[:-1].strip()
+        if not text:
+            return None
+        try:
+            number = float(text)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    def period_value(row: Mapping[str, Any]) -> Any:
+        for key in ("period", "time", "month", "date", "year", "x", "label", "name"):
+            value = row.get(key)
+            if value not in (None, ""):
+                return value
+        return ""
+
+    def value_value(row: Mapping[str, Any]) -> Any:
+        for key in ("display_value", "y", "value", "count", "amount", "measure"):
+            value = row.get(key)
+            if value not in (None, ""):
+                return value
+        return None
+
+    def series_value(row: Mapping[str, Any], default: Any = None) -> Any:
+        supplied = row.get("series")
+        if supplied not in (None, "") and not isinstance(supplied, (list, Mapping)):
+            return supplied
+        for key in ("series_name", "measure_name", "name"):
+            value = row.get(key)
+            if value not in (None, ""):
+                return value
+        return default if default not in (None, "") else "Value"
+
+    # Prefer explicit point/row containers.  A top-level series declaration is
+    # also accepted when it contains nested point arrays; string declarations
+    # are used only as names for the supplied row fields.
+    raw_container: Any = None
+    for key in ("points", "rows", "values", "data"):
+        if isinstance(widget.get(key), list):
+            raw_container = widget.get(key)
+            break
+    declared_series = [
+        _text(value).strip()
+        for value in _as_list(widget.get("series"))
+        if isinstance(value, str) and value.strip()
+    ]
+    if raw_container is None and isinstance(widget.get("series"), list):
+        nested = [value for value in widget.get("series", []) if isinstance(value, Mapping)]
+        if nested and any(isinstance(value.get("points") or value.get("rows") or value.get("values"), list) for value in nested):
+            expanded: list[dict[str, Any]] = []
+            for series in nested:
+                series_name = series.get("name") or series.get("label") or series.get("series") or "Value"
+                points = series.get("points") or series.get("rows") or series.get("values") or []
+                for point in points:
+                    if isinstance(point, Mapping):
+                        expanded.append({**dict(point), "series": series_name})
+            raw_container = expanded
+        elif nested:
+            raw_container = nested
+    raw_rows = _as_list(raw_container)
+    points: list[dict[str, Any]] = []
+    for raw in raw_rows:
+        if not isinstance(raw, Mapping):
+            points.append({"period": raw, "series": "Value", "value": raw})
+            continue
+        nested_series = raw.get("series")
+        if isinstance(nested_series, list) and nested_series and all(isinstance(item, Mapping) for item in nested_series):
+            for item in nested_series:
+                item_map = dict(item)
+                period = period_value(raw)
+                value = value_value(item_map)
+                if period in (None, "") or value is None:
+                    continue
+                points.append({"period": period, "series": series_value(item_map), "value": value})
+            continue
+        # A declared list of measure names expands one row into one point per
+        # measure, preserving the exact row order and supplied field values.
+        if declared_series and value_value(raw) is None:
+            period = period_value(raw)
+            for name in declared_series:
+                if name in raw and raw.get(name) not in (None, ""):
+                    points.append({"period": period, "series": name, "value": raw.get(name)})
+            continue
+        points.append({
+            "period": period_value(raw),
+            "series": series_value(raw, declared_series[0] if len(declared_series) == 1 else None),
+            "value": value_value(raw),
+        })
+    points = [point for point in points if point.get("period") not in (None, "") and point.get("value") is not None]
+
     # A single supplied point is a snapshot, not a trend.  Keep the value
     # visible while explicitly declining to draw a misleading line.
-    if len(rows) < 2:
-        if not rows:
+    if len(points) < 2:
+        if not points:
             return '<p class="viz-note">Trend unavailable: no reviewed points were supplied.</p>'
-        row = rows[0]
-        label = row.get("label") or row.get("x") or row.get("period") or row.get("name")
-        value = row.get("display_value", row.get("y", row.get("value")))
+        point = points[0]
         return (
             '<div class="viz-snapshot"><span class="eyebrow">Snapshot only</span>'
-            f'<strong>{_escape(_display_value(value))}</strong>'
-            f'<span>{_escape(label)}</span><p class="viz-note">Not enough reviewed points to infer a trend.</p></div>'
+            f'<strong>{_escape(_display_value(point.get("value")))}</strong>'
+            f'<span>{_escape(point.get("period"))}</span><p class="viz-note">Not enough reviewed points to infer a trend.</p></div>'
         )
-    rendered = []
-    for row in rows:
-        label = row.get("label") or row.get("x") or row.get("period") or row.get("name")
-        value = row.get("display_value", row.get("y", row.get("value")))
-        rendered.append(f'<li><span>{_escape(label)}</span><strong>{_escape(_display_value(value))}</strong></li>')
-    return '<ol class="viz viz-line-list">' + "".join(rendered) + "</ol>"
+
+    periods: list[str] = []
+    for point in points:
+        period = _text(point.get("period"))
+        if period not in periods:
+            periods.append(period)
+    series_names: list[str] = []
+    for point in points:
+        name = _text(point.get("series"), "Value") or "Value"
+        if name not in series_names:
+            series_names.append(name)
+    numeric_points = [numeric(point.get("value")) for point in points]
+    numeric_values = [value for value in numeric_points if value is not None]
+    rows_for_table = [
+        {"Period": point.get("period"), "Series": point.get("series"), "Value": point.get("value")}
+        for point in points
+    ]
+    unit = _text(widget.get("unit") or widget.get("units")).strip()
+    table_widget = {"type": "table", "rows": rows_for_table}
+    data_table = _render_table(table_widget, rows_override=rows_for_table)
+    unit_caption = f'<caption>{_escape(unit)}</caption>' if unit else ""
+    # ``_render_table`` intentionally leaves columns generic and exact.  Add
+    # a caption only when the declaration supplied a unit; no unit is guessed.
+    if unit_caption:
+        data_table = data_table.replace("<table>", f"<table>{unit_caption}", 1)
+    data_table = f'<div class="line-data">{data_table}</div>'
+    if len(numeric_values) < 2:
+        return (
+            '<div class="viz viz-line viz-line-table">'
+            '<p class="viz-note">Reviewed points are shown as a labelled table; numeric coordinates were not supplied for a line plot.</p>'
+            f'{data_table}</div>'
+        )
+
+    # A reviewed limitation can explicitly require separate scales (for
+    # example when orders and order-lines use different units).  Honor that
+    # declaration with one labelled panel per series; no index, ratio, or
+    # other comparison is calculated here.
+    independent_axes = any(
+        re.search(r"\bseparate axes?\b", _text(value), flags=re.IGNORECASE)
+        for value in _as_list(widget.get("limitations"))
+    )
+    width, height = 720, 300
+    left, right, top, bottom = 56, 18, 26, 58
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+    low, high = min(numeric_values), max(numeric_values)
+    if low == high:
+        low -= 1.0
+        high += 1.0
+
+    def x_for(period: str) -> float:
+        if len(periods) <= 1:
+            return float(left)
+        return left + periods.index(period) * plot_width / (len(periods) - 1)
+
+    def y_for(value: float) -> float:
+        return top + (high - value) * plot_height / (high - low)
+
+    palette = ("#076f75", "#1f6f9d", "#b97811", "#a43b47", "#78909e", "#4f7391")
+    label_step = max(1, math.ceil(len(periods) / 8))
+    chart_title = _text(widget.get("title"), "Reviewed trend")
+    chart_id = _slug(widget.get("id") or chart_title)
+
+    def x_label_markup(panel_height: int, x_for_period: Any) -> str:
+        labels: list[str] = []
+        for index, period in enumerate(periods):
+            if index not in {0, len(periods) - 1} and index % label_step:
+                continue
+            labels.append(
+                f'<text x="{x_for_period(period):.2f}" y="{panel_height - 22}" text-anchor="middle" fill="#536170" font-size="11">{_escape(period)}</text>'
+            )
+        return "".join(labels)
+
+    if independent_axes and len(series_names) > 1:
+        panel_height = 236
+        panel_top, panel_bottom = 22, 50
+        panel_plot_height = panel_height - panel_top - panel_bottom
+        panel_plot_width = width - left - right
+        panels: list[str] = []
+        for series_index, name in enumerate(series_names):
+            color = palette[series_index % len(palette)]
+            series_points = [
+                point for point in points
+                if _text(point.get("series"), "Value") == name and numeric(point.get("value")) is not None
+            ]
+            series_values = [numeric(point.get("value")) for point in series_points]
+            if not series_values:
+                continue
+            panel_low, panel_high = min(series_values), max(series_values)
+            if panel_low == panel_high:
+                panel_low -= 1.0
+                panel_high += 1.0
+
+            def panel_x(period: str) -> float:
+                if len(periods) <= 1:
+                    return float(left)
+                return left + periods.index(period) * panel_plot_width / (len(periods) - 1)
+
+            def panel_y(value: float) -> float:
+                return panel_top + (panel_high - value) * panel_plot_height / (panel_high - panel_low)
+
+            grid_markup: list[str] = []
+            for grid_index in range(3):
+                grid_value = panel_high - (panel_high - panel_low) * grid_index / 2
+                y = panel_y(grid_value)
+                grid_markup.append(
+                    f'<line x1="{left}" x2="{width - right}" y1="{y:.2f}" y2="{y:.2f}" stroke="#d9e1e8" stroke-width="1" />'
+                    f'<text x="{left - 8}" y="{y + 4:.2f}" text-anchor="end" fill="#536170" font-size="11">{_escape(f"{grid_value:g}")}</text>'
+                )
+            coordinates = " ".join(
+                f"{panel_x(_text(point.get('period'))):.2f},{panel_y(numeric(point.get('value'))):.2f}"
+                for point in series_points
+            )
+            line_markup = (
+                f'<polyline class="line-series" points="{coordinates}" fill="none" stroke="{color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" data-series="{_escape(name)}" />'
+                if len(series_points) >= 2 else ""
+            )
+            point_markup = "".join(
+                f'<circle class="line-point" cx="{panel_x(_text(point.get("period"))):.2f}" cy="{panel_y(numeric(point.get("value"))):.2f}" r="3.5" fill="{color}" data-series="{_escape(name)}" data-period="{_escape(point.get("period"))}" aria-label="{_escape(f"{name} · {_text(point.get('period'))}: {_display_value(point.get('value'))}")}"><title>{_escape(f"{name} · {_text(point.get('period'))}: {_display_value(point.get('value'))}")}</title></circle>'
+                for point in series_points
+            )
+            panel_id = f"{chart_id}-{series_index + 1}"
+            panel_title = f"{chart_title} · {name}" if chart_title else name
+            unit_label = _escape(unit) if unit else "supplied units"
+            panels.append(
+                f'<div class="line-panel"><h4>{_escape(panel_title)}</h4>'
+                f'<svg class="line-chart line-chart-panel" viewBox="0 0 {width} {panel_height}" role="img" aria-labelledby="line-title-{_slug(panel_id)} line-summary-{_slug(panel_id)}" style="width:100%;height:auto">'
+                f'<title id="line-title-{_slug(panel_id)}">{_escape(panel_title)}</title><desc id="line-summary-{_slug(panel_id)}">{_escape(panel_title)}; values retain their supplied {unit_label}.</desc>'
+                f'<g aria-hidden="true">{"".join(grid_markup)}<line x1="{left}" x2="{left}" y1="{panel_top}" y2="{panel_height - panel_bottom}" stroke="#aabac4" /><line x1="{left}" x2="{width - right}" y1="{panel_height - panel_bottom}" y2="{panel_height - panel_bottom}" stroke="#aabac4" /></g>'
+                f'{line_markup}{point_markup}{x_label_markup(panel_height, panel_x)}</svg></div>'
+            )
+        if panels:
+            return f'<div class="viz viz-line"><div class="line-panels">{"".join(panels)}</div>{data_table}</div>'
+
+    geometry: list[str] = []
+    legend: list[str] = []
+    grid: list[str] = []
+    for index in range(5):
+        value = high - (high - low) * index / 4
+        y = y_for(value)
+        label = _escape(f"{value:g}")
+        grid.append(
+            f'<line x1="{left}" x2="{width - right}" y1="{y:.2f}" y2="{y:.2f}" stroke="#d9e1e8" stroke-width="1" />'
+            f'<text x="{left - 8}" y="{y + 4:.2f}" text-anchor="end" fill="#536170" font-size="11">{label}</text>'
+        )
+    x_labels: list[str] = []
+    for index, period in enumerate(periods):
+        if index not in {0, len(periods) - 1} and index % label_step:
+            continue
+        x = x_for(period)
+        x_labels.append(
+            f'<text x="{x:.2f}" y="{height - 22}" text-anchor="middle" fill="#536170" font-size="11">{_escape(period)}</text>'
+        )
+    for series_index, name in enumerate(series_names):
+        color = palette[series_index % len(palette)]
+        series_points = [point for point in points if _text(point.get("series"), "Value") == name and numeric(point.get("value")) is not None]
+        if len(series_points) >= 2:
+            coordinates = " ".join(f"{x_for(_text(point.get('period'))):.2f},{y_for(numeric(point.get('value'))):.2f}" for point in series_points)
+            geometry.append(
+                f'<polyline class="line-series" points="{coordinates}" fill="none" stroke="{color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" data-series="{_escape(name)}" />'
+            )
+        for point in series_points:
+            x = x_for(_text(point.get("period")))
+            y = y_for(numeric(point.get("value")))
+            exact = f"{name} · {_text(point.get('period'))}: {_display_value(point.get('value'))}"
+            geometry.append(
+                f'<circle class="line-point" cx="{x:.2f}" cy="{y:.2f}" r="3.5" fill="{color}" data-series="{_escape(name)}" data-period="{_escape(point.get("period"))}" aria-label="{_escape(exact)}"><title>{_escape(exact)}</title></circle>'
+            )
+        legend.append(
+            f'<li><span class="line-key" style="background:{color}" aria-hidden="true"></span><span>{_escape(name)}</span></li>'
+        )
+    title = chart_title
+    unit_suffix = f" ({unit})" if unit else ""
+    summary = "; ".join(
+        f"{_text(point.get('series'), 'Value')} {_text(point.get('period'))}: {_display_value(point.get('value'))}"
+        for point in points
+    )
+    aria = f"{title}{unit_suffix}: {summary}"
+    svg = (
+        f'<svg class="line-chart" viewBox="0 0 {width} {height}" role="img" aria-labelledby="line-title-{chart_id} line-summary-{chart_id}" style="width:100%;height:auto">'
+        f'<title id="line-title-{chart_id}">{_escape(title)}</title><desc id="line-summary-{chart_id}">{_escape(aria)}</desc>'
+        f'<g aria-hidden="true">{"".join(grid)}<line x1="{left}" x2="{left}" y1="{top}" y2="{height - bottom}" stroke="#aabac4" /><line x1="{left}" x2="{width - right}" y1="{height - bottom}" y2="{height - bottom}" stroke="#aabac4" /></g>'
+        f'{"".join(geometry)}{"".join(x_labels)}</svg>'
+    )
+    legend_html = f'<ul class="line-legend" role="list">{"".join(legend)}</ul>'
+    return f'<div class="viz viz-line"><div class="line-chart-wrap">{svg}</div>{legend_html}{data_table}</div>'
 
 
 def _render_stacked(widget: Mapping[str, Any]) -> str:
-    rows = _rows(widget.get("segments") or widget.get("values") or widget.get("data"))
+    rows = _rows(widget.get("segments") or widget.get("rows") or widget.get("values") or widget.get("data"))
     if not rows:
         return '<p class="viz-note">No reviewed values were supplied for this composition.</p>'
     geometry = []
@@ -1517,17 +2108,16 @@ def _render_stacked(widget: Mapping[str, Any]) -> str:
             raise ValueError("stacked segment percentages cannot exceed 100")
         start_text = f"{start:.6f}".rstrip("0").rstrip(".") or "0"
         width_text = f"{percent:.6f}".rstrip("0").rstrip(".") or "0"
-        label = _text(row.get("label") or row.get("name"))
-        value = _display_value(row.get("display_value", row.get("value")))
+        label, value = _required_visual_row(row, f"stacked row {index + 1}")
         aria_parts.append(f"{label}: {value} ({normalized_size})")
         geometry.append(
             f'<rect class="stack-segment stack-segment-{index}" x="{_escape(start_text)}" y="0" '
             f'width="{_escape(width_text)}" height="10" data-start="{_escape(start_text)}" '
-            f'data-size="{_escape(normalized_size)}" aria-hidden="true"></rect>'
+            f'data-size="{_escape(normalized_size)}" data-series-key="stack-{index}" aria-hidden="true"></rect>'
         )
         legend.append(
             f'<li><span class="stack-key stack-key-{index}" aria-hidden="true"></span>'
-            f'<span class="stack-label">{_escape(label)}</span>'
+            f'<button type="button" class="series-toggle" data-series-toggle="stack-{index}" aria-pressed="true"><span class="stack-label">{_escape(label)}</span></button>'
             f'<strong>{_escape(value)}</strong><small>{_escape(normalized_size)}</small></li>'
         )
     aria = f"{title}: " + "; ".join(aria_parts)
@@ -1559,7 +2149,7 @@ def _render_heatmap(widget: Mapping[str, Any]) -> str:
 
 
 def _render_scatter(widget: Mapping[str, Any]) -> str:
-    rows = _rows(widget.get("points") or widget.get("data"))
+    rows = _rows(widget.get("points") or widget.get("rows") or widget.get("data"))
     if not rows:
         return '<p class="viz-note">No reviewed points were supplied for this view.</p>'
     rendered = []
@@ -1631,12 +2221,20 @@ def _normalize_signed_percent(value: Any, label: str) -> str:
 
 
 def _donut_categories(widget: Mapping[str, Any]) -> tuple[Any, str, list[tuple[Mapping[str, Any], float]]]:
-    if "denominator_value" not in widget or widget.get("denominator_value") in (None, ""):
+    denominator_key = next(
+        (
+            key
+            for key in ("denominator_value", "denominator", "total")
+            if key in widget and widget.get(key) not in (None, "")
+        ),
+        None,
+    )
+    if denominator_key is None:
         raise ValueError("donut requires explicit denominator_value")
-    denominator_label = _text(widget.get("denominator_label"))
+    denominator_label = _text(widget.get("denominator_label") or widget.get("denominator_name"))
     if not denominator_label:
         raise ValueError("donut requires explicit denominator_label")
-    categories = widget.get("categories")
+    categories = widget.get("categories") or widget.get("rows") or widget.get("segments")
     if not isinstance(categories, list) or not 2 <= len(categories) <= 5:
         raise ValueError("donut requires 2 to 5 categories")
     validated: list[tuple[Mapping[str, Any], float]] = []
@@ -1644,15 +2242,35 @@ def _donut_categories(widget: Mapping[str, Any]) -> tuple[Any, str, list[tuple[M
     for index, category in enumerate(categories):
         if not isinstance(category, Mapping):
             raise ValueError(f"donut category {index + 1} must be an object")
-        label = _text(category.get("label"))
-        if not label or "value" not in category or category.get("value") in (None, "") or "size" not in category:
+        label = _text(category.get("label") or category.get("name"))
+        value_key = next(
+            (
+                key
+                for key in ("value", "display_value", "count", "amount", "measure")
+                if key in category and category.get(key) not in (None, "")
+            ),
+            None,
+        )
+        size_key = next(
+            (
+                key
+                for key in ("size", "percent", "share")
+                if key in category and category.get(key) not in (None, "")
+            ),
+            None,
+        )
+        if not label or value_key is None or size_key is None:
             raise ValueError(f"donut category {index + 1} requires label, value, and size")
-        percent = _supplied_percent(category.get("size"), f"donut category {index + 1}")
-        validated.append((category, percent))
+        normalized = dict(category)
+        normalized.setdefault("label", label)
+        normalized.setdefault("value", category[value_key])
+        normalized.setdefault("size", category[size_key])
+        percent = _supplied_percent(normalized["size"], f"donut category {index + 1}")
+        validated.append((normalized, percent))
         total += percent
     if abs(total - 100.0) > 0.5:
         raise ValueError(f"donut category percentages must total approximately 100 (got {total:g})")
-    return widget.get("denominator_value"), denominator_label, validated
+    return widget.get(denominator_key), denominator_label, validated
 
 
 def _render_donut(widget: Mapping[str, Any]) -> str:
@@ -1668,14 +2286,14 @@ def _render_donut(widget: Mapping[str, Any]) -> str:
         segments.append(
             f'<circle class="donut-segment donut-segment-{index}" cx="60" cy="60" r="{radius:g}" '
             f'stroke="{palette[index]}" stroke-dasharray="{length:.3f} {circumference:.3f}" '
-            f'stroke-dashoffset="{-offset:.3f}"></circle>'
+            f'stroke-dashoffset="{-offset:.3f}" data-series-key="donut-{index}"></circle>'
         )
         label = _text(category.get("label"))
         value = _display_value(category.get("display_value", category.get("value")))
         size = _text(category.get("size"))
         legend.append(
             f'<li><span class="donut-key donut-key-{index}" aria-hidden="true"></span>'
-            f'<span class="donut-label">{_escape(label)}</span><strong>{_escape(value)}</strong>'
+            f'<button type="button" class="series-toggle" data-series-toggle="donut-{index}" aria-pressed="true"><span class="donut-label">{_escape(label)}</span></button><strong>{_escape(value)}</strong>'
             f'<small>{_escape(size)}</small></li>'
         )
         offset += length
@@ -1867,25 +2485,217 @@ def _render_table(
     the complete reviewed table visible.
     """
 
-    rows = _rows(widget.get("rows") or widget.get("data")) if rows_override is None else rows_override
+    rows = _table_input_rows(widget, manager_view=manager_view) if rows_override is None else rows_override
     if not rows:
         return '<p class="table-empty">No reviewed rows were supplied for this table.</p>'
     columns = _as_list(widget.get("manager_columns" if manager_view else "columns"))
     if not columns and rows:
         columns = list(dict.fromkeys(key for row in rows for key in row.keys()))
     columns = [_text(column) for column in columns]
-    head = "".join(f"<th>{_escape(_humanize_label(column) if manager_view else column)}</th>" for column in columns)
+    exact_projection = manager_view and widget.get("__explicit_plan_projection") is True
+    head = "".join(f"<th>{_escape(column if exact_projection else _humanize_label(column) if manager_view else column)}</th>" for column in columns)
     body = []
     for row in rows:
+        def cell_value(column: str) -> str:
+            value = row.get(column)
+            if exact_projection:
+                return _text(value)
+            if manager_view and widget.get("accepted_evidence_fact_sheet") is True:
+                return _display_value(value)
+            return _manager_prose_text(_manager_cell_value(value)) if manager_view else _text(value)
+
         body.append(
             "<tr>"
             + "".join(
-                f"<td>{_escape(_manager_prose_text(_manager_cell_value(row.get(column))) if manager_view else row.get(column))}</td>"
+                f"<td>{_escape(cell_value(column))}</td>"
                 for column in columns
             )
             + "</tr>"
         )
     return f'<div class="table-wrap"><table><thead><tr>{head}</tr></thead><tbody>{"".join(body)}</tbody></table></div>'
+
+
+def _render_funnel(widget: Mapping[str, Any]) -> str:
+    """Render supplied process stages without deriving conversion rates."""
+
+    raw_rows = _as_list(widget.get("stages") or widget.get("rows") or widget.get("values") or widget.get("data"))
+    if any(not isinstance(row, Mapping) for row in raw_rows):
+        raise ValueError("funnel rows must be objects")
+    rows = [row for row in raw_rows if isinstance(row, Mapping)]
+    if not rows:
+        return '<p class="viz-note">No reviewed stages were supplied for this funnel.</p>'
+    rendered: list[str] = []
+    for index, row in enumerate(rows, 1):
+        supplied_size = next((row[key] for key in ("size", "width", "share", "percent") if key in row), None)
+        if supplied_size is None:
+            raise ValueError(f"funnel stage {index} requires supplied size")
+        size = _normalize_percent(supplied_size, f"funnel stage {index}")
+        label, value = _required_visual_row(row, f"funnel stage {index}")
+        rendered.append(
+            f'<div class="funnel-step" role="img" aria-label="{_escape(label)}: {_escape(value)}">'
+            f'<span class="funnel-label">{_escape(label)}</span>'
+            f'<span class="funnel-track"><span class="funnel-fill" style="--funnel-size:{_escape(size)}"></span></span>'
+            f'<strong class="funnel-value">{_escape(value)}</strong></div>'
+        )
+    return '<div class="viz viz-funnel" role="list">' + "".join(rendered) + "</div>"
+
+
+def _render_histogram(widget: Mapping[str, Any]) -> str:
+    """Render supplied bins; counts are never normalized by the renderer."""
+
+    raw_rows = _as_list(widget.get("bins") or widget.get("rows") or widget.get("values") or widget.get("data"))
+    if any(not isinstance(row, Mapping) for row in raw_rows):
+        raise ValueError("histogram bins must be objects")
+    rows = [row for row in raw_rows if isinstance(row, Mapping)]
+    if not rows:
+        return '<p class="viz-note">No reviewed bins were supplied for this histogram.</p>'
+    rendered: list[str] = []
+    for index, row in enumerate(rows, 1):
+        supplied_size = next((row[key] for key in ("size", "height", "share", "percent") if key in row), None)
+        if supplied_size is None:
+            raise ValueError(f"histogram bin {index} requires supplied size")
+        size = _normalize_percent(supplied_size, f"histogram bin {index}")
+        label = _text(row.get("label") or row.get("bin") or row.get("name"), f"Bin {index}")
+        value = _display_value(row.get("display_value", row.get("count", row.get("value"))))
+        rendered.append(
+            f'<div class="histogram-bin" role="img" aria-label="{_escape(label)}: {_escape(value)}">'
+            f'<span class="histogram-value">{_escape(value)}</span>'
+            f'<span class="histogram-track"><span class="histogram-fill" style="--histogram-size:{_escape(size)}"></span></span>'
+            f'<span class="histogram-label">{_escape(label)}</span></div>'
+        )
+    return '<div class="viz viz-histogram" role="list">' + "".join(rendered) + "</div>"
+
+
+def _render_box_plot(widget: Mapping[str, Any]) -> str:
+    """Render exact five-number summaries as a compact evidence-bound table."""
+
+    raw_rows = _as_list(widget.get("boxes") or widget.get("rows") or widget.get("values") or widget.get("data"))
+    if any(not isinstance(row, Mapping) for row in raw_rows):
+        raise ValueError("box plot rows must be objects")
+    rows = [row for row in raw_rows if isinstance(row, Mapping)]
+    if not rows:
+        return '<p class="viz-note">No reviewed distributions were supplied for this box plot.</p>'
+    required = ("min", "q1", "median", "q3", "max")
+    for index, row in enumerate(rows, 1):
+        if any(key not in row or row.get(key) in (None, "") for key in required):
+            raise ValueError(f"box plot row {index} requires min, q1, median, q3, and max")
+    columns = ("label", *required)
+    head = "".join(f"<th>{_escape(column)}</th>" for column in columns)
+    body = "".join(
+        "<tr>" + "".join(
+            f'<td>{_escape(row.get(column) if column == "label" else _display_value(row.get(column)))}</td>'
+            for column in columns
+        ) + "</tr>"
+        for index, row in enumerate(rows, 1)
+    )
+    return f'<div class="viz viz-box-plot table-wrap"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
+
+
+def _render_pareto(widget: Mapping[str, Any]) -> str:
+    """Render bars plus reviewer-supplied cumulative values."""
+
+    raw_rows = _as_list(widget.get("bars") or widget.get("rows") or widget.get("values") or widget.get("data"))
+    if any(not isinstance(row, Mapping) for row in raw_rows):
+        raise ValueError("pareto rows must be objects")
+    rows = [row for row in raw_rows if isinstance(row, Mapping)]
+    if not rows:
+        return '<p class="viz-note">No reviewed categories were supplied for this Pareto view.</p>'
+    rendered: list[str] = []
+    for index, row in enumerate(rows, 1):
+        supplied_size = next((row[key] for key in ("size", "width", "share", "percent") if key in row), None)
+        cumulative = next((row[key] for key in ("cumulative_size", "cumulative_percent", "cumulative_share") if key in row), None)
+        if supplied_size is None or cumulative is None:
+            raise ValueError(f"pareto row {index} requires supplied size and cumulative value")
+        size = _normalize_percent(supplied_size, f"pareto row {index}")
+        cumulative_display = _display_value(cumulative)
+        label, value = _required_visual_row(row, f"pareto row {index}")
+        rendered.append(
+            f'<div class="pareto-row" role="img" aria-label="{_escape(label)}: {_escape(value)}; cumulative {_escape(cumulative_display)}">'
+            f'<span class="pareto-label">{_escape(label)}</span><span class="pareto-track"><span class="pareto-bar" style="--pareto-size:{_escape(size)}"></span></span>'
+            f'<span class="pareto-value">{_escape(value)}</span><small class="pareto-cumulative">{_escape(cumulative_display)}</small></div>'
+        )
+    return '<div class="viz viz-pareto" role="list">' + "".join(rendered) + "</div>"
+
+
+def _render_waterfall(widget: Mapping[str, Any]) -> str:
+    """Render an additive bridge only when every supplied boundary is present."""
+
+    raw_rows = _as_list(widget.get("steps") or widget.get("rows") or widget.get("values") or widget.get("data"))
+    if any(not isinstance(row, Mapping) for row in raw_rows):
+        raise ValueError("waterfall rows must be objects")
+    rows = [row for row in raw_rows if isinstance(row, Mapping)]
+    if not rows:
+        return '<p class="viz-note">No reviewed bridge steps were supplied for this waterfall.</p>'
+    # ``start``/``end`` are the canonical fields.  The explicit aliases are
+    # accepted for source-local chart maps, but no subtotal or change is
+    # calculated from them.
+    normalized_rows: list[dict[str, Any]] = []
+    for index, row in enumerate(rows, 1):
+        start_key = next((key for key in ("start", "start_value", "start_size") if key in row and row.get(key) not in (None, "")), None)
+        end_key = next((key for key in ("end", "end_value", "end_size") if key in row and row.get(key) not in (None, "")), None)
+        if start_key is None or end_key is None:
+            raise ValueError(f"waterfall step {index} requires supplied start and end")
+        normalized = dict(row)
+        normalized["start"] = row[start_key]
+        normalized["end"] = row[end_key]
+        if "change" not in normalized:
+            for key in ("delta", "change_value", "change_size"):
+                if key in row and row.get(key) not in (None, ""):
+                    normalized["change"] = row[key]
+                    break
+        normalized_rows.append(normalized)
+    rows = normalized_rows
+    columns = ("label", "start", "change", "end")
+    head = "".join(f"<th>{_escape(column)}</th>" for column in columns)
+    body = "".join(
+        "<tr>" + "".join(
+            f'<td>{_escape(row.get(column) if column == "label" else _display_value(row.get(column)))}</td>'
+            for column in columns
+        ) + "</tr>"
+        for index, row in enumerate(rows, 1)
+    )
+    return f'<div class="viz viz-waterfall table-wrap"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
+
+
+def _table_input_rows(widget: Mapping[str, Any], *, manager_view: bool = False) -> list[Mapping[str, Any]]:
+    """Select an already supplied row container without reshaping values.
+
+    A table fallback is the local degradation path for an unsupported or
+    malformed chart.  It must retain the actual reviewed container (for
+    example ``points`` or ``bins``), rather than claiming that no rows exist
+    merely because the source did not call them ``rows``.
+    """
+
+    keys = (
+        ("manager_rows",) if manager_view else ()
+    ) + (
+        "rows", "data", "bars", "categories", "segments", "points", "series",
+        "cells", "tiles", "stages", "bins", "boxes", "steps", "values",
+        "manager_rows",
+    )
+    for key in keys:
+        value = widget.get(key)
+        if isinstance(value, list):
+            rows = _rows(value)
+            if rows:
+                return rows
+    return []
+
+
+def _render_visual_fallback(widget: Mapping[str, Any], *, manager_view: bool = False) -> str:
+    """Keep one bad visual local to an evidence-bound table/empty state."""
+
+    rows = _table_input_rows(widget, manager_view=manager_view)
+    if rows:
+        table_widget = dict(widget)
+        table_widget["type"] = "table"
+        table_widget["rows"] = rows
+        return (
+            '<div class="visual-fallback"><p class="viz-note">Visual unavailable; exact reviewed rows remain available below.</p>'
+            + _render_table(table_widget, rows_override=rows, manager_view=manager_view)
+            + "</div>"
+        )
+    return '<div class="visual-fallback"><p class="viz-note">Visual unavailable: no reviewed rows were supplied.</p></div>'
 
 
 def _is_large_audit_table(widget: Mapping[str, Any], rows: list[Mapping[str, Any]]) -> bool:
@@ -1912,6 +2722,11 @@ def _render_site_table(widget: Mapping[str, Any]) -> str:
 
     manager_rows = _manager_table_rows(widget)
     rows = _rows(manager_rows)
+    # A Product-plan projection is the exact selected manager surface.  Never
+    # truncate or collapse its rows; audit-only/legacy tables may still use a
+    # compact preview below.
+    if widget.get("__explicit_plan_projection") is True:
+        return _render_table(widget, rows_override=rows, manager_view=manager_rows is not None)
     if not _is_large_audit_table(widget, rows):
         return _render_table(widget, rows_override=rows, manager_view=manager_rows is not None)
 
@@ -1942,6 +2757,14 @@ def _render_visual(widget: Mapping[str, Any]) -> str:
         return _render_waffle(widget)
     if kind == "line":
         return _render_line(widget)
+    if kind == "area":
+        return '<div class="viz viz-area">' + _render_line(widget) + "</div>"
+    if kind == "stacked_area":
+        return '<div class="viz viz-stacked-area">' + _render_stacked(widget) + "</div>"
+    if kind in {"grouped_bar", "stacked_bar", "normalized_stacked_bar"}:
+        if kind == "grouped_bar":
+            return _render_bar(widget)
+        return _render_stacked(widget)
     if kind == "stacked_composition":
         return _render_stacked(widget)
     if kind == "heatmap":
@@ -1950,6 +2773,18 @@ def _render_visual(widget: Mapping[str, Any]) -> str:
         return _render_scatter(widget)
     if kind == "donut":
         return _render_donut(widget)
+    if kind == "pie":
+        return _render_donut(widget)
+    if kind == "funnel":
+        return _render_funnel(widget)
+    if kind == "histogram":
+        return _render_histogram(widget)
+    if kind == "box_plot":
+        return _render_box_plot(widget)
+    if kind == "pareto":
+        return _render_pareto(widget)
+    if kind == "waterfall":
+        return _render_waterfall(widget)
     if kind == "progress":
         return _render_progress(widget)
     if kind == "leaderboard":
@@ -2087,15 +2922,101 @@ def _ordered_widgets(widgets: list[Mapping[str, Any]], domains: list[Mapping[str
     return output
 
 
-def _validate_links(document: str) -> None:
-    anchors = set(re.findall(r'\bid=["\']([^"\']+)["\']', document))
-    links = re.findall(r'href=["\']([^"\']+)["\']', document)
+_FAILED_ITEM_LIMITATION = (
+    "This requirement did not contribute analytical values to the dashboard. "
+    "Its accepted output remains preserved, and no analytics are fabricated from this item."
+)
+
+
+def _render_failed_items(fixture: Mapping[str, Any]) -> str:
+    """Render every terminal item state without exposing its raw failure reason.
+
+    ``failed_items`` is a fixture-owned lifecycle projection, not an analytical
+    widget.  Keep the status and recovery state visible on the audit surface,
+    while allowing only stable hash/reference metadata through for diagnosis.
+    Unknown fields (including a raw ``reason``) are deliberately ignored.
+    """
+
+    raw_items = fixture.get("failed_items")
+    if raw_items is None:
+        return ""
+    if not isinstance(raw_items, (list, tuple)):
+        raise ValueError("fixture failed_items must be a list")
+    if not raw_items:
+        return ""
+
+    entries: list[str] = []
+    for index, item in enumerate(raw_items):
+        if not isinstance(item, Mapping):
+            raise ValueError(f"fixture failed_items entry {index} must be an object")
+        item_id = _text(item.get("item_id")).strip()
+        status = _text(item.get("status")).strip()
+        recovery_exhausted = item.get("recovery_exhausted")
+        if not item_id or not status or not isinstance(recovery_exhausted, bool):
+            raise ValueError(
+                "fixture failed_items entries require item_id, status, and boolean recovery_exhausted"
+            )
+
+        metadata: list[str] = []
+        manifest_ref = _text(item.get("manifest_ref")).strip()
+        if manifest_ref:
+            metadata.append(f'<dt>manifest_ref</dt><dd><code>{_escape(manifest_ref)}</code></dd>')
+        manifest_hash = _text(item.get("manifest_hash")).strip()
+        if manifest_hash:
+            metadata.append(f'<dt>manifest_hash</dt><dd><code>{_escape(manifest_hash)}</code></dd>')
+        reason_hash = _text(item.get("reason_hash")).strip()
+        if reason_hash:
+            metadata.append(f'<dt>reason_hash</dt><dd><code>{_escape(reason_hash)}</code></dd>')
+        metadata_html = f'<dl class="failed-item-metadata">{"".join(metadata)}</dl>' if metadata else ""
+        entries.append(
+            f'<li class="failed-item" data-failed-item="{_escape(item_id)}">'
+            f'<dl class="failed-item-state">'
+            f'<dt>item_id</dt><dd>{_escape(item_id)}</dd>'
+            f'<dt>status</dt><dd>{_escape(status)}</dd>'
+            f'<dt>recovery_exhausted</dt><dd>{_escape(json.dumps(recovery_exhausted))}</dd>'
+            f'</dl><p class="failed-item-limitation">{_escape(_FAILED_ITEM_LIMITATION)}</p>'
+            f'{metadata_html}</li>'
+        )
+    return (
+        '<section class="limits failed-items" aria-labelledby="failed-items-heading">'
+        '<h2 id="failed-items-heading">Failed requirements and limitations</h2>'
+        '<p>Terminal item states are shown for completeness; they are not analytical results.</p>'
+        f'<ul>{"".join(entries)}</ul>'
+        '</section>'
+    )
+
+
+_HTML_ID_RE = re.compile(r'\bid=["\']([^"\']+)["\']')
+_HTML_HREF_RE = re.compile(r'href=["\']([^"\']+)["\']')
+
+
+def _scan_html_links(document: str | bytes) -> tuple[set[str], list[str]]:
+    """Extract anchors and links with one bounded pass per attribute type.
+
+    Site validation used to rescan every target document once for every
+    fragment link pointing at it.  Keeping the two existing attribute
+    patterns, but materializing their results once per page, preserves the
+    renderer's link semantics while making validation proportional to the
+    total serialized site size and number of links.
+    """
+
+    if isinstance(document, bytes):
+        document = document.decode("utf-8")
+    return set(_HTML_ID_RE.findall(document)), _HTML_HREF_RE.findall(document)
+
+
+def _validate_link_values(anchors: set[str], links: Iterable[str]) -> None:
     for href in links:
         if href.startswith("#"):
             if href[1:] not in anchors:
                 raise ValueError(f"broken internal dashboard link: {href}")
         elif href.startswith(("http://", "https://", "//")):
             raise ValueError(f"offline dashboard cannot contain external link: {href}")
+
+
+def _validate_links(document: str | bytes) -> None:
+    anchors, links = _scan_html_links(document)
+    _validate_link_values(anchors, links)
 
 
 def render_dashboard(
@@ -2123,6 +3044,13 @@ def render_dashboard(
     registry_info = _validate_v4_chart_assets(fixture, widgets, context)
     domains = _normalize_domains(fixture, widgets)
     ordered = _ordered_widgets(widgets, domains)
+    accepted_review = fixture.get("accepted_final_product_review")
+    surface_status = (
+        "Reviewed"
+        if isinstance(accepted_review, Mapping)
+        and _text(accepted_review.get("status")).lower() in {"accepted", "approved", "final"}
+        else "Preview"
+    )
 
     trace_records: list[dict[str, str]] = []
     trace_seen: set[str] = set()
@@ -2139,10 +3067,19 @@ def render_dashboard(
                 trace_seen.add(record["anchor"])
         trace = _trace_links(records)
         title = _text(widget.get("title") or widget.get("label"), widget_id)
-        content = _render_visual(widget)
+        try:
+            content = _render_visual(widget)
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            # A malformed or unsupported visual must not blank the full
+            # dashboard. Keep exact supplied rows visible as a fallback.
+            content = _render_visual_fallback(widget)
         meta = _meta_lines(widget)
-        review_status = widget.get("review_status") or fixture.get("review_status")
-        review = f'<p class="review-status">Review: {_escape(review_status)}</p>' if review_status else ""
+        review_status = surface_status
+        # Keep the machine review state in the manifest while using a neutral
+        # visible label.  Candidate bytes are immutable before Product Review
+        # and may be promoted later; a literal ``Preview`` badge would become
+        # stale in that accepted artifact.
+        review = '<p class="review-status">Source-bound output</p>' if review_status else ""
         block = (
             f'<article class="widget widget-{_escape(kind)}" id="widget-{_escape(widget_id)}">'
             f'<h3>{_escape(title)}</h3>{content}{meta}{review}{trace}</article>'
@@ -2194,6 +3131,7 @@ def render_dashboard(
     limitations_block = "".join(f"<li>{_escape(value)}</li>" for value in limitations)
     if not limitations_block:
         limitations_block = "<li>Only reviewed values supplied in the fixture are shown; no new analytics were calculated.</li>"
+    failed_items_html = _render_failed_items(fixture)
     trace_block = "".join(
         f'<li id="{_escape(record["anchor"])}"><strong>{_escape(record["label"])}</strong>'
         f'<span class="trace-ref">{_escape(record["ref"])}</span></li>'
@@ -2214,10 +3152,11 @@ def render_dashboard(
     subtitle = _text(fixture.get("subtitle"), "Static presentation of already-reviewed widget specifications")
     document = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{_escape(title)}</title><style>{css}</style></head>
-<body><main><header><p class="eyebrow">Offline · reviewed outputs only</p><h1>{_escape(title)}</h1><p>{_escape(subtitle)}</p><p>No external assets, JavaScript, CDN, source reads, or new calculations are used by this renderer.</p></header>
+<body><main><header><p class="eyebrow">Offline · Source-bound outputs only</p><h1>{_escape(title)}</h1><p>{_escape(subtitle)}</p><p>No external assets, JavaScript, CDN, source reads, or new calculations are used by this renderer.</p></header>
 <section aria-labelledby="kpi-heading"><h2 id="kpi-heading">Key indicators</h2><div class="kpi-grid">{"".join(cards) or '<p>No KPI cards were supplied.</p>'}</div></section>
 <section aria-labelledby="flow-heading"><h2 id="flow-heading">Decision flow</h2>{"".join(domain_blocks)}</section>
 <section aria-labelledby="detail-heading"><h2 id="detail-heading">Reviewed visual details</h2><div class="widget-grid">{"".join(sections) or '<p>No non-KPI widgets were supplied.</p>'}</div></section>
+{failed_items_html}
 <section class="limitations" aria-labelledby="limits-heading"><h2 id="limits-heading">Assumptions and limitations</h2><ul>{limitations_block}</ul></section>
 <section class="trace-panel" aria-labelledby="trace-heading"><h2 id="trace-heading">Audit and trace references</h2><ul>{trace_block}</ul></section>
 </main></body></html>"""
@@ -2225,13 +3164,15 @@ def render_dashboard(
     manifest = {
         "product_type": "offline_static_dashboard",
         "source_status": "reviewed_outputs_only",
+        "status": surface_status,
+        "review_status": surface_status,
         "new_analytics": False,
         "organization": "business_domain_and_decision_flow",
         "assets_local": True,
         "internal_links_checked": True,
         "freeze_markers": freeze_markers.to_dict(),
         "run_id": _text(fixture.get("run_id")),
-        "skill_version": _text(fixture.get("skill_version"), "0.7.1"),
+        "skill_version": _text(fixture.get("skill_version"), "0.7.2"),
         "domain_order": [domain["id"] for domain in domains],
         "decision_flow_order": [
             {"domain_id": domain["id"], "flow_id": flow["id"]}
@@ -2254,17 +3195,39 @@ def _canonical_dashboard_css() -> bytes:
     return css_path.read_bytes()
 
 
+def _canonical_dashboard_js() -> bytes:
+    """Load the single deterministic interaction runtime used by the site."""
+
+    js_path = Path(__file__).resolve().parent.parent / "assets" / "dashboard.js"
+    return js_path.read_bytes()
 
 
-def _site_nav(current: str, domains: list[Mapping[str, Any]], *, prefix: str = "", include_ontology: bool = False) -> str:
-    links = [
-        ("index.html", "Overview"),
-        *[(f"domains/{_slug(domain['id'])}.html", _manager_prose_text(domain["title"])) for domain in domains],
-        ("data-quality-audit.html", "Data quality & model audit"),
-        ("evidence.html", "Evidence & audit"),
-    ]
-    if include_ontology:
-        links.insert(-1, ("ontology.html", "Ontology projection"))
+
+
+def _site_nav(
+    current: str,
+    domains: list[Mapping[str, Any]],
+    *,
+    prefix: str = "",
+    include_ontology: bool = True,
+    manager_surface: bool = True,
+) -> str:
+    if manager_surface:
+        # The default manager canvas links only to business pages. Provenance,
+        # ontology, and data-quality surfaces remain available as separate
+        # technical pages with their own navigation.
+        links = [
+            ("index.html", "Overview"),
+            *[(f"domains/{_slug(domain['id'])}.html", _manager_prose_text(domain["title"])) for domain in domains],
+        ]
+    else:
+        links = [
+            ("index.html", "Overview"),
+            ("data-quality-audit.html", "Data quality & model audit"),
+            ("evidence.html", "Evidence & audit"),
+        ]
+        if include_ontology:
+            links.insert(-1, ("ontology.html", "Ontology projection"))
     rendered = []
     for target, label in links:
         href = posixpath.normpath(posixpath.join(prefix, target))
@@ -2273,25 +3236,60 @@ def _site_nav(current: str, domains: list[Mapping[str, Any]], *, prefix: str = "
     return "".join(rendered)
 
 
-def _site_page(*, title: str, current: str, domains: list[Mapping[str, Any]], body: str, prefix: str = "", subtitle: str = "", include_ontology: bool = False) -> str:
-    nav = _site_nav(current, domains, prefix=prefix, include_ontology=include_ontology)
+def _site_page(
+    *,
+    title: str,
+    current: str,
+    domains: list[Mapping[str, Any]],
+    body: str,
+    prefix: str = "",
+    subtitle: str = "",
+    include_ontology: bool = True,
+    status: str = "Preview",
+    manager_surface: bool = True,
+) -> str:
+    nav = _site_nav(
+        current,
+        domains,
+        prefix=prefix,
+        include_ontology=include_ontology,
+        manager_surface=manager_surface,
+    )
     css_href = posixpath.normpath(posixpath.join(prefix, "assets/dashboard.css"))
+    runtime_href = posixpath.normpath(posixpath.join(prefix, "assets/dashboard.js"))
     favicon_href = posixpath.normpath(posixpath.join(prefix, "assets/favicon.svg"))
     index_href = posixpath.normpath(posixpath.join(prefix, "index.html"))
     subtitle_html = f'<p>{_escape(subtitle)}</p>' if subtitle else ""
+    domain_options = "".join(
+        f'<option value="{_escape(_slug(domain.get("id")))}">{_escape(_manager_prose_text(domain.get("title")))}</option>'
+        for domain in domains
+    )
+    toolbar = (
+        '<section class="runtime-toolbar" aria-label="Dashboard exploration controls">'
+        '<label>Find a view <input type="search" data-runtime-search placeholder="Search visible views"></label>'
+        f'<label>Decision domain <select data-runtime-domain><option value="">All domains</option>{domain_options}</select></label>'
+        '<button type="button" data-runtime-clear>Reset</button><span class="runtime-count" data-runtime-count></span>'
+        '</section>'
+    )
+    brand_subtitle = "business decision workspace" if manager_surface else "source-bound business analytics"
+    rail_note = "Manager decisions<br>Business information only" if manager_surface else "Offline · source-bound outputs only<br>Manager decisions and evidence"
+    hero_status = "Manager view" if manager_surface else "Source-bound"
+    footer_note = "Static local product · Business decision workspace." if manager_surface else "Static local product · Source-bound manager workspace."
+    status_text = _escape(hero_status if manager_surface else status)
     return f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{_escape(title)}</title><link rel="stylesheet" href="{_escape(css_href)}"><link rel="icon" href="{_escape(favicon_href)}" type="image/svg+xml"></head>
-<body><div class="shell"><aside class="rail"><a class="brand" href="{_escape(index_href)}"><strong>DECISION//ROOM</strong><small>reviewed business analytics</small></a><nav class="nav" aria-label="Dashboard pages">{nav}</nav><p class="rail-note">Offline · reviewed outputs only<br>Manager decisions and evidence</p></aside><main class="content"><header class="hero"><div><span class="eyebrow">Decision workspace</span><h1>{_escape(title)}</h1>{subtitle_html}</div><span class="status">Reviewed</span></header>{body}<footer class="footer">Static local product · reviewed manager workspace.</footer></main></div></body></html>"""
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{_escape(title)}</title><link rel="stylesheet" href="{_escape(css_href)}"><link rel="icon" href="{_escape(favicon_href)}" type="image/svg+xml"><script src="{_escape(runtime_href)}" defer></script></head>
+<body><div class="shell"><aside class="rail"><a class="brand" href="{_escape(index_href)}"><strong>AUTO FOUNDRY</strong><small>{_escape(brand_subtitle)}</small></a><nav class="nav" aria-label="Dashboard pages">{nav}</nav><p class="rail-note">{rail_note}</p></aside><main class="content" data-dashboard-runtime><header class="hero"><div><span class="eyebrow">Auto Foundry Control Center</span><h1>{_escape(title)}</h1>{subtitle_html}</div><span class="status">{status_text}</span></header>{toolbar}{body}<footer class="footer">{footer_note}</footer></main></div></body></html>"""
 
 
 def _layout_class(widget: Mapping[str, Any]) -> str:
     """Return a bounded layout class from optional fixture metadata."""
 
-    layout = _slug(widget.get("layout") or "")
+    manager = widget.get("manager_presentation")
+    layout = _slug(widget.get("layout") or (manager.get("layout") if isinstance(manager, Mapping) else "") or "")
     span = _text(widget.get("span") or "")
     if span in {"1", "2", "3", "4", "6", "8", "12"}:
         return f" span-{span}"
-    if layout in {"wide", "full", "hero", "compact", "kpi", "chart", "detail"}:
+    if layout in {"wide", "full", "half", "hero", "compact", "kpi", "chart", "detail"}:
         return f" layout-{layout}"
     return ""
 
@@ -2359,29 +3357,28 @@ def _requirement_anchor(requirement_id: Any) -> str:
 
 
 def _manager_widget_allowed(widget: Mapping[str, Any], *, strict: bool = False) -> bool:
-    """Return whether one widget is admitted to the business manager surface."""
+    """Return plan-bound manager visibility without semantic inference.
+
+    The assembler has already applied the Product Agent's explicit plan.  The
+    renderer validates only the status/audience contract and never examines a
+    title, table key/value, role, kind, or technical annotation to veto a
+    selected widget.
+    """
 
     admission = widget.get("manager_admission")
     audience = _text(widget.get("presentation_audience"))
     if not isinstance(admission, Mapping):
         if strict:
             raise ValueError(f"widget {_text(widget.get('id'), 'widget')} lacks manager_admission")
-        # Legacy/manual fixtures do not carry the assembler's explicit policy.
-        # A relationship coverage projection is nevertheless unambiguously an
-        # audit artifact; keep it assigned and exact in Technical audit rather
-        # than publishing an empty manager card after row sanitization.
-        kind = _text(widget.get("type") or widget.get("kind"), "kpi").lower()
-        role = _text(widget.get("presentation_role")).lower()
-        if role == "relationship_matrix" or (kind == "progress" and "relationship" in _text(widget.get("title")).lower()):
-            return False
+        # Legacy/manual fixtures without the V4 admission envelope remain
+        # visible to direct callers; V4 fixtures are strict and must carry the
+        # persisted Product plan metadata.
         return _text(widget.get("presentation_tier"), "primary").lower() != "audit"
     status = _text(admission.get("status"))
     if status not in {"admitted", "audit_only"} or audience not in {"business_manager", "technical_audit"}:
         raise ValueError(f"widget {_text(widget.get('id'), 'widget')} has unknown manager admission")
     if (status == "admitted") != (audience == "business_manager"):
         raise ValueError(f"widget {_text(widget.get('id'), 'widget')} has inconsistent manager admission")
-    if status == "admitted" and _text(widget.get("presentation_tier"), "primary").lower() == "audit":
-        return False
     return status == "admitted"
 
 
@@ -2391,7 +3388,8 @@ def _validate_manager_admission_contract(fixture: Mapping[str, Any], widgets: li
     if not _is_v4_fixture(fixture):
         return
     policy = fixture.get("manager_admission")
-    if not isinstance(policy, Mapping) or _text(policy.get("policy")) != "explicit_business_presentation_plan":
+    expected_policy = "terminal_limited_dashboard" if fixture.get("limited_dashboard") is True else "explicit_business_presentation_plan"
+    if not isinstance(policy, Mapping) or _text(policy.get("policy")) != expected_policy:
         raise ValueError("v4 fixture requires explicit manager_admission policy")
     for widget in widgets:
         _manager_widget_allowed(widget, strict=True)
@@ -2452,8 +3450,9 @@ def _validate_fixture_presentation_plan_v2(
         or len(set(manager_visual)) != len(manager_visual)
         or len(set(audit_visual)) != len(audit_visual)
         or set(manager_visual).intersection(audit_visual)
-        or not manager_visual
-        or not audit_visual
+        # A small blueprint may legitimately contain only manager visuals or
+        # only technical visuals; an empty partition is represented explicitly
+        # rather than forcing a fabricated chart into the other audience.
     ):
         raise ValueError("v2 fixture visual partition must contain disjoint unique IDs")
     entries = fixture.get("visual_entries")
@@ -2485,16 +3484,7 @@ def _validate_fixture_presentation_plan_v2(
     current_visual_ids = [
         widget_id
         for widget_id, widget in by_id.items()
-        if _text(widget.get("type") or widget.get("kind")).strip().lower()
-        == _text(charts[widget_id].get("type")).strip().lower()
-        and (
-            _text(charts[widget_id].get("type")).strip().lower() in _VISUAL_WIDGET_TYPES
-            or (
-                bool(widget.get("dashboard_fact"))
-                and _text(widget.get("type") or widget.get("kind")).strip().lower() == "table"
-                and _text(charts[widget_id].get("type")).strip().lower() == "table"
-            )
-        )
+        if _is_partition_visual(widget, charts[widget_id])
     ]
     if set(manager_visual).union(audit_visual) != set(current_visual_ids):
         raise ValueError("v2 fixture visual partition does not cover current chart universe")
@@ -2510,6 +3500,16 @@ def _validate_fixture_presentation_plan_v2(
             raise ValueError(f"v2 visual entry type drifted: {widget_id}")
         if entry.get("chart_family") != _text(chart.get("family")):
             raise ValueError(f"v2 visual entry family drifted: {widget_id}")
+        if "recipe_id" in entry and (not isinstance(entry.get("recipe_id"), str) or not entry["recipe_id"].strip()):
+            raise ValueError(f"v2 visual entry recipe selection is invalid: {widget_id}")
+        if "layout" in entry and entry.get("layout") not in {"full", "wide", "half", "compact"}:
+            raise ValueError(f"v2 visual entry layout is invalid: {widget_id}")
+        if "renderer_type" in entry and entry.get("renderer_type") not in {
+            "kpi", "bar", "column", "grouped_bar", "stacked_bar", "diverging_bar", "waffle",
+            "funnel", "histogram", "box_plot", "pareto", "waterfall", "heatmap", "scatter",
+            "line", "area", "stacked_area", "lollipop", "donut", "metric_grid", "table",
+        }:
+            raise ValueError(f"v2 visual entry renderer selection is invalid: {widget_id}")
         if snapshot_hash(widget) != entry.get("widget_snapshot_sha256") or chart_hash(chart) != entry.get("chart_entry_sha256"):
             raise ValueError(f"v2 visual snapshot/chart hash drifted: {widget_id}")
         title = entry.get("title_projection")
@@ -2542,7 +3542,14 @@ def _validate_fixture_presentation_plan_v2(
         visual_entry = visual_by_id.get(widget_id)
         if not isinstance(manager_entry, Mapping) or not isinstance(visual_entry, Mapping):
             raise ValueError(f"v2 manager visual entry is missing: {widget_id}")
-        for key in ("visual_type", "chart_family", "widget_snapshot_sha256", "chart_entry_sha256", "allowed_visual_fields", "title_projection", "visual_projection"):
+        visual_keys = ("visual_type", "chart_family", "widget_snapshot_sha256", "chart_entry_sha256", "allowed_visual_fields", "title_projection", "visual_projection")
+        if "recipe_id" in visual_entry or "recipe_id" in manager_entry:
+            visual_keys += ("recipe_id",)
+        if "layout" in visual_entry or "layout" in manager_entry:
+            visual_keys += ("layout",)
+        if "renderer_type" in visual_entry or "renderer_type" in manager_entry:
+            visual_keys += ("renderer_type",)
+        for key in visual_keys:
             if manager_entry.get(key) != visual_entry.get(key):
                 raise ValueError(f"v2 manager visual entry drifted: {widget_id}:{key}")
 
@@ -2560,6 +3567,18 @@ def _validate_fixture_presentation_plan(
     plan_ref = fixture.get("presentation_plan_ref")
     manager_ids = fixture.get("manager_widget_ids", [])
     if plan_ref in (None, ""):
+        if fixture.get("limited_dashboard") is True:
+            allowed = {
+                _text(widget.get("id"))
+                for widget in widgets
+                if isinstance(widget, Mapping)
+                and widget.get("limited_empty_state") is True
+                and isinstance(widget.get("manager_admission"), Mapping)
+                and _text(widget.get("manager_admission", {}).get("status")) == "admitted"
+            }
+            if not isinstance(manager_ids, list) or set(_text(value) for value in manager_ids) != allowed:
+                raise ValueError("limited dashboard manager IDs do not match its empty-state widget")
+            return
         if manager_ids not in (None, []) or any(
             isinstance(widget.get("manager_admission"), Mapping)
             and _text(widget.get("manager_admission", {}).get("status")) == "admitted"
@@ -2578,81 +3597,10 @@ def _validate_fixture_presentation_plan(
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("fixture presentation plan is invalid") from exc
-    if not isinstance(plan, Mapping) or plan.get("schema_version") != "dashboard.business_presentation_plan.v1":
-        if isinstance(plan, Mapping) and plan.get("schema_version") == "dashboard.business_presentation_plan.v2":
-            _validate_fixture_presentation_plan_v2(fixture, widgets, plan, plan_path=plan_path, context=context)
-            return
-        raise ValueError("fixture presentation plan schema is invalid")
-    plan_hash = hashlib.sha256(plan_path.read_bytes()).hexdigest()
-    if fixture.get("presentation_plan_sha256") != plan_hash or plan.get("manager_widget_ids") != manager_ids:
-        raise ValueError("fixture presentation plan hash or IDs do not match")
-    by_id = {_text(widget.get("id")): widget for widget in widgets if _text(widget.get("id"))}
-    entries = plan.get("manager_entries")
-    if not isinstance(entries, list) or [entry.get("widget_id") for entry in entries if isinstance(entry, Mapping)] != manager_ids:
-        raise ValueError("fixture presentation plan manager entries are invalid")
-    if fixture.get("manager_entries") != entries:
-        raise ValueError("fixture manager entries do not match the persisted plan")
-    binding_by_id = {entry.get("widget_id"): entry for entry in entries if isinstance(entry, Mapping)}
-    audit_by_id = {
-        _text(record.get("record_id")): record
-        for record in _as_list(fixture.get("audit_records"))
-        if isinstance(record, Mapping) and _text(record.get("record_id"))
-    }
-    selected = set(manager_ids)
-    for widget in widgets:
-        widget_id = _text(widget.get("id"))
-        admitted = widget_id in selected
-        admission = widget.get("manager_admission")
-        if not isinstance(admission, Mapping) or (admission.get("status") == "admitted") != admitted or (admission.get("presentation_audience") == "business_manager") != admitted:
-            raise ValueError(f"widget {widget_id} overrides presentation-plan membership")
-    for widget_id in manager_ids:
-        if widget_id not in by_id:
-            raise ValueError(f"presentation plan references unknown widget: {widget_id}")
-        binding = binding_by_id[widget_id]
-        widget = by_id[widget_id]
-        actual_record_ids = sorted({
-            _text(value).strip()
-            for value in (_as_list(widget.get("integration_record_ids")) or [widget.get("integration_record_id")])
-            if _text(value).strip()
-        })
-        actual_record_refs = sorted({
-            _text(value).strip()
-            for value in (_as_list(widget.get("integration_record_refs")) or [widget.get("integration_record_ref")])
-            if _text(value).strip()
-        })
-        if binding.get("requirement_id") != widget.get("requirement_id") or binding.get("presentation_role") != _text(widget.get("presentation_role") or "decision_view"):
-            raise ValueError(f"presentation plan widget identity binding drifted: {widget_id}")
-        if binding.get("record_id") not in actual_record_ids or len(actual_record_ids) != 1:
-            raise ValueError(f"presentation plan widget record binding drifted: {widget_id}")
-        if widget.get("manager_presentation") != binding:
-            raise ValueError(f"presentation plan widget projection binding drifted: {widget_id}")
-        record = audit_by_id.get(_text(binding.get("record_id")))
-        if not isinstance(record, Mapping) or not isinstance(record.get("payload"), Mapping):
-            raise ValueError(f"presentation plan manager record audit is missing: {widget_id}")
-        for field, projection in binding.get("display_projection", {}).items():
-            pointer = projection.get("pointer") if isinstance(projection, Mapping) else None
-            if not isinstance(pointer, str) or not (pointer.startswith("/payload/") or pointer.startswith("/accepted/")):
-                raise ValueError(f"presentation plan renderer pointer is unverifiable: {widget_id}:{field}")
-            if pointer.startswith("/accepted/"):
-                # Accepted-content pointers are validated against the
-                # immutable accepted bundle by the assembler before the
-                # fixture is emitted.  The renderer carries the exact bound
-                # value and does not reclassify it from raw widget fields.
-                continue
-            current: Any = {"payload": record["payload"]}
-            try:
-                for part in pointer[1:].split("/"):
-                    part = part.replace("~1", "/").replace("~0", "~")
-                    if isinstance(current, Mapping):
-                        current = current[part]
-                    elif isinstance(current, list):
-                        current = current[int(part)]
-                    else:
-                        raise KeyError(part)
-            except (KeyError, IndexError, TypeError, ValueError) as exc:
-                raise ValueError(f"presentation plan renderer pointer is missing: {widget_id}:{field}") from exc
-            if json.dumps(current, ensure_ascii=False, sort_keys=True, separators=(",", ":")) != json.dumps(projection.get("value"), ensure_ascii=False, sort_keys=True, separators=(",", ":")):
-                raise ValueError(f"presentation plan renderer projection value drifted: {widget_id}:{field}")
+    if not isinstance(plan, Mapping) or plan.get("schema_version") != "dashboard.business_presentation_plan.v2":
+        raise ValueError("V1 presentation plans are rejected at the renderer boundary")
+    _validate_fixture_presentation_plan_v2(fixture, widgets, plan, plan_path=plan_path, context=context)
+    return
 
 
 def _validate_audit_inventory(
@@ -2714,7 +3662,12 @@ def _validate_audit_inventory(
         raise ValueError("v4 fixture audit_widget_entry_count does not match audit_widgets")
 
 
-def _site_widget(widget: Mapping[str, Any], records: list[dict[str, str]]) -> str:
+def _site_widget(
+    widget: Mapping[str, Any],
+    records: list[dict[str, str]],
+    *,
+    manager_surface: bool = True,
+) -> str:
     display_widget = _manager_surface_widget(widget)
     kind = _text(display_widget.get("type") or display_widget.get("kind"), "kpi").lower()
     explicit_projection = bool(display_widget.get("__explicit_plan_projection"))
@@ -2726,16 +3679,15 @@ def _site_widget(widget: Mapping[str, Any], records: list[dict[str, str]]) -> st
     )
     role = _text(display_widget.get("presentation_role") or "decision_view")
     if explicit_projection and "body" in projection_fields:
-        # Pointer-bound business prose is authoritative.  Do not route it
-        # through technical keyword filters or table sanitation: those
-        # policies apply only to legacy/unplanned surfaces.
+        # Pointer-bound business prose is authoritative.  Keep it exact and
+        # do not route it through any semantic reinterpretation path.
         findings_value = display_widget.get("manager_findings")
         first_finding = findings_value[0] if isinstance(findings_value, list) and findings_value else None
         body = _text(first_finding.get("finding")) if isinstance(first_finding, Mapping) else _text(display_widget.get("body"))
         visual = f'<div class="manager-projection-body"><p>{_escape(body)}</p></div>'
-    elif role == "finding_list":
+    elif not explicit_projection and role == "finding_list":
         visual = _render_finding_list(display_widget)
-    elif role == "relationship_matrix" or (kind == "progress" and "relationship" in _text(display_widget.get("title")).lower()):
+    elif not explicit_projection and role == "relationship_matrix":
         relationship_rows = _relationship_manager_rows(display_widget)
         relationship_widget = dict(display_widget)
         relationship_widget["type"] = "table"
@@ -2744,7 +3696,10 @@ def _site_widget(widget: Mapping[str, Any], records: list[dict[str, str]]) -> st
     elif kind in {"table", "status_table"}:
         visual = _render_site_table(display_widget)
     else:
-        visual = _render_visual(display_widget)
+        try:
+            visual = _render_visual(display_widget)
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            visual = _render_visual_fallback(display_widget, manager_view=True)
     notes = _as_list(display_widget.get("chart_notes") or display_widget.get("notes"))
     note = next((
         _text(value) if explicit_projection else _manager_prose_text(value)
@@ -2761,9 +3716,20 @@ def _site_widget(widget: Mapping[str, Any], records: list[dict[str, str]]) -> st
         anchor = _text(widget.get("manager_anchor") or widget.get("display_anchor") or f'{widget.get("requirement_id", "requirement")}-{role}')
     else:
         anchor = _text(widget.get("manager_anchor") or widget.get("display_anchor") or widget.get("id") or f'{widget.get("requirement_id", "requirement")}-{role}-{title}')
+    # Requirement/widget IDs are stable DOM/runtime identity, not visible
+    # manager content. Keep them for deterministic navigation and the offline
+    # interaction runtime; visible headings/eyebrows are cleaned separately.
     widget_id_attr = _text(widget.get("id")).strip()
     data_widget = f' data-widget-id="{_escape(widget_id_attr)}"' if widget_id_attr else ""
-    return f'<article class="widget manager-widget widget-{_escape(kind)} role-{_escape(_slug(role))}{_layout_class(widget)}{panel_class}"{panel_attr}{data_widget} id="widget-{_escape(_slug(anchor))}"><h3>{_escape(title)}</h3>{panel_note}{note_html}{manager_meta}{visual}</article>'
+    requirement_attr = _escape(_text(widget.get("requirement_id") or ""))
+    domain_attr = _escape(_slug(widget.get("domain_id") or ""))
+    detail_key = _slug(anchor) + "-detail"
+    detail = "" if manager_surface else (
+        f'<button type="button" class="runtime-drilldown" data-runtime-drilldown="{_escape(detail_key)}" aria-expanded="false">Explore detail</button>'
+        f'<div class="runtime-detail" data-runtime-detail="{_escape(detail_key)}" hidden><p>Exact reviewed rows and provenance remain available in the technical audit.</p></div>'
+    )
+    requirement_data = f' data-runtime-requirement="{requirement_attr}"' if requirement_attr else ""
+    return f'<article class="widget manager-widget widget-{_escape(kind)} role-{_escape(_slug(role))}{_layout_class(widget)}{panel_class}" data-runtime-card{requirement_data} data-runtime-domain="{domain_attr}" data-runtime-role="{_escape(_slug(role))}"{panel_attr}{data_widget} id="widget-{_escape(_slug(anchor))}"><h3>{_escape(title)}</h3>{panel_note}{note_html}{manager_meta}{visual}{detail}</article>'
 
 
 def _ontology_graph_body_generic(
@@ -3118,7 +4084,7 @@ def _ontology_body(fixture: Mapping[str, Any]) -> str:
     raw_summary = fixture.get("ontology_summary")
     summary = raw_summary if isinstance(raw_summary, Mapping) else {}
     labels = (
-        ("ontology_items", "Objects"),
+        ("ontology_items", "Total ontology items"),
         ("relationships", "Relationships"),
         ("canonical_mappings", "Canonical mappings"),
         ("identity_decisions", "Identity decisions"),
@@ -3157,12 +4123,18 @@ def _ontology_body(fixture: Mapping[str, Any]) -> str:
 def _validate_site_links(pages: Mapping[str, str | bytes]) -> None:
     html_pages = {name for name in pages if name.endswith(".html")}
     local_assets = set(pages)
-    for name, document in pages.items():
-        if not name.endswith(".html"):
-            continue
-        _validate_links(document)
-        anchors = set(re.findall(r'\bid=["\']([^"\']+)["\']', document))
-        for href in re.findall(r'href=["\']([^"\']+)["\']', document):
+    # Parse every HTML page once.  In particular, a large evidence page can
+    # receive thousands of fragment links from audit pages; rescanning its
+    # serialized bytes for each link turns validation into an accidental
+    # quadratic operation.
+    scanned_pages = {
+        name: _scan_html_links(document)
+        for name, document in pages.items()
+        if name.endswith(".html")
+    }
+    for name, (anchors, links) in scanned_pages.items():
+        _validate_link_values(anchors, links)
+        for href in links:
             if href.startswith("#"):
                 if href[1:] not in anchors:
                     raise ValueError(f"broken site fragment in {name}: {href}")
@@ -3178,9 +4150,44 @@ def _validate_site_links(pages: Mapping[str, str | bytes]) -> None:
             if target not in html_pages:
                 raise ValueError(f"broken site page link in {name}: {href}")
             if fragment:
-                target_anchors = set(re.findall(r'\bid=["\']([^"\']+)["\']', pages[target]))
+                target_anchors = scanned_pages[target][0]
                 if fragment not in target_anchors:
                     raise ValueError(f"broken site fragment in {name}: {href}")
+
+
+def _evidence_detail(
+    context: RunContext | None,
+    record: Mapping[str, str],
+    audit_records: Iterable[Mapping[str, Any]],
+) -> str:
+    """Render actionable, reviewed detail without consulting work artifacts."""
+
+    reference = _text(record.get("ref"))
+    sections: list[str] = []
+    if context is not None and re.fullmatch(
+        r"requirements/[A-Za-z0-9_.-]+/(?:accepted/(?:manifest|answer_content)\.json|integration/committed/(?:manifest\.json|records\.jsonl))",
+        reference,
+    ):
+        path = context.resolve_run_path(reference)
+        if path.is_file() and not path.is_symlink():
+            exact = path.read_text(encoding="utf-8")
+            sections.append(
+                '<details class="evidence-detail"><summary>Open exact frozen artifact</summary>'
+                f'<pre>{_escape(exact)}</pre></details>'
+            )
+    related = [
+        dict(value)
+        for value in audit_records
+        if isinstance(value, Mapping)
+        and reference in {_text(item) for item in _as_list(value.get("reference_union"))}
+    ]
+    if related:
+        exact_records = json.dumps(related, ensure_ascii=False, sort_keys=True, indent=2)
+        sections.append(
+            f'<details class="evidence-detail"><summary>Open reviewed committed record details ({len(related)})</summary>'
+            f'<pre>{_escape(exact_records)}</pre></details>'
+        )
+    return "".join(sections)
 
 
 def render_dashboard_site(
@@ -3203,7 +4210,16 @@ def render_dashboard_site(
     domains = _normalize_domains(fixture, widgets)
     by_id = {_text(widget.get("id")): widget for widget in widgets}
     title = _manager_prose_text(_text(fixture.get("title"), "Reviewed decision workspace"))
-    subtitle = _manager_prose_text(_text(fixture.get("subtitle"), "Business signals are separated into focused pages; detail stays linked to reviewed evidence."))
+    # Keep pipeline/provenance wording out of the manager canvas. Technical
+    # details remain available on the dedicated audit pages below.
+    subtitle = "Business signals and decisions."
+    accepted_review = fixture.get("accepted_final_product_review")
+    surface_status = (
+        "Reviewed"
+        if isinstance(accepted_review, Mapping)
+        and _text(accepted_review.get("status")).lower() in {"accepted", "approved", "final"}
+        else "Preview"
+    )
     domain_cards: list[str] = []
     domain_pages: dict[str, str] = {}
     all_trace: list[dict[str, str]] = []
@@ -3228,6 +4244,18 @@ def render_dashboard_site(
             all_trace.append(record)
             trace_seen.add(record["anchor"])
     raw_overview_ids = fixture.get("overview_widget_ids")
+
+    # Product's persisted manager order is the only ordering authority for
+    # selected widgets.  Keep a lookup for domain rendering and manifest
+    # projection; fixtures without an explicit plan retain their reviewed
+    # structural order as a legacy/manual fallback.
+    raw_manager_ids = fixture.get("manager_widget_ids")
+    manager_order = {
+        _text(widget_id).strip(): index
+        for index, widget_id in enumerate(raw_manager_ids, 1)
+        if _text(widget_id).strip()
+    } if isinstance(raw_manager_ids, list) else {}
+
     if raw_overview_ids is not None:
         if not isinstance(raw_overview_ids, list) or len(set(_text(value) for value in raw_overview_ids)) != len(raw_overview_ids):
             raise ValueError("overview_widget_ids must be a unique list")
@@ -3237,23 +4265,16 @@ def render_dashboard_site(
             widget = by_id.get(widget_id)
             if widget is None:
                 raise ValueError(f"overview_widget_ids references unknown widget: {widget_id}")
-            if _text(widget.get("type") or widget.get("kind"), "kpi").lower() != "kpi" or widget.get("value") is None:
-                raise ValueError(f"overview widget must be a non-null KPI card: {widget_id}")
-            if _is_v4_fixture(fixture) and not _manager_widget_allowed(widget, strict=True):
-                raise ValueError(f"overview widget is not admitted to the business surface: {widget_id}")
             overview_widgets.append(widget)
     else:
         overview_widgets = [widget for widget in widgets if widget.get("overview") is True]
-        if any(_text(widget.get("type") or widget.get("kind"), "kpi").lower() != "kpi" or widget.get("value") is None for widget in overview_widgets):
-            raise ValueError("overview flag requires non-null KPI cards")
-        if _is_v4_fixture(fixture) and any(not _manager_widget_allowed(widget, strict=True) for widget in overview_widgets):
-            raise ValueError("overview flag requires admitted business KPI cards")
     # Build the complete requirement grouping once, then expose only groups
     # with explicitly admitted business widgets on domain pages.  Technical
     # groups remain assigned and traceable for the separate audit page.
     domain_cache: dict[str, tuple[list[Mapping[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]] = {}
     business_domains: list[Mapping[str, Any]] = []
     technical_groups: list[tuple[Mapping[str, Any], dict[str, Any]]] = []
+    manager_requirement_targets: dict[str, str] = {}
     for domain in domains:
         domain_widgets: list[Mapping[str, Any]] = []
         for flow in domain["decision_flow"]:
@@ -3281,32 +4302,39 @@ def render_dashboard_site(
         domain_path = f'domains/{_slug(domain["id"])}.html'
         # Domain headers stay neutral: accepted takeaways/subtitles are not
         # manager projections and therefore cannot leak unplanned values.
-        domain_summary = "Reviewed decisions and evidence limits."
+        domain_summary = "Business decisions and stated limits."
         domain_cards.append(
             f'<a class="domain-card" href="{_escape(domain_path)}">'
             f'<span class="eyebrow">Business domain {domain["order"]}</span>'
-            f'<h2>{_escape(_manager_prose_text(domain["title"]))}</h2>'
+            f'<h2>{_escape(_manager_heading_text(domain["title"], "Business decisions"))}</h2>'
             f'<p>{_escape(domain_summary)}</p>'
             f'<span class="count">{len(groups)} reviewed decisions · Open domain →</span></a>'
         )
         quicklinks = []
         requirement_blocks = []
-        for group in groups:
+        for group_index, group in enumerate(groups, 1):
             requirement_id = group["id"]
-            requirement_anchor = _requirement_anchor(requirement_id)
+            # Internal requirement IDs remain in the audit manifest only. The
+            # manager page uses a neutral, stable anchor derived from the
+            # visible title and group position.
+            requirement_anchor = f"decision-{_slug(group.get('title') or 'view')}-{group_index}"
+            manager_requirement_targets[requirement_id] = f"domains/{_slug(domain['id'])}.html#{requirement_anchor}"
             quicklinks.append(
                 f'<a class="requirement-link" href="#{_escape(requirement_anchor)}">'
-                f'<span class="requirement-link-title">{_escape(_manager_prose_text(group["title"]))}</span>'
-                f'<small>{_escape(requirement_id)}</small></a>'
+                f'<span class="requirement-link-title">{_escape(_manager_heading_text(group["title"]))}</span></a>'
             )
-            kpis: list[str] = []
-            charts: list[str] = []
-            relationships: list[str] = []
-            findings: list[str] = []
             manager_widgets = [
                 widget for widget in group["widgets"]
                 if _manager_widget_allowed(widget, strict=_is_v4_fixture(fixture))
             ]
+            if manager_order:
+                manager_widgets = sorted(
+                    manager_widgets,
+                    key=lambda widget: manager_order.get(
+                        _text(widget.get("id")).strip(),
+                        len(manager_order) + 1,
+                    ),
+                )
             audit_widgets = [widget for widget in group["widgets"] if widget not in manager_widgets]
             group_records: list[str] = []
             for widget in group["widgets"]:
@@ -3320,42 +4348,11 @@ def render_dashboard_site(
             manager_ids = [_text(widget.get("id")).strip() for widget in manager_widgets]
             if len(set(manager_ids)) != len(manager_ids) or any(not widget_id for widget_id in manager_ids):
                 raise ValueError(f"requirement {requirement_id} has duplicate or missing manager widget IDs")
-            # A manually authored claim-shaped table may be aggregated into a
-            # findings block, but the source widget ID is consumed and is not
-            # rendered again in Decision views. Explicit plan projections use
-            # the same set, so every admitted ID appears in exactly one card.
-            finding_candidates = [
-                widget for widget in manager_widgets
-                if _text(widget.get("presentation_role") or "decision_view").lower() != "finding_list"
-                and any(row.get("claim") is not None for row in _rows(widget.get("rows")))
-            ]
-            if not findings and finding_candidates:
-                aggregate_widget = finding_candidates[0]
-                aggregate_id = _text(aggregate_widget.get("id"))
-                claim_rows: list[dict[str, Any]] = []
-                for widget in finding_candidates:
-                    for row in _rows(widget.get("rows")):
-                        if row.get("claim") is not None:
-                            claim_rows.append({"finding": row.get("claim"), "status": row.get("status"), "period": row.get("period")})
-                if claim_rows:
-                    consumed_manager_ids.add(aggregate_id)
-                    findings.append(_site_widget({**aggregate_widget, "presentation_role": "finding_list", "manager_findings": claim_rows, "title": "Reviewed findings"}, _trace_records(aggregate_widget)))
+            rendered_decisions: list[str] = []
             for widget in manager_widgets:
                 widget_id = _text(widget.get("id"))
-                if widget_id in consumed_manager_ids:
-                    continue
                 records = _trace_records(widget)
-                rendered = _site_widget(widget, records)
-                kind = _text(widget.get("type") or widget.get("kind"), "kpi").lower()
-                role = _text(widget.get("presentation_role") or "decision_view").lower()
-                if role == "finding_list":
-                    findings.append(rendered)
-                elif role == "relationship_matrix":
-                    relationships.append(rendered)
-                elif kind == "kpi":
-                    kpis.append(rendered)
-                else:
-                    charts.append(rendered)
+                rendered_decisions.append(_site_widget(widget, records))
                 consumed_manager_ids.add(widget_id)
             if consumed_manager_ids != set(manager_ids):
                 raise ValueError(f"requirement {requirement_id} manager widgets were not rendered exactly once")
@@ -3364,25 +4361,15 @@ def render_dashboard_site(
             # in the collapsed audit scope and committed record payloads.
             takeaway = ""
             subtitle_html = ""
-            # Manually supplied fixtures may not carry assembler roles.  A
-            # claim-shaped table is still aggregated into the same finding
-            # block without changing its stable widget identity.
-            if not findings:
-                claim_rows: list[dict[str, Any]] = []
-                for widget in manager_widgets:
-                    for row in _rows(widget.get("rows")):
-                        if row.get("claim") is not None:
-                            claim_rows.append({"finding": row.get("claim"), "status": row.get("status"), "period": row.get("period")})
-                if claim_rows:
-                    findings.append(_site_widget({**manager_widgets[0], "presentation_role": "finding_list", "manager_findings": claim_rows, "title": "Reviewed findings"}, _trace_records(manager_widgets[0])))
-            finding_html = f'<section class="manager-findings"><h3>Reviewed findings</h3>{"".join(findings)}</section>' if findings else ""
-            kpi_html = f'<section class="manager-signals"><h3>Key signals</h3><div class="kpi-strip">{"".join(kpis)}</div></section>' if kpis else ""
-            chart_html = f'<section class="decision-views"><h3>Decision views</h3><div class="chart-grid">{"".join(charts)}</div></section>' if charts else ""
-            relationship_html = f'<section class="relationship-matrix"><h3>Relationship coverage</h3><div class="chart-grid">{"".join(relationships)}</div></section>' if relationships else ""
+            decision_html = (
+                f'<div class="decision-widget-container">{"".join(rendered_decisions)}</div>'
+                if rendered_decisions
+                else ""
+            )
             limitation_values = [] if _is_v4_fixture(fixture) else [
                 value
                 for value in group.get("limitations", [])
-                if _text(value).strip() and not _manager_surface_technical(value)
+                if _text(value).strip()
             ]
             limit_html = (
                 '<section class="requirement-limitations"><h3>What this analysis does not prove</h3><ul>'
@@ -3390,15 +4377,13 @@ def render_dashboard_site(
                 + '</ul></section>'
                 if limitation_values else ""
             )
-            audit_html = _render_technical_audit(
-                group["widgets"], [], scope=group.get("scope", ""), evidence_prefix="../",
-                committed_records=committed_records_by_id,
-                audit_widget_ids={_text(entry.get("widget_id")) for entry in raw_audit_widgets if isinstance(entry, Mapping)} if _is_v4_fixture(fixture) else None,
-            )
+            # Technical snapshots and provenance are intentionally kept on the
+            # separate audit pages, never collapsed into the manager canvas.
+            audit_html = ""
             requirement_blocks.append(
-                f'<section class="requirement-section" id="{_escape(requirement_anchor)}">'
-                f'<header class="requirement-header"><div><span class="eyebrow requirement-id-badge">{_escape(requirement_id)}</span><h2>{_escape(_manager_prose_text(group["title"]))}</h2>{subtitle_html}</div>{takeaway}</header>'
-                f'{finding_html}{kpi_html}{chart_html}{relationship_html}{limit_html}{audit_html}</section>'
+                f'<section class="requirement-section" data-runtime-section id="{_escape(requirement_anchor)}">'
+                f'<header class="requirement-header"><div><span class="eyebrow">Decision</span><h2>{_escape(_manager_heading_text(group["title"]))}</h2>{subtitle_html}</div>{takeaway}</header>'
+                f'{decision_html}{limit_html}{audit_html}</section>'
             )
             requirement_manifest.append({
                 "domain_id": _text(domain.get("id")),
@@ -3417,17 +4402,19 @@ def render_dashboard_site(
         limits_html = "" if _is_v4_fixture(fixture) else "".join(
             f'<li>{_escape(_manager_prose_text(value))}</li>'
             for value in _as_list(fixture.get("limitations"))
-            if _text(value) and not _manager_surface_technical(value)
+            if _text(value).strip()
         )
         if limits_html:
             body += f'<section class="limits"><h2>Read with these limits</h2><ul>{limits_html}</ul></section>'
         domain_pages[domain_path] = _site_page(
-            title=_manager_prose_text(domain["title"]),
+            title=_manager_heading_text(domain["title"], "Business decisions"),
             current=domain_path,
             domains=business_domains,
             body=body,
             prefix="../",
             subtitle=domain_summary,
+            status=surface_status,
+            manager_surface=True,
         )
     # Technical-only requirements intentionally have no business domain page.
     # They are still complete, clickable, and exact on one separate audit
@@ -3437,7 +4424,7 @@ def render_dashboard_site(
     for domain, group in technical_groups:
         requirement_id = _text(group.get("id"))
         technical_blocks.append(
-            f'<section class="audit-requirement" id="{_escape(_requirement_anchor(requirement_id))}">'
+            f'<section class="audit-requirement" data-runtime-section id="{_escape(_requirement_anchor(requirement_id))}">'
             f'<header><span class="eyebrow requirement-id-badge">{_escape(requirement_id)}</span>'
             f'<h2>{_escape(_manager_prose_text(group.get("title")))}</h2></header>'
             f'{_render_technical_audit(group["widgets"], [], scope=group.get("scope", ""), evidence_prefix="", committed_records=committed_records_by_id, audit_widget_ids={_text(entry.get("widget_id")) for entry in raw_audit_widgets if isinstance(entry, Mapping)} if _is_v4_fixture(fixture) else None)}'
@@ -3468,40 +4455,58 @@ def render_dashboard_site(
         + ("".join(technical_blocks) or '<p class="network-empty">No technical-only requirement records were supplied.</p>')
     )
     overview_cards = []
+    portfolio_title = title
     for widget in overview_widgets:
-        kind = _text(widget.get("type") or widget.get("kind"), "kpi").lower()
-        if kind != "kpi":
-            continue
-        target_domain = next((domain for domain in business_domains if any(widget.get("id") in flow.get("widget_ids", []) for flow in domain.get("decision_flow", []))), None)
-        target = ""
-        if target_domain is not None:
-            target = f'domains/{_slug(target_domain.get("id"))}.html#{_requirement_anchor(widget.get("requirement_id") or widget.get("id"))}'
-        value = widget.get("manager_display_value") or (widget.get("value") if widget.get("value") is not None else widget.get("display_value"))
-        unit = _manager_prose_text(widget.get("unit"))
-        if _manager_surface_technical(unit):
-            unit = ""
-        unit_html = f'<small>{_escape(unit)}</small>' if unit else ""
-        card = f'<article class="overview-kpi"><span class="eyebrow">{_escape(widget.get("requirement_id") or "Signal")}</span><h2>{_escape(_manager_prose_text(_manager_title(_manager_surface_widget(widget))))}</h2><strong>{_escape(_compact_scalar_display(value))}</strong>{unit_html}'
+        # Domain pages render the validated manager projection through
+        # ``_site_widget``.  Reuse that same projection here instead of
+        # reading raw fixture geometry: a stale/raw bar must never disagree
+        # with the pointer-bound plan value shown on the requirement page.
+        display_widget = _manager_surface_widget(widget)
+        kind = _text(display_widget.get("type") or display_widget.get("kind"), "kpi").lower()
+        target = manager_requirement_targets.get(_text(widget.get("requirement_id") or ""), "")
+        widget_title = (
+            _manager_title(display_widget)
+            if display_widget.get("__explicit_plan_projection") is True
+            else _manager_prose_text(_manager_title(display_widget))
+        )
+        if kind == "kpi":
+            value = display_widget.get("manager_display_value") or (display_widget.get("value") if display_widget.get("value") is not None else display_widget.get("display_value"))
+            unit = _manager_prose_text(display_widget.get("unit"))
+            unit_html = f'<small>{_escape(unit)}</small>' if unit else ""
+            card = f'<article class="overview-kpi"><span class="eyebrow">Signal</span><h2>{_escape(widget_title)}</h2><strong>{_escape(_compact_scalar_display(value))}</strong>{unit_html}'
+        else:
+            try:
+                if kind in {"table", "status_table"}:
+                    visual = _render_site_table(display_widget)
+                else:
+                    visual = _render_visual(display_widget)
+            except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                visual = _render_visual_fallback(display_widget, manager_view=True)
+            card = f'<article class="overview-surface overview-{_escape(_slug(kind))}"><span class="eyebrow">Signal</span><h2>{_escape(widget_title)}</h2>{visual}'
         if target:
             card += f'<a href="{_escape(target)}">Open requirement →</a>'
         card += "</article>"
         overview_cards.append(card)
-    overview_kpi_html = f'<section class="overview-kpis"><div class="section-head"><h2>Priority signals</h2><p>Explicitly selected for the overview; details stay on requirement pages</p></div><div class="kpi-strip">{"".join(overview_cards)}</div></section>' if overview_cards else ""
+    overview_kpi_html = f'<section class="overview-kpis"><div class="section-head"><h2>Priority signals</h2><p>Explicitly selected reviewed business signals; details stay on requirement pages</p></div><div class="kpi-strip">{"".join(overview_cards)}</div></section>' if overview_cards else ""
     overview = _site_page(
-        title=title,
+        title=portfolio_title,
         current="index.html",
         domains=business_domains,
         body=f'{overview_kpi_html}<section class="section-head overview-heading"><h2>Decision domains</h2><p>Short navigation into requirement-level decisions</p></section><section class="domain-grid">{"".join(domain_cards)}</section>',
         subtitle=subtitle,
+        status=surface_status,
+        manager_surface=True,
     )
     evidence_items = "".join(
-        f'<li id="{_escape(record["anchor"])}"><strong>{_escape(record["label"])}</strong><span>{_escape(record["ref"])}</span></li>'
+        f'<li id="{_escape(record["anchor"])}"><strong>{_escape(record["label"])}</strong><span>{_escape(record["ref"])}</span>'
+        f'{_evidence_detail(context, record, raw_audit_records)}</li>'
         for record in all_trace
     )
+    failed_items_html = _render_failed_items(fixture)
     limitations = "".join(f'<li>{_escape(value)}</li>' for value in _as_list(fixture.get("limitations")) if _text(value))
     chart_map_ref = _text(fixture.get("chart_map_ref"))
     provenance_note = f'<p class="evidence-note">Chart definitions and exact values: <code>{_escape(chart_map_ref)}</code></p>' if chart_map_ref else ""
-    evidence_body = f'<section><div class="section-head"><h2>Reviewed evidence references</h2><p>Links preserved from accepted outputs</p></div>{provenance_note}<ul class="evidence-list">{evidence_items}</ul></section>'
+    evidence_body = f'<section><div class="section-head"><h2>Reviewed evidence references</h2><p>Links preserved from accepted outputs</p></div>{provenance_note}<ul class="evidence-list">{evidence_items}</ul></section>{failed_items_html}'
     if limitations:
         evidence_body += f'<section class="limits"><h2>Assumptions and limitations</h2><ul>{limitations}</ul></section>'
     pages = {
@@ -3513,14 +4518,35 @@ def render_dashboard_site(
             domains=business_domains,
             body=data_quality_body,
             subtitle="Technical mechanics remain exact, collapsed, and traceable outside the business manager surface.",
-            include_ontology=False,
+            status=surface_status,
+            manager_surface=False,
         ),
-        "ontology.html": _site_page(title="Ontology", current="ontology.html", domains=[], body=_ontology_body(fixture), subtitle="Reusable definitions and model audit; not a business decision surface."),
-        "evidence.html": _site_page(title="Evidence & audit", current="evidence.html", domains=business_domains, body=evidence_body, subtitle="Compact provenance, limitations and reviewed source references."),
+        "ontology.html": _site_page(title="Ontology", current="ontology.html", domains=[], body=_ontology_body(fixture), subtitle="Reusable definitions and model audit; not a business decision surface.", status=surface_status, manager_surface=False),
+        "evidence.html": _site_page(title="Evidence & audit", current="evidence.html", domains=business_domains, body=evidence_body, subtitle="Compact provenance, limitations and reviewed source references.", status=surface_status, manager_surface=False),
         "assets/dashboard.css": _canonical_dashboard_css(),
+        "assets/dashboard.js": _canonical_dashboard_js(),
         "assets/favicon.svg": _OFFLINE_FAVICON_SVG,
     }
     _validate_site_links(pages)
+    # Keep the serialized manifest's item order aligned with the same
+    # Product-selected sequence used by domain pages.  Unselected/audit items
+    # retain their original fixture order after the selected manager items.
+    if manager_order and isinstance(manifest.get("items"), list):
+        original_items = list(manifest["items"])
+        manifest["items"] = [
+            item
+            for _index, item in sorted(
+                enumerate(original_items),
+                key=lambda pair: (
+                    0,
+                    manager_order.get(
+                        _text(pair[1].get("element_id", "")).removeprefix("widget-").strip(),
+                        len(manager_order) + 1,
+                    ),
+                ) if _text(pair[1].get("element_id", "")).removeprefix("widget-").strip() in manager_order
+                else (1, pair[0]),
+            )
+        ]
     supplied_site_version = fixture.get("site_version") or fixture.get("dashboard_version")
     try:
         site_version = int(supplied_site_version) if supplied_site_version is not None else 2
@@ -3529,9 +4555,12 @@ def render_dashboard_site(
     site_manifest = {
         **manifest,
         "product_type": "offline_static_dashboard_site",
+        "status": surface_status,
+        "review_status": surface_status,
         "site_version": site_version,
         "pages": ["index.html", *domain_pages, "data-quality-audit.html", "ontology.html", "evidence.html"],
-        "assets": ["assets/dashboard.css", "assets/favicon.svg"],
+        "assets": ["assets/dashboard.css", "assets/dashboard.js", "assets/favicon.svg"],
+        "runtime": {"asset": "assets/dashboard.js", "deterministic": True, "network": False},
         "favicon_ref": "assets/favicon.svg",
         "chart_led": True,
         "tables_collapsed": True,
@@ -3593,7 +4622,7 @@ def _prune_renderer_controlled_files(
             raise ValueError(f"site output contains symlink: {path.relative_to(output_root).as_posix()}")
     expected = {str(value).replace("\\", "/").lstrip("./") for value in (*expected_pages, *expected_assets)}
     expected.add("site_manifest.json")
-    fixed_owned = {"index.html", "ontology.html", "evidence.html", "data-quality-audit.html", "site_manifest.json", "assets/dashboard.css", "assets/favicon.svg"}
+    fixed_owned = {"index.html", "ontology.html", "evidence.html", "data-quality-audit.html", "site_manifest.json", "assets/dashboard.css", "assets/dashboard.js", "assets/favicon.svg"}
 
     def renderer_owned(relative: str) -> bool:
         return relative in fixed_owned or relative.startswith("domains/")
@@ -3615,11 +4644,396 @@ def _prune_renderer_controlled_files(
                 pass
 
 
+def _bound_dataset_for_widget(widget: Mapping[str, Any], chart: Mapping[str, Any]) -> dict[str, Any]:
+    """Reconstruct the runtime's metadata-only dataset binding exactly.
+
+    Blueprint validation must check the rows and provenance that the runtime
+    bound, rather than accepting a dataset with only a matching ID.  This is
+    deliberately the same lossless field selection used by
+    ``dashboard_runtime._dataset_for_widget``: it never derives a measure or
+    alters reviewed values.
+    """
+
+    rows: Any = None
+    for key in (
+        "rows",
+        "bars",
+        "categories",
+        "segments",
+        "points",
+        "series",
+        "cells",
+        "tiles",
+        "stages",
+        "bins",
+        "boxes",
+        "steps",
+        "manager_rows",
+        "data",
+        "values",
+    ):
+        if key in widget:
+            rows = copy.deepcopy(widget.get(key))
+            break
+    fields = chart.get("fields_or_values_used") if isinstance(chart, Mapping) else {}
+    if not isinstance(fields, Mapping):
+        fields = {}
+    dimensions = widget.get("dimensions", fields.get("dimensions"))
+    measures = widget.get("measures", fields.get("measures"))
+    source_record_ids = sorted(
+        {
+            _text(value).strip()
+            for value in _as_list(widget.get("integration_record_ids"))
+            if _text(value).strip()
+        }
+        | ({_text(widget.get("integration_record_id")).strip()} if _text(widget.get("integration_record_id")).strip() else set())
+    )
+    return {
+        "id": f"dataset-{_text(widget.get('id'), 'visual')}",
+        "requirement_id": _text(widget.get("requirement_id")),
+        "source_record_ids": source_record_ids,
+        "rows": rows,
+        "row_count": len(rows) if isinstance(rows, list) else (1 if rows is not None else 0),
+        "grain": copy.deepcopy(widget.get("grain", fields.get("grain"))),
+        "dimensions": copy.deepcopy(dimensions),
+        "measures": copy.deepcopy(measures),
+        "time": copy.deepcopy(widget.get("time", fields.get("time"))),
+        "denominator": copy.deepcopy(widget.get("denominator", fields.get("denominator"))),
+        "coverage": copy.deepcopy(widget.get("coverage", fields.get("coverage"))),
+        "limitations": copy.deepcopy(widget.get("limitations", fields.get("limitations", []))),
+    }
+
+
+def _validate_bound_blueprint(
+    context: RunContext,
+    fixture_path: Path,
+    fixture: Mapping[str, Any],
+    blueprint_ref: str | Path,
+) -> None:
+    """Validate the staged V2 Blueprint consumed by the renderer.
+
+    Assembly creates this file before rendering.  Keeping the check here
+    prevents a renderer call from silently selecting a family/layout from
+    fixture metadata when the Product Agent supplied a different, validated
+    choice in its Blueprint.
+    """
+
+    resolved = context.resolve_run_path(blueprint_ref)
+    if resolved.is_symlink() or not resolved.is_file():
+        raise ValueError("bound dashboard blueprint is missing or symlinked")
+    try:
+        blueprint = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("bound dashboard blueprint is invalid") from exc
+    if not isinstance(blueprint, Mapping) or blueprint.get("schema_version") != "dashboard.business_presentation_plan.v2":
+        raise ValueError("bound dashboard blueprint must be V2")
+    if blueprint.get("kind") != "dashboard_blueprint":
+        raise ValueError("bound dashboard blueprint kind is invalid")
+    if blueprint.get("run_id") != fixture.get("run_id") or blueprint.get("generation_id") != fixture.get("generation_id"):
+        raise ValueError("bound dashboard blueprint run/generation binding drifted")
+    if blueprint.get("source_policy") != "accepted_and_committed_only":
+        raise ValueError("bound dashboard blueprint source policy is invalid")
+    source = blueprint.get("source_bindings")
+    expected_source_keys = {
+        "fixture_ref", "fixture_sha256", "chart_map_ref", "chart_map_sha256",
+        "chart_registry_ref", "chart_registry_sha256", "blueprint_ref",
+        "presentation_plan_ref", "presentation_plan_sha256",
+    }
+    if not isinstance(source, Mapping) or set(source) != expected_source_keys:
+        raise ValueError("bound dashboard blueprint source bindings are missing")
+    try:
+        fixture_ref = fixture_path.relative_to(context.run_root).as_posix()
+    except ValueError as exc:
+        raise ValueError("bound dashboard fixture escaped the run root") from exc
+    try:
+        expected_blueprint_ref = context.resolve_run_path(blueprint_ref).relative_to(context.run_root).as_posix()
+    except (AllowedRootError, ValueError) as exc:
+        raise ValueError("bound dashboard blueprint reference escaped the run root") from exc
+    if source.get("blueprint_ref") != expected_blueprint_ref:
+        raise ValueError("bound dashboard blueprint self reference drifted")
+    if source.get("fixture_ref") != fixture_ref or source.get("fixture_sha256") != hashlib.sha256(fixture_path.read_bytes()).hexdigest():
+        raise ValueError("bound dashboard blueprint fixture binding drifted")
+    chart_map_ref = _text(fixture.get("chart_map_ref")).strip()
+    if not chart_map_ref:
+        raise ValueError("bound dashboard fixture chart map reference is missing")
+    chart_path = context.resolve_run_path(chart_map_ref)
+    if chart_path.is_symlink() or not chart_path.is_file():
+        raise ValueError("bound dashboard chart map is missing or symlinked")
+    if source.get("chart_map_ref") != chart_map_ref or source.get("chart_map_sha256") != hashlib.sha256(chart_path.read_bytes()).hexdigest():
+        raise ValueError("bound dashboard blueprint chart-map binding drifted")
+    registry_ref = _text(fixture.get("chart_registry_ref")).strip()
+    if not registry_ref:
+        raise ValueError("bound dashboard fixture chart registry reference is missing")
+    registry_path = context.resolve_run_path(registry_ref)
+    if registry_path.is_symlink() or not registry_path.is_file():
+        raise ValueError("bound dashboard chart registry is missing or symlinked")
+    registry_hash = hashlib.sha256(registry_path.read_bytes()).hexdigest()
+    if source.get("chart_registry_ref") != registry_ref or source.get("chart_registry_sha256") != registry_hash:
+        raise ValueError("bound dashboard blueprint registry binding drifted")
+    try:
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("bound dashboard chart registry is invalid") from exc
+    if not isinstance(registry, Mapping) or registry.get("schema_version") != _V4_REGISTRY_SCHEMA or not isinstance(registry.get("families"), list):
+        raise ValueError("bound dashboard chart registry is invalid")
+
+    # Presentation-plan refs are optional only for the pre-plan/audit-only
+    # path (including the terminal limited dashboard).  If either side is
+    # present, both refs and hashes must resolve to the exact immutable V2
+    # plan that produced the fixture's manager projections.
+    fixture_plan_ref = fixture.get("presentation_plan_ref")
+    fixture_plan_hash = fixture.get("presentation_plan_sha256")
+    if (fixture_plan_ref is None) != (fixture_plan_hash is None):
+        raise ValueError("bound dashboard fixture presentation-plan binding is incomplete")
+    if source.get("presentation_plan_ref") != fixture_plan_ref or source.get("presentation_plan_sha256") != fixture_plan_hash:
+        raise ValueError("bound dashboard blueprint presentation-plan binding drifted")
+    presentation_plan: Mapping[str, Any] | None = None
+    presentation_plan_path: Path | None = None
+    if fixture_plan_ref is not None:
+        if not isinstance(fixture_plan_ref, str) or not fixture_plan_ref.strip() or not isinstance(fixture_plan_hash, str):
+            raise ValueError("bound dashboard presentation-plan binding is invalid")
+        plan_path = context.resolve_run_path(fixture_plan_ref)
+        if plan_path.is_symlink() or not plan_path.is_file() or hashlib.sha256(plan_path.read_bytes()).hexdigest() != fixture_plan_hash:
+            raise ValueError("bound dashboard presentation-plan hash mismatch")
+        try:
+            presentation_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("bound dashboard presentation plan is invalid") from exc
+        if not isinstance(presentation_plan, Mapping) or presentation_plan.get("schema_version") != "dashboard.business_presentation_plan.v2":
+            raise ValueError("bound dashboard presentation plan must be V2")
+        if presentation_plan.get("run_id") != fixture.get("run_id") or presentation_plan.get("generation_id") != fixture.get("generation_id"):
+            raise ValueError("bound dashboard presentation-plan lineage drifted")
+        presentation_plan_path = plan_path
+    try:
+        chart_map = json.loads(chart_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("bound dashboard chart map is invalid") from exc
+    if not isinstance(chart_map, Mapping) or not isinstance(chart_map.get("charts"), list):
+        raise ValueError("bound dashboard chart map is invalid")
+    widgets = {
+        _text(widget.get("id")): widget
+        for widget in _as_list(fixture.get("widgets"))
+        if isinstance(widget, Mapping) and _text(widget.get("id"))
+    }
+    raw_charts = chart_map.get("charts", [])
+    chart_ids = [
+        _text(chart.get("id")).strip()
+        for chart in raw_charts
+        if isinstance(chart, Mapping) and _text(chart.get("id")).strip()
+    ]
+    if len(chart_ids) != len(raw_charts) or len(set(chart_ids)) != len(chart_ids):
+        raise ValueError("bound dashboard chart map IDs are invalid")
+    if chart_map.get("fixture_ref") != fixture_ref or chart_map.get("chart_registry_ref") != registry_ref:
+        raise ValueError("bound dashboard chart-map source bindings drifted")
+    charts = {
+        _text(chart.get("id")): chart
+        for chart in raw_charts
+        if isinstance(chart, Mapping) and _text(chart.get("id"))
+    }
+    fixture_widgets = [widget for widget in _as_list(fixture.get("widgets")) if isinstance(widget, Mapping)]
+    by_id = {_text(widget.get("id")): widget for widget in fixture_widgets}
+    fixture_ids = [_text(widget.get("id")).strip() for widget in fixture_widgets]
+    if len(fixture_ids) != len(fixture_widgets) or any(not value for value in fixture_ids) or len(set(fixture_ids)) != len(fixture_ids):
+        raise ValueError("bound dashboard fixture widget IDs are invalid")
+    if set(charts) != set(fixture_ids):
+        raise ValueError("bound dashboard chart map/widget coverage drifted")
+    if presentation_plan is not None:
+        if presentation_plan_path is None:
+            raise ValueError("bound dashboard presentation-plan path is missing")
+        # Reuse the renderer's exact fixture/plan projection validator before
+        # checking the Blueprint.  This binds every manager and audit visual
+        # to the same V2 visual-entry snapshots, not just manager metadata.
+        _validate_fixture_presentation_plan_v2(
+            fixture,
+            fixture_widgets,
+            presentation_plan,
+            plan_path=presentation_plan_path,
+            context=context,
+        )
+    visuals = blueprint.get("visuals")
+    expected_visual_ids = sorted(fixture_ids)
+    if not isinstance(visuals, list) or not visuals:
+        raise ValueError("bound dashboard blueprint visuals are invalid")
+    visual_ids = [_text(visual.get("id")).strip() if isinstance(visual, Mapping) else "" for visual in visuals]
+    if visual_ids != expected_visual_ids or len(set(visual_ids)) != len(visual_ids):
+        raise ValueError("bound dashboard blueprint visual coverage/order is invalid")
+    datasets = blueprint.get("datasets")
+    if not isinstance(datasets, list) or [
+        _text(dataset.get("id")).strip() if isinstance(dataset, Mapping) else ""
+        for dataset in datasets
+    ] != [f"dataset-{widget_id}" for widget_id in expected_visual_ids]:
+        raise ValueError("bound dashboard blueprint dataset coverage/order is invalid")
+    dataset_by_id = {
+        _text(dataset.get("id")).strip(): dataset
+        for dataset in datasets
+        if isinstance(dataset, Mapping) and _text(dataset.get("id")).strip()
+    }
+    if len(dataset_by_id) != len(datasets):
+        raise ValueError("bound dashboard blueprint datasets are invalid")
+    for visual_id in expected_visual_ids:
+        expected_dataset = _bound_dataset_for_widget(by_id[visual_id], charts[visual_id])
+        if dataset_by_id.get(f"dataset-{visual_id}") != expected_dataset:
+            raise ValueError(f"bound dashboard blueprint dataset payload drifted: {visual_id}")
+    pages = blueprint.get("pages")
+    if not isinstance(pages, list) or not pages:
+        raise ValueError("bound dashboard blueprint pages are invalid")
+    page_ids = { _text(page.get("id")).strip() for page in pages if isinstance(page, Mapping) }
+    section_ids: set[str] = set()
+    page_visual_ids: list[str] = []
+    for page in pages:
+        if not isinstance(page, Mapping) or not isinstance(page.get("sections"), list):
+            raise ValueError("bound dashboard blueprint page sections are invalid")
+        for section in page["sections"]:
+            if not isinstance(section, Mapping) or not isinstance(section.get("visual_ids"), list):
+                raise ValueError("bound dashboard blueprint section is invalid")
+            section_id = _text(section.get("id")).strip()
+            if not section_id or section_id in section_ids:
+                raise ValueError("bound dashboard blueprint section IDs are invalid")
+            section_ids.add(section_id)
+            for visual_id in section["visual_ids"]:
+                visual_id = _text(visual_id).strip()
+                if visual_id not in expected_visual_ids or visual_id in page_visual_ids:
+                    raise ValueError("bound dashboard blueprint page visual coverage is invalid")
+                page_visual_ids.append(visual_id)
+    if set(page_visual_ids) != set(expected_visual_ids) or len(page_visual_ids) != len(expected_visual_ids):
+        raise ValueError("bound dashboard blueprint pages omit or duplicate visuals")
+    bp_by_id = { _text(visual.get("id")): visual for visual in visuals }
+    plan_manager_visual_ids = (
+        set(presentation_plan.get("manager_visual_widget_ids") or [])
+        if isinstance(presentation_plan, Mapping)
+        else None
+    )
+    for visual_id in expected_visual_ids:
+        visual = bp_by_id[visual_id]
+        widget = by_id[visual_id]
+        chart = charts[visual_id]
+        if visual.get("dataset_id") != f"dataset-{visual_id}":
+            raise ValueError(f"bound dashboard blueprint dataset binding drifted: {visual_id}")
+        if visual.get("family") != _text(chart.get("family")) or visual.get("type") != _text(widget.get("type") or widget.get("kind")):
+            raise ValueError(f"bound dashboard blueprint visual identity drifted: {visual_id}")
+        if visual.get("page_id") not in page_ids or visual.get("section_id") not in section_ids:
+            raise ValueError(f"bound dashboard blueprint visual page binding drifted: {visual_id}")
+        expected_chart_intent = _text(widget.get("chart_intent") or widget.get("title") or visual_id)
+        if visual.get("chart_intent") != expected_chart_intent:
+            raise ValueError(f"bound dashboard blueprint chart intent drifted: {visual_id}")
+        expected_encodings = copy.deepcopy(widget.get("encodings", chart.get("encodings", {})))
+        expected_filters = copy.deepcopy(widget.get("filters", []))
+        expected_drilldown = copy.deepcopy(widget.get("drilldown", {"enabled": True}))
+        expected_empty_state = copy.deepcopy(widget.get("empty_state", "No reviewed values are available for this view."))
+        for key, expected in (
+            ("encodings", expected_encodings),
+            ("filters", expected_filters),
+            ("drilldown", expected_drilldown),
+            ("empty_state", expected_empty_state),
+        ):
+            if visual.get(key) != expected:
+                raise ValueError(f"bound dashboard blueprint visual metadata drifted: {visual_id}:{key}")
+        expected_provenance = {
+            key: copy.deepcopy(widget[key])
+            for key in (
+                "integration_record_id",
+                "integration_record_ids",
+                "integration_record_ref",
+                "integration_record_refs",
+                "evidence_refs",
+                "trace_refs",
+            )
+            if key in widget
+        }
+        if visual.get("provenance") != expected_provenance:
+            raise ValueError(f"bound dashboard blueprint visual provenance drifted: {visual_id}")
+        if plan_manager_visual_ids is None or visual_id in plan_manager_visual_ids:
+            for key in ("recipe_id", "layout", "renderer_type"):
+                if not isinstance(visual.get(key), str) or not visual[key].strip():
+                    raise ValueError(f"bound dashboard blueprint visual selection is missing: {visual_id}:{key}")
+        selection = widget.get("manager_presentation")
+        if isinstance(selection, Mapping):
+            for key in ("recipe_id", "layout", "renderer_type"):
+                if key in selection and selection.get(key) != visual.get(key):
+                    raise ValueError(f"bound dashboard blueprint selection drifted: {visual_id}:{key}")
+    if presentation_plan is not None:
+        manager_visual_ids = presentation_plan.get("manager_visual_widget_ids")
+        audit_visual_ids = presentation_plan.get("audit_visual_widget_ids")
+        if not isinstance(manager_visual_ids, list) or not isinstance(audit_visual_ids, list) or len(set(manager_visual_ids + audit_visual_ids)) != len(manager_visual_ids + audit_visual_ids):
+            raise ValueError("bound dashboard presentation-plan visual partition is invalid")
+        plan_visual_ids = list(manager_visual_ids) + list(audit_visual_ids)
+        if any(visual_id not in expected_visual_ids for visual_id in plan_visual_ids):
+            raise ValueError("bound dashboard presentation-plan visuals are not in fixture")
+        plan_entries = presentation_plan.get("visual_entries")
+        if not isinstance(plan_entries, list) or [
+            _text(entry.get("widget_id")).strip() if isinstance(entry, Mapping) else ""
+            for entry in plan_entries
+        ] != plan_visual_ids:
+            raise ValueError("bound dashboard presentation-plan visual order is invalid")
+        rendered_visual_ids = [
+            widget_id
+            for widget_id in fixture_ids
+            if _is_partition_visual(by_id[widget_id], charts[widget_id])
+        ]
+        if len(plan_visual_ids) != len(rendered_visual_ids) or set(plan_visual_ids) != set(rendered_visual_ids):
+            raise ValueError("bound dashboard presentation-plan visual coverage is incomplete")
+        plan_visual_by_id = {
+            _text(entry.get("widget_id")).strip(): entry
+            for entry in plan_entries
+            if isinstance(entry, Mapping) and _text(entry.get("widget_id")).strip()
+        }
+        if len(plan_visual_by_id) != len(plan_entries):
+            raise ValueError("bound dashboard presentation-plan visual entries are invalid")
+        runtime = _dashboard_runtime_module()
+        manager_visual_set = set(manager_visual_ids)
+        for visual_id in plan_visual_ids:
+            visual = bp_by_id[visual_id]
+            widget = by_id[visual_id]
+            chart = charts[visual_id]
+            plan_entry = plan_visual_by_id.get(visual_id)
+            if not isinstance(plan_entry, Mapping):
+                raise ValueError(f"bound dashboard presentation-plan visual is missing: {visual_id}")
+            # Manager visuals must bind the Product Agent's explicit recipe
+            # choice.  Audit-only visuals may have no executable geometry (for
+            # example a later empty accepted declaration), so their source
+            # chart family remains audit evidence without requiring an
+            # ineligible manager recipe.
+            if visual_id in manager_visual_set:
+                for key in ("recipe_id", "layout", "renderer_type"):
+                    if visual.get(key) != plan_entry.get(key):
+                        raise ValueError(f"bound dashboard blueprint selection drifted from plan: {visual_id}:{key}")
+            if (
+                visual.get("requirement_id") != plan_entry.get("requirement_id")
+                or visual.get("type") != plan_entry.get("visual_type")
+                or visual.get("family") != plan_entry.get("chart_family")
+            ):
+                raise ValueError(f"bound dashboard blueprint visual envelope drifted from plan: {visual_id}")
+            actual_record_ids = sorted({
+                _text(value).strip()
+                for value in (_as_list(widget.get("integration_record_ids")) or [widget.get("integration_record_id")])
+                if _text(value).strip()
+            })
+            if plan_entry.get("record_ids") != actual_record_ids:
+                raise ValueError(f"bound dashboard presentation-plan record binding drifted: {visual_id}")
+            if visual_id in manager_visual_set:
+                recipes = runtime.eligible_chart_recipes(widget, chart, registry)
+                selected_recipe = _text(plan_entry.get("recipe_id")).strip()
+                selected = next(
+                    (recipe for recipe in recipes if isinstance(recipe, Mapping) and recipe.get("id") == selected_recipe),
+                    None,
+                )
+                if not isinstance(selected, Mapping) or selected.get("eligible") is not True:
+                    raise ValueError(f"bound dashboard presentation-plan recipe is ineligible: {visual_id}")
+                renderer_types = selected.get("renderer_types")
+                if not isinstance(renderer_types, list) or plan_entry.get("renderer_type") not in renderer_types:
+                    raise ValueError(f"bound dashboard presentation-plan renderer is ineligible: {visual_id}")
+    for visual in visuals:
+        if not isinstance(visual, Mapping):
+            raise ValueError("bound dashboard blueprint visual is invalid")
+
+
 def render_site_fixture(
     context: RunContext,
     fixture_path: str | Path,
     output_dir: str | Path,
     manifest_path: str | Path | None = None,
+    *,
+    blueprint_ref: str | Path | None = None,
 ) -> dict[str, Any]:
     """Render one reviewed fixture as a bounded multi-page product site."""
 
@@ -3633,6 +5047,8 @@ def render_site_fixture(
     fixture = json.loads(resolved_fixture.read_text(encoding="utf-8"))
     if not isinstance(fixture, Mapping):
         raise ValueError("dashboard fixture root must be a JSON object")
+    if blueprint_ref is not None:
+        _validate_bound_blueprint(context, resolved_fixture, fixture, blueprint_ref)
     pages, manifest = render_dashboard_site(fixture, context=context)
     _prune_renderer_controlled_files(
         resolved_output,

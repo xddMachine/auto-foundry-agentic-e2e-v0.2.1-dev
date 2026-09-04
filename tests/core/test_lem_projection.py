@@ -19,8 +19,8 @@ from auto_foundry_core.prepared import PreparedAssetRegistry
 from auto_foundry_core.workspace import RunContext
 
 
-def _accepted(context: RunContext, item_id: str) -> ItemWorkspace:
-    item = ItemWorkspace.create(context, item_id, original_text=f"question {item_id}")
+def _accepted(context: RunContext, item_id: str, *, mode: str = "question") -> ItemWorkspace:
+    item = ItemWorkspace.create(context, item_id, mode=mode, original_text=f"question {item_id}")
     item.write_plan({"item_id": item_id})
     item.write_draft({"answer": item_id})
     item.record_review("accept", reviewer_ref="reviewer")
@@ -28,10 +28,10 @@ def _accepted(context: RunContext, item_id: str) -> ItemWorkspace:
     return item
 
 
-def _session(context: RunContext, item_id: str) -> IntegrationSession:
+def _session(context: RunContext, item_id: str, *, mode: str = "question") -> IntegrationSession:
     return IntegrationSession.create(
         context,
-        _accepted(context, item_id),
+        _accepted(context, item_id, mode=mode),
         PreparedAssetRegistry(context),
         "integration-owner",
         invocation_id=f"inv-{item_id}",
@@ -103,7 +103,7 @@ def test_projection_rebuilds_prior_commits_in_lifecycle_order(tmp_path: Path) ->
     relationship_payload = relationship.to_dict()
     second_analyst.submit_answer("The bounded fixture contains one customer-order pair.")
     second_item.record_review("accept", reviewer_ref="reviewer")
-    second_analyst.accept(accepted_refs=("work/plan.json", "work/analytical_relationships.jsonl"))
+    second_item.accept(accepted_refs=("work/plan.json", "work/analytical_relationships.jsonl"))
     second = IntegrationSession.create(
         context,
         second_item,
@@ -174,17 +174,35 @@ def test_projection_rejects_lifecycle_bound_to_another_run(tmp_path: Path) -> No
         )
 
 
-def test_projection_skips_nonaccepted_and_integration_failed_items(tmp_path: Path) -> None:
-    context = RunContext("RUN", tmp_path / "run")
-    RunLifecycle.create(context, ("Q-001", "Q-002", "Q-003"))
+def test_projection_skips_nonaccepted_and_pending_integration_items(tmp_path: Path) -> None:
+    """An accepted item with a recoverable integration fault stays pending."""
 
-    failed_analysis = ItemWorkspace.create(context, "Q-001", original_text="question Q-001")
+    context = RunContext("RUN", tmp_path / "run")
+    # Requirement-mode projection treats pending accepted items as skipped
+    # candidates, allowing later work to be inspected without inventing a
+    # terminal integration failure.
+    RunLifecycle.create(context, ("Q-001", "Q-002", "Q-003"), mode="requirement")
+
+    failed_analysis = ItemWorkspace.create(
+        context,
+        "Q-001",
+        mode="requirement",
+        original_text="question Q-001",
+    )
     failed_analysis.technical_failure("fixture failure", recovery_exhausted=True)
 
-    failed_integration = _session(context, "Q-002")
-    failed_integration.mark_technical_failure("fixture integration failure")
+    pending_integration = _session(context, "Q-002", mode="requirement")
+    failure_path = pending_integration.staging_root.parent / "technical_failure" / "manifest.json"
+    result = pending_integration.mark_technical_failure("fixture integration failure")
+    assert result["status"] == "pending"
+    assert result["recoverable"] is True
+    assert result["continuation"] == "same_session"
+    assert pending_integration.status == "open"
+    assert pending_integration.item_workspace.integration_state == "pending"
+    assert not failure_path.exists()
+    pending_integration.release()
 
-    third = _session(context, "Q-003")
+    third = _session(context, "Q-003", mode="requirement")
     assert third.lem_projection.bindings == ()
     assert third.lem.ontology == {}
     assert third.lem.knowledge == {}
@@ -244,15 +262,27 @@ def test_projection_rejects_stale_integrated_state_binding(tmp_path: Path) -> No
         LivingEnterpriseModelProjector.project(context, before_item_id="Q-002")
 
 
-def test_projection_rejects_missing_integration_failure_manifest(tmp_path: Path) -> None:
-    context = RunContext("RUN", tmp_path / "run")
-    RunLifecycle.create(context, ("Q-001", "Q-002"))
-    first = _session(context, "Q-001")
-    first.mark_technical_failure("fixture integration failure")
-    (first.item_workspace.item_root / "integration" / "technical_failure" / "manifest.json").unlink()
+def test_projection_accepts_pending_integration_without_failure_manifest(tmp_path: Path) -> None:
+    """A recoverable handoff fault has no failure manifest to validate."""
 
-    with pytest.raises(ValueError, match="technical failure manifest is missing"):
-        LivingEnterpriseModelProjector.project(context, before_item_id="Q-002")
+    context = RunContext("RUN", tmp_path / "run")
+    RunLifecycle.create(context, ("Q-001", "Q-002"), mode="requirement")
+    first = _session(context, "Q-001", mode="requirement")
+    failure_path = first.staging_root.parent / "technical_failure" / "manifest.json"
+    result = first.mark_technical_failure("fixture integration failure")
+    assert result["status"] == "pending"
+    assert result["recoverable"] is True
+    assert result["continuation"] == "same_session"
+    assert first.item_workspace.integration_state == "pending"
+    assert first.status == "open"
+    assert not failure_path.exists()
+    first.release()
+    # Keep the lifecycle frontier complete so the pending first item can be
+    # skipped without turning an absent later workspace into a synthetic gap.
+    ItemWorkspace.create(context, "Q-002", mode="requirement", original_text="Q-002")
+
+    projection = LivingEnterpriseModelProjector.project(context, before_item_id="Q-002")
+    assert projection.bindings == ()
 
 
 def test_projection_rejects_stale_accepted_manifest_binding(tmp_path: Path) -> None:

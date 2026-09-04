@@ -67,6 +67,21 @@ _TARGET_OR_EDGE_RELATIONSHIP_MEASUREMENT_FIELDS = frozenset({
     "target_coverage",
 })
 
+_SUCCESSOR_ONTOLOGY_OPERATIONS = frozenset({
+    "add_ontology_item",
+    "add_metric",
+    "add_definition",
+    "add_rule",
+    "add_process",
+    "add_event",
+    "add_dimension",
+})
+_SUCCESSOR_OPERATIONS = _SUCCESSOR_ONTOLOGY_OPERATIONS | {
+    "add_prepared_asset",
+    "add_canonical_mapping",
+    "add_relationship",
+}
+
 
 def _validate_analytical_relationship_payload_if_present(payload: Mapping[str, Any]) -> None:
     """Validate analytical relationship measurements while preserving generic LEM joins."""
@@ -170,11 +185,12 @@ def _validate_export_payload(value: Any, *, path: str = "export") -> None:
     """
 
     if isinstance(value, Mapping):
+        prepared_schema = path.startswith("export.prepared_assets[") and path.endswith("].schema")
         for raw_key, nested in value.items():
             if not isinstance(raw_key, str):
                 raise ValueError(f"LEM export keys must be strings: {path}")
             key = raw_key.lower()
-            if "hash" in key and nested is not None:
+            if not prepared_schema and "hash" in key and nested is not None:
                 if isinstance(nested, Mapping):
                     for hash_key, hash_value in nested.items():
                         if not _is_sha256(hash_value):
@@ -184,7 +200,7 @@ def _validate_export_payload(value: Any, *, path: str = "export") -> None:
                         raise ValueError(f"LEM export hash list is invalid: {path}.{raw_key}")
                 elif not _is_sha256(nested):
                     raise ValueError(f"LEM export hash is invalid: {path}.{raw_key}")
-            if key in {"evidence_refs", "source_refs"} and not isinstance(nested, (list, tuple)):
+            if not prepared_schema and key in {"evidence_refs", "source_refs"} and not isinstance(nested, (list, tuple)):
                 raise ValueError(f"LEM export {raw_key} must be a list: {path}.{raw_key}")
             _validate_export_payload(nested, path=f"{path}.{raw_key}")
     elif isinstance(value, (list, tuple)):
@@ -359,6 +375,116 @@ def _export_value(value: Any) -> Any:
     raise TypeError(f"LEM export does not support value type: {type(value).__name__}")
 
 
+def _ontology_value_empty(value: Any) -> bool:
+    """Return whether an ontology fact carries no usable information."""
+
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (Mapping, list, tuple, set, frozenset)):
+        return not value
+    return False
+
+
+def _ontology_value_copy(value: Any) -> Any:
+    """Detach one JSON-shaped ontology value while retaining collection shape."""
+
+    if isinstance(value, Mapping):
+        return {str(key): _ontology_value_copy(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_ontology_value_copy(item) for item in value)
+    if isinstance(value, list):
+        return [_ontology_value_copy(item) for item in value]
+    if isinstance(value, set):
+        return {_ontology_value_copy(item) for item in value}
+    if isinstance(value, frozenset):
+        return frozenset(_ontology_value_copy(item) for item in value)
+    return value
+
+
+def _ontology_value_key(value: Any) -> str:
+    """Return a deterministic key for stable collection union."""
+
+    return json.dumps(
+        _export_value(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _ontology_collection_merge(existing: Any, incoming: Any) -> Any:
+    """Stable-union two ontology collections, preserving existing order/type."""
+
+    values = list(existing)
+    if isinstance(existing, (set, frozenset)):
+        values.sort(key=_ontology_value_key)
+    seen = {_ontology_value_key(value) for value in values}
+    incoming_values = list(incoming)
+    if isinstance(incoming, (set, frozenset)):
+        incoming_values.sort(key=_ontology_value_key)
+    for value in incoming_values:
+        key = _ontology_value_key(value)
+        if key not in seen:
+            values.append(_ontology_value_copy(value))
+            seen.add(key)
+    if isinstance(existing, tuple):
+        return tuple(values)
+    if isinstance(existing, list):
+        return values
+    if isinstance(existing, frozenset):
+        return frozenset(values)
+    if isinstance(existing, set):
+        return set(values)
+    return values
+
+
+def _ontology_value_merge(existing: Any, incoming: Any) -> Any:
+    """Merge reviewed ontology facts without replacing canonical values."""
+
+    if _ontology_value_empty(existing):
+        return _ontology_value_copy(incoming) if not _ontology_value_empty(incoming) else existing
+    if _ontology_value_empty(incoming):
+        return existing
+    if isinstance(existing, Mapping) and isinstance(incoming, Mapping):
+        merged = {str(key): _ontology_value_copy(value) for key, value in existing.items()}
+        for raw_key, value in incoming.items():
+            key = str(raw_key)
+            if key in merged:
+                merged[key] = _ontology_value_merge(merged[key], value)
+            elif not _ontology_value_empty(value):
+                merged[key] = _ontology_value_copy(value)
+        return merged
+    if (
+        isinstance(existing, (list, tuple, set, frozenset))
+        and not isinstance(existing, (str, bytes, bytearray))
+        and isinstance(incoming, (list, tuple, set, frozenset))
+        and not isinstance(incoming, (str, bytes, bytearray))
+    ):
+        return _ontology_collection_merge(existing, incoming)
+    # The first accepted non-empty scalar (including identity/authority fields)
+    # is canonical.  Requirement-specific wording is retained as evidence in
+    # the accepted record rather than replacing the shared ontology fact.
+    return existing
+
+
+def _merge_ontology_items(existing: OntologyItem, incoming: OntologyItem) -> OntologyItem:
+    """Return one deterministic canonical item from two same-ID facts."""
+
+    if existing.item_id != incoming.item_id:
+        raise ValueError("ontology item IDs must match for merge")
+    values = {
+        field.name: _ontology_value_merge(
+            getattr(existing, field.name),
+            getattr(incoming, field.name),
+        )
+        for field in fields(OntologyItem)
+    }
+    values["item_id"] = existing.item_id
+    return OntologyItem(**values)
+
+
 class LivingEnterpriseModel:
     """A bounded in-memory model intended to be exported at run end."""
 
@@ -380,31 +506,106 @@ class LivingEnterpriseModel:
     def ontology_index(self) -> list[dict[str, Any]]:
         return [
             {"item_id": item.item_id, "item_type": item.item_type, "label": item.label, "scope": item.scope, "status": item.status}
+            for item in sorted(self.current_ontology.values(), key=lambda item: item.item_id)
+        ]
+
+    @property
+    def ontology_history_index(self) -> list[dict[str, Any]]:
+        """Return the full ontology index, including superseded history."""
+
+        return [
+            {"item_id": item.item_id, "item_type": item.item_type, "label": item.label, "scope": item.scope, "status": item.status}
             for item in sorted(self.ontology.values(), key=lambda item: item.item_id)
         ]
 
-    def add_ontology_item(self, item: OntologyItem | Mapping[str, Any]) -> OntologyItem:
+    @property
+    def current_ontology(self) -> dict[str, OntologyItem]:
+        """Return the active ontology view without discarding history."""
+
+        return {
+            item_id: item
+            for item_id, item in self.ontology.items()
+            if item.status != "superseded"
+        }
+
+    @property
+    def current_prepared_assets(self) -> dict[str, PreparedAssetDescriptor]:
+        """Return active prepared descriptors while retaining old revisions."""
+
+        return {
+            asset_id: asset
+            for asset_id, asset in self.prepared_assets.items()
+            if asset.status != "superseded" and asset.scope != "superseded"
+        }
+
+    @property
+    def current_canonical_mappings(self) -> dict[str, CanonicalMapping]:
+        """Return accepted, non-superseded canonical mappings."""
+
+        return {
+            mapping_id: mapping
+            for mapping_id, mapping in self.canonical_mappings.items()
+            if mapping.status != "superseded"
+        }
+
+    @property
+    def current_relationships(self) -> dict[str, dict[str, Any]]:
+        """Return active relationship records without mutating history."""
+
+        return {
+            relationship_id: relationship
+            for relationship_id, relationship in self.relationships.items()
+            if relationship.get("status", "active") != "superseded"
+        }
+
+    @staticmethod
+    def _coerce_ontology_item(item: OntologyItem | Mapping[str, Any]) -> OntologyItem:
         if isinstance(item, OntologyItem):
             _reject_observation_shape(item.to_dict())
-        else:
-            _reject_observation_shape(item)
-        item = item if isinstance(item, OntologyItem) else OntologyItem.from_dict(_clean(item))
-        if item.item_id in self.ontology:
-            raise ValueError(f"ontology item already exists: {item.item_id}")
-        self.ontology[item.item_id] = item
-        return item
+            return item
+        _reject_observation_shape(item)
+        return OntologyItem.from_dict(_clean(item))
+
+    def _add_ontology_item_strict(self, item: OntologyItem | Mapping[str, Any]) -> OntologyItem:
+        """Insert an absent ontology item while retaining export integrity checks."""
+
+        candidate = self._coerce_ontology_item(item)
+        if candidate.item_id in self.ontology:
+            raise ValueError(f"ontology item already exists: {candidate.item_id}")
+        self.ontology[candidate.item_id] = candidate
+        return candidate
+
+    def add_ontology_item(self, item: OntologyItem | Mapping[str, Any]) -> OntologyItem:
+        """Get or create one canonical ontology item and merge new facts."""
+
+        candidate = self._coerce_ontology_item(item)
+        existing = self.ontology.get(candidate.item_id)
+        if existing is None:
+            return self._add_ontology_item_strict(candidate)
+        merged = _merge_ontology_items(existing, candidate)
+        if merged != existing:
+            self.ontology[candidate.item_id] = merged
+        return self.ontology[candidate.item_id]
+
+    def ensure_ontology_item(self, item: OntologyItem | Mapping[str, Any]) -> OntologyItem:
+        """Alias for the canonical public ontology get-or-create operation."""
+
+        return self.add_ontology_item(item)
 
     def extend_ontology_item(self, item_id: str, patch: Mapping[str, Any]) -> OntologyItem:
         if item_id not in self.ontology:
             raise KeyError(item_id)
-        current = self.ontology[item_id]
+        if not isinstance(patch, Mapping):
+            raise TypeError("ontology extension patch must be a mapping")
         clean = _clean(patch)
-        properties = dict(current.properties)
-        properties.update(clean.pop("properties", {}))
-        values = {"properties": properties, **clean}
-        updated = replace(current, **values)
-        self.ontology[item_id] = updated
-        return updated
+        supplied_id = clean.get("item_id")
+        if supplied_id is not None and str(supplied_id) != str(item_id):
+            raise ValueError("ontology extension cannot overwrite item_id")
+        current = self.ontology[item_id]
+        candidate = current.to_dict()
+        candidate.update({key: value for key, value in clean.items() if key != "item_id"})
+        candidate["item_id"] = item_id
+        return self.ensure_ontology_item(candidate)
 
     def register_prepared_asset(self, asset: PreparedAssetDescriptor | Mapping[str, Any]) -> PreparedAssetDescriptor:
         asset = asset if isinstance(asset, PreparedAssetDescriptor) else PreparedAssetDescriptor.from_dict(asset)
@@ -461,6 +662,7 @@ class LivingEnterpriseModel:
             "ontology": self.ontology,
             "prepared_asset": self.prepared_assets,
             "canonical_mapping": self.canonical_mappings,
+            "relationship": self.relationships,
             "knowledge_delta": self.knowledge,
         }
         registry = registries[ref.namespace]
@@ -475,7 +677,7 @@ class LivingEnterpriseModel:
         if item_id is None:
             raise ValueError(f"{item_type} requires item_id (or a typed operation id)")
         label = value.get("label") or value.get("name") or value.get("title") or value.get("description") or item_id
-        known = {"item_id", "item_type", "label", "properties", "source_refs", "evidence_level", "limitations", "scope", "effective_period", "status", "metadata"}
+        known = {"item_id", "item_type", "label", "properties", "source_refs", "evidence_level", "limitations", "scope", "effective_period", "status", "metadata", "superseded_by"}
         properties = dict(value.get("properties") or {})
         properties.update({key: val for key, val in value.items() if key not in known and key not in {"metric_id", "definition_id", "rule_id", "process_id", "relationship_id", "id", "name", "title", "description"}})
         return OntologyItem(
@@ -496,7 +698,7 @@ class LivingEnterpriseModel:
         payload = dict(item) if isinstance(item, Mapping) else (item.to_dict() if isinstance(item, OntologyItem) else {})
         payload.update(values)
         ontology_item = self._semantic_payload(payload, item_type)
-        return self.add_ontology_item(ontology_item)
+        return self.ensure_ontology_item(ontology_item)
 
     def add_metric(self, item: OntologyItem | Mapping[str, Any] | None = None, **values: Any) -> OntologyItem:
         # ``add_metric`` remains the historical semantic helper.  Integration
@@ -530,6 +732,28 @@ class LivingEnterpriseModel:
         relationship_id = payload.get("relationship_id") or payload.get("item_id") or payload.get("id")
         if relationship_id is None:
             raise ValueError("relationship requires relationship_id")
+        relationship_key = str(relationship_id)
+        if relationship_key in self.relationships:
+            existing_record = self.relationships[relationship_key]
+            # Relationship IDs are canonical edge identities.  Once an edge
+            # exists, the stored relationship record is authoritative: a
+            # repeated add must return/reuse it before inspecting the
+            # incoming endpoints or analytical shape.  This keeps ordinary
+            # replay idempotent even when a later requirement's payload is
+            # incomplete or uses different wording.
+            existing_item = self.ontology.get(relationship_key)
+            if existing_item is not None:
+                return existing_item
+            # A partially rehydrated model may retain the edge record without
+            # its generated ontology item.  Repair only that companion from
+            # the stored canonical relationship record, never from incoming
+            # (possibly malformed) data.
+            canonical_payload = dict(existing_record)
+            canonical_payload.setdefault("relationship_id", relationship_key)
+            return self.ensure_ontology_item(self._semantic_payload(canonical_payload, "relationship"))
+
+        # Only a genuinely new relationship receives full endpoint and
+        # analytical-shape validation.
         has_source = "source_id" in payload and payload.get("source_id") is not None
         has_target = "target_id" in payload and payload.get("target_id") is not None
         if has_source != has_target:
@@ -537,15 +761,13 @@ class LivingEnterpriseModel:
         if has_source:
             self._validate_relationship_endpoints(payload["source_id"], payload["target_id"])
         _validate_analytical_relationship_payload_if_present(payload)
-        if str(relationship_id) in self.relationships:
-            raise ValueError(f"relationship already exists: {relationship_id}")
         record = _clean(dict(payload))
-        record["relationship_id"] = str(relationship_id)
-        self.relationships[str(relationship_id)] = record
+        record["relationship_id"] = relationship_key
+        self.relationships[relationship_key] = record
         try:
             return self._add_semantic_item("relationship", payload)
         except Exception:
-            self.relationships.pop(str(relationship_id), None)
+            self.relationships.pop(relationship_key, None)
             raise
 
     def _validate_relationship_endpoints(self, source_id: Any, target_id: Any) -> tuple[str, str]:
@@ -581,10 +803,16 @@ class LivingEnterpriseModel:
         source_hashes: Iterable[str] | None = None,
         core_version: str | None = None,
         prepared_content_hash: str | None = None,
+        include_superseded: bool = False,
     ) -> PreparedAssetDescriptor | None:
         """Find a matching descriptor in this run only."""
 
         candidates = list(self.prepared_assets.values())
+        if not include_superseded:
+            candidates = [
+                asset for asset in candidates
+                if asset.status != "superseded" and asset.scope != "superseded"
+            ]
         if prepared_asset_id is not None:
             candidates = [asset for asset in candidates if asset.prepared_asset_id == str(prepared_asset_id)]
         if operation_manifest_hash is not None:
@@ -658,6 +886,7 @@ class LivingEnterpriseModel:
         relationship_limit: int | None = None,
         scope: str | None = None,
         effective_period: str | None = None,
+        include_superseded: bool = False,
     ) -> dict[str, Any]:
         """Resolve exact IDs into a bounded, scope-safe bundle.
 
@@ -669,6 +898,7 @@ class LivingEnterpriseModel:
             "ontology": "ontology",
             "prepared_asset": "prepared_assets",
             "canonical_mapping": "mappings",
+            "relationship": "relationships",
             "knowledge_delta": "knowledge",
         }
         ids: dict[str, list[str]] = {"ontology": [], "prepared_assets": [], "mappings": [], "relationships": []}
@@ -705,17 +935,10 @@ class LivingEnterpriseModel:
         for raw in mapping_ids or ():
             add_ref(raw, "canonical_mapping")
         for raw in relationship_ids or ():
-            if isinstance(raw, (LEMRef, Mapping)):
-                # Relationship records are not a LEMRef namespace; a typed
-                # canonical_mapping/ontology ref is therefore rejected.
-                raise ValueError("relationship_ids require explicit relationship IDs, not LEMRef")
-            value = str(raw)
-            key = ("relationship", value)
-            if key in seen:
-                raise ValueError(f"duplicate relevant bundle relationship reference: {value}")
-            seen.add(key)
-            ids["relationships"].append(value)
-            typed["relationships"].append(LEMRef("ontology", value))
+            if isinstance(raw, LEMRef) or (isinstance(raw, Mapping) and "namespace" in raw):
+                add_ref(raw, "relationship")
+                continue
+            add_ref(raw, "relationship")
 
         missing = {
             "ontology": [key for key in ids["ontology"] if key not in self.ontology],
@@ -725,6 +948,22 @@ class LivingEnterpriseModel:
         }
         if any(missing.values()):
             raise KeyError(f"unknown exact IDs: {missing}")
+
+        if not include_superseded:
+            superseded = {
+                "ontology": [key for key in ids["ontology"] if self.ontology[key].status == "superseded"],
+                "prepared_assets": [
+                    key for key in ids["prepared_assets"]
+                    if self.prepared_assets[key].status == "superseded" or self.prepared_assets[key].scope == "superseded"
+                ],
+                "mappings": [key for key in ids["mappings"] if self.canonical_mappings[key].status == "superseded"],
+                "relationships": [
+                    key for key in ids["relationships"]
+                    if self.relationships[key].get("status", "active") == "superseded"
+                ],
+            }
+            if any(superseded.values()):
+                raise ValueError(f"requested IDs are superseded: {superseded}")
 
         def matches_scope(value: str | None, *, prepared: bool = False) -> bool:
             if scope is None or value is None:
@@ -802,7 +1041,7 @@ class LivingEnterpriseModel:
             "mappings": [self.canonical_mappings[key].to_dict() for key in ids["mappings"]],
             "relationships": [self.relationships[key] for key in ids["relationships"]],
             "exact_ids": {layer: list(values) for layer, values in ids.items()},
-            "exact_refs": {layer: [ref.to_dict() for ref in typed[layer]] for layer in ("ontology", "prepared_assets", "mappings")},
+            "exact_refs": {layer: [ref.to_dict() for ref in typed[layer]] for layer in ("ontology", "prepared_assets", "mappings", "relationships")},
         }
         byte_limit = max_json_bytes if max_json_bytes is not None else max_bytes
         if byte_limit is None:
@@ -828,6 +1067,85 @@ class LivingEnterpriseModel:
             raise ValueError(f"bundle exceeds approximate JSON byte limit {byte_limit}: {approximate_bytes}")
         metadata["approximate_json_bytes"] = approximate_bytes
         return bundle
+
+    def _successor_ref(self, operation: str, payload: Mapping[str, Any]) -> LEMRef | None:
+        """Derive the fresh object identity for an add-style successor."""
+
+        if operation in _SUCCESSOR_ONTOLOGY_OPERATIONS:
+            item = (
+                OntologyItem.from_dict(payload)
+                if operation == "add_ontology_item"
+                else self._semantic_payload(payload, operation.removeprefix("add_"))
+            )
+            return LEMRef("ontology", item.item_id)
+        if operation == "add_prepared_asset":
+            asset = PreparedAssetDescriptor.from_dict(payload)
+            return LEMRef("prepared_asset", asset.prepared_asset_id)
+        if operation == "add_canonical_mapping":
+            mapping = CanonicalMapping.from_dict(payload)
+            return LEMRef("canonical_mapping", mapping.canonical_id)
+        if operation == "add_relationship":
+            relationship_id = payload.get("relationship_id") or payload.get("item_id") or payload.get("id")
+            if relationship_id is None:
+                raise ValueError("relationship requires relationship_id")
+            return LEMRef("relationship", str(relationship_id))
+        return None
+
+    def _mark_superseded(self, ref: LEMRef, target: Any, successor: LEMRef) -> None:
+        """Mark one resolved predecessor without changing its object ID."""
+
+        if ref.namespace == "ontology":
+            self.ontology[ref.object_id] = replace(target, status="superseded")
+        elif ref.namespace == "prepared_asset":
+            self.prepared_assets[ref.object_id] = replace(target, status="superseded")
+        elif ref.namespace == "canonical_mapping":
+            self.canonical_mappings[ref.object_id] = replace(target, status="superseded")
+        elif ref.namespace == "relationship":
+            updated = dict(target)
+            updated["status"] = "superseded"
+            previous = [
+                value for value in updated.get("superseded_by", ())
+                if value != successor.to_dict()
+            ]
+            updated["superseded_by"] = sorted(
+                (*previous, successor.to_dict()),
+                key=lambda value: json.dumps(value, sort_keys=True),
+            )
+            self.relationships[ref.object_id] = updated
+            generated_item = self.ontology.get(ref.object_id)
+            if generated_item is not None:
+                self.ontology[ref.object_id] = replace(generated_item, status="superseded")
+
+    def _validate_successor_targets(
+        self,
+        operation: str,
+        payload: Mapping[str, Any],
+        supersession_targets: tuple[LEMRef, ...],
+        resolved_targets: list[tuple[LEMRef, Any]],
+    ) -> LEMRef | None:
+        """Validate add-style typed predecessor links before mutation."""
+
+        if not supersession_targets:
+            return None
+        if operation not in _SUCCESSOR_OPERATIONS:
+            if operation in {"extend_ontology_item", "extend_prepared_asset"}:
+                raise ValueError("successor revisions must use a fresh add operation, not extend")
+            return None
+        successor = self._successor_ref(operation, payload)
+        if successor is None:  # pragma: no cover - guarded by operation set
+            return None
+        keys = [(ref.namespace, ref.object_id) for ref in supersession_targets]
+        if len(set(keys)) != len(keys):
+            raise ValueError("knowledge delta supersedes contains duplicate targets")
+        if any(ref.namespace != successor.namespace for ref in supersession_targets):
+            raise ValueError(
+                f"incompatible supersession namespace for {operation}: expected {successor.namespace}"
+            )
+        if any(ref.object_id == successor.object_id for ref in supersession_targets):
+            raise ValueError("successor and predecessor cannot share an object ID")
+        if len(resolved_targets) != len(supersession_targets):  # pragma: no cover - internal invariant
+            raise ValueError("knowledge delta supersession resolution is incomplete")
+        return successor
 
     def apply_delta(self, delta: KnowledgeDelta | Mapping[str, Any], *, accepted: bool | None = None) -> dict[str, Any]:
         """Apply one accepted delta atomically, preserving conflicts/supersession."""
@@ -861,6 +1179,7 @@ class LivingEnterpriseModel:
                     "ontology": self.ontology,
                     "prepared_asset": self.prepared_assets,
                     "canonical_mapping": self.canonical_mappings,
+                    "relationship": self.relationships,
                     "knowledge_delta": self.knowledge,
                 }
                 registry = registries[ref.namespace]
@@ -871,8 +1190,14 @@ class LivingEnterpriseModel:
             # Resolve every target before mutation.  A mixed valid/invalid set
             # therefore fails atomically and never leaves a partial supersession.
             resolved_targets = [(ref, resolve(ref)) for ref in supersession_targets]
+            successor_ref = self._validate_successor_targets(
+                operation,
+                payload,
+                supersession_targets,
+                resolved_targets,
+            )
             if operation == "add_ontology_item":
-                self.add_ontology_item(payload)
+                self.ensure_ontology_item(payload)
             elif operation == "extend_ontology_item":
                 item_id = str(payload.pop("item_id"))
                 self.extend_ontology_item(item_id, payload)
@@ -925,14 +1250,12 @@ class LivingEnterpriseModel:
                 self.conflicts.append({"delta_id": delta.delta_id, "operation": operation, "payload": payload, "conflicts_with": list(conflict_targets), "supersedes": [ref.to_dict() for ref in supersession_targets], "evidence_refs": list(delta.evidence_refs), "unresolved": bool(payload.get("unresolved", operation == "record_conflict")), "working_definition": payload.get("working_definition")})
             elif operation == "supersede":
                 for ref, target in resolved_targets:
-                    if ref.namespace == "ontology":
-                        self.ontology[ref.object_id] = replace(target, status="superseded")
-                    elif ref.namespace == "prepared_asset":
-                        self.prepared_assets[ref.object_id] = replace(target, status="superseded")
-                    elif ref.namespace == "canonical_mapping":
-                        self.canonical_mappings[ref.object_id] = replace(target, status="superseded")
+                    self._mark_superseded(ref, target, LEMRef("knowledge_delta", delta.delta_id))
             elif operation == "no_change":
                 pass
+            if successor_ref is not None:
+                for ref, target in resolved_targets:
+                    self._mark_superseded(ref, target, successor_ref)
             if conflict_targets:
                 links = self.conflict_links.setdefault(delta.delta_id, set())
                 for target in conflict_targets:
@@ -1017,7 +1340,10 @@ class LivingEnterpriseModel:
                 item = OntologyItem.from_dict(raw)
                 if item.item_id in candidate.ontology:
                     raise ValueError(f"LEM export contains duplicate ontology item: {item.item_id}")
-                candidate.add_ontology_item(item)
+                # Export ontology rows are an integrity boundary: duplicate
+                # IDs in the serialized list must remain a hard failure,
+                # rather than being silently merged by the public add API.
+                candidate._add_ontology_item_strict(item)
 
             prepared_values = require_list("prepared_assets")
             for raw in prepared_values:
@@ -1036,7 +1362,14 @@ class LivingEnterpriseModel:
             for raw in mappings:
                 if not isinstance(raw, Mapping):
                     raise ValueError("LEM export canonical mapping is invalid")
-                candidate.add_mapping(CanonicalMapping.from_dict(raw))
+                mapping = CanonicalMapping.from_dict(raw)
+                if mapping.status == "superseded":
+                    # Publication requires accepted mappings, while export
+                    # rehydration must retain immutable superseded history.
+                    candidate.add_mapping(replace(mapping, status="accepted"))
+                    candidate.canonical_mappings[mapping.canonical_id] = mapping
+                else:
+                    candidate.add_mapping(mapping)
 
             relationships = exported.get("relationships")
             if not isinstance(relationships, Mapping):
@@ -1061,15 +1394,10 @@ class LivingEnterpriseModel:
                     raise ValueError("LEM export relationship reference is invalid") from exc
                 # ``export()`` contains both the relationship registry record
                 # and the generated relationship ontology item.  Ontology was
-                # loaded above, so reusing the public add operation here would
-                # falsely report a duplicate.  Reconstruct both layers
-                # explicitly while retaining collision checks.
+                # loaded above, so use the canonical ensure path rather than
+                # treating a same-ID payload difference as a collision.
                 relationship_item = candidate._semantic_payload(raw, "relationship")
-                existing_item = candidate.ontology.get(relationship_item.item_id)
-                if existing_item is None:
-                    candidate.add_ontology_item(relationship_item)
-                elif existing_item != relationship_item:
-                    raise ValueError(f"LEM export relationship ontology collision: {relationship_item.item_id}")
+                candidate.ensure_ontology_item(relationship_item)
                 relationship_record = _clean(dict(raw))
                 relationship_record["relationship_id"] = relationship_id
                 existing_record = candidate.relationships.get(relationship_id)
@@ -1081,7 +1409,7 @@ class LivingEnterpriseModel:
             if not isinstance(knowledge, Mapping):
                 raise ValueError("LEM export knowledge must be an object")
 
-            def parse_knowledge_ref(raw_ref: Any, *, label: str) -> LEMRef:
+            def parse_lem_ref(raw_ref: Any, *, label: str) -> LEMRef:
                 if not isinstance(raw_ref, Mapping) or set(raw_ref) != {"namespace", "object_id"}:
                     raise ValueError(f"LEM export {label} reference is invalid")
                 ref = LEMRef.from_dict(raw_ref)
@@ -1096,18 +1424,22 @@ class LivingEnterpriseModel:
                 ref = raw.get("ref")
                 if not isinstance(ref, Mapping) or ref.get("namespace") != "knowledge_delta" or ref.get("object_id") != str(raw_id):
                     raise ValueError("LEM export knowledge reference is invalid")
-                parse_knowledge_ref(ref, label="knowledge")
+                parsed_ref = parse_lem_ref(ref, label="knowledge")
+                if parsed_ref.namespace != "knowledge_delta":
+                    raise ValueError("LEM export knowledge reference must use knowledge_delta namespace")
                 raw_supersedes = raw.get("supersedes", ())
                 if not isinstance(raw_supersedes, list):
                     raise ValueError("LEM export knowledge supersedes links are invalid")
-                supersedes = tuple(parse_knowledge_ref(value, label="knowledge supersedes") for value in raw_supersedes)
+                supersedes = tuple(parse_lem_ref(value, label="knowledge supersedes") for value in raw_supersedes)
                 if len({ref.to_dict()["namespace"] + "\0" + ref.object_id for ref in supersedes}) != len(supersedes):
                     raise ValueError("LEM export knowledge supersedes links contain duplicates")
                 raw_superseded_by = raw.get("superseded_by", [])
                 if not isinstance(raw_superseded_by, list):
                     raise ValueError("LEM export knowledge superseded_by links are invalid")
                 for value in raw_superseded_by:
-                    parse_knowledge_ref(value, label="knowledge superseded_by")
+                    reverse_ref = parse_lem_ref(value, label="knowledge superseded_by")
+                    if reverse_ref.namespace != "knowledge_delta":
+                        raise ValueError("LEM export knowledge superseded_by must target knowledge deltas")
                 parsed_supersedes[str(raw_id)] = supersedes
                 candidate.knowledge[str(raw_id)] = _snapshot_value(dict(raw))
 
@@ -1129,7 +1461,7 @@ class LivingEnterpriseModel:
                             raise ValueError("LEM export supersession link source is dangling")
                         if not isinstance(values, (list, tuple, set, frozenset)):
                             raise ValueError("LEM export supersession links are invalid")
-                        refs = tuple(parse_knowledge_ref(value, label="supersession") for value in values)
+                        refs = tuple(parse_lem_ref(value, label="supersession") for value in values)
                         if len({ref.to_dict()["namespace"] + "\0" + ref.object_id for ref in refs}) != len(refs):
                             raise ValueError("LEM export supersession links contain duplicates")
                         parsed = parsed_supersedes.get(source_id, ())
@@ -1147,6 +1479,7 @@ class LivingEnterpriseModel:
                             "ontology": candidate.ontology,
                             "prepared_asset": candidate.prepared_assets,
                             "canonical_mapping": candidate.canonical_mappings,
+                            "relationship": candidate.relationships,
                             "knowledge_delta": candidate.knowledge,
                         }
                         for ref in refs:
@@ -1158,6 +1491,7 @@ class LivingEnterpriseModel:
                                 "ontology": candidate.ontology,
                                 "prepared_asset": candidate.prepared_assets,
                                 "canonical_mapping": candidate.canonical_mappings,
+                                "relationship": candidate.relationships,
                                 "knowledge_delta": candidate.knowledge,
                             }[ref.namespace]:
                                 raise ValueError("LEM export supersession link target is dangling")
@@ -1170,7 +1504,7 @@ class LivingEnterpriseModel:
                         raw_reverse = target_record.get("superseded_by", ())
                         parsed_reverse = {
                             (ref.namespace, ref.object_id)
-                            for ref in (parse_knowledge_ref(value, label="knowledge superseded_by") for value in raw_reverse)
+                            for ref in (parse_lem_ref(value, label="knowledge superseded_by") for value in raw_reverse)
                         }
                         if parsed_reverse != reverse:
                             raise ValueError("LEM export superseded_by links do not match supersession links")

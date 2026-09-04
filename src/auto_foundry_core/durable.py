@@ -61,6 +61,19 @@ _SPECIALIST_TASKS_FILENAME = "specialist_tasks.jsonl"
 _SPECIALIST_MEMOS_FILENAME = "specialist_memos.jsonl"
 _SEMANTIC_SELECTIONS_FILENAME = "semantic_selections.jsonl"
 _IDENTITY_DOMAIN_PROPOSALS_FILENAME = "identity_domain_proposals.jsonl"
+_IDENTITY_DOMAIN_PROPOSAL_BASE_FIELDS = frozenset(
+    {
+        "record_kind",
+        "domain_id",
+        "object_type",
+        "rationale",
+        "source_hints",
+        "representation_item_ids",
+    }
+)
+_IDENTITY_DOMAIN_PROPOSAL_REVISION_FIELDS = frozenset(
+    {"revision", "supersedes_hash", "proposal_hash", "superseded_object_type"}
+)
 _ANALYTICAL_RELATIONSHIPS_FILENAME = "analytical_relationships.jsonl"
 _OPEN_ISSUES_FILENAME = "open_issues.json"
 _HANDOFF_FILENAME = "handoff.json"
@@ -134,7 +147,23 @@ _PROGRAM_CONTEXT_ARTIFACT_PATHS = frozenset(
 _BUSINESS_REVIEW_DISCARD_AUDIT_FILENAME = "business_review_discard_audit.jsonl"
 _BUSINESS_REVIEW_DISCARD_STATE_FILENAME = "business_review_discard_state.json"
 _ITEM_STATE_TRANSITION_LOCK_FILENAME = ".item_state_transition.lock"
+_ITEM_STATE_TRANSITION_LOCK_NAMESPACE = Path(".locks") / "item_state"
 _HELD_ITEM_LOCKS = threading.local()
+
+
+@dataclass(frozen=True)
+class _IdentityDomainProposalNode:
+    """Minimal digest node retained for legacy malformed proposal rows."""
+
+    domain_id: str
+    object_type: str
+    rationale: str
+    source_hints: tuple[Any, ...]
+    representation_item_ids: tuple[str, ...]
+    revision: int
+    supersedes_hash: str | None
+    superseded_object_type: str | None
+    digest: str
 _BUSINESS_REVIEW_DISCARD_AUDIT_FIELDS = frozenset(
     {
         "record_kind",
@@ -361,6 +390,26 @@ _ACCEPTED_MANIFEST_FIELDS = frozenset(
         "manifest_hash",
     }
 )
+# Business acceptance seals the exact typed analytical artifacts named by the
+# accepted answer.  The handoff lives in the acceptance envelope so the
+# answer, envelope, and manifest can be published by the same atomic rename;
+# no second mutable registry is needed between the reviewer and integration.
+_ACCEPTED_ANALYTICAL_HANDOFF_SCHEMA = "auto_foundry.accepted_analytical_artifact_handoff.v1"
+_ACCEPTED_ANALYTICAL_HANDOFF_FIELD = "analytical_artifact_handoff"
+_ACCEPTED_ANALYTICAL_HANDOFF_FIELDS = frozenset({"schema_version", "artifacts", "handoff_hash"})
+_ACCEPTED_ANALYTICAL_DESCRIPTOR_FIELDS = frozenset(
+    {
+        "ref",
+        "hash",
+        "artifact_id",
+        "artifact_type",
+        "schema_version",
+        "requirement_id",
+        "content_hash",
+        "envelope_hash",
+        "canonical_bytes_sha256",
+    }
+)
 _TECHNICAL_MANIFEST_FIELDS = frozenset(
     {
         "item_id",
@@ -454,6 +503,11 @@ def _item_state_transition_lock(path: Path):
     if key in held:
         yield
         return
+    parent = path.parent
+    while not parent.exists() and not parent.is_symlink() and parent != parent.parent:
+        parent = parent.parent
+    if parent.is_symlink() or not parent.is_dir():
+        raise AllowedRootError("item state transition lock namespace is not a regular directory")
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b") as stream:
         if fcntl is not None:
@@ -501,6 +555,20 @@ def _validate_mode(mode: str) -> str:
     if value not in _VALID_MODES:
         raise ValueError("mode must be 'question' or 'requirement'")
     return value
+
+
+def _state_transition_lock_path(context: RunContext, item_id: str, mode: str) -> Path:
+    """Return the stable run-local lock path for one mode/item pair."""
+
+    item_id = _simple_component(item_id, "item_id")
+    mode = _validate_mode(mode)
+    relative = _ITEM_STATE_TRANSITION_LOCK_NAMESPACE / mode / item_id / _ITEM_STATE_TRANSITION_LOCK_FILENAME
+    current = context.run_root
+    for component in relative.parts:
+        current = current / component
+        if current.is_symlink():
+            raise AllowedRootError(f"item state transition lock path cannot use symlink: {current}")
+    return context.resolve_run_path(relative)
 
 
 def _jsonable(value: Any) -> Any:
@@ -929,6 +997,27 @@ class ItemWorkspace:
     ) -> "ItemWorkspace":
         item_id = _simple_component(item_id, "item_id")
         mode = _validate_mode(mode)
+        with _item_state_transition_lock(_state_transition_lock_path(context, item_id, mode)):
+            return cls._create_unlocked(
+                context,
+                item_id,
+                mode=mode,
+                original_text=original_text,
+                telemetry=telemetry,
+            )
+
+    @classmethod
+    def _create_unlocked(
+        cls,
+        context: RunContext,
+        item_id: str,
+        *,
+        mode: str = "question",
+        original_text: str,
+        telemetry: Any = None,
+    ) -> "ItemWorkspace":
+        item_id = _simple_component(item_id, "item_id")
+        mode = _validate_mode(mode)
         if not isinstance(original_text, str):
             raise TypeError("original_text must be a string")
         item_root = cls._resolve_item_root(context, item_id, mode)
@@ -1012,6 +1101,20 @@ class ItemWorkspace:
 
     @classmethod
     def load(
+        cls,
+        context: RunContext,
+        item_id: str,
+        *,
+        mode: str = "question",
+        telemetry: Any = None,
+    ) -> "ItemWorkspace":
+        item_id = _simple_component(item_id, "item_id")
+        mode = _validate_mode(mode)
+        with _item_state_transition_lock(_state_transition_lock_path(context, item_id, mode)):
+            return cls._load_unlocked(context, item_id, mode=mode, telemetry=telemetry)
+
+    @classmethod
+    def _load_unlocked(
         cls,
         context: RunContext,
         item_id: str,
@@ -1290,6 +1393,7 @@ class ItemWorkspace:
                 content_hash=content_hash,
                 outcome=outcome,
             )
+            self._validate_accepted_analytical_handoff(envelope, manifest)
             return
         if outcome == _BLOCKED_REVIEW_OUTCOME:
             self._validate_blocked_manifest(manifest, files)
@@ -1307,6 +1411,141 @@ class ItemWorkspace:
         unsigned.pop("manifest_hash", None)
         if _sha256_bytes(_json_bytes(unsigned)) != content_hash:
             raise ValueError("technical failure manifest hash does not match content")
+
+    @staticmethod
+    def _validate_analytical_handoff_shape(
+        value: Any,
+        *,
+        item_id: str,
+    ) -> tuple[dict[str, Any], ...]:
+        """Validate the self-contained shape of an accepted artifact handoff.
+
+        Filesystem binding is deliberately kept in the instance method below;
+        this helper only validates deterministic wire fields so an envelope
+        cannot smuggle arbitrary JSON into the integration boundary.
+        """
+
+        if not isinstance(value, Mapping) or set(value) != _ACCEPTED_ANALYTICAL_HANDOFF_FIELDS:
+            raise ValueError("accepted analytical artifact handoff fields are invalid")
+        if value.get("schema_version") != _ACCEPTED_ANALYTICAL_HANDOFF_SCHEMA:
+            raise ValueError("accepted analytical artifact handoff schema_version is invalid")
+        artifacts = value.get("artifacts")
+        if not isinstance(artifacts, list):
+            raise ValueError("accepted analytical artifact handoff artifacts are invalid")
+        if not _is_sha256(value.get("handoff_hash")):
+            raise ValueError("accepted analytical artifact handoff hash is invalid")
+        unsigned = {
+            "schema_version": value["schema_version"],
+            "artifacts": artifacts,
+        }
+        if _sha256_bytes(_json_bytes(unsigned)) != value["handoff_hash"]:
+            raise ValueError("accepted analytical artifact handoff hash does not match content")
+        normalized: list[dict[str, Any]] = []
+        seen_refs: set[str] = set()
+        seen_artifact_ids: set[str] = set()
+        for descriptor in artifacts:
+            if not isinstance(descriptor, Mapping) or set(descriptor) != _ACCEPTED_ANALYTICAL_DESCRIPTOR_FIELDS:
+                raise ValueError("accepted analytical artifact descriptor fields are invalid")
+            ref = descriptor.get("ref")
+            if not isinstance(ref, str) or not ref or ref != ref.strip():
+                raise ValueError("accepted analytical artifact descriptor ref is invalid")
+            path = PurePath(ref)
+            if (
+                path.is_absolute()
+                or ".." in path.parts
+                or "\\" in ref
+                or "\x00" in ref
+                or not ref.startswith("work/")
+                or not ref.endswith(".json")
+                or path.as_posix() != ref
+                or ref in seen_refs
+            ):
+                raise ValueError("accepted analytical artifact descriptor ref is invalid")
+            seen_refs.add(ref)
+            for field in (
+                "hash",
+                "content_hash",
+                "envelope_hash",
+                "canonical_bytes_sha256",
+            ):
+                if not _is_sha256(descriptor.get(field)):
+                    raise ValueError(f"accepted analytical artifact descriptor {field} is invalid")
+            for field in ("artifact_id", "artifact_type", "schema_version", "requirement_id"):
+                if not isinstance(descriptor.get(field), str) or not descriptor[field].strip():
+                    raise ValueError(f"accepted analytical artifact descriptor {field} is invalid")
+            artifact_id = str(descriptor["artifact_id"])
+            if artifact_id in seen_artifact_ids:
+                # Artifact identity is independent of bytes/ref.  Reusing an
+                # ID for two accepted descriptors is therefore a contract
+                # defect even when the underlying files happen to be byte
+                # identical; reject it before terminal intent publication.
+                raise ValueError(f"accepted analytical artifact_id values must be unique: {artifact_id}")
+            seen_artifact_ids.add(artifact_id)
+            if descriptor.get("requirement_id") != item_id:
+                raise ValueError("accepted analytical artifact descriptor requirement_id is invalid")
+            normalized.append(copy.deepcopy(dict(descriptor)))
+        if normalized != sorted(normalized, key=lambda item: item["ref"]):
+            raise ValueError("accepted analytical artifact descriptors are not canonical")
+        return tuple(normalized)
+
+    def _validate_accepted_analytical_handoff(
+        self,
+        envelope: Mapping[str, Any],
+        manifest: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], ...]:
+        """Bind accepted typed artifacts to exact reviewed work-file bytes."""
+
+        if _ACCEPTED_ANALYTICAL_HANDOFF_FIELD not in envelope:
+            return ()
+        descriptors = self._validate_analytical_handoff_shape(
+            envelope.get(_ACCEPTED_ANALYTICAL_HANDOFF_FIELD),
+            item_id=self.item_id,
+        )
+        hashes = manifest.get("hashes")
+        if not isinstance(hashes, Mapping):
+            raise ValueError("accepted analytical artifact handoff manifest is invalid")
+        from .analytical_artifacts import (
+            ANALYTICAL_ARTIFACT_TYPES,
+            AnalyticalArtifact,
+            AnalyticalArtifactValidationError,
+        )
+        for descriptor in descriptors:
+            ref = descriptor["ref"]
+            expected_hash = hashes.get(ref)
+            if expected_hash != descriptor["hash"]:
+                raise ValueError("accepted analytical artifact descriptor hash is not manifest-bound")
+            path = self.item_root / Path(ref)
+            lexical = self.item_root
+            for component in PurePath(ref).parts:
+                lexical = lexical / component
+                if lexical.is_symlink():
+                    raise AllowedRootError(f"accepted analytical artifact cannot use symlink components: {lexical}")
+            _assert_regular_no_symlink(path, label="accepted analytical artifact")
+            if not path.is_file():
+                raise ValueError("accepted analytical artifact reference is missing")
+            raw_bytes = path.read_bytes()
+            if _sha256_bytes(raw_bytes) != expected_hash:
+                raise ValueError("accepted analytical artifact bytes do not match manifest")
+            try:
+                artifact = AnalyticalArtifact.from_json(raw_bytes.decode("utf-8"))
+            except (OSError, UnicodeDecodeError, AnalyticalArtifactValidationError, TypeError, ValueError) as exc:
+                raise ValueError("accepted analytical artifact JSON is invalid") from exc
+            canonical_bytes = artifact.to_json().encode("utf-8")
+            if raw_bytes != canonical_bytes:
+                raise ValueError("accepted analytical artifact bytes are not canonical")
+            if artifact.artifact_type not in ANALYTICAL_ARTIFACT_TYPES:
+                raise ValueError("accepted analytical artifact type is unsupported")
+            if artifact.requirement_id != self.item_id:
+                raise ValueError("accepted analytical artifact requirement_id does not match item")
+            if descriptor["artifact_id"] != artifact.artifact_id or descriptor["artifact_type"] != artifact.artifact_type:
+                raise ValueError("accepted analytical artifact descriptor identity is stale")
+            if descriptor["schema_version"] != artifact.schema_version:
+                raise ValueError("accepted analytical artifact descriptor schema_version is stale")
+            if descriptor["content_hash"] != artifact.content_hash or descriptor["envelope_hash"] != artifact.envelope_hash:
+                raise ValueError("accepted analytical artifact descriptor hashes are stale")
+            if descriptor["canonical_bytes_sha256"] != _sha256_bytes(canonical_bytes):
+                raise ValueError("accepted analytical artifact descriptor canonical hash is stale")
+        return descriptors
 
     @staticmethod
     def _validate_acceptance_envelope(
@@ -1329,7 +1568,7 @@ class ItemWorkspace:
             "knowledge_delta",
             "accepted_at",
         }
-        if not isinstance(envelope, Mapping) or set(envelope) != expected:
+        if not isinstance(envelope, Mapping) or set(envelope) not in (expected, expected | {_ACCEPTED_ANALYTICAL_HANDOFF_FIELD}):
             raise ValueError("acceptance envelope fields are invalid")
         if envelope.get("item_id") != item_id or envelope.get("outcome") != outcome:
             raise ValueError("acceptance envelope outcome is invalid")
@@ -1348,6 +1587,11 @@ class ItemWorkspace:
             not isinstance(ref, str) or not ref for ref in envelope["accepted_refs"]
         ):
             raise ValueError("acceptance envelope accepted_refs are invalid")
+        if _ACCEPTED_ANALYTICAL_HANDOFF_FIELD in envelope:
+            ItemWorkspace._validate_analytical_handoff_shape(
+                envelope.get(_ACCEPTED_ANALYTICAL_HANDOFF_FIELD),
+                item_id=item_id,
+            )
         if envelope.get("knowledge_delta") not in _KNOWLEDGE_DELTAS:
             raise ValueError("acceptance envelope knowledge_delta is invalid")
         if not isinstance(envelope.get("accepted_at"), str) or not envelope.get("accepted_at"):
@@ -1502,11 +1746,13 @@ class ItemWorkspace:
 
     @contextmanager
     def _state_transition_lock(self):
-        """Serialize every durable ``item_state.json`` transition."""
+        """Serialize every durable ``item_state.json`` transition.
 
-        with _item_state_transition_lock(
-            self._resolve_item_subpath(_ITEM_STATE_TRANSITION_LOCK_FILENAME)
-        ):
+        The lock lives in a run-local namespace outside the movable item
+        tree, so refresh archive/reopen operations retain one lock identity.
+        """
+
+        with _item_state_transition_lock(_state_transition_lock_path(self.context, self.item_id, self.mode)):
             yield
 
     @staticmethod
@@ -5367,6 +5613,209 @@ class ItemWorkspace:
             dedupe_field="selection_id",
         )
 
+    @staticmethod
+    def _identity_domain_proposal_digest(
+        mapping: Mapping[str, Any],
+    ) -> tuple[Any, str]:
+        """Parse one proposal and return its typed value plus stable digest.
+
+        The digest intentionally excludes transport-only ``item_id`` and
+        ``owner_ref`` fields.  Those fields remain independently validated for
+        item/owner authorization, while historical owner-label rotation does
+        not fork the semantic proposal chain.
+        """
+
+        from .analyst_workspace import IdentityDomainProposal
+
+        if not isinstance(mapping, Mapping):
+            raise ValueError("identity domain proposal must be a mapping")
+        if mapping.get("record_kind") != "identity_domain_proposal":
+            raise ValueError("identity domain proposal record_kind is invalid")
+        try:
+            proposal = IdentityDomainProposal.from_dict(mapping)
+        except (TypeError, ValueError):
+            # Keep legacy low-level rows observable long enough for the
+            # Entity Resolution admission boundary to report its own precise
+            # owner/proposal diagnostic.  Planner/effective callers still
+            # parse the row through IdentityDomainProposal and fail closed on
+            # genuinely malformed semantic fields.
+            required = _IDENTITY_DOMAIN_PROPOSAL_BASE_FIELDS - {"record_kind"}
+            if any(key not in mapping for key in required):
+                raise ValueError("identity domain proposal is invalid")
+            allowed = (
+                _IDENTITY_DOMAIN_PROPOSAL_BASE_FIELDS
+                | _IDENTITY_DOMAIN_PROPOSAL_REVISION_FIELDS
+                | {"item_id", "owner_ref"}
+            )
+            if set(mapping).difference(allowed):
+                raise ValueError("identity domain proposal contains unexpected fields")
+            domain_id = mapping.get("domain_id")
+            object_type = mapping.get("object_type")
+            rationale = mapping.get("rationale")
+            source_hints = mapping.get("source_hints")
+            representation_item_ids = mapping.get("representation_item_ids")
+            if not all(isinstance(value, str) and value.strip() for value in (domain_id, object_type, rationale)):
+                raise ValueError("identity domain proposal is invalid")
+            if not isinstance(source_hints, (list, tuple)) or not isinstance(
+                representation_item_ids,
+                (list, tuple),
+            ):
+                raise ValueError("identity domain proposal is invalid")
+            if any(not isinstance(value, str) or not value.strip() for value in source_hints):
+                raise ValueError("identity domain proposal is invalid")
+            if any(not isinstance(value, str) or not value.strip() for value in representation_item_ids):
+                raise ValueError("identity domain proposal is invalid")
+            revision = mapping.get("revision", 1)
+            if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+                raise ValueError("identity domain proposal revision is invalid")
+            supersedes_hash = mapping.get("supersedes_hash")
+            superseded_object_type = mapping.get("superseded_object_type")
+            if revision == 1 and (supersedes_hash is not None or superseded_object_type is not None):
+                raise ValueError("identity domain proposal revision metadata is invalid")
+            payload: dict[str, Any] = {
+                "record_kind": "identity_domain_proposal",
+                "domain_id": str(domain_id).strip(),
+                "object_type": str(object_type).strip(),
+                "rationale": str(rationale).strip(),
+                "source_hints": list(source_hints),
+                "representation_item_ids": list(representation_item_ids),
+            }
+            if revision != 1:
+                payload.update(
+                    {
+                        "revision": revision,
+                        "supersedes_hash": supersedes_hash,
+                        "superseded_object_type": superseded_object_type,
+                    }
+                )
+            digest = hashlib.sha256(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+            ).hexdigest()
+            supplied_digest = mapping.get("proposal_hash")
+            if supplied_digest is not None and supplied_digest != digest:
+                raise ValueError("identity domain proposal proposal_hash is invalid")
+            return (
+                _IdentityDomainProposalNode(
+                    payload["domain_id"],
+                    payload["object_type"],
+                    payload["rationale"],
+                    tuple(payload["source_hints"]),
+                    tuple(payload["representation_item_ids"]),
+                    revision,
+                    supersedes_hash,
+                    superseded_object_type,
+                    digest,
+                ),
+                digest,
+            )
+        canonical = proposal.to_dict()
+        for field_name in (*_IDENTITY_DOMAIN_PROPOSAL_BASE_FIELDS, *_IDENTITY_DOMAIN_PROPOSAL_REVISION_FIELDS):
+            if field_name in mapping and mapping.get(field_name) != canonical.get(field_name):
+                raise ValueError(f"identity domain proposal {field_name} is not canonical")
+        digest = proposal.digest
+        supplied_digest = mapping.get("proposal_hash")
+        if supplied_digest is not None and supplied_digest != digest:
+            raise ValueError("identity domain proposal proposal_hash is invalid")
+        return proposal, digest
+
+    def _identity_domain_proposal_records_locked(self) -> tuple[dict[str, Any], ...]:
+        """Validate the append-only proposal chains under the item lock."""
+
+        from .analyst_workspace import IdentityDomainProposal
+
+        raw_records = self._read_work_records(
+            _IDENTITY_DOMAIN_PROPOSALS_FILENAME,
+            label="identity domain proposal",
+        )
+        by_domain: dict[str, dict[int, tuple[IdentityDomainProposal, str, dict[str, Any]]]] = {}
+        domain_order: list[str] = []
+        history: list[dict[str, Any]] = []
+        for raw in raw_records:
+            if raw.get("item_id") != self.item_id:
+                raise ValueError("identity domain proposal item binding is invalid")
+            raw_owner = raw.get("owner_ref")
+            if not isinstance(raw_owner, str) or not raw_owner.strip():
+                raise ValueError("identity domain proposal owner binding is invalid")
+            try:
+                owner_ref = _owner_ref_value(raw_owner)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("identity domain proposal owner binding is invalid") from exc
+            proposal, digest = self._identity_domain_proposal_digest(raw)
+            revision = proposal.revision
+            domain = proposal.domain_id
+            record = dict(raw)
+            # ``proposal_hash`` is a derived read value for legacy revision-one
+            # rows.  It is not written back and therefore cannot alter history
+            # bytes; successor rows persist the same digest explicitly.
+            record["owner_ref"] = owner_ref
+            record["proposal_hash"] = digest
+            history.append(record)
+            if domain not in by_domain:
+                by_domain[domain] = {}
+                domain_order.append(domain)
+            revisions = by_domain[domain]
+            prior = revisions.get(revision)
+            if prior is not None:
+                if prior[1] != digest:
+                    raise ValueError(
+                        "identity domain proposal revision conflicts with prior proposal: "
+                        f"domain_id={domain}, revision={revision}"
+                    )
+                # Exact duplicate rows are harmless historical retries.  Keep
+                # both in the audit history but use one canonical chain node.
+                continue
+            revisions[revision] = (proposal, digest, record)
+
+        effective: list[dict[str, Any]] = []
+        for domain in domain_order:
+            revisions = by_domain[domain]
+            if not revisions:
+                continue
+            ordinals = sorted(revisions)
+            if ordinals[0] != 1 or ordinals != list(range(1, ordinals[-1] + 1)):
+                raise ValueError(f"identity domain proposal revisions are not contiguous: domain_id={domain}")
+            for revision in ordinals[1:]:
+                predecessor, predecessor_hash, _predecessor_record = revisions[revision - 1]
+                proposal, _digest, _record = revisions[revision]
+                if proposal.supersedes_hash != predecessor_hash:
+                    raise ValueError(
+                        "identity domain proposal predecessor digest is invalid: "
+                        f"domain_id={domain}, revision={revision}"
+                    )
+                if proposal.superseded_object_type != predecessor.object_type:
+                    raise ValueError(
+                        "identity domain proposal predecessor type audit is invalid: "
+                        f"domain_id={domain}, revision={revision}"
+                    )
+            effective.append(dict(revisions[ordinals[-1]][2]))
+        # Return rows in first-domain order for deterministic Planner/domain
+        # ordering while selecting only the latest node of each valid chain.
+        return tuple(effective)
+
+    def _identity_domain_proposal_history_locked(self) -> tuple[dict[str, Any], ...]:
+        """Validate and return all proposal rows with derived digests."""
+
+        # Re-run the chain validator first so history callers never receive a
+        # partially trusted branch.  The second read is cheap and preserves the
+        # exact append order for the audit projection.
+        self._identity_domain_proposal_records_locked()
+        history: list[dict[str, Any]] = []
+        for raw in self._read_work_records(
+            _IDENTITY_DOMAIN_PROPOSALS_FILENAME,
+            label="identity domain proposal",
+        ):
+            if raw.get("item_id") != self.item_id:
+                raise ValueError("identity domain proposal item binding is invalid")
+            raw_owner = raw.get("owner_ref")
+            if not isinstance(raw_owner, str) or not raw_owner.strip():
+                raise ValueError("identity domain proposal owner binding is invalid")
+            proposal, digest = self._identity_domain_proposal_digest(raw)
+            row = dict(raw)
+            row["owner_ref"] = _owner_ref_value(raw_owner)
+            row["proposal_hash"] = digest
+            history.append(row)
+        return tuple(history)
+
     def append_identity_domain_proposal(self, mapping: Mapping[str, Any]) -> None:
         """Append one owner-bound identity-domain proposal.
 
@@ -5381,6 +5830,16 @@ class ItemWorkspace:
         owner_ref = mapping.get("owner_ref")
         if owner_ref is None:
             raise ValueError("identity domain proposal owner_ref is required")
+        # The ordinary append path is intentionally limited to a new semantic
+        # proposal or an exact retry.  Once a domain has a durable row, callers
+        # must use the explicit successor API below; silently treating a
+        # changed object type as a retry would erase the canonical-type
+        # collision that the Planner is required to surface.
+        revision = mapping.get("revision", 1)
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+            raise ValueError("identity domain proposal revision is invalid")
+        if revision != 1 or mapping.get("supersedes_hash") is not None:
+            raise ValueError("successor proposals require supersede_identity_domain_proposal")
         self._append_work_record(
             _IDENTITY_DOMAIN_PROPOSALS_FILENAME,
             mapping,
@@ -5392,6 +5851,168 @@ class ItemWorkspace:
             dedupe_ignored_fields=("owner_ref",),
             owner_ref=_owner_ref_value(owner_ref),
         )
+
+    def supersede_identity_domain_proposal(
+        self,
+        mapping: Mapping[str, Any],
+        *,
+        expected_predecessor_hash: str,
+        owner_ref: Any | None = None,
+    ) -> dict[str, Any]:
+        """Append one immutable, CAS-bound identity-domain proposal successor.
+
+        The predecessor remains in the append-only JSONL history.  The
+        successor receives the next contiguous revision and records the prior
+        requested object type as ``superseded_object_type`` audit metadata.
+        Transport owner/item labels are validated independently and are not
+        part of the semantic predecessor digest.
+        """
+
+        if not isinstance(mapping, Mapping):
+            raise TypeError("identity domain proposal successor must be a mapping")
+        if mapping.get("record_kind") != "identity_domain_proposal":
+            raise ValueError("identity domain proposal successor record_kind is invalid")
+        if not isinstance(expected_predecessor_hash, str) or not _is_sha256(expected_predecessor_hash):
+            raise ValueError("expected_predecessor_hash must be a SHA-256 digest")
+        supplied_item = mapping.get("item_id")
+        if supplied_item is not None and supplied_item != self.item_id:
+            raise ValueError("identity domain proposal successor item binding is invalid")
+        supplied_owner = mapping.get("owner_ref")
+        effective_owner = owner_ref if owner_ref is not None else supplied_owner
+        if effective_owner is None:
+            raise ValueError("identity domain proposal successor owner_ref is required")
+
+        from .analyst_workspace import IdentityDomainProposal
+
+        try:
+            supplied = IdentityDomainProposal.from_dict(mapping)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("identity domain proposal successor is invalid") from exc
+        if supplied.revision != 1 or supplied.supersedes_hash is not None or supplied.proposal_hash is not None:
+            # Revision and hashes are program-derived from the current head;
+            # callers may not smuggle an alternate branch through this API.
+            raise ValueError("successor revision and hashes are program-owned")
+        owner = _owner_ref_value(effective_owner)
+        if supplied_owner is not None and _owner_ref_value(supplied_owner) != owner:
+            raise ValueError("identity domain proposal successor owner_ref does not match the bound owner")
+
+        destination_relative = (Path("work") / _IDENTITY_DOMAIN_PROPOSALS_FILENAME).as_posix()
+        with self._state_transition_lock():
+            self._reload_authoritative_for_artifact_mutation_locked()
+            self._ensure_not_terminal()
+            self._verify_analysis_owner_locked(owner)
+            destination = self._resolve_item_subpath(destination_relative)
+            _assert_regular_no_symlink(destination, label="identity domain proposal artifact")
+            history = self._identity_domain_proposal_history_locked()
+            predecessor = next(
+                (
+                    row
+                    for row in history
+                    if row.get("proposal_hash") == expected_predecessor_hash
+                    and row.get("domain_id") == supplied.domain_id
+                ),
+                None,
+            )
+            if predecessor is None:
+                raise ValueError("identity domain proposal predecessor is unknown")
+            predecessor_proposal, predecessor_hash = self._identity_domain_proposal_digest(predecessor)
+            if predecessor_hash != expected_predecessor_hash:
+                raise ValueError("identity domain proposal predecessor digest is invalid")
+
+            effective_rows = self._identity_domain_proposal_records_locked()
+            current = next(
+                (row for row in effective_rows if row.get("domain_id") == supplied.domain_id),
+                None,
+            )
+            current_hash = None if current is None else current.get("proposal_hash")
+            expected_revision = predecessor_proposal.revision + 1
+            candidate = IdentityDomainProposal(
+                domain_id=supplied.domain_id,
+                object_type=supplied.object_type,
+                rationale=supplied.rationale,
+                source_hints=supplied.source_hints,
+                representation_item_ids=supplied.representation_item_ids,
+                revision=expected_revision,
+                supersedes_hash=expected_predecessor_hash,
+                superseded_object_type=predecessor_proposal.object_type,
+            )
+            candidate_hash = candidate.digest
+            candidate_with_hash = IdentityDomainProposal(
+                domain_id=candidate.domain_id,
+                object_type=candidate.object_type,
+                rationale=candidate.rationale,
+                source_hints=candidate.source_hints,
+                representation_item_ids=candidate.representation_item_ids,
+                revision=candidate.revision,
+                supersedes_hash=candidate.supersedes_hash,
+                proposal_hash=candidate_hash,
+                superseded_object_type=candidate.superseded_object_type,
+            )
+            candidate_payload = {
+                **candidate_with_hash.to_dict(),
+                "item_id": self.item_id,
+                "owner_ref": owner,
+            }
+            if mapping.get("revision") is not None and mapping.get("revision") != expected_revision:
+                raise ValueError("identity domain proposal successor revision is not contiguous")
+            if mapping.get("supersedes_hash") is not None and mapping.get("supersedes_hash") != expected_predecessor_hash:
+                raise ValueError("identity domain proposal successor predecessor digest conflicts")
+            if (
+                mapping.get("superseded_object_type") is not None
+                and mapping.get("superseded_object_type") != predecessor_proposal.object_type
+            ):
+                raise ValueError("identity domain proposal successor predecessor type audit conflicts")
+
+            # Exact retries are idempotent even after the successor has become
+            # the effective head.  A different successor on the same
+            # predecessor is a stale/conflicting CAS and must fail closed.
+            matching_successors = [
+                row
+                for row in history
+                if row.get("domain_id") == supplied.domain_id
+                and row.get("supersedes_hash") == expected_predecessor_hash
+            ]
+            for existing in matching_successors:
+                existing_proposal, existing_hash = self._identity_domain_proposal_digest(existing)
+                if existing_proposal.to_dict() == candidate_with_hash.to_dict() and existing_hash == candidate_hash:
+                    return dict(existing)
+                raise ValueError("identity domain proposal successor conflicts with predecessor")
+            if current_hash != expected_predecessor_hash:
+                raise ValueError("identity domain proposal predecessor is stale")
+
+            prior_state = copy.deepcopy(self._state)
+            state_path = self._resolve_item_subpath(_STATE_FILENAME)
+            prior_state_bytes = state_path.read_bytes()
+            prior_destination_exists = destination.exists() or destination.is_symlink()
+            prior_destination_bytes = destination.read_bytes() if prior_destination_exists else None
+            try:
+                _append_jsonl(destination, candidate_payload)
+                state = copy.deepcopy(self._state)
+                state["updated_at"] = _now()
+                self._persist_state_unlocked(state, touch=False)
+            except Exception as exc:
+                rollback_errors: list[Exception] = []
+                try:
+                    self._restore_artifact_bytes(destination, prior_destination_exists, prior_destination_bytes)
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+                try:
+                    _atomic_write_bytes(state_path, prior_state_bytes)
+                    self._state = prior_state
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+                if rollback_errors:
+                    raise RuntimeError("identity domain proposal successor rollback failed") from exc
+                raise
+        self._emit(
+            "item_workspace_supersede_identity_domain_proposal",
+            artifact=destination_relative,
+            domain_id=supplied.domain_id,
+            revision=expected_revision,
+            supersedes_hash=expected_predecessor_hash,
+            proposal_hash=candidate_hash,
+        )
+        return dict(candidate_payload)
 
     def append_analytical_relationship(self, mapping: Mapping[str, Any]) -> None:
         """Append one owner-bound analytical relationship evidence record."""
@@ -5724,12 +6345,33 @@ class ItemWorkspace:
             raise ValueError(f"{label} artifact is invalid")
         return tuple(copy.deepcopy(dict(record)) for record in records)
 
-    def read_identity_domain_proposals(self) -> tuple[dict[str, Any], ...]:
-        """Return immutable-by-copy identity-domain proposal records."""
+    def read_identity_domain_proposals(
+        self,
+        *,
+        include_superseded: bool = False,
+    ) -> tuple[dict[str, Any], ...]:
+        """Return effective proposal heads or the validated full history.
 
-        return self._read_work_records(
-            _IDENTITY_DOMAIN_PROPOSALS_FILENAME,
-            label="identity domain proposal",
+        Planner/entity-resolution callers receive exactly one latest proposal
+        per domain by default.  ``include_superseded`` is an explicit audit
+        read and retains every immutable predecessor row.
+        """
+
+        if type(include_superseded) is not bool:
+            raise TypeError("include_superseded must be a bool")
+        if include_superseded:
+            return self.read_identity_domain_proposal_history()
+        return tuple(
+            dict(row)
+            for row in self._identity_domain_proposal_records_locked()
+        )
+
+    def read_identity_domain_proposal_history(self) -> tuple[dict[str, Any], ...]:
+        """Return all validated append-only proposal rows with digests."""
+
+        return tuple(
+            dict(row)
+            for row in self._identity_domain_proposal_history_locked()
         )
 
     def read_analytical_relationships(self) -> tuple[dict[str, Any], ...]:
@@ -6364,6 +7006,182 @@ class ItemWorkspace:
             raise
         return accepted / "manifest.json"
 
+    def _normalise_acceptance_ref(self, value: Any) -> tuple[str, bool]:
+        """Normalize an answer evidence ref and identify item-local paths.
+
+        Analyst answers may carry source identifiers and JSONL row fragments in
+        addition to item-local files.  The latter are reduced to their
+        manifest-bound regular-file path; source identifiers remain useful
+        analytical evidence but are not mistaken for filesystem artifacts.
+        """
+
+        if not isinstance(value, str):
+            raise ValueError("answer evidence_refs must contain strings")
+        ref = value.strip()
+        if not ref:
+            raise ValueError("answer evidence_refs must contain non-empty strings")
+        # Owners sometimes persist a run-relative path including the current
+        # item namespace (``requirements/<item>/work/...``).  Canonicalize
+        # that one form to item-local ``work/...``; a sibling item's path is
+        # deliberately left external and can never become a typed handoff.
+        for namespace in ("requirements", "questions"):
+            prefix = f"{namespace}/{self.item_id}/"
+            if ref.startswith(prefix):
+                ref = ref[len(prefix) :]
+                break
+        local = ref.startswith(("work/", "draft.json", "answer_content.json", "accepted/"))
+        base = ref.split("#", 1)[0] if local else ref
+        if local:
+            if not base or "#" in base or "\\" in base or "\x00" in base:
+                raise ValueError("answer evidence reference is invalid")
+            path = PurePath(base)
+            if path.is_absolute() or ".." in path.parts or path.as_posix() != base:
+                raise ValueError("answer evidence reference is invalid")
+            return base, True
+        return ref, False
+
+    def _validate_acceptance_refs(
+        self,
+        payload: Mapping[str, Any],
+        progress: ArtifactProgress,
+        explicit_refs: Iterable[Any],
+        *,
+        content_hash: str,
+    ) -> tuple[tuple[str, ...], tuple[dict[str, Any], ...]]:
+        """Derive accepted refs and typed artifact descriptors from the answer."""
+
+        raw_answer_refs = payload.get("evidence_refs", ())
+        if raw_answer_refs is None:
+            raw_answer_refs = ()
+        if isinstance(raw_answer_refs, (str, bytes, Mapping)) or not isinstance(raw_answer_refs, (list, tuple)):
+            raise ValueError("answer evidence_refs must be a sequence")
+        manifest_hashes = dict(progress.hashes)
+        normalized: list[str] = []
+        answer_local_refs: list[str] = []
+
+        def bind_ref(raw: Any, *, from_answer: bool) -> None:
+            ref, local = self._normalise_acceptance_ref(raw)
+            if not local:
+                # External/source identifiers do not identify item files and
+                # therefore cannot be validated against the terminal manifest.
+                # Preserve them only when supplied through the legacy explicit
+                # accepted_refs argument; answer evidence remains the typed
+                # handoff authority.
+                if not from_answer and ref not in normalized:
+                    normalized.append(ref)
+                return
+            if ref in normalized:
+                if from_answer and ref not in answer_local_refs:
+                    answer_local_refs.append(ref)
+                return
+            if ref == "answer_content.json":
+                expected_hash = content_hash
+                path = self._resolve_item_subpath(Path(_ACCEPTED_FILENAME) / "answer_content.json")
+            elif ref == "accepted/answer_content.json":
+                expected_hash = content_hash
+                path = self._resolve_item_subpath(Path(_ACCEPTED_FILENAME) / "answer_content.json")
+            else:
+                expected_hash = manifest_hashes.get(ref)
+                if expected_hash is None:
+                    if from_answer:
+                        raise ValueError(f"accepted evidence reference is not bound by reviewed manifest: {ref}")
+                    # The caller-supplied accepted_refs argument is only a
+                    # legacy supplement.  It must never be needed for the
+                    # sealed answer handoff, so an obsolete/missing hint is
+                    # retained as a legacy envelope hint rather than blocking
+                    # business acceptance.  Integration never treats this
+                    # hint as a typed artifact without a sealed descriptor.
+                    normalized.append(ref)
+                    return
+                path = self._resolve_item_subpath(ref)
+            _assert_regular_no_symlink(path, label="accepted evidence artifact")
+            if not path.is_file():
+                if from_answer:
+                    raise ValueError(f"accepted evidence reference is missing: {ref}")
+                normalized.append(ref)
+                return
+            if _sha256_file(path) != expected_hash:
+                if from_answer:
+                    raise ValueError(f"accepted evidence reference hash does not match reviewed manifest: {ref}")
+                normalized.append(ref)
+                return
+            normalized.append(ref)
+            if from_answer:
+                answer_local_refs.append(ref)
+
+        for raw in raw_answer_refs:
+            bind_ref(raw, from_answer=True)
+        # Explicit refs are retained as supplemental evidence for existing
+        # callers, but the answer-derived refs above are sufficient to create
+        # the sealed typed handoff when the caller supplies no whitelist.
+        if explicit_refs is None:
+            explicit_refs = ()
+        elif isinstance(explicit_refs, (str, bytes, Mapping)):
+            explicit_refs = (explicit_refs,)
+        for raw in explicit_refs:
+            bind_ref(raw, from_answer=False)
+
+        descriptors: list[dict[str, Any]] = []
+        seen_artifact_ids: set[str] = set()
+        from .analytical_artifacts import (
+            ANALYTICAL_ARTIFACT_TYPES,
+            AnalyticalArtifact,
+            AnalyticalArtifactValidationError,
+        )
+        for ref in sorted(set(answer_local_refs)):
+            if not ref.startswith("work/") or not ref.lower().endswith(".json"):
+                continue
+            path = self._resolve_item_subpath(ref)
+            raw_bytes = path.read_bytes()
+            try:
+                raw_value = json.loads(raw_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(raw_value, Mapping):
+                continue
+            # Only an explicit analytical-artifact discriminator opts a work
+            # JSON file into strict artifact parsing.  Projection/result JSON
+            # without that discriminator remains ordinary evidence.
+            if "artifact_type" not in raw_value:
+                continue
+            try:
+                artifact = AnalyticalArtifact.from_dict(raw_value)
+            except (AnalyticalArtifactValidationError, TypeError, ValueError) as exc:
+                raise ValueError(f"accepted analytical artifact is invalid: {ref}") from exc
+            if artifact.artifact_type not in ANALYTICAL_ARTIFACT_TYPES:
+                raise ValueError(f"accepted analytical artifact type is unsupported: {artifact.artifact_type!r}")
+            if artifact.requirement_id != self.item_id:
+                raise ValueError(f"accepted analytical artifact requirement_id does not match item: {ref}")
+            if artifact.artifact_id in seen_artifact_ids:
+                # Do not defer duplicate identity detection to Integration
+                # staging.  Business acceptance must fail before its durable
+                # terminal intent can be written, regardless of matching
+                # content bytes or distinct work-file references.
+                raise ValueError(
+                    f"accepted analytical artifact_id values must be unique: {artifact.artifact_id}"
+                )
+            seen_artifact_ids.add(artifact.artifact_id)
+            canonical_bytes = artifact.to_json().encode("utf-8")
+            if raw_bytes != canonical_bytes:
+                raise ValueError(f"accepted analytical artifact bytes are not canonical: {ref}")
+            descriptors.append(
+                {
+                    "ref": ref,
+                    "hash": manifest_hashes.get(ref),
+                    "artifact_id": artifact.artifact_id,
+                    "artifact_type": artifact.artifact_type,
+                    "schema_version": artifact.schema_version,
+                    "requirement_id": artifact.requirement_id,
+                    "content_hash": artifact.content_hash,
+                    "envelope_hash": artifact.envelope_hash,
+                    "canonical_bytes_sha256": _sha256_bytes(canonical_bytes),
+                }
+            )
+        descriptors.sort(key=lambda descriptor: descriptor["ref"])
+        if any(not _is_sha256(descriptor["hash"]) for descriptor in descriptors):
+            raise ValueError("accepted analytical artifact descriptor is not manifest-bound")
+        return tuple(sorted(set(normalized))), tuple(descriptors)
+
     def accept(
         self,
         *,
@@ -6415,14 +7233,50 @@ class ItemWorkspace:
         knowledge_delta = str(knowledge_delta).strip()
         if knowledge_delta not in _KNOWLEDGE_DELTAS:
             raise ValueError("knowledge_delta is invalid")
-        refs = tuple(str(ref) for ref in accepted_refs)
-        if any(not ref for ref in refs):
-            raise ValueError("accepted_refs must be non-empty strings")
         accepted_outcome = "accepted"
         if review.get("verdict") == "accept_with_limits" or review.get("status") == "unavailable":
             accepted_outcome = "accepted_with_limits"
         content_name = "answer_content.json"
         envelope_name = "acceptance_envelope.json"
+        # Business acceptance must publish the same item-local artifact set
+        # that the final Business Review inspected.  The draft hash alone is
+        # insufficient: a work artifact can be added or replaced between
+        # review and acceptance, and those bytes would otherwise become
+        # authorized merely because the caller listed their refs in
+        # ``accepted_refs``.  Compare the complete post-review hash map while
+        # the transition lock is held; a mismatch is a review-boundary drift
+        # and requires a fresh Business Review.
+        progress = self._artifact_progress(payload)
+        review_packet = self._read_business_review()
+        reviewed_artifact_hashes = (
+            review_packet.get("after_artifact_hashes")
+            if isinstance(review_packet, Mapping)
+            else None
+        )
+        if not isinstance(reviewed_artifact_hashes, Mapping) or dict(progress.hashes) != dict(reviewed_artifact_hashes):
+            raise ValueError(
+                "accept requires the exact currently reviewed artifact progress; re-review required"
+            )
+        try:
+            answer_value = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("accepted answer content is invalid JSON") from exc
+        if not isinstance(answer_value, Mapping):
+            raise ValueError("accepted answer content must be a JSON object")
+        refs, analytical_descriptors = self._validate_acceptance_refs(
+            answer_value,
+            progress,
+            accepted_refs or (),
+            content_hash=content_hash,
+        )
+        handoff_unsigned = {
+            "schema_version": _ACCEPTED_ANALYTICAL_HANDOFF_SCHEMA,
+            "artifacts": list(analytical_descriptors),
+        }
+        analytical_handoff = {
+            **handoff_unsigned,
+            "handoff_hash": _sha256_bytes(_json_bytes(handoff_unsigned)),
+        }
         accepted_at = _now()
         envelope = {
             "item_id": self.item_id,
@@ -6437,9 +7291,14 @@ class ItemWorkspace:
             "knowledge_delta": knowledge_delta,
             "accepted_at": accepted_at,
         }
+        # Keep content-only/relationship-only answers on the compact legacy
+        # envelope shape; typed analytical output carries the additional
+        # sealed handoff object.  Bundle loaders treat an absent handoff as an
+        # empty tuple, while any present handoff is validated strictly.
+        if analytical_descriptors:
+            envelope[_ACCEPTED_ANALYTICAL_HANDOFF_FIELD] = analytical_handoff
         envelope_payload = _json_bytes(envelope)
         envelope_hash = _sha256_bytes(envelope_payload)
-        progress = self._artifact_progress(payload)
         manifest = {
             "item_id": self.item_id,
             "outcome": accepted_outcome,
@@ -6495,8 +7354,22 @@ class ItemWorkspace:
         self._emit("item_integration_committed", integration_manifest_ref=manifest_ref, integration_manifest_hash=manifest_hash)
         return copy.deepcopy(self._state)
 
-    def mark_integration_failed(self, manifest_hash: str, manifest_ref: str) -> dict[str, Any]:
-        """Record an explicit, non-retryable integration technical failure."""
+    def mark_integration_failed(
+        self,
+        manifest_hash: str,
+        manifest_ref: str,
+        *,
+        recovery_exhausted: bool = False,
+    ) -> dict[str, Any]:
+        """Record a recoverable accepted-integration incident.
+
+        Analytical acceptance is already immutable under ``accepted/``.  A
+        failure-shaped compatibility call must therefore leave the item
+        ``pending`` and return a typed same-session continuation envelope,
+        rather than creating a terminal integration state or throwing.  The
+        run-level incident ledger supplies the durable, idempotent record; the
+        accepted bytes and item state are not rewritten.
+        """
 
         self._ensure_execution_state()
         self._reconcile_business_review_discard()
@@ -6510,13 +7383,66 @@ class ItemWorkspace:
             raise ValueError("integration manifest hash must be a SHA-256 digest")
         if not manifest_ref or Path(manifest_ref).is_absolute() or "\x00" in manifest_ref:
             raise ValueError("integration manifest ref is invalid")
-        state = copy.deepcopy(self._state)
-        state["integration_state"] = "technical_failure"
-        state["integration_manifest_hash"] = manifest_hash
-        state["integration_manifest_ref"] = manifest_ref
-        self._persist_state(state)
-        self._emit("item_integration_failed", integration_manifest_ref=manifest_ref, integration_manifest_hash=manifest_hash)
-        return copy.deepcopy(self._state)
+        terminal = self._state.get("terminal_outcome")
+        accepted_content_hash = terminal.get("content_hash") if isinstance(terminal, Mapping) else None
+        if not _is_sha256(accepted_content_hash):
+            raise ValueError("accepted integration content hash is unavailable")
+        from .requirement_planning import RequirementSupervisorWorkspace
+
+        incident_id = "INC-" + _sha256_bytes(
+            _json_bytes(
+                {
+                    "kind": "accepted_integration_recovery",
+                    "item_id": self.item_id,
+                    "accepted_content_hash": accepted_content_hash,
+                    "manifest_hash": manifest_hash,
+                    "manifest_ref": manifest_ref,
+                }
+            )
+        )[:24]
+        incident = IncidentRecord(
+            incident_id=incident_id,
+            category="recovery",
+            disposition="recovery_exhausted" if recovery_exhausted else "pending_same_session",
+            admissible=False,
+            item_id=self.item_id,
+            scope=("integration", self.item_id),
+            source="item_workspace",
+            facts={
+                "accepted_content_hash": accepted_content_hash,
+                "manifest_hash": manifest_hash,
+                "manifest_ref": manifest_ref,
+                "continuation": "terminal" if recovery_exhausted else "same_session",
+                "recovery_exhausted": bool(recovery_exhausted),
+            },
+        )
+        recorded = RequirementSupervisorWorkspace(self.context).record_incident(incident)
+        if recovery_exhausted:
+            state = dict(self._state)
+            state["integration_state"] = "technical_failure"
+            state["integration_manifest_hash"] = manifest_hash
+            state["integration_manifest_ref"] = manifest_ref
+            self._persist_state(state)
+            self._emit(
+                "item_integration_technical_failure",
+                integration_manifest_ref=manifest_ref,
+                integration_manifest_hash=manifest_hash,
+                recovery_exhausted=True,
+            )
+        return {
+            "status": "technical_failure" if recovery_exhausted else "pending",
+            "recoverable": not recovery_exhausted,
+            "continuation": "terminal" if recovery_exhausted else "same_session",
+            "item_id": self.item_id,
+            "integration_state": "technical_failure" if recovery_exhausted else "pending",
+            "accepted_content_hash": accepted_content_hash,
+            "manifest_hash": manifest_hash,
+            "manifest_ref": manifest_ref,
+            "incident": dict(recorded),
+        }
+
+    # Positive naming for callers migrating away from failure-shaped APIs.
+    record_integration_incident = mark_integration_failed
 
     def technical_failure(self, reason: str, *, recovery_exhausted: bool) -> AcceptedSnapshot:
         """Linearize technical terminalization against all item writers."""
@@ -6533,12 +7459,38 @@ class ItemWorkspace:
         self._ensure_execution_state()
         self._reconcile_business_review_discard()
         if self.accepted_root.exists() or self.accepted_root.is_symlink():
+            # Replaying the same terminalization is an idempotent durable
+            # operation.  A competing reason still fails closed rather than
+            # rewriting an immutable outcome.
+            if self._state.get("lifecycle_state") == "technical_failure":
+                try:
+                    _snapshot, manifest = self._read_valid_terminal_snapshot()
+                except Exception:
+                    raise FileExistsError(self.accepted_root)
+                if manifest.get("outcome") == "technical_failure" and manifest.get("reason") == str(reason):
+                    return _snapshot
             raise FileExistsError(self.accepted_root)
         self._ensure_not_terminal()
-        self._require_no_active_attempt()
         reason = str(reason)
         if not reason:
             raise ValueError("technical_failure reason must be non-empty")
+        # A requirement-scoped transport failure may arrive while its role
+        # attempt is still active.  Close that attempt as part of the same
+        # item transition so the capacity claim is released before Planner is
+        # read again.  This is deliberately item-local and does not alter any
+        # run-level retry accounting.
+        active_attempt_id = self._state.get("active_attempt_id")
+        if active_attempt_id is not None:
+            index, record = self._active_record(str(active_attempt_id))
+            state = dict(self._state)
+            state["attempts"] = [dict(item) for item in self._state["attempts"]]
+            state["attempts"][index] = dict(record)
+            state["attempts"][index]["status"] = "failed"
+            state["attempts"][index]["error"] = "recovery_exhausted"
+            state["active_attempt_id"] = None
+            state["lifecycle_state"] = "work"
+            self._persist_state(state)
+        self._require_no_active_attempt()
         # Retain reviewer findings as historical evidence, but make the
         # consumed repair authority inactive before publishing the terminal
         # snapshot.  This prevents stale repair metadata from participating in
@@ -6567,6 +7519,35 @@ class ItemWorkspace:
         state["lifecycle_state"] = "technical_failure"
         state["terminal_outcome"] = {"status": "technical_failure", **snapshot.to_dict()}
         self._persist_state(state)
+        from .requirement_planning import RequirementSupervisorWorkspace
+
+        incident_id = "INC-" + _sha256_bytes(
+            _json_bytes(
+                {
+                    "kind": "requirement_recovery_exhausted",
+                    "item_id": self.item_id,
+                    "content_hash": content_hash,
+                    "manifest_hash": manifest["manifest_hash"],
+                }
+            )
+        )[:24]
+        RequirementSupervisorWorkspace(self.context).record_incident(
+            IncidentRecord(
+                incident_id=incident_id,
+                category="recovery",
+                disposition="terminal_item_failure",
+                admissible=False,
+                item_id=self.item_id,
+                scope=("requirement", self.item_id),
+                source="item_workspace",
+                facts={
+                    "failure_class": "requirement_action",
+                    "reason_hash": _sha256_bytes(reason.encode("utf-8")),
+                    "recovery_exhausted": True,
+                    "terminal_outcome": "technical_failure",
+                },
+            )
+        )
         self._emit(
             "item_technical_failure",
             outcome="technical_failure",

@@ -90,6 +90,7 @@ def test_export_rehydrates_relationship_prepared_and_knowledge_evidence(tmp_path
         PreparedAssetDescriptor(
             prepared_asset_id="asset",
             location="work/prepared/asset.jsonl",
+            schema={"evidence_refs": "json", "row_hash": "string"},
             prepared_content_hash="a" * 64,
             operation_manifest_hash="b" * 64,
             row_count=1,

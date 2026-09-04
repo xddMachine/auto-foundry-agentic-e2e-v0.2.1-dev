@@ -23,9 +23,11 @@ item/resolution outcomes. Initial order and grouping are advisory; it preserves
 explicit user priority/order but never declares runtime semantic dependencies.
 The Analytical Owner discovers those after understanding the requirement, and
 the runtime `waiting_on_resolution`/`ready_to_resume` ledger is the sole
-semantic block. It may suggest zero to three owner specialists,
-but does not calculate or write answers and is not a deterministic ID/hash or
-lifecycle authority. `RequirementExecutionPlan` and
+semantic block. It recommends the smallest useful set of owner specialists for
+genuinely independent uncertainty, bounded by actual host capacity, and never
+one specialist per method or checklist item. It does not calculate or write
+answers and is not a deterministic ID/hash or lifecycle authority.
+`RequirementExecutionPlan` and
 `RequirementExecutionGroup` are revisionable recommendations/current
 scheduling, not catalog or lifecycle authority. A technical failure does not
 create Planner dependency blocks; independent groups remain eligible and runtime
@@ -49,10 +51,11 @@ Classify the request as `analytics_in_scope`,
 `analytics_requires_missing_data`, or `out_of_analytics_scope` without a
 keyword router.
 
-The default Requirement Mode capacity is four entity-resolution workers, one
-Analytical Owner, up to three owner specialists, and eight active workers; the
-Planner is not counted. Hosts may configure lower or higher limits but must not
-oversubscribe actual host capacity. Requested Run A and Run B executions remain
+Requirement Mode capacity is adaptive to the actual host. The scheduler leases
+the smallest useful set without oversubscribing available worker slots. Every
+requirement keeps exactly one Analytical Owner, reviewers remain independent,
+and entity-resolution jobs or specialists use only capacity that is available;
+the Planner is not counted. Requested Run A and Run B executions remain
 sequential.
 
 ## 2. Form an answer strategy
@@ -61,6 +64,16 @@ Choose the smallest strategy that can answer the decision. Possible routes
 include direct measurement, prepared-data reuse, a clearly labelled proxy,
 alternative-definition scenarios, descriptive association, a policy/process
 scenario, or a bounded partial answer.
+
+For supported tabular work, use the analytics toolkit first and record the
+exact method and parameters: `profile_data` for descriptive profiling,
+`compute_kpi_table` for explicit KPI aggregations, `segment_customers` for
+deterministic k-means with optional agglomerative comparison, and
+`score_segments` for assigning new rows with the serialized k-means model.
+Use custom owner-authored code only for methods the toolkit does not support,
+through the deterministic runner. Follow
+[ANALYTICS_TOOLKIT.md](ANALYTICS_TOOLKIT.md) for strict artifact JSON,
+output/evidence bindings, review, and downstream integration.
 
 Write down the working population, denominator, grain, period, units, join
 hypotheses, source authority, and assumptions. Treat them as hypotheses until
@@ -161,8 +174,11 @@ reviewed tested relationships established here.
 
 ## 5. Delegate only bounded uncertainties
 
-Use zero to three specialists. Good specialist questions are separable and can
-be answered without owning the parent answer, for example:
+Use the smallest useful set of specialists for genuinely independent
+uncertainties. Zero is valid; add a specialist only when its bounded result is
+material and the host has capacity. Never create one specialist per method or
+checklist item. Good specialist questions are separable and can be answered
+without owning the parent answer, for example:
 
 - “Measure join coverage and fanout for these two selected sources.”
 - “Check whether this denominator matches the stated KPI definition.”

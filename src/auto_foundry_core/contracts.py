@@ -63,7 +63,13 @@ class ContractMixin:
         return cls.from_dict(json.loads(text))
 
 
-LEMNamespace = Literal["ontology", "prepared_asset", "canonical_mapping", "knowledge_delta"]
+LEMNamespace = Literal[
+    "ontology",
+    "prepared_asset",
+    "canonical_mapping",
+    "relationship",
+    "knowledge_delta",
+]
 
 
 @dataclass(frozen=True)
@@ -79,7 +85,7 @@ class LEMRef(ContractMixin):
     object_id: str
 
     NAMESPACES: ClassVar[frozenset[str]] = frozenset({
-        "ontology", "prepared_asset", "canonical_mapping", "knowledge_delta",
+        "ontology", "prepared_asset", "canonical_mapping", "relationship", "knowledge_delta",
     })
 
     def __post_init__(self) -> None:

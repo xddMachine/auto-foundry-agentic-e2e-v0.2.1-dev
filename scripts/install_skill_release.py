@@ -27,14 +27,14 @@ import zipfile
 
 
 SKILL_NAME = "auto-foundry-agentic-e2e"
-SKILL_VERSION = "0.7.1"
-CORE_VERSION = "0.8.0"
-RELEASE_SLUG = "entity-resolution-and-analytical-relationships"
+SKILL_VERSION = "0.7.2"
+CORE_VERSION = "0.8.1"
+RELEASE_SLUG = "universal-data-room-ingestion"
 # Provisioning updates this tracked value after the deterministic package is
 # built. API callers may inject an expected hash/count for self-contained
 # tests; the production CLI has no such override.
-PRODUCTION_PACKAGE_SHA256 = "01b0bd8b8fe1edbef8bf5b86c4315526bcb8993e5e044428269efd71d16b0b19"
-PRODUCTION_FILE_COUNT = 27
+PRODUCTION_PACKAGE_SHA256 = "ab73f92778616f40908120cf0f711781417e6af5595a1c1f7d081dbd58c3e30b"
+PRODUCTION_FILE_COUNT = 30
 
 _TRANSACTION_DIRNAME = f".{SKILL_NAME}-installer"
 _LOCK_FILENAME = "install.lock"
@@ -412,7 +412,15 @@ def _move_records(intent: Mapping[str, object]) -> list[tuple[Path, Path]]:
     return moves
 
 
-def _validate_intent(intent: Mapping[str, object], transaction_root: Path, skills_root: Path) -> None:
+def _validate_intent(
+    intent: Mapping[str, object],
+    transaction_root: Path,
+    skills_root: Path,
+    *,
+    approved_archive_root: Path | None = None,
+) -> None:
+    if approved_archive_root is None:
+        approved_archive_root = _raw_path(skills_root.parent / "skill-archives")
     expected_transaction = _require_existing_dir(transaction_root, "installer transaction root")
     recorded_transaction = _intent_path_value(intent, "transaction_root")
     if recorded_transaction != expected_transaction:
@@ -421,6 +429,8 @@ def _validate_intent(intent: Mapping[str, object], transaction_root: Path, skill
     if recorded_skills != skills_root:
         raise ReleaseInstallError("installer intent discovery root does not match this invocation")
     archive_root = _intent_path_value(intent, "archive_root")
+    if approved_archive_root is not None and archive_root != approved_archive_root:
+        raise ReleaseInstallError("installer intent archive root is not approved for this invocation")
     if _is_under(archive_root, skills_root):
         raise ReleaseInstallError("installer intent archive root is inside discovery")
     _reject_symlink_components(archive_root, allow_missing_leaf=True)
@@ -513,12 +523,22 @@ def _move_hashes(intent: Mapping[str, object], moves: list[tuple[Path, Path]]) -
     return result
 
 
-def _recover_pending(transaction_root: Path, skills_root: Path) -> None:
+def _recover_pending(
+    transaction_root: Path,
+    skills_root: Path,
+    *,
+    approved_archive_root: Path | None = None,
+) -> None:
     intent_path = _intent_path(transaction_root)
     intent = _read_intent(intent_path)
     if intent is None:
         return
-    _validate_intent(intent, transaction_root, skills_root)
+    _validate_intent(
+        intent,
+        transaction_root,
+        skills_root,
+        approved_archive_root=approved_archive_root,
+    )
     state = str(intent["state"])
     staged = _intent_path_value(intent, "staged")
     active = _intent_path_value(intent, "active")
@@ -626,7 +646,11 @@ def install_skill_release(
     intent_path = _intent_path(transaction_root)
 
     with _installer_lock(lock_path):
-        _recover_pending(transaction_root, skills_root)
+        _recover_pending(
+            transaction_root,
+            skills_root,
+            approved_archive_root=archive_root,
+        )
         zip_path = _require_existing_file(zip_path, "release ZIP")
         inspection = inspect_release(zip_path, expected_sha256=expected_sha256, expected_file_count=expected_file_count)
         active = skills_root / SKILL_NAME
@@ -717,7 +741,12 @@ def install_skill_release(
             try:
                 intent_value = _read_intent(intent_path)
                 if intent_value is not None:
-                    _validate_intent(intent_value, transaction_root, skills_root)
+                    _validate_intent(
+                        intent_value,
+                        transaction_root,
+                        skills_root,
+                        approved_archive_root=archive_root,
+                    )
                     if (
                         intent_value.get("state") == "activated"
                         and active.exists()

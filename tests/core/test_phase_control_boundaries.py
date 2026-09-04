@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 from pathlib import Path
+from typing import Mapping
 import zipfile
 
 import pytest
@@ -15,6 +16,7 @@ from auto_foundry_core import (
     DataAssetRef,
     DataInsufficiencyConclusion,
     DataRoomWorkbench,
+    PlannerAction,
     ReviewFinding,
 )
 from auto_foundry_core.contracts import OntologyItem
@@ -36,6 +38,7 @@ from auto_foundry_core.product_review import (
     canonical_hash,
     discard_stale_product_candidate,
 )
+from auto_foundry_core.coordinator import CoordinatorRunSpec, RunCoordinator
 from auto_foundry_core.reporting import (
     ReportPreflightError,
     RunReportFinalizer,
@@ -55,6 +58,7 @@ def _product_outputs(root: Path) -> dict[str, object]:
         "fixture": "dashboard_fixture.json",
         "chart_map": "chart_map.json",
         "chart_registry": "chart_registry.json",
+        "blueprint": "dashboard_blueprint_v2.json",
         "receipt": "build_receipt.json",
     }.items():
         path = product / filename
@@ -182,6 +186,15 @@ def test_product_candidate_review_and_publish_are_independent_and_idempotent(tmp
         publication_policy_hash=policy_hash,
         artifact_bindings=bindings,
     )
+    assert "blueprint" in candidate.artifact_bindings
+    missing_blueprint = dict(candidate.to_dict())
+    missing_blueprint["artifact_bindings"] = {
+        name: binding
+        for name, binding in candidate.artifact_bindings.items()
+        if name != "blueprint"
+    }
+    with pytest.raises(ValueError, match="artifact_bindings must contain"):
+        ProductCandidate.from_dict(missing_blueprint)
     store = ProductReviewStore(context, "G-0001")
     canonical_candidate = candidate.to_dict()
     for alias, field in (
@@ -245,6 +258,17 @@ def test_product_candidate_review_and_publish_are_independent_and_idempotent(tmp
     assert store.review_path.stat().st_mtime_ns == review_mtime
     assert store.authorization_path.stat().st_mtime_ns == authorization_mtime
     manifest_path.write_bytes(original_manifest)
+    blueprint_path = outputs["blueprint"]
+    assert isinstance(blueprint_path, Path)
+    original_blueprint = blueprint_path.read_bytes()
+    blueprint_path.write_bytes(original_blueprint + b"blueprint-drift")
+    with pytest.raises(ValueError, match="hash|artifact"):
+        store.load_candidate()
+    with pytest.raises(ValueError, match="hash|artifact"):
+        store.load_review()
+    with pytest.raises(ValueError, match="hash|artifact"):
+        store.load_authorization()
+    blueprint_path.write_bytes(original_blueprint)
     with pytest.raises(PermissionError, match="denied"):
         ProductReviewStore(context, "G-0001").authorize_publish(
             publisher_ref="other",
@@ -255,6 +279,136 @@ def test_product_candidate_review_and_publish_are_independent_and_idempotent(tmp
             publisher_ref="other",
             publication_policy_hash=policy_hash,
         )
+
+
+def _publication_gate_fixture(tmp_path: Path, *, enabled: bool) -> tuple[RunContext, ProductReviewStore, object, object, dict[str, object]]:
+    """Seed one reviewed candidate for deterministic coordinator-gate tests."""
+
+    context = RunContext(
+        f"RUN-PUBLICATION-GATE-{str(enabled).upper()}",
+        tmp_path / "run",
+    )
+    RunLifecycle.create(context, ("REQ-01",), mode="requirement")
+    plan_path = context.run_root / "requirement_supervisor_plan.json"
+    plan_path.write_text('{"schema_version":1}\n', encoding="utf-8")
+    outputs = _product_outputs(context.run_root)
+    policy = {"enabled": enabled, "channel": "local-test"}
+    policy_hash = canonical_hash(policy)
+    bindings = {
+        name: {"ref": str(path.relative_to(context.run_root))}
+        for name, path in outputs.items()
+    }
+    candidate = ProductCandidate(
+        run_id=context.run_id,
+        generation_id="G-0001",
+        product_owner="product-owner",
+        parent_lineage={
+            "root_generation": True,
+            "parent_generation_id": None,
+            "parent_manifest_ref": None,
+            "parent_manifest_hash": None,
+        },
+        plan_binding={
+            "plan_ref": "requirement_supervisor_plan.json",
+            "plan_hash": hashlib.sha256(plan_path.read_bytes()).hexdigest(),
+        },
+        publication_policy_hash=policy_hash,
+        artifact_bindings=bindings,
+    )
+    store = ProductReviewStore(context, "G-0001")
+    persisted = store.record_candidate(candidate)
+    review = store.record_review(
+        reviewer_ref="independent-reviewer",
+        verdict="accept",
+        reviewed_at="2026-01-01T00:00:00Z",
+    )
+    metadata = {
+        "generation_id": "G-0001",
+        "candidate_hash": persisted.computed_hash,
+        "review_hash": review.computed_hash,
+        "publication_policy_hash": policy_hash,
+    }
+    return context, store, persisted, review, metadata
+
+
+def test_publication_disabled_is_typed_waiting_control_without_model_dispatch(tmp_path: Path) -> None:
+    context, _store, _candidate, _review, metadata = _publication_gate_fixture(tmp_path, enabled=False)
+    action = PlannerAction(
+        "await_publication_authorization",
+        "planner",
+        context.run_id,
+        "reviewed product awaiting publication authorization",
+        metadata={**metadata, "publication_policy_enabled": False},
+    )
+    calls: list[str] = []
+
+    def forbidden_transport(current: object, **_: object) -> object:
+        calls.append(str(getattr(current, "action", current)))
+        raise AssertionError("publication-disabled control must not reach model transport")
+
+    spec = CoordinatorRunSpec(
+        context.run_id,
+        "G-0001",
+        "planner://publication-disabled",
+        hashlib.sha256(b"publication-disabled").hexdigest(),
+        publication_policy={"enabled": False, "channel": "local-test"},
+    )
+    coordinator = RunCoordinator(
+        context,
+        planner=lambda _state: (action,),
+        adapters={"await_publication_authorization": forbidden_transport},
+    )
+    coordinator.start(spec)
+    status = coordinator.step()
+    assert calls == []
+    assert status.status == "waiting"
+    assert status.next_action == action.to_dict()
+    assert status.next_action["reason"] == "reviewed product awaiting publication authorization"
+    assert not (_store.authorization_path.exists())
+    coordinator.close(wait_for_roles=True)
+
+
+def test_publication_enabled_uses_hash_bound_deterministic_authorization_without_model_dispatch(tmp_path: Path) -> None:
+    context, store, candidate, review, metadata = _publication_gate_fixture(tmp_path, enabled=True)
+    action = PlannerAction(
+        "publish_final_product",
+        "product_agent",
+        context.run_id,
+        "accepted product review awaits hash-bound publication authorization",
+        metadata=metadata,
+    )
+    calls: list[str] = []
+
+    def forbidden_transport(current: object, **_: object) -> object:
+        calls.append(str(getattr(current, "action", current)))
+        raise AssertionError("deterministic publication must not reach model transport")
+
+    spec = CoordinatorRunSpec(
+        context.run_id,
+        "G-0001",
+        "planner://publication-enabled",
+        hashlib.sha256(b"publication-enabled").hexdigest(),
+        publication_policy={"enabled": True, "channel": "local-test"},
+    )
+    offers = [(action,), ()]
+
+    def planner(_state: Mapping[str, object]) -> tuple[object, ...]:
+        return offers.pop(0) if offers else ()
+
+    coordinator = RunCoordinator(
+        context,
+        planner=planner,
+        adapters={"publish_final_product": forbidden_transport},
+    )
+    coordinator.start(spec)
+    status = coordinator.step()
+    assert calls == []
+    authorization = store.load_authorization()
+    assert authorization.candidate_hash == candidate.computed_hash
+    assert authorization.review_hash == review.computed_hash
+    assert authorization.publication_policy_hash == metadata["publication_policy_hash"]
+    assert status.status == "waiting"
+    coordinator.close(wait_for_roles=True)
 
 
 def test_stale_product_candidate_discard_rebuilds_refs_and_guards_review_auth(tmp_path: Path) -> None:
@@ -409,6 +563,121 @@ def test_stale_product_candidate_discard_fails_closed_for_foreign_malformed_and_
     assert store.candidate_path.is_symlink()
 
 
+def test_repair_once_review_is_archived_before_stale_candidate_rebuild(tmp_path: Path) -> None:
+    context = RunContext("RUN-PRODUCT-REPAIR-REBUILD", tmp_path / "run")
+    RunLifecycle.create(context, ("REQ-01",), mode="requirement")
+    outputs = _product_outputs(context.run_root)
+    plan_path = context.run_root / "requirement_supervisor_plan.json"
+    plan_path.write_text('{"schema_version": 1}\n', encoding="utf-8")
+    candidate = ProductCandidate(
+        run_id=context.run_id,
+        generation_id="G-0001",
+        product_owner="product-owner",
+        parent_lineage={"root_generation": True, "parent_generation_id": None, "parent_manifest_ref": None, "parent_manifest_hash": None},
+        plan_binding={"plan_ref": "requirement_supervisor_plan.json", "plan_hash": hashlib.sha256(plan_path.read_bytes()).hexdigest()},
+        publication_policy_hash=canonical_hash({"enabled": False}),
+        artifact_bindings={name: {"ref": str(path.relative_to(context.run_root))} for name, path in outputs.items()},
+    )
+    store = ProductReviewStore(context, "G-0001")
+    persisted = store.record_candidate(candidate)
+    review = store.record_review(
+        reviewer_ref="independent-reviewer",
+        verdict="repair_once",
+        findings=({"category": "presentation", "required_change": "repair navigation"},),
+        reviewed_at="2026-01-01T00:00:00Z",
+    )
+    assert store.begin_repair_once_rebuild() is True
+    assert not store.candidate_path.exists()
+    assert not store.review_path.exists()
+    archive = store.root / f"product_review.repair_once.{review.computed_hash}.json"
+    assert ProductReview.from_dict(json.loads(archive.read_text(encoding="utf-8"))).to_dict() == review.to_dict()
+
+    # The stale-output cleanup path has the same preservation guarantee when
+    # a role performs assembly before retiring the old candidate.
+    persisted = store.record_candidate(candidate)
+    review = store.record_review(
+        reviewer_ref="independent-reviewer",
+        verdict="repair_once",
+        findings=({"category": "presentation", "required_change": "repair navigation"},),
+        reviewed_at="2026-01-01T00:00:00Z",
+    )
+    manifest_path = outputs["manifest"]
+    assert isinstance(manifest_path, Path)
+    manifest_path.write_bytes(manifest_path.read_bytes() + b"reviewed-repair")
+
+    assert store.discard_stale_candidate_for_rebuild() is True
+    assert not store.candidate_path.exists()
+    assert not store.review_path.exists()
+    archive = store.root / f"product_review.repair_once.{review.computed_hash}.json"
+    assert ProductReview.from_dict(json.loads(archive.read_text(encoding="utf-8"))).to_dict() == review.to_dict()
+    assert persisted.computed_hash == review.candidate_hash
+
+
+def test_blocked_rethink_product_review_allows_candidate_rebuild_but_accept_stays_protected(tmp_path: Path) -> None:
+    """A rejected presentation may be replaced, while an accepted one cannot."""
+
+    context = RunContext("RUN-PRODUCT-BLOCKED-RETHINK", tmp_path / "run")
+    RunLifecycle.create(context, ("REQ-01",), mode="requirement")
+    outputs = _product_outputs(context.run_root)
+    plan_path = context.run_root / "requirement_supervisor_plan.json"
+    plan_path.write_text('{"schema_version": 1}\n', encoding="utf-8")
+    policy_hash = canonical_hash({"enabled": False})
+    candidate = ProductCandidate(
+        run_id=context.run_id,
+        generation_id="G-0001",
+        product_owner="product-owner",
+        parent_lineage={
+            "root_generation": True,
+            "parent_generation_id": None,
+            "parent_manifest_ref": None,
+            "parent_manifest_hash": None,
+        },
+        plan_binding={
+            "plan_ref": "requirement_supervisor_plan.json",
+            "plan_hash": hashlib.sha256(plan_path.read_bytes()).hexdigest(),
+        },
+        publication_policy_hash=policy_hash,
+        artifact_bindings={
+            name: {"ref": str(path.relative_to(context.run_root))}
+            for name, path in outputs.items()
+        },
+    )
+    store = ProductReviewStore(context, "G-0001")
+    persisted = store.record_candidate(candidate)
+    blocked = store.record_review(
+        reviewer_ref="independent-reviewer",
+        verdict="blocked_rethink",
+        findings=({"category": "presentation", "required_change": "recompose decision views"},),
+        reviewed_at="2026-01-01T00:00:00Z",
+    )
+
+    # The explicit blocked-rethink verdict authorizes retiring a valid
+    # candidate so Product Agent can write a replacement through the public
+    # API.  The review remains durable in its verdict-specific archive.
+    assert discard_stale_product_candidate(context, generation_id="G-0001") is True
+    assert not store.candidate_path.exists()
+    assert not store.review_path.exists()
+    archive = store.root / f"product_review.blocked_rethink.{blocked.computed_hash}.json"
+    assert ProductReview.from_dict(json.loads(archive.read_text(encoding="utf-8"))).to_dict() == blocked.to_dict()
+
+    # Accepted candidates remain protected even if a rendered artifact later
+    # drifts; only an explicit repair verdict may retire a reviewed candidate.
+    rebuilt = store.record_candidate(candidate)
+    accepted = store.record_review(
+        reviewer_ref="independent-reviewer",
+        verdict="accept",
+        reviewed_at="2026-01-01T00:00:01Z",
+    )
+    manifest_path = outputs["manifest"]
+    assert isinstance(manifest_path, Path)
+    manifest_path.write_bytes(manifest_path.read_bytes() + b"accepted-candidate-drift")
+    with pytest.raises(ValueError, match="review or authorization"):
+        store.discard_stale_candidate_for_rebuild()
+    assert store.candidate_path.exists()
+    assert store.review_path.exists()
+    assert rebuilt.computed_hash == accepted.candidate_hash
+
+
 def test_product_receipt_inspector_rejects_foreign_extension_receipt(tmp_path: Path) -> None:
     context = RunContext("RUN-PRODUCT-RECEIPT", tmp_path / "run")
     root = context.run_root
@@ -422,10 +691,12 @@ def test_product_receipt_inspector_rejects_foreign_extension_receipt(tmp_path: P
     fixture_path = generation_root / "dashboard_fixture.json"
     chart_map_path = generation_root / "chart_map.json"
     chart_registry_path = generation_root / "chart_registry.json"
+    blueprint_path = generation_root / "dashboard_blueprint_v2.json"
     for path, payload in (
         (fixture_path, {"widgets": []}),
         (chart_map_path, {"charts": []}),
         (chart_registry_path, {"charts": []}),
+        (blueprint_path, {"schema_version": "dashboard.business_presentation_plan.v2", "kind": "dashboard_blueprint"}),
     ):
         path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     site_path = generation_root / "site"
@@ -447,6 +718,7 @@ def test_product_receipt_inspector_rejects_foreign_extension_receipt(tmp_path: P
         "fixture_sha256": __import__("hashlib").sha256(fixture_path.read_bytes()).hexdigest(),
         "chart_map_sha256": __import__("hashlib").sha256(chart_map_path.read_bytes()).hexdigest(),
         "chart_registry_sha256": __import__("hashlib").sha256(chart_registry_path.read_bytes()).hexdigest(),
+        "blueprint_sha256": __import__("hashlib").sha256(blueprint_path.read_bytes()).hexdigest(),
         "site_manifest_sha256": __import__("hashlib").sha256(site_manifest_path.read_bytes()).hexdigest(),
     }
     receipt = {
@@ -469,10 +741,17 @@ def test_product_receipt_inspector_rejects_foreign_extension_receipt(tmp_path: P
             "fixture_ref": str(fixture_path.relative_to(root)),
             "chart_map_ref": str(chart_map_path.relative_to(root)),
             "chart_registry_ref": str(chart_registry_path.relative_to(root)),
+            "blueprint_ref": str(blueprint_path.relative_to(root)),
             "site_ref": str(site_path.relative_to(root)),
             "receipt_ref": receipt_ref,
         },
         "output_hashes": output_hashes,
+        "blueprint_binding": {
+            "ref": str(blueprint_path.relative_to(root)),
+            "sha256": output_hashes["blueprint_sha256"],
+            "schema_version": "dashboard.business_presentation_plan.v2",
+            "status": "Preview",
+        },
     }
     receipt_path.write_text(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     receipt_hash = __import__("hashlib").sha256(receipt_path.read_bytes()).hexdigest()
@@ -555,8 +834,13 @@ def test_product_receipt_inspector_requires_root_parent_marker_and_plan_binding(
     fixture_path = product_root / "dashboard_fixture.json"
     chart_map_path = product_root / "chart_map.json"
     chart_registry_path = product_root / "chart_registry.json"
+    blueprint_path = product_root / "dashboard_blueprint_v2.json"
     for path in (fixture_path, chart_map_path, chart_registry_path):
         path.write_text("{}\n", encoding="utf-8")
+    blueprint_path.write_text(
+        json.dumps({"schema_version": "dashboard.business_presentation_plan.v2", "kind": "dashboard_blueprint"}, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
     site_path = product_root / "site"
     site_path.mkdir()
     site_manifest_path = site_path / "site_manifest.json"
@@ -585,6 +869,7 @@ def test_product_receipt_inspector_requires_root_parent_marker_and_plan_binding(
             "fixture_ref": str(fixture_path.relative_to(root)),
             "chart_map_ref": str(chart_map_path.relative_to(root)),
             "chart_registry_ref": str(chart_registry_path.relative_to(root)),
+            "blueprint_ref": str(blueprint_path.relative_to(root)),
             "site_ref": str(site_path.relative_to(root)),
             "receipt_ref": receipt_ref,
         },
@@ -592,7 +877,14 @@ def test_product_receipt_inspector_requires_root_parent_marker_and_plan_binding(
             "fixture_sha256": __import__("hashlib").sha256(fixture_path.read_bytes()).hexdigest(),
             "chart_map_sha256": __import__("hashlib").sha256(chart_map_path.read_bytes()).hexdigest(),
             "chart_registry_sha256": __import__("hashlib").sha256(chart_registry_path.read_bytes()).hexdigest(),
+            "blueprint_sha256": __import__("hashlib").sha256(blueprint_path.read_bytes()).hexdigest(),
             "site_manifest_sha256": __import__("hashlib").sha256(site_manifest_path.read_bytes()).hexdigest(),
+        },
+        "blueprint_binding": {
+            "ref": str(blueprint_path.relative_to(root)),
+            "sha256": __import__("hashlib").sha256(blueprint_path.read_bytes()).hexdigest(),
+            "schema_version": "dashboard.business_presentation_plan.v2",
+            "status": "Preview",
         },
     }
     receipt_path.write_text(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
@@ -749,7 +1041,10 @@ def test_planner_reads_integration_fidelity_boundary_from_persisted_artifacts(tm
         )
     )
     planner = RequirementSupervisorWorkspace(context)
-    assert [(a.action, a.role) for a in planner.next_actions()] == [("integrate_requirement", "integration_agent")]
+    assert [(a.action, a.role) for a in planner.next_actions()] == [
+        ("integrate_requirement", "integration_agent"),
+        ("refresh_product_preview", "product_agent"),
+    ]
 
     session = IntegrationSession.create(
         context,
@@ -769,7 +1064,10 @@ def test_planner_reads_integration_fidelity_boundary_from_persisted_artifacts(tm
         evidence_refs=("draft.json",),
     )
     session.build_fidelity_packet()
-    assert [(a.action, a.role) for a in planner.next_actions()] == [("review_integration_fidelity", "integration_fidelity_reviewer")]
+    assert [(a.action, a.role) for a in planner.next_actions()] == [
+        ("review_integration_fidelity", "integration_fidelity_reviewer"),
+        ("refresh_product_preview", "product_agent"),
+    ]
     record_id = session.records[0].record_id
     dependency_id = session.records[1].record_id
     session.record_fidelity_review(
@@ -778,7 +1076,10 @@ def test_planner_reads_integration_fidelity_boundary_from_persisted_artifacts(tm
         dependency_ids=(dependency_id,),
         checked_record_ids=(record_id, dependency_id),
     )
-    assert [(a.action, a.role) for a in planner.next_actions()] == [("repair_integration_fidelity", "integration_agent")]
+    assert [(a.action, a.role) for a in planner.next_actions()] == [
+        ("repair_integration_fidelity", "integration_agent"),
+        ("refresh_product_preview", "product_agent"),
+    ]
 
     result_path = context.run_root / "requirements" / "REQ-01" / "integration" / "review" / "result.json"
     original_result = result_path.read_bytes()
@@ -800,7 +1101,8 @@ def test_planner_reads_integration_fidelity_boundary_from_persisted_artifacts(tm
     assert transition["integration_stage"] == "awaiting_targeted_fidelity_review"
     assert transition["fidelity_verdict"] is None
     assert [(a.action, a.role) for a in planner.next_actions()] == [
-        ("review_integration_fidelity", "integration_fidelity_reviewer")
+        ("review_integration_fidelity", "integration_fidelity_reviewer"),
+        ("refresh_product_preview", "product_agent"),
     ]
     assert planner.next_actions()[0].metadata["targeted_recheck"] is True
 
@@ -827,7 +1129,8 @@ def test_planner_reads_integration_fidelity_boundary_from_persisted_artifacts(tm
     assert any("incomplete" in diagnostic for diagnostic in invalid_transition["integration_validation"]["diagnostics"])
     assert invalid_transition["integration_stage"] == "invalid"
     assert [(a.action, a.role) for a in planner.next_actions()] == [
-        ("repair_integration_fidelity", "integration_agent")
+        ("repair_integration_fidelity", "integration_agent"),
+        ("refresh_product_preview", "product_agent"),
     ]
 
     # A dependency is review scope, not mutation scope.
@@ -857,7 +1160,10 @@ def test_planner_reads_integration_fidelity_boundary_from_persisted_artifacts(tm
         review_kind="targeted",
         checked_record_ids=(record_id, dependency_id),
     )
-    assert [(a.action, a.role) for a in planner.next_actions()] == [("commit_integration_requirement", "integration_agent")]
+    assert [(a.action, a.role) for a in planner.next_actions()] == [
+        ("commit_integration_requirement", "integration_agent"),
+        ("refresh_product_preview", "product_agent"),
+    ]
     session.commit()
     committed_snapshot = planner.phase_snapshot()
     committed_item = committed_snapshot["items"]["REQ-01"]
@@ -891,9 +1197,10 @@ def test_planner_reads_integration_fidelity_boundary_from_persisted_artifacts(tm
     manifest_path.write_bytes(original_manifest_bytes)
 
 
-@pytest.mark.parametrize("tamper", ("stale", "missing", "foreign"))
-def test_technical_failure_manifest_is_validated_before_product_routing(tmp_path: Path, tamper: str) -> None:
-    context = RunContext("RUN-TECHNICAL-FAILURE-BOUNDARY", tmp_path / tamper)
+def test_pending_integration_failure_stays_retryable_before_product_routing(tmp_path: Path) -> None:
+    """A rejected technical-failure attempt cannot route an item terminally."""
+
+    context = RunContext("RUN-TECHNICAL-FAILURE-BOUNDARY", tmp_path / "pending")
     RunLifecycle.create(context, ("REQ-01",), mode="requirement")
     item = ItemWorkspace.create(context, "REQ-01", mode="requirement", original_text="unrecoverable")
     item.write_draft({"answer": "accepted"})
@@ -906,7 +1213,18 @@ def test_technical_failure_manifest_is_validated_before_product_routing(tmp_path
         "integration-owner",
         invocation_id="inv-REQ-01",
     )
-    session.mark_technical_failure("unrecoverable integration")
+    state_path = item.item_root / "item_state.json"
+    before_state = state_path.read_bytes()
+    failure_path = context.run_root / "requirements/REQ-01/integration/technical_failure/manifest.json"
+    result = session.mark_technical_failure("unrecoverable integration")
+    assert result["status"] == "pending"
+    assert result["recoverable"] is True
+    assert result["continuation"] == "same_session"
+    assert session.status == "open"
+    assert item.integration_state == "pending"
+    assert state_path.read_bytes() == before_state
+    assert not failure_path.exists()
+
     RequirementSupervisorWorkspace(context).save(
         RequirementExecutionPlan(
             input_records=(RequirementRecord(requirement_id="REQ-01", original_text="unrecoverable"),),
@@ -916,31 +1234,22 @@ def test_technical_failure_manifest_is_validated_before_product_routing(tmp_path
             revision=1,
         )
     )
-    failure_path = context.run_root / "requirements/REQ-01/integration/technical_failure/manifest.json"
-    if tamper == "stale":
-        value = json.loads(failure_path.read_text(encoding="utf-8"))
-        value["reason"] = "different reason"
-        failure_path.write_text(json.dumps(value), encoding="utf-8")
-    elif tamper == "missing":
-        failure_path.unlink()
-    else:
-        value = json.loads(failure_path.read_text(encoding="utf-8"))
-        value["item_id"] = "REQ-FOREIGN"
-        unsigned = {key: value for key, value in value.items() if key != "manifest_hash"}
-        value["manifest_hash"] = __import__("hashlib").sha256(
-            (json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
-        ).hexdigest()
-        failure_path.write_text(
-            json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
-            encoding="utf-8",
-        )
     planner = RequirementSupervisorWorkspace(context)
     snapshot = planner.phase_snapshot()
     item_view = snapshot["items"]["REQ-01"]
-    assert item_view["committed_integration_validation"]["valid"] is False
+    assert item_view["terminal_status"] == "accepted"
+    assert item_view["integration_state"] == "pending"
+    assert item_view["integration_stage"] == "staging_incomplete"
+    assert item_view["integration_validation"]["stage"] == "staging_incomplete"
+    assert item_view["integration_validation"]["handoff"]["continuation"] == "same_session"
     assert snapshot["all_items_integrated"] is False
     actions = planner.next_actions()
-    assert any(action.action == "repair_integration_fidelity" for action in actions)
+    assert [(action.action, action.role) for action in actions] == [
+        ("integrate_requirement", "integration_agent"),
+        ("refresh_product_preview", "product_agent"),
+    ]
+    assert actions[0].metadata["continuation"] == "same_session"
+    assert actions[0].metadata["handoff"]["session_id"] == session.session_id
     assert all(action.action not in {"build_final_product", "build_product_candidate"} for action in actions)
 
 
@@ -1033,6 +1342,60 @@ def test_report_finalizer_requires_persisted_preflight_and_recovers_transaction(
         if path.is_file()
     }
     assert before == after
+
+
+def test_report_finalizer_public_recover_converges_backup_moved_in_fresh_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A backup-moved crash is recoverable without retaining the old object."""
+
+    root = tmp_path / "run"
+    preflight = _report_preflight(root, "RUN-REPORT-FRESH-RECOVERY")
+    first = RunReportFinalizer(root)
+
+    class SimulatedProcessDeath(BaseException):
+        pass
+
+    reporting_module = __import__("auto_foundry_core.reporting", fromlist=["RunReportFinalizer"])
+    original_write_intent = reporting_module.RunReportFinalizer._write_intent
+    fired = {"value": False}
+
+    def fail_after_backup_moved(finalizer: object, intent: object) -> object:
+        result = original_write_intent(finalizer, intent)
+        if not fired["value"] and isinstance(intent, dict) and intent.get("phase") == "backup_moved":
+            fired["value"] = True
+            raise SimulatedProcessDeath("after backup_moved journal")
+        return result
+
+    monkeypatch.setattr(reporting_module.RunReportFinalizer, "_write_intent", fail_after_backup_moved)
+    with pytest.raises(SimulatedProcessDeath, match="backup_moved"):
+        first.finalize(preflight, lifecycle_status="complete")
+    assert fired["value"] is True
+    assert (root / ".reporting.finalize.intent.json").is_file()
+    assert any(path.name.startswith(".reporting.finalize-staging-") for path in root.iterdir())
+
+    # Restore the failpoint and construct the finalizer from disk only.  No
+    # Python finalizer/preflight object from the crashed process is reused.
+    monkeypatch.setattr(reporting_module.RunReportFinalizer, "_write_intent", original_write_intent)
+    del first
+    del preflight
+    fresh = RunReportFinalizer(root)
+    recovered = fresh.recover()
+    assert recovered["valid"] is True
+    assert recovered["stage"] == "finalized"
+    persisted = RunReportInputGatherer(root, run_id="RUN-REPORT-FRESH-RECOVERY").load()
+    receipt = fresh.finalize(persisted, lifecycle_status="complete")
+    assert receipt["terminal_status"] == "terminalized"
+    assert not (root / ".reporting.finalize.intent.json").exists()
+
+
+def test_report_finalizer_public_recover_rejects_unbound_residue(tmp_path: Path) -> None:
+    root = tmp_path / "run"
+    root.mkdir(parents=True)
+    (root / ".reporting.finalize-staging-orphan").mkdir()
+    with pytest.raises(ValueError, match="unbound.*operator repair"):
+        RunReportFinalizer(root).recover()
 
 
 @pytest.mark.parametrize("failpoint", ("before_mkdir", "write_report", "after_staging_verify", "after_swap"))

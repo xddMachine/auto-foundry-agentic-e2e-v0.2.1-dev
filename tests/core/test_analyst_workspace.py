@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import threading
 import textwrap
@@ -22,7 +23,10 @@ from auto_foundry_core import (
     DataRoomWorkbench,
     EvidenceNote,
     ItemWorkspace,
+    KnowledgeDelta,
+    LEMRef,
     load_bound_analysis_context,
+    OntologyItem,
     PreparedAssetRegistry,
     ReviewFinding,
     RequirementAnalysisPlan,
@@ -30,6 +34,7 @@ from auto_foundry_core import (
     RunContext,
     SpecialistMemo,
     SpecialistTask,
+    SemanticSnapshotStore,
 )
 from auto_foundry_core.integration import IntegrationSession
 from auto_foundry_core.lifecycle import AgentInvocationReceipt, InvocationReceiptLedger, RunLifecycle
@@ -345,7 +350,7 @@ def test_business_review_uses_semantic_provenance_and_item_local_paths(tmp_path:
     targeted = analyst.review.record("accept", reviewer_ref="targeted-business-reviewer")
     assert targeted["targeted_recheck"] is True
     assert targeted["changed_pointers"] == ["/answer"]
-    snapshot = analyst.accept(accepted_refs=("work/plan.json", "work/calculations/count.py"))
+    snapshot = item.accept(accepted_refs=("work/plan.json", "work/calculations/count.py"))
     assert snapshot.outcome == "accepted"
 
 
@@ -1872,7 +1877,7 @@ def obsolete_targeted_business_repair_replaces_scope_with_exact_narrow_union_end
     assert (item.item_root / "item_state.json").read_bytes() == state_before_third
     assert item.business_review_path.read_bytes() == packet_before_third
 
-    accepted = analyst.accept(accepted_refs=("work/analysis.json", "work/evidence.jsonl"))
+    accepted = item.accept(accepted_refs=("work/analysis.json", "work/evidence.jsonl"))
     assert accepted.outcome == "accepted"
     assert item.state["business_repair_count"] == 2
 
@@ -2124,6 +2129,91 @@ def test_requirement_plan_is_parent_scoped_exactly_idempotent_and_required_befor
     analyst.submit_answer("One parent requirement answer.")
     assert item.draft_root.is_file()
     assert item.state["review"]["status"] == "pending"
+
+
+def test_requirement_plan_binds_during_readiness_attempt_before_material_analysis(tmp_path: Path) -> None:
+    input_root = tmp_path / "inputs"
+    input_root.mkdir()
+    archive = input_root / "fixture.zip"
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+        output.writestr("milk.csv", "milk_fat,price\n3.5,10\n")
+    original = "dashboard should show the ratio of milk fat content to procurement price"
+    context = RunContext("RUN-REQUIREMENT-PLAN-ACTIVE-ATTEMPT", tmp_path / "run", (input_root,))
+    workbench = DataRoomWorkbench(context, DataAssetRef.from_path(archive))
+    item = ItemWorkspace.create(context, "R-002", mode="requirement", original_text=original)
+    bound = BoundAnalysisContext.create(context, DataAssetRef.from_path(archive), item, workbench=workbench)
+    analyst = AnalystWorkspace(bound, owner_ref="owner-R-002")
+
+    attempt = item.begin_attempt("ao-R-002", "Analytical Owner", route="requirement")
+    plan = RequirementAnalysisPlan(
+        tasks=(
+            RequirementAnalysisTask(
+                task_id="T-1",
+                question="Measure the supplied milk-fat population.",
+                expected_analytical_outputs=("milk-fat numerator",),
+            ),
+        ),
+        synthesis_intent="Synthesize one bounded ratio answer.",
+    )
+    first = analyst.plan_requirement(plan)
+    assert first == analyst.plan_requirement(plan)
+    assert item.work_root.joinpath("requirement_plan.json").is_file()
+
+    changed = RequirementAnalysisPlan(
+        tasks=plan.tasks,
+        synthesis_intent="Revise the ratio intent while research is active.",
+    )
+    revised = analyst.plan_requirement(changed)
+    assert revised.synthesis_intent == changed.synthesis_intent
+    assert analyst.brief().requirement_plan == revised
+
+    with pytest.raises(ValueError, match="semantic scope decision"):
+        analyst.begin_analysis(objective="ratio", strategy="bounded")
+    analyst.select_semantic_scope(
+        no_reuse_reason="The readiness snapshot contains no accepted reusable semantics.",
+        purpose="Record the first-run semantic decision.",
+    )
+    analyst.begin_analysis(objective="ratio", strategy="bounded")
+    item.finish_attempt(attempt.attempt_id, status="completed")
+
+
+def test_requirement_material_paths_require_plan_but_question_mode_prepare_is_unchanged(tmp_path: Path) -> None:
+    input_root = tmp_path / "requirement-inputs"
+    input_root.mkdir()
+    archive = input_root / "fixture.zip"
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as output:
+        output.writestr("orders.csv", "order_id,amount\nO-1,10\n")
+    context = RunContext("RUN-REQUIREMENT-MATERIAL-GATES", tmp_path / "requirement-run", (input_root,))
+    workbench = DataRoomWorkbench(context, DataAssetRef.from_path(archive))
+    item = ItemWorkspace.create(context, "R-003", mode="requirement", original_text="Analyze supplied orders.")
+    bound = BoundAnalysisContext.create(context, DataAssetRef.from_path(archive), item, workbench=workbench)
+    analyst = AnalystWorkspace(bound, owner_ref="owner-R-003")
+    analyst.select_semantic_scope(
+        no_reuse_reason="The requirement snapshot contains no accepted reusable semantics.",
+        purpose="Record the semantic decision before material execution.",
+    )
+
+    with pytest.raises(ValueError, match="persisted semantic plan"):
+        analyst.run_analysis(tmp_path / "not-run.py")
+    with pytest.raises(ValueError, match="persisted semantic plan"):
+        analyst.prepare_data(
+            "requirement-candidate",
+            next(entry for entry in analyst.context.source_catalog.entries if entry.path == "orders.csv"),
+        )
+
+    question_root = tmp_path / "question"
+    question_root.mkdir()
+    question_analyst, _question_item = _workspace(question_root)
+    question_entry = next(
+        entry for entry in question_analyst.context.source_catalog.entries if entry.path == "orders.csv"
+    )
+    candidate = question_analyst.prepare_data(
+        "question-candidate",
+        question_entry,
+        scope="reusable",
+        transformations=("bounded_fixture_copy",),
+    )
+    assert candidate.prepared_asset_id == "question-candidate"
 
 
 def test_active_repair_reconciliation_rejects_category_changes(
@@ -2387,8 +2477,8 @@ def test_facade_rejects_duplicate_or_unassigned_evidence_and_specialist_records(
         )
     analyst.assign_specialist(tasks[1])
     analyst.assign_specialist(tasks[2])
-    with pytest.raises(ValueError, match="at most three"):
-        analyst.assign_specialist(tasks[3])
+    analyst.assign_specialist(tasks[3])
+    assert tuple(task.task_id for task in analyst.specialist_tasks()) == ("S-1", "S-2", "S-3", "S-4")
 
 
 def test_analyst_facade_runs_deterministic_code_without_transferring_ownership(tmp_path: Path) -> None:
@@ -2478,7 +2568,7 @@ def test_later_item_reuses_accepted_lem_and_prepared_asset(tmp_path: Path) -> No
     relationship_payload = relationship.to_dict()
     q1_analyst.submit_answer("Two bounded order rows were supplied.")
     q1.record_review("accept", reviewer_ref="reviewer-Q-001")
-    q1_analyst.accept(accepted_refs=("work/plan.json", "work/analytical_relationships.jsonl"))
+    q1.accept(accepted_refs=("work/plan.json", "work/analytical_relationships.jsonl"))
 
     session = IntegrationSession.create(
         context,
@@ -2708,8 +2798,52 @@ def test_reserved_semantic_snapshot_fresh_manifest_reload_requires_inheritance(t
         load_bound_analysis_context(analyst.context.context, path=analyst.context.manifest_path, item_workspace=item)
 
 
-def test_snapshot_skips_accepted_integration_failure_and_keeps_later_commits(tmp_path: Path) -> None:
-    """A failed integration predecessor does not hide later committed semantics."""
+def _seed_historical_integration_failure(item: ItemWorkspace, session: IntegrationSession) -> None:
+    """Seed a pre-existing failure snapshot for historical projection replay.
+
+    New accepted integrations cannot create this state.  This fixture models
+    an older run so the projection reader remains covered without reopening a
+    production terminalization path.
+    """
+
+    failure_root = item.item_root / "integration" / "technical_failure"
+    failure_root.mkdir(parents=True)
+    unsigned = {
+        "schema_version": "1",
+        "session_id": session.session_id,
+        "item_id": item.item_id,
+        "owner_id": session.owner_id,
+        "status": "technical_failure",
+        "accepted_content_hash": session.bundle.content_hash,
+        "reason": "historical fixture failure",
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+    manifest = {
+        **unsigned,
+        "manifest_hash": hashlib.sha256(
+            (
+                json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                + "\n"
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+    (failure_root / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    state_path = item.item_root / "item_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["integration_state"] = "technical_failure"
+    state["integration_manifest_hash"] = manifest["manifest_hash"]
+    state["integration_manifest_ref"] = "integration/technical_failure/manifest.json"
+    state_path.write_text(
+        json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_snapshot_skips_pending_integration_and_keeps_later_commits(tmp_path: Path) -> None:
+    """A recoverable predecessor stays pending; later commits remain visible."""
 
     input_root = tmp_path / "inputs"
     input_root.mkdir()
@@ -2751,7 +2885,22 @@ def test_snapshot_skips_accepted_integration_failure_and_keeps_later_commits(tmp
         scope="question",
         evidence_refs=("work/plan.json",),
     )
-    q2_session.mark_technical_failure("integration unavailable")
+    q2_state_path = q2.item_root / "item_state.json"
+    before_q2_state = q2_state_path.read_bytes()
+    failure_path = q2_session.staging_root.parent / "technical_failure" / "manifest.json"
+    incident = q2_session.mark_technical_failure("integration unavailable")
+    assert incident["status"] == "pending"
+    assert incident["recoverable"] is True
+    assert incident["continuation"] == "same_session"
+    assert q2_session.status == "open"
+    assert q2.integration_state == "pending"
+    assert not failure_path.exists()
+    assert q2_state_path.read_bytes() == before_q2_state
+
+    # Preserve historical-reader coverage with an explicit old-run fixture,
+    # never through the now-forbidden production failure transition.
+    _seed_historical_integration_failure(q2, q2_session)
+    q2_session.release()
 
     q3 = ItemWorkspace.create(context, "Q-003", original_text="Q3")
     q3_bound = BoundAnalysisContext.create_from_transitioned_catalog(context, q3, q2_bound, lifecycle)
@@ -2771,6 +2920,205 @@ def test_snapshot_skips_accepted_integration_failure_and_keeps_later_commits(tmp
     q4_bound = BoundAnalysisContext.create_from_transitioned_catalog(context, q4, q3_bound, lifecycle)
     ids = {item.item_id for item in AnalystWorkspace(q4_bound, owner_ref="owner-Q-004").search_ontology()}
     assert ids == {"q1-definition", "q3-definition"}
+
+
+def test_requirement_refresh_snapshot_uses_archived_target_frontier_and_current_views(tmp_path: Path) -> None:
+    """A reopened owner sees its reviewed predecessor and live successors only."""
+
+    input_root = tmp_path / "inputs"
+    input_root.mkdir()
+    archive_path = input_root / "fixture.zip"
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as output:
+        output.writestr("orders.csv", "id\nA-1\n")
+
+    context = RunContext("RUN-SEMANTIC-REFRESH-FRONTIER", tmp_path / "run", (input_root,))
+    lifecycle = RunLifecycle.create(context, ("REQ-1", "REQ-2"), mode="requirement")
+
+    def accepted(item_id: str, *, relationship_id: str | None = None, relation_object_id: str | None = None) -> ItemWorkspace:
+        item = ItemWorkspace.create(context, item_id, mode="requirement", original_text=item_id)
+        item.write_plan({"item_id": item_id, "offline": True})
+        accepted_refs = ["work/plan.json"]
+        if relationship_id is not None:
+            assert relation_object_id is not None
+            bound = BoundAnalysisContext.create_for_requirement(
+                context,
+                DataAssetRef.from_path(archive_path),
+                item,
+                lifecycle,
+            )
+            AnalystWorkspace(bound, owner_ref=f"owner-{item_id}").record_analytical_relationship(
+                relationship_id=relationship_id,
+                source_id=relation_object_id,
+                target_id=relation_object_id,
+                cardinality="one_to_one",
+                join_keys=({"source_field": "id", "target_field": "id"},),
+                matched_pairs=1,
+                source_population=1,
+                target_population=1,
+                matched_source_count=1,
+                matched_target_count=1,
+                source_coverage=1.0,
+                target_coverage=1.0,
+                date_authority="fixture",
+                limitations=(),
+                evidence_refs=("work/plan.json",),
+                publishable=True,
+            )
+            accepted_refs.append("work/analytical_relationships.jsonl")
+        item.write_draft({"answer": item_id})
+        item.record_review("accept", reviewer_ref=f"reviewer-{item_id}")
+        item.accept(accepted_refs=tuple(accepted_refs))
+        return item
+
+    def commit_records(item: ItemWorkspace, records: tuple[tuple[str, str, str], ...]) -> None:
+        session = IntegrationSession.create(
+            context,
+            item,
+            PreparedAssetRegistry(context),
+            "integration-owner",
+            invocation_id=f"inv-{item.item_id}",
+        )
+        for kind, object_id, label in records:
+            if kind == "ontology":
+                session.add_ontology_item(
+                    OntologyItem(
+                        item_id=object_id,
+                        item_type="entity",
+                        label=label,
+                        source_refs=(f"evidence://{object_id}",),
+                    ),
+                    scope="requirement",
+                    evidence_refs=("work/plan.json",),
+                )
+            else:
+                session.add_relationship(
+                        {
+                            "relationship_id": object_id,
+                            "analysis_relationship_id": object_id,
+                            "source_id": label,
+                            "target_id": label,
+                            "label": object_id,
+                            "cardinality": "one_to_one",
+                                "join_keys": [{"source_field": "id", "target_field": "id"}],
+                            "matched_pairs": 1,
+                            "source_population": 1,
+                            "target_population": 1,
+                            "matched_source_count": 1,
+                            "matched_target_count": 1,
+                            "source_coverage": 1.0,
+                            "target_coverage": 1.0,
+                            "date_authority": "fixture",
+                            "as_of": None,
+                            "limitations": [],
+                            "evidence_refs": ["work/plan.json"],
+                        },
+                        scope="requirement",
+                        evidence_refs=("work/plan.json",),
+                )
+        session.record_fidelity_review("accept", checked_record_ids=tuple(record.record_id for record in session.records))
+        session.commit()
+
+    def archive_item(item_id: str, generation_id: str) -> None:
+        source = context.run_root / "requirements" / item_id
+        history = context.run_root / "history" / "requirements" / item_id / generation_id
+        history.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(source, history)
+
+    # First generation: REQ-1 is the target's reviewed predecessor; REQ-2 is
+    # the other item's predecessor that the next generation will supersede.
+    req1_old = accepted("REQ-1", relationship_id="req1-rel-v1", relation_object_id="req1-v1")
+    commit_records(req1_old, (("ontology", "req1-v1", "REQ-1"), ("relationship", "req1-rel-v1", "req1-v1")))
+    req2_old = accepted("REQ-2", relationship_id="req2-rel-v1", relation_object_id="req2-v1")
+    commit_records(req2_old, (("ontology", "req2-v1", "REQ-2"), ("relationship", "req2-rel-v1", "req2-v1")))
+    archive_item("REQ-1", "G-0002")
+    archive_item("REQ-2", "G-0003")
+
+    # REQ-2's current successor explicitly supersedes both prior objects.  It
+    # is committed before the REQ-1 fresh head is opened, so it is in the
+    # target's before-current-candidate frontier.
+    req2_new = accepted("REQ-2")
+    session = IntegrationSession.create(
+        context,
+        req2_new,
+        PreparedAssetRegistry(context),
+        "integration-owner",
+        invocation_id="inv-REQ-2-successor",
+    )
+    session.add_knowledge_delta(
+        KnowledgeDelta(
+            "req2-ontology-v2",
+            "add_ontology_item",
+            {
+                "item_id": "req2-v2",
+                "item_type": "entity",
+                "label": "REQ-2 current",
+                "source_refs": ["evidence://req2-v2"],
+            },
+            evidence_refs=("work/plan.json",),
+            supersedes=(LEMRef("ontology", "req2-v1"),),
+            accepted=True,
+        ),
+        scope="requirement",
+        evidence_refs=("work/plan.json",),
+    )
+    session.add_knowledge_delta(
+        KnowledgeDelta(
+            "req2-relationship-v2",
+            "add_relationship",
+            {
+                "relationship_id": "req2-rel-v2",
+                "analysis_relationship_id": "req2-rel-v2",
+                "source_id": "req2-v2",
+                "target_id": "req2-v2",
+                "label": "REQ-2 current relationship",
+                "cardinality": "one_to_one",
+                "join_keys": [{"source_field": "id", "target_field": "id"}],
+                "matched_pairs": 1,
+                "source_population": 1,
+                "target_population": 1,
+                "matched_source_count": 1,
+                "matched_target_count": 1,
+                "source_coverage": 1.0,
+                "target_coverage": 1.0,
+                "date_authority": "fixture",
+                "as_of": None,
+                "limitations": [],
+                "evidence_refs": ["work/plan.json"],
+            },
+            evidence_refs=("work/plan.json",),
+            supersedes=(LEMRef("relationship", "req2-rel-v1"),),
+            accepted=True,
+        ),
+        scope="requirement",
+        evidence_refs=("work/plan.json",),
+    )
+    session.record_fidelity_review("accept", checked_record_ids=tuple(record.record_id for record in session.records))
+    session.commit()
+
+    # The fresh REQ-1 head has an uncommitted candidate in staging.  It must
+    # remain invisible while its archived accepted predecessor is reusable.
+    req1_current = ItemWorkspace.create(context, "REQ-1", mode="requirement", original_text="REQ-1 refreshed")
+    req1_current.write_plan({"item_id": "REQ-1", "candidate_ontology": "req1-uncommitted"})
+    req1_current.write_draft({"answer": "uncommitted candidate"})
+
+    bound = BoundAnalysisContext.create_for_requirement(
+        context,
+        DataAssetRef.from_path(archive_path),
+        req1_current,
+        lifecycle,
+    )
+    analyst = AnalystWorkspace(bound, owner_ref="owner-REQ-1")
+    found = analyst.search_ontology()
+    found_ids = {item.item_id for item in found}
+    assert {"req1-v1", "req1-rel-v1", "req2-v2", "req2-rel-v2"}.issubset(found_ids)
+    assert {"req2-v1", "req2-rel-v1", "req1-uncommitted"}.isdisjoint(found_ids)
+
+    snapshot_ontology = SemanticSnapshotStore.records(context, bound.semantic_snapshot_ref, "ontology")["ontology"]
+    snapshot_relationships = SemanticSnapshotStore.records(context, bound.semantic_snapshot_ref, "relationships")["relationships"]
+    req1_item = next(item for item in snapshot_ontology if item["item_id"] == "req1-v1")
+    req1_relationship = next(item for item in snapshot_relationships if item["relationship_id"] == "req1-rel-v1")
+    assert req1_item["source_refs"] == ["evidence://req1-v1"]
+    assert req1_relationship["evidence_refs"] == ["work/plan.json"]
 
 
 @pytest.mark.parametrize(
@@ -2857,6 +3205,75 @@ def test_identity_domain_proposals_are_typed_idempotent_and_item_local(tmp_path:
     )
     assert len(other_analyst.read_identity_domain_proposals()) == 1
     assert len(analyst.read_identity_domain_proposals()) == 1
+
+
+def test_identity_domain_successor_is_append_only_cas_bound_and_effective(tmp_path: Path) -> None:
+    analyst, item = _workspace(tmp_path)
+    predecessor = analyst.propose_identity_domain(
+        "shared-product",
+        "product_material_sku",
+        "The first proposal used the narrower material representation.",
+        ("materials.csv:sku",),
+        ("materials",),
+    )
+    proposal_path = item.work_root / "identity_domain_proposals.jsonl"
+    predecessor_bytes = proposal_path.read_bytes()
+
+    successor = analyst.supersede_identity_domain_proposal(
+        "shared-product",
+        "product",
+        "The shared domain is one product class and retains the material scope.",
+        ("materials.csv:sku", "catalog.csv:product_id"),
+        ("materials", "catalog"),
+        expected_predecessor_hash=predecessor.digest,
+    )
+    assert successor.revision == 2
+    assert successor.supersedes_hash == predecessor.digest
+    assert successor.superseded_object_type == "product_material_sku"
+    assert successor.object_type == "product"
+    assert proposal_path.read_bytes().startswith(predecessor_bytes)
+
+    effective = analyst.read_identity_domain_proposals()
+    history = analyst.read_identity_domain_proposal_history()
+    assert len(effective) == 1
+    assert effective[0] == successor
+    assert [proposal.revision for proposal in history] == [1, 2]
+    assert history[0].digest == predecessor.digest
+    assert history[0].object_type == predecessor.object_type
+    assert history[0].rationale == predecessor.rationale
+    assert history[1].superseded_object_type == predecessor.object_type
+
+    # Retrying the exact CAS is idempotent and does not append another row.
+    successor_bytes = proposal_path.read_bytes()
+    retried = analyst.supersede_identity_domain_proposal(
+        "shared-product",
+        "product",
+        "The shared domain is one product class and retains the material scope.",
+        ("materials.csv:sku", "catalog.csv:product_id"),
+        ("materials", "catalog"),
+        expected_predecessor_hash=predecessor.digest,
+    )
+    assert retried == successor
+    assert proposal_path.read_bytes() == successor_bytes
+
+    with pytest.raises(ValueError, match="successor conflicts"):
+        analyst.supersede_identity_domain_proposal(
+            "shared-product",
+            "supplier",
+            "A divergent branch is not a retry.",
+            ("suppliers.csv:id",),
+            ("suppliers",),
+            expected_predecessor_hash=predecessor.digest,
+        )
+    with pytest.raises(ValueError, match="predecessor is unknown"):
+        analyst.supersede_identity_domain_proposal(
+            "shared-product",
+            "product",
+            "The shared domain is one product class and retains the material scope.",
+            ("materials.csv:sku", "catalog.csv:product_id"),
+            ("materials", "catalog"),
+            expected_predecessor_hash="a" * 64,
+        )
 
 
 def test_mark_waiting_on_resolution_delegates_without_runtime_import(tmp_path: Path) -> None:
@@ -3622,44 +4039,6 @@ def obsolete_replace_evidence_notes_exact_retry_accepts_authorized_completed_att
     ).hexdigest()
 
 
-def obsolete_replace_evidence_notes_accepts_authorized_receipt_delta_after_public_upgrade(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A public implementation rebase may carry one current authorized receipt."""
-
-    analyst, item, corrected = _a3_evidence_replacement_fixture(tmp_path)
-    lifecycle = RunLifecycle.create(item.context, (item.item_id,))
-    monkeypatch.setattr(
-        analysis_module,
-        "_current_implementation_identity",
-        lambda _context: ("a" * 40, "b" * 40),
-    )
-    upgrade_active_repair_implementation(
-        item.context,
-        item,
-        lifecycle,
-        owner_ref=analyst.owner_ref,
-        reason="authorized evidence repair implementation rebase",
-        receipt_ref="receipt:evidence-repair-rebase",
-    )
-
-    late_receipt = item.work_root / ".analysis-run" / "late.stdout"
-    late_receipt.write_bytes(b"authorized late receipt")
-    late_ref = "work/.analysis-run/late.stdout"
-    packet = json.loads(item.business_review_path.read_text(encoding="utf-8"))
-    packet["after_artifact_hashes"][late_ref] = hashlib.sha256(late_receipt.read_bytes()).hexdigest()
-    item._write_business_review(packet, touch_state=False, emit=False)
-
-    assert analyst.replace_evidence_notes(corrected) == corrected
-    artifact = item.work_root / "evidence.jsonl"
-    content = artifact.read_bytes()
-    mtime = artifact.stat().st_mtime_ns
-    assert analyst.replace_evidence_notes(corrected) == corrected
-    assert artifact.read_bytes() == content
-    assert artifact.stat().st_mtime_ns == mtime
-
-
 def obsolete_replace_evidence_notes_accepts_unchanged_failed_attempt_receipts_in_latest_baseline(
     tmp_path: Path,
 ) -> None:
@@ -3697,53 +4076,6 @@ def obsolete_replace_evidence_notes_narrow_scope_accepts_a4_a5_exact_retry(
     assert analyst.replace_evidence_notes(corrected) == corrected
     assert artifact.read_bytes() == content
     assert artifact.stat().st_mtime_ns == mtime
-
-
-def obsolete_replace_evidence_notes_narrow_scope_accepts_upgrade_then_exact_retry(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A public program rebase remains valid across the first replacement retry."""
-
-    analyst, item, corrected = _a4_failed_a5_baseline_fixture(tmp_path, narrow=True)
-    lifecycle = RunLifecycle.create(item.context, (item.item_id,))
-    monkeypatch.setattr(
-        analysis_module,
-        "_current_implementation_identity",
-        lambda _context: ("a" * 40, "b" * 40),
-    )
-    upgrade_active_repair_implementation(
-        item.context,
-        item,
-        lifecycle,
-        owner_ref=analyst.owner_ref,
-        reason="evidence repair implementation rebase",
-        receipt_ref="receipt:evidence-repair-rebase-narrow",
-    )
-
-    artifact = item.work_root / "evidence.jsonl"
-    assert analyst.replace_evidence_notes(corrected) == corrected
-    content = artifact.read_bytes()
-    mtime = artifact.stat().st_mtime_ns
-    assert analyst.replace_evidence_notes(corrected) == corrected
-    assert artifact.read_bytes() == content
-    assert artifact.stat().st_mtime_ns == mtime
-
-    changed = tuple(
-        _evidence_note_for_replacement(
-            f"E-A5-CHANGED-{index}",
-            evidence_ref=f"work/evidence.jsonl#E-A5-CHANGED-{index}",
-        )
-        for index in range(4)
-    )
-    assert analyst.replace_evidence_notes(changed) == changed
-    assert artifact.read_bytes() != content
-    rows = [
-        json.loads(line)
-        for line in artifact.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert [row["evidence_id"] for row in rows] == [value.evidence_id for value in changed]
 
 
 def obsolete_replace_evidence_notes_narrow_scope_rejects_unvalidated_extra_receipt(
@@ -4281,351 +4613,6 @@ def obsolete_replace_relationships_rejects_completed_recovery_route_handoff(tmp_
 
     corrected = _repair_relationship("rel-handoff-recovery", evidence_ref="work/results/result.json")
     with pytest.raises(ValueError, match="route"):
-        analyst.replace_analytical_relationships((corrected,))
-
-
-def obsolete_active_repair_implementation_upgrade_is_explicit_owner_bound_and_idempotent(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    analyst, item = _workspace(tmp_path)
-    lifecycle = RunLifecycle.create(item.context, (item.item_id,))
-    analyst.record_analytical_relationship(_repair_relationship("rel-upgrade"))
-    _begin_relationship_repair(analyst, finding_id="BR-IMPLEMENTATION-UPGRADE")
-    stale_context = analyst.context
-    old_pair = analysis_module._current_implementation_identity(item.context)
-    fake_pair = ("a" * 40, "b" * 40)
-    monkeypatch.setattr(analysis_module, "_current_implementation_identity", lambda _context: fake_pair)
-
-    with pytest.raises(ValueError, match="implementation identity is not current"):
-        load_bound_analysis_context(item.context, path=stale_context.manifest_path, item_workspace=item)
-
-    upgraded = upgrade_active_repair_implementation(
-        item.context,
-        item,
-        lifecycle,
-        owner_ref=analyst.owner_ref,
-        reason="repair API source hot-upgrade",
-        receipt_ref="receipt:repair-upgrade-1",
-    )
-    assert upgraded.manifest_hash != stale_context.manifest_hash
-    assert (upgraded.manifest_path.parent / "analysis_context_repair_upgrades.jsonl").is_file()
-    packet_after_upgrade = json.loads(
-        (item.work_root / "business_review.json").read_text(encoding="utf-8")
-    )
-    assert packet_after_upgrade["after_artifact_hashes"] == dict(item.artifact_progress().hashes)
-    manifest_bytes = upgraded.manifest_path.read_bytes()
-    audit_path = upgraded.manifest_path.parent / "analysis_context_repair_upgrades.jsonl"
-    audit_bytes = audit_path.read_bytes()
-    manifest_mtime = upgraded.manifest_path.stat().st_mtime_ns
-    audit_mtime = audit_path.stat().st_mtime_ns
-    assert load_bound_analysis_context(item.context, path=upgraded.manifest_path, item_workspace=item).manifest_hash == upgraded.manifest_hash
-
-    retry = upgrade_active_repair_implementation(
-        item.context,
-        item,
-        lifecycle,
-        owner_ref=analyst.owner_ref,
-        reason="repair API source hot-upgrade",
-        receipt_ref="receipt:repair-upgrade-1",
-    )
-    assert retry.manifest_hash == upgraded.manifest_hash
-    assert upgraded.manifest_path.read_bytes() == manifest_bytes
-    assert audit_path.read_bytes() == audit_bytes
-    assert upgraded.manifest_path.stat().st_mtime_ns == manifest_mtime
-    assert audit_path.stat().st_mtime_ns == audit_mtime
-
-    corrected = _repair_relationship("rel-upgrade", evidence_ref="work/evidence.jsonl#corrected")
-    assert analyst.replace_analytical_relationships((corrected,)) == (corrected,)
-    relationship_path = item.work_root / "analytical_relationships.jsonl"
-    relationship_bytes = relationship_path.read_bytes()
-    relationship_mtime = relationship_path.stat().st_mtime_ns
-    replacement_packet_bytes = (item.work_root / "business_review.json").read_bytes()
-    assert analyst.replace_analytical_relationships((corrected,)) == (corrected,)
-    assert relationship_path.read_bytes() == relationship_bytes
-    assert relationship_path.stat().st_mtime_ns == relationship_mtime
-    assert (item.work_root / "business_review.json").read_bytes() == replacement_packet_bytes
-
-    with pytest.raises(ValueError, match="owner_ref"):
-        upgrade_active_repair_implementation(
-            item.context,
-            item,
-            lifecycle,
-            owner_ref="other-owner",
-            reason="repair API source hot-upgrade",
-            receipt_ref="receipt:repair-upgrade-1",
-        )
-    assert old_pair != fake_pair
-
-
-def obsolete_replace_relationships_accepts_handoff_after_public_implementation_upgrade(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    analyst, item = _workspace(tmp_path)
-    lifecycle = RunLifecycle.create(item.context, (item.item_id,))
-    analyst.record_analytical_relationship(_repair_relationship("rel-upgrade-handoff"))
-    _begin_relationship_repair(analyst)
-    attempt = item.begin_attempt(analyst.owner_ref, "Analytical Owner", route="requirement")
-    item.write_handoff(_repair_handoff_payload(item, analyst, attempt.attempt_id))
-    item.finish_attempt(attempt.attempt_id, status="completed")
-
-    monkeypatch.setattr(
-        analysis_module,
-        "_current_implementation_identity",
-        lambda _context: ("a" * 40, "b" * 40),
-    )
-    upgrade_active_repair_implementation(
-        item.context,
-        item,
-        lifecycle,
-        owner_ref=analyst.owner_ref,
-        reason="repair API source hot-upgrade with completed handoff",
-        receipt_ref="receipt:repair-upgrade-handoff",
-    )
-
-    corrected = _repair_relationship(
-        "rel-upgrade-handoff",
-        evidence_ref="work/results/result.json",
-    )
-    assert analyst.replace_analytical_relationships((corrected,)) == (corrected,)
-
-
-def _upgraded_handoff_workspace(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> tuple[AnalystWorkspace, ItemWorkspace]:
-    analyst, item = _workspace(tmp_path)
-    lifecycle = RunLifecycle.create(item.context, (item.item_id,))
-    analyst.record_analytical_relationship(_repair_relationship("rel-upgrade-negative"))
-    _begin_relationship_repair(analyst)
-    attempt = item.begin_attempt(analyst.owner_ref, "Analytical Owner", route="requirement")
-    item.write_handoff(_repair_handoff_payload(item, analyst, attempt.attempt_id))
-    item.finish_attempt(attempt.attempt_id, status="completed")
-    monkeypatch.setattr(
-        analysis_module,
-        "_current_implementation_identity",
-        lambda _context: ("a" * 40, "b" * 40),
-    )
-    upgrade_active_repair_implementation(
-        item.context,
-        item,
-        lifecycle,
-        owner_ref=analyst.owner_ref,
-        reason="repair API source hot-upgrade with completed handoff",
-        receipt_ref="receipt:repair-upgrade-negative",
-    )
-    return analyst, item
-
-
-def _rewrite_repair_upgrade_artifacts(
-    item: ItemWorkspace,
-    records: list[dict[str, Any]],
-    *,
-    implementation_pair: tuple[str, str] | None = None,
-) -> None:
-    """Persist a canonical adversarial audit/manifest pair and packet maps."""
-
-    audit_ref = "work/analysis_context_repair_upgrades.jsonl"
-    manifest_ref = "work/analysis_context.json"
-
-    previous_hash: str | None = None
-    for record in records:
-        record["previous_hash"] = previous_hash
-        unsigned = {key: value for key, value in record.items() if key != "record_hash"}
-        record["record_hash"] = analysis_module._transition_digest(unsigned)
-        previous_hash = record["record_hash"]
-
-    audit = item.work_root / "analysis_context_repair_upgrades.jsonl"
-    audit.write_bytes(
-        b"".join(analysis_module._json_bytes(record) + b"\n" for record in records)
-    )
-    manifest_path = item.work_root / "analysis_context.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    unsigned_manifest = dict(manifest)
-    unsigned_manifest.pop("manifest_hash", None)
-    if implementation_pair is not None:
-        unsigned_manifest["implementation_sha"], unsigned_manifest["implementation_tree"] = implementation_pair
-    unsigned_manifest["active_repair_implementation_upgrade"] = {
-        "path": audit_ref,
-        "audit_count": len(records),
-        "audit_head": records[-1]["record_hash"],
-    }
-    unsigned_manifest["manifest_hash"] = hashlib.sha256(
-        analysis_module._json_bytes(
-            {key: value for key, value in unsigned_manifest.items() if key != "manifest_hash"}
-        )
-    ).hexdigest()
-    manifest_path.write_bytes(analysis_module._manifest_bytes(unsigned_manifest))
-
-    packet = json.loads(item.business_review_path.read_text(encoding="utf-8"))
-    for hashes in (packet["before_artifact_hashes"], packet["after_artifact_hashes"]):
-        hashes[manifest_ref] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-        hashes[audit_ref] = hashlib.sha256(audit.read_bytes()).hexdigest()
-    item._write_business_review(packet, touch_state=False, emit=False)
-
-
-@pytest.mark.parametrize("tamper", ("journal", "program_hash", "intent", "foreign"))
-def obsolete_replace_relationships_rejects_invalid_program_context_rebase(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    tamper: str,
-) -> None:
-    analyst, item = _upgraded_handoff_workspace(tmp_path, monkeypatch)
-    if tamper == "journal":
-        audit = item.work_root / "analysis_context_repair_upgrades.jsonl"
-        audit.write_bytes(audit.read_bytes() + b"{}\n")
-    elif tamper == "program_hash":
-        manifest = item.work_root / "analysis_context.json"
-        manifest.write_bytes(manifest.read_bytes() + b"\n")
-    elif tamper == "intent":
-        (item.work_root / "analysis_context_repair_upgrade_intent.json").write_text(
-            "{}\n",
-            encoding="utf-8",
-        )
-    else:
-        (item.work_root / "foreign.json").write_text("foreign\n", encoding="utf-8")
-
-    corrected = _repair_relationship("rel-upgrade-negative", evidence_ref="work/results/result.json")
-    with pytest.raises(ValueError, match="handoff|program context|authorized scope"):
-        analyst.replace_analytical_relationships((corrected,))
-
-
-@pytest.mark.parametrize(
-    ("program_path", "payload"),
-    (
-        ("work/analysis_context_transitions.jsonl", b"{}\n"),
-        ("work/analysis_context_transition_state.json", b"{}\n"),
-        ("work/analysis_context_transition_intent.json", b"{}\n"),
-        ("work/analysis_context_repair_upgrade_intent.json", b"{}\n"),
-    ),
-)
-def obsolete_replace_relationships_rejects_forged_program_context_delta(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    program_path: str,
-    payload: bytes,
-) -> None:
-    """Packet maps cannot authorize program artifacts outside public rebase."""
-
-    analyst, item = _upgraded_handoff_workspace(tmp_path, monkeypatch)
-    artifact = item.item_root / program_path
-    artifact.parent.mkdir(parents=True, exist_ok=True)
-    artifact.write_bytes(payload)
-    digest = hashlib.sha256(payload).hexdigest()
-    packet = json.loads(item.business_review_path.read_text(encoding="utf-8"))
-    packet["before_artifact_hashes"][program_path] = digest
-    packet["after_artifact_hashes"][program_path] = digest
-    # Use the durable writer so the forged packet is still canonical and
-    # shape-valid; the repair boundary must reject it on program provenance.
-    item._write_business_review(packet, touch_state=False, emit=False)
-
-    corrected = _repair_relationship("rel-upgrade-negative", evidence_ref="work/results/result.json")
-    with pytest.raises(ValueError, match="handoff|program context|authorized scope"):
-        analyst.replace_analytical_relationships((corrected,))
-
-
-def obsolete_replace_relationships_rejects_self_consistent_forged_upgrade_identity(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Packet hashes cannot bless a forged audit/manifest identity pair."""
-
-    analyst, item = _upgraded_handoff_workspace(tmp_path, monkeypatch)
-    audit_path = item.work_root / "analysis_context_repair_upgrades.jsonl"
-    manifest_path = item.work_root / "analysis_context.json"
-    records = [
-        dict(json.loads(line))
-        for line in audit_path.read_bytes().splitlines()
-    ]
-    forged = dict(records[-1])
-    forged.update(
-        {
-            "upgrade_id": "repair-upgrade-forged-self-consistent",
-            "before_manifest_hash": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
-            "old_sha": records[-1]["new_sha"],
-            "old_tree": records[-1]["new_tree"],
-            "new_sha": "c" * 40,
-            "new_tree": "d" * 40,
-            "reason": "forged repair implementation upgrade",
-            "receipt_ref": "receipt:forged-repair-upgrade",
-        }
-    )
-    records.append(forged)
-    _rewrite_repair_upgrade_artifacts(item, records, implementation_pair=("c" * 40, "d" * 40))
-
-    corrected = _repair_relationship("rel-upgrade-negative", evidence_ref="work/results/result.json")
-    with pytest.raises(ValueError, match="identity|program context|handoff"):
-        analyst.replace_analytical_relationships((corrected,))
-
-
-def obsolete_replace_relationships_rejects_upgrade_owner_chain_tamper(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    analyst, item = _upgraded_handoff_workspace(tmp_path, monkeypatch)
-    audit_path = item.work_root / "analysis_context_repair_upgrades.jsonl"
-    records = [
-        dict(json.loads(line))
-        for line in audit_path.read_bytes().splitlines()
-    ]
-    records[-1]["owner_ref"] = "other-owner"
-    _rewrite_repair_upgrade_artifacts(item, records)
-
-    corrected = _repair_relationship("rel-upgrade-negative", evidence_ref="work/results/result.json")
-    with pytest.raises(ValueError, match="owner|program context|handoff"):
-        analyst.replace_analytical_relationships((corrected,))
-
-
-def obsolete_replace_relationships_rejects_upgrade_baseline_root_tamper(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    analyst, item = _upgraded_handoff_workspace(tmp_path, monkeypatch)
-    audit_path = item.work_root / "analysis_context_repair_upgrades.jsonl"
-    records = [
-        dict(json.loads(line))
-        for line in audit_path.read_bytes().splitlines()
-    ]
-    records[0]["before_manifest_hash"] = "f" * 64
-    _rewrite_repair_upgrade_artifacts(item, records)
-
-    corrected = _repair_relationship("rel-upgrade-negative", evidence_ref="work/results/result.json")
-    with pytest.raises(ValueError, match="manifest chain|baseline|program context|handoff"):
-        analyst.replace_analytical_relationships((corrected,))
-
-
-def obsolete_replace_relationships_rejects_upgrade_identity_continuity_tamper(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    analyst, item = _upgraded_handoff_workspace(tmp_path, monkeypatch)
-    lifecycle = RunLifecycle.load(item.context)
-    second_pair = ("c" * 40, "d" * 40)
-    monkeypatch.setattr(
-        analysis_module,
-        "_current_implementation_identity",
-        lambda _context: second_pair,
-    )
-    upgrade_active_repair_implementation(
-        item.context,
-        item,
-        lifecycle,
-        owner_ref=analyst.owner_ref,
-        reason="repair API source second hot-upgrade",
-        receipt_ref="receipt:repair-upgrade-second",
-    )
-    audit_path = item.work_root / "analysis_context_repair_upgrades.jsonl"
-    records = [
-        dict(json.loads(line))
-        for line in audit_path.read_bytes().splitlines()
-    ]
-    records[-1]["old_sha"] = "e" * 40
-    records[-1]["old_tree"] = "f" * 40
-    _rewrite_repair_upgrade_artifacts(item, records, implementation_pair=second_pair)
-
-    corrected = _repair_relationship("rel-upgrade-negative", evidence_ref="work/results/result.json")
-    with pytest.raises(ValueError, match="implementation chain|program context|handoff"):
         analyst.replace_analytical_relationships((corrected,))
 
 

@@ -10,10 +10,13 @@ It never invokes a model or chooses an analytical conclusion.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
+import re
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
@@ -27,6 +30,7 @@ from .contracts import (
     RequirementAnalysisTask,
 )
 from .durable import AcceptedSnapshot, ItemWorkspace
+from .lifecycle import RunLifecycle
 from .mapping_view import IdentityMappingView
 from .semantic_store import SemanticSnapshotRef, SemanticSnapshotStore
 from .workbench import DataRoomCatalogEntry, DataRoomMember
@@ -68,8 +72,32 @@ _EVIDENCE_FILENAME = "evidence.jsonl"
 _SPECIALIST_TASKS_FILENAME = "specialist_tasks.jsonl"
 _SPECIALIST_MEMOS_FILENAME = "specialist_memos.jsonl"
 _REQUIREMENT_PLAN_FILENAME = "requirement_plan.json"
+_REQUIREMENT_PLAN_REVISIONS_DIRNAME = "requirement_plan_revisions"
+_REQUIREMENT_PLAN_REVISION_KIND = "requirement_plan_revision"
+_REQUIREMENT_PLAN_REVISION_SCHEMA = "auto_foundry.requirement_plan_revision.v1"
+_REQUIREMENT_PLAN_REVISION_NAME = re.compile(r"^rev-(\d{4,})\.json$")
+_REQUIREMENT_PLAN_REVISION_FIELDS = frozenset(
+    {
+        "kind",
+        "schema",
+        "item_id",
+        "revision",
+        "plan_payload",
+        "plan_hash",
+        "parent_plan_hash",
+        "analysis_context_manifest_hash",
+        "active_generation_id",
+        "active_generation_manifest_hash",
+        "created_at",
+        "record_hash",
+    }
+)
+_MISSING_EXPECTED_PLAN_HEAD = object()
 _SEMANTIC_SELECTIONS_FILENAME = "semantic_selections.jsonl"
 _IDENTITY_DOMAIN_PROPOSALS_FILENAME = "identity_domain_proposals.jsonl"
+_IDENTITY_DOMAIN_PROPOSAL_OPTIONAL_FIELDS = frozenset(
+    {"revision", "supersedes_hash", "proposal_hash", "superseded_object_type"}
+)
 _ANALYTICAL_RELATIONSHIPS_FILENAME = "analytical_relationships.jsonl"
 _RELATIONSHIP_CARDINALITIES = frozenset(
     {"one_to_one", "one_to_many", "many_to_one", "many_to_many"}
@@ -116,6 +144,10 @@ def _canonical_hash(value: Any) -> str:
 
     encoded = json.dumps(native(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(char in "0123456789abcdef" for char in value)
 
 
 def validate_analytical_relationship_measurement(
@@ -200,9 +232,7 @@ def validate_analytical_relationship_measurement(
 
 
 def _source_id(entry: DataRoomCatalogEntry) -> str:
-    if entry.sheet_name is None:
-        return entry.path
-    return f"{entry.path}::sheet={entry.sheet_name}"
+    return entry.source_id
 
 
 @dataclass(frozen=True)
@@ -310,6 +340,16 @@ class IdentityDomainProposal:
     rationale: str
     source_hints: tuple[str, ...]
     representation_item_ids: tuple[str, ...]
+    # Proposal revisions are item-local append-only successors.  Legacy rows
+    # omit these fields and are interpreted as revision one without rewriting
+    # their original bytes.
+    revision: int = 1
+    supersedes_hash: str | None = None
+    proposal_hash: str | None = None
+    # The immediate predecessor's requested type is retained as audit
+    # metadata.  The effective successor type is still checked by the
+    # run-level Entity Resolution reservation boundary.
+    superseded_object_type: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "domain_id", _required_text(self.domain_id, field_name="domain_id"))
@@ -326,9 +366,35 @@ class IdentityDomainProposal:
             raise ValueError("representation_item_ids cannot be empty")
         object.__setattr__(self, "source_hints", source_hints)
         object.__setattr__(self, "representation_item_ids", representation_item_ids)
+        if isinstance(self.revision, bool) or not isinstance(self.revision, int) or self.revision < 1:
+            raise ValueError("revision must be a positive integer")
+        supersedes_hash = _optional_text(self.supersedes_hash, field_name="supersedes_hash")
+        if self.revision == 1 and supersedes_hash is not None:
+            raise ValueError("revision one cannot supersede a predecessor")
+        if self.revision > 1 and not _is_sha256(supersedes_hash):
+            raise ValueError("successor revision requires a valid supersedes_hash")
+        object.__setattr__(self, "supersedes_hash", supersedes_hash)
+        superseded_object_type = _optional_text(
+            self.superseded_object_type,
+            field_name="superseded_object_type",
+        )
+        if self.revision == 1 and superseded_object_type is not None:
+            raise ValueError("revision one cannot carry superseded_object_type")
+        if self.revision > 1 and superseded_object_type is None:
+            raise ValueError("successor revision requires superseded_object_type")
+        object.__setattr__(self, "superseded_object_type", superseded_object_type)
+        proposal_hash = _optional_text(self.proposal_hash, field_name="proposal_hash")
+        if proposal_hash is not None:
+            if not _is_sha256(proposal_hash):
+                raise ValueError("proposal_hash must be a SHA-256 digest")
+            if proposal_hash != _canonical_hash(self._hash_payload()):
+                raise ValueError("proposal_hash does not match the canonical proposal")
+        object.__setattr__(self, "proposal_hash", proposal_hash)
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
+    def _hash_payload(self) -> dict[str, Any]:
+        """Return the canonical proposal payload covered by ``proposal_hash``."""
+
+        payload: dict[str, Any] = {
             "record_kind": "identity_domain_proposal",
             "domain_id": self.domain_id,
             "object_type": self.object_type,
@@ -336,6 +402,42 @@ class IdentityDomainProposal:
             "source_hints": list(self.source_hints),
             "representation_item_ids": list(self.representation_item_ids),
         }
+        if self.revision != 1:
+            payload.update(
+                {
+                    "revision": self.revision,
+                    "supersedes_hash": self.supersedes_hash,
+                    "superseded_object_type": self.superseded_object_type,
+                }
+            )
+        return payload
+
+    @property
+    def digest(self) -> str:
+        """Return the stable predecessor digest used by revision CAS."""
+
+        return self.proposal_hash or _canonical_hash(self._hash_payload())
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "record_kind": "identity_domain_proposal",
+            "domain_id": self.domain_id,
+            "object_type": self.object_type,
+            "rationale": self.rationale,
+            "source_hints": list(self.source_hints),
+            "representation_item_ids": list(self.representation_item_ids),
+        }
+        if self.revision != 1:
+            payload.update(
+                {
+                    "revision": self.revision,
+                    "supersedes_hash": self.supersedes_hash,
+                    "superseded_object_type": self.superseded_object_type,
+                }
+            )
+        if self.proposal_hash is not None:
+            payload["proposal_hash"] = self.proposal_hash
+        return payload
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "IdentityDomainProposal":
@@ -1066,20 +1168,221 @@ class AnalystWorkspace:
         )
 
     def _read_requirement_plan(self) -> RequirementAnalysisPlan | None:
+        revisions = self._load_requirement_plan_revisions()
+        current, _current_hash = self._read_current_requirement_plan()
+        if not revisions:
+            if current is None:
+                return None
+            raise ValueError("requirement plan revision chain is missing")
+        if current is None:
+            raise ValueError("requirement plan current file is missing")
+        latest = revisions[-1]
+        if current.to_dict() != latest["plan_payload"]:
+            raise ValueError("requirement plan current file does not match latest revision")
+        return current
+
+    def _requirement_plan_revisions_root(self) -> Path:
+        return self.item_workspace.work_root / _REQUIREMENT_PLAN_REVISIONS_DIRNAME
+
+    def _read_current_requirement_plan(self) -> tuple[RequirementAnalysisPlan | None, str | None]:
+        """Read and validate the compatibility current-plan representation."""
+
         path = self.item_workspace.work_root / _REQUIREMENT_PLAN_FILENAME
         if path.is_symlink():
             raise ValueError("requirement plan cannot be a symlink")
         if not path.exists():
-            return None
+            return None, None
+        if not path.is_file():
+            raise ValueError("requirement plan must be a regular file")
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError("requirement plan is invalid") from exc
         if not isinstance(value, Mapping):
             raise ValueError("requirement plan is invalid")
-        plan = RequirementAnalysisPlan.from_dict(value)
+        try:
+            plan = RequirementAnalysisPlan.from_dict(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("requirement plan is invalid") from exc
+        if plan.to_dict() != dict(value):
+            raise ValueError("requirement plan is not canonical")
         if plan.original_text != self.item_workspace.original_text:
             raise ValueError("requirement plan original_text does not match requirement")
+        return plan, _canonical_hash(value)
+
+    def _published_requirement_plan_hash(self) -> str | None:
+        """Return the current-file head used for optimistic publication CAS."""
+
+        _plan, plan_hash = self._read_current_requirement_plan()
+        return plan_hash
+
+    def _load_requirement_plan_revisions(self) -> tuple[Mapping[str, Any], ...]:
+        """Validate every immutable plan revision and its hash chain."""
+
+        root = self._requirement_plan_revisions_root()
+        if root.is_symlink():
+            raise ValueError("requirement plan revisions cannot be a symlink")
+        if not root.exists():
+            return ()
+        if not root.is_dir():
+            raise ValueError("requirement plan revisions must be a directory")
+        try:
+            paths = tuple(root.iterdir())
+        except OSError as exc:
+            raise ValueError("requirement plan revisions are unreadable") from exc
+
+        by_revision: dict[int, Path] = {}
+        for path in paths:
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("requirement plan revisions contain a non-regular path")
+            match = _REQUIREMENT_PLAN_REVISION_NAME.fullmatch(path.name)
+            if match is None:
+                raise ValueError("requirement plan revisions contain an unexpected path")
+            revision = int(match.group(1))
+            if revision in by_revision:
+                raise ValueError("requirement plan revisions contain a duplicate ordinal")
+            by_revision[revision] = path
+        if not by_revision:
+            raise ValueError("requirement plan revisions directory is empty")
+        ordinals = sorted(by_revision)
+        if ordinals != list(range(1, len(ordinals) + 1)):
+            raise ValueError("requirement plan revision ordinals are not contiguous")
+
+        records: list[Mapping[str, Any]] = []
+        previous_plan_hash: str | None = None
+        for revision in ordinals:
+            path = by_revision[revision]
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("requirement plan revision is invalid") from exc
+            if not isinstance(value, Mapping) or set(value) != _REQUIREMENT_PLAN_REVISION_FIELDS:
+                raise ValueError("requirement plan revision fields are invalid")
+            record = dict(value)
+            if record["kind"] != _REQUIREMENT_PLAN_REVISION_KIND:
+                raise ValueError("requirement plan revision kind is invalid")
+            if record["schema"] != _REQUIREMENT_PLAN_REVISION_SCHEMA:
+                raise ValueError("requirement plan revision schema is invalid")
+            if record["item_id"] != self.item_workspace.item_id:
+                raise ValueError("requirement plan revision item_id is invalid")
+            if isinstance(record["revision"], bool) or not isinstance(record["revision"], int) or record["revision"] != revision:
+                raise ValueError("requirement plan revision ordinal is invalid")
+            payload = record["plan_payload"]
+            if not isinstance(payload, Mapping):
+                raise ValueError("requirement plan revision plan_payload is invalid")
+            try:
+                plan = RequirementAnalysisPlan.from_dict(payload)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("requirement plan revision plan_payload is invalid") from exc
+            if plan.to_dict() != dict(payload):
+                raise ValueError("requirement plan revision plan_payload is not canonical")
+            if plan.original_text != self.item_workspace.original_text:
+                raise ValueError("requirement plan revision original_text does not match requirement")
+            if not _is_sha256(record["plan_hash"]) or record["plan_hash"] != _canonical_hash(payload):
+                raise ValueError("requirement plan revision plan_hash is invalid")
+            parent_plan_hash = record["parent_plan_hash"]
+            if revision == 1:
+                if parent_plan_hash is not None:
+                    raise ValueError("requirement plan revision one must not have a parent")
+            elif not _is_sha256(parent_plan_hash) or parent_plan_hash != previous_plan_hash:
+                raise ValueError("requirement plan revision parent is invalid")
+            context_manifest_hash = record["analysis_context_manifest_hash"]
+            if not _is_sha256(context_manifest_hash):
+                raise ValueError("requirement plan revision analysis context hash is invalid")
+            generation_id = record["active_generation_id"]
+            generation_manifest_hash = record["active_generation_manifest_hash"]
+            if generation_id is None:
+                if generation_manifest_hash is not None:
+                    raise ValueError("requirement plan revision active generation hash is invalid")
+            elif (
+                not isinstance(generation_id, str)
+                or not generation_id.strip()
+                or not _is_sha256(generation_manifest_hash)
+            ):
+                raise ValueError("requirement plan revision active generation metadata is invalid")
+            if not isinstance(record["created_at"], str) or not record["created_at"].strip():
+                raise ValueError("requirement plan revision created_at is invalid")
+            unsigned = {key: record[key] for key in _REQUIREMENT_PLAN_REVISION_FIELDS if key != "record_hash"}
+            if not _is_sha256(record["record_hash"]) or record["record_hash"] != _canonical_hash(unsigned):
+                raise ValueError("requirement plan revision record_hash is invalid")
+            records.append(record)
+            previous_plan_hash = record["plan_hash"]
+        return tuple(records)
+
+    def _active_generation_binding(self) -> tuple[str | None, str | None]:
+        """Return validated lifecycle generation metadata, without fabrication."""
+
+        with RunLifecycle._run_lock(self.context.context):  # noqa: SLF001 - shared run authority boundary
+            return self._active_generation_binding_unlocked()
+
+    def _active_generation_binding_unlocked(self) -> tuple[str | None, str | None]:
+        """Read generation metadata while the caller owns the run lock."""
+
+        pointer = RunLifecycle._read_generation_pointer_unlocked(self.context.context)  # noqa: SLF001
+        if pointer is None:
+            return None, None
+        metadata = RunLifecycle._load_generation_unlocked(self.context.context, pointer)  # noqa: SLF001
+        if metadata is None:
+            return None, None
+        return metadata.generation_id, metadata.manifest_hash
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        try:
+            descriptor = os.open(path, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            try:
+                os.fsync(descriptor)
+            except OSError:
+                pass
+        finally:
+            os.close(descriptor)
+
+    @classmethod
+    def _revision_bytes(cls, record: Mapping[str, Any]) -> bytes:
+        return (
+            json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+        ).encode("utf-8")
+
+    @classmethod
+    def _publish_requirement_revision(cls, path: Path, record: Mapping[str, Any]) -> None:
+        """Create one immutable revision file without replacing existing bytes."""
+
+        if path.parent.is_symlink() or (path.parent.exists() and not path.parent.is_dir()):
+            raise ValueError("requirement plan revisions directory is invalid")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ValueError("requirement plan revisions directory is invalid") from exc
+        if path.parent.is_symlink() or not path.parent.is_dir():
+            raise ValueError("requirement plan revisions directory is invalid")
+        payload = cls._revision_bytes(record)
+        created = False
+        try:
+            with path.open("xb") as stream:
+                created = True
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            cls._fsync_directory(path.parent)
+        except Exception:
+            if created:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            raise
+
+    def _require_requirement_plan(self, *, operation: str) -> RequirementAnalysisPlan | None:
+        """Require the current validated requirement plan before material work."""
+
+        if self.item_workspace.mode != "requirement":
+            return None
+        plan = self._read_requirement_plan()
+        if plan is None:
+            raise ValueError(f"requirement {operation} requires a persisted semantic plan first")
         return plan
 
     def plan_requirement(
@@ -1091,7 +1394,7 @@ class AnalystWorkspace:
     ) -> RequirementAnalysisPlan:
         """Persist one semantic decomposition for a requirement item."""
 
-        self._assert_owner()
+        expected_current_hash = self._published_requirement_plan_hash()
         if self.item_workspace.mode != "requirement":
             raise ValueError("requirement planning is available only in requirement mode")
         if plan is not None and (tuple(tasks) or synthesis_intent is not None):
@@ -1112,35 +1415,112 @@ class AnalystWorkspace:
             synthesis_intent=plan.synthesis_intent,
             original_text=self.item_workspace.original_text,
         )
-        with self.item_workspace._state_transition_lock():  # noqa: SLF001 - one item authority boundary
-            return self._persist_requirement_plan_locked(bound_plan)
+        # Refresh/rebind takes the run lock before any item transition lock.
+        # Keep the same order here and capture the generation binding while
+        # the run authority is stable; model/material work above remains
+        # outside both locks.
+        with RunLifecycle._run_lock(self.context.context):  # noqa: SLF001 - shared run authority boundary
+            self._assert_owner()
+            active_generation_binding = self._active_generation_binding_unlocked()
+            with self.item_workspace._state_transition_lock():  # noqa: SLF001 - one item authority boundary
+                return self._persist_requirement_plan_locked(
+                    bound_plan,
+                    _expected_current_plan_hash=expected_current_hash,
+                    _active_generation_binding=active_generation_binding,
+                )
 
     def _persist_requirement_plan_locked(
         self,
         bound_plan: RequirementAnalysisPlan,
         *,
         _state_loaded: bool = False,
+        _expected_current_plan_hash: str | None | object = _MISSING_EXPECTED_PLAN_HEAD,
+        _active_generation_binding: tuple[str | None, str | None] | object = _MISSING_EXPECTED_PLAN_HEAD,
     ) -> RequirementAnalysisPlan:
         """Publish a requirement plan while the item transition lock is held."""
 
         if not _state_loaded:
             self.item_workspace._reload_authoritative_for_artifact_mutation_locked()  # noqa: SLF001
         self.item_workspace._ensure_not_terminal()  # noqa: SLF001
-        self.item_workspace._require_no_active_attempt()  # noqa: SLF001
-        destination = self.item_workspace.work_root / _REQUIREMENT_PLAN_FILENAME
-        if destination.exists() or destination.is_symlink():
-            if destination.is_symlink():
-                raise ValueError("requirement plan cannot be a symlink")
-            try:
-                existing = RequirementAnalysisPlan.from_dict(json.loads(destination.read_text(encoding="utf-8")))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
-                raise ValueError("existing requirement plan is invalid") from exc
-            if existing != bound_plan:
-                raise ValueError("requirement plan is immutable")
-            return existing
+        revisions = self._load_requirement_plan_revisions()
+        current, current_hash = self._read_current_requirement_plan()
+        if (
+            _expected_current_plan_hash is not _MISSING_EXPECTED_PLAN_HEAD
+            and current_hash != _expected_current_plan_hash
+        ):
+            raise ValueError("concurrent requirement plan publication conflict")
+
+        staged = False
+        if not revisions:
+            if current is not None:
+                raise ValueError("requirement plan revision chain is missing")
+        elif current is None:
+            if len(revisions) != 1:
+                raise ValueError("requirement plan has multiple unpublished revisions")
+            staged = True
+        else:
+            current_index = next(
+                (
+                    index
+                    for index, record in enumerate(revisions)
+                    if record["plan_hash"] == current_hash and record["plan_payload"] == current.to_dict()
+                ),
+                None,
+            )
+            if current_index is None:
+                raise ValueError("requirement plan current file does not match revision chain")
+            if current_index != len(revisions) - 1:
+                if current_index != len(revisions) - 2:
+                    raise ValueError("requirement plan has multiple unpublished revisions")
+                staged = True
+
+        if staged:
+            latest = revisions[-1]
+            if latest["plan_payload"] != bound_plan.to_dict():
+                raise ValueError("staged requirement plan revision conflicts with requested plan")
+            self.item_workspace._write_json_artifact(  # noqa: SLF001 - item owns path and atomicity
+                Path("work") / _REQUIREMENT_PLAN_FILENAME,
+                latest["plan_payload"],
+            )
+            return RequirementAnalysisPlan.from_dict(latest["plan_payload"])
+
+        if current is not None and current == bound_plan:
+            if not revisions:
+                raise ValueError("requirement plan revision chain is missing")
+            return current
+
+        revision = len(revisions) + 1
+        plan_payload = bound_plan.to_dict()
+        plan_hash = _canonical_hash(plan_payload)
+        parent_plan_hash = revisions[-1]["plan_hash"] if revisions else None
+        if _active_generation_binding is _MISSING_EXPECTED_PLAN_HEAD:
+            generation_id, generation_manifest_hash = self._active_generation_binding()
+        else:
+            generation_id, generation_manifest_hash = _active_generation_binding  # type: ignore[misc]
+        unsigned = {
+            "kind": _REQUIREMENT_PLAN_REVISION_KIND,
+            "schema": _REQUIREMENT_PLAN_REVISION_SCHEMA,
+            "item_id": self.item_workspace.item_id,
+            "revision": revision,
+            "plan_payload": plan_payload,
+            "plan_hash": plan_hash,
+            "parent_plan_hash": parent_plan_hash,
+            "analysis_context_manifest_hash": self.context.manifest_hash,
+            "active_generation_id": generation_id,
+            "active_generation_manifest_hash": generation_manifest_hash,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if not _is_sha256(unsigned["analysis_context_manifest_hash"]):
+            raise ValueError("analysis context manifest hash is invalid")
+        record = {**unsigned, "record_hash": _canonical_hash(unsigned)}
+        revision_path = self._requirement_plan_revisions_root() / f"rev-{revision:04d}.json"
+        self._publish_requirement_revision(revision_path, record)
+        # The immutable record is durable before the compatibility current file
+        # advances.  If this write fails, the next exact retry repairs the
+        # staged successor without replacing its bytes.
         self.item_workspace._write_json_artifact(  # noqa: SLF001 - item owns path and atomicity
             Path("work") / _REQUIREMENT_PLAN_FILENAME,
-            bound_plan.to_dict(),
+            plan_payload,
         )
         return bound_plan
 
@@ -1203,9 +1583,19 @@ class AnalystWorkspace:
         """Load only ontology and relationship layers for this search."""
 
         records = self._layer_records("ontology", "relationships")
-        entries = [OntologyItem.from_dict(item) for item in records["ontology"]]
+        # Semantic snapshots are produced from the LEM current_* views, but
+        # keep this read boundary defensive: a historical/superseded object
+        # must never become selectable merely because an older snapshot or a
+        # hand-authored payload still contains it.
+        entries = [
+            OntologyItem.from_dict(item)
+            for item in records["ontology"]
+            if str(item.get("status", "active")) != "superseded"
+        ]
         known = {item.item_id for item in entries}
         for record in records["relationships"]:
+            if str(record.get("status", "active")) == "superseded":
+                continue
             relationship_id = str(record["relationship_id"])
             if relationship_id in known:
                 continue
@@ -1391,7 +1781,11 @@ class AnalystWorkspace:
         self.context.ensure_valid()
         limit = self._bounded_limit(limit)
         wanted_type = None if item_type is None else _required_text(item_type, field_name="item_type")
-        entries = [item for item in self._ontology_entries() if wanted_type is None or item.item_type == wanted_type]
+        entries = [
+            item
+            for item in self._ontology_entries()
+            if item.status != "superseded" and (wanted_type is None or item.item_type == wanted_type)
+        ]
         tokens = tuple(token for token in str(query).strip().lower().split() if token)
         if not tokens:
             return tuple(entries[:limit])
@@ -1774,11 +2168,56 @@ class AnalystWorkspace:
         self.item_workspace.append_identity_domain_proposal(payload)
         return proposal
 
-    def read_identity_domain_proposals(self) -> tuple[IdentityDomainProposal, ...]:
-        """Read item-bound proposals while retaining historical owner provenance."""
+    def supersede_identity_domain_proposal(
+        self,
+        domain_id: str,
+        object_type: str,
+        rationale: str,
+        source_hints: Iterable[str],
+        representation_item_ids: Iterable[str],
+        *,
+        expected_predecessor_hash: str,
+    ) -> IdentityDomainProposal:
+        """Append an owner-bound successor through the public CAS API.
+
+        The caller supplies the semantic successor, while the durable item
+        workspace assigns the next revision, predecessor audit metadata, and
+        proposal digest.  Existing proposal rows remain immutable.
+        """
 
         self._assert_owner()
-        records = self.item_workspace.read_identity_domain_proposals()
+        proposal = IdentityDomainProposal(
+            domain_id=domain_id,
+            object_type=object_type,
+            rationale=rationale,
+            source_hints=tuple(source_hints),
+            representation_item_ids=tuple(representation_item_ids),
+        )
+        payload = {
+            **proposal.to_dict(),
+            "item_id": self.item_workspace.item_id,
+            "owner_ref": self.owner_ref,
+        }
+        successor = self.item_workspace.supersede_identity_domain_proposal(
+            payload,
+            expected_predecessor_hash=expected_predecessor_hash,
+            owner_ref=self.owner_ref,
+        )
+        return IdentityDomainProposal.from_dict(successor)
+
+    def read_identity_domain_proposals(
+        self,
+        *,
+        include_history: bool = False,
+    ) -> tuple[IdentityDomainProposal, ...]:
+        """Read effective heads or the immutable item-local proposal history."""
+
+        self._assert_owner()
+        if type(include_history) is not bool:
+            raise TypeError("include_history must be a bool")
+        records = self.item_workspace.read_identity_domain_proposals(
+            include_superseded=include_history,
+        )
         proposals: list[IdentityDomainProposal] = []
         for record in records:
             owner_ref = record.get("owner_ref")
@@ -1790,6 +2229,11 @@ class AnalystWorkspace:
                 raise ValueError("identity domain proposal owner binding is invalid")
             proposals.append(IdentityDomainProposal.from_dict(record))
         return tuple(proposals)
+
+    def read_identity_domain_proposal_history(self) -> tuple[IdentityDomainProposal, ...]:
+        """Return every validated proposal revision for audit/recovery."""
+
+        return self.read_identity_domain_proposals(include_history=True)
 
     def mark_waiting_on_resolution(
         self,
@@ -2023,9 +2467,7 @@ class AnalystWorkspace:
     ) -> None:
         self._assert_owner()
         if self.item_workspace.mode == "requirement":
-            plan = self._read_requirement_plan()
-            if plan is None:
-                raise ValueError("requirement analysis requires a persisted semantic plan first")
+            self._require_requirement_plan(operation="analysis")
             if not self._has_current_semantic_scope_decision():
                 raise ValueError(
                     "requirement analysis requires an explicit semantic scope decision for the current snapshot"
@@ -2218,25 +2660,121 @@ class AnalystWorkspace:
         if not isinstance(task, SpecialistTask):
             raise TypeError("task must be a SpecialistTask")
         existing = self._work_records(_SPECIALIST_TASKS_FILENAME)
-        if len(existing) >= 3:
-            raise ValueError("an analytical item may assign at most three specialists")
         if task.task_id in {str(value.get("task_id")) for value in existing}:
             raise ValueError("specialist task_id is already recorded")
         for source_id in task.source_ids:
             self._entry(source_id)
         self.item_workspace.append_specialist_task(task.to_dict())
 
+    @staticmethod
+    def _decode_specialist_task(value: Mapping[str, Any]) -> SpecialistTask:
+        """Decode one canonical durable specialist-task row."""
+
+        if not isinstance(value, Mapping) or value.get("record_kind") != "specialist_task":
+            raise ValueError("specialist task row is not canonical")
+        raw = dict(value)
+        raw.pop("record_kind", None)
+        try:
+            task = SpecialistTask(**raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("specialist task row is invalid") from exc
+        if task.to_dict() != dict(value):
+            raise ValueError("specialist task row is not canonical")
+        return task
+
+    @staticmethod
+    def _decode_specialist_memo(value: Mapping[str, Any]) -> SpecialistMemo:
+        """Decode one canonical durable specialist-memo row."""
+
+        if not isinstance(value, Mapping) or value.get("record_kind") != "specialist_memo":
+            raise ValueError("specialist memo row is not canonical")
+        raw = dict(value)
+        raw.pop("record_kind", None)
+        try:
+            memo = SpecialistMemo(**raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("specialist memo row is invalid") from exc
+        if memo.to_dict() != dict(value):
+            raise ValueError("specialist memo row is not canonical")
+        return memo
+
+    @classmethod
+    def _read_specialist_tasks_for_item(cls, item_workspace: ItemWorkspace) -> tuple[SpecialistTask, ...]:
+        if not isinstance(item_workspace, ItemWorkspace):
+            raise TypeError("item_workspace must be an ItemWorkspace")
+        rows = item_workspace._read_work_records(  # noqa: SLF001 - public facade owns validation
+            _SPECIALIST_TASKS_FILENAME,
+            label="specialist task",
+        )
+        values = tuple(cls._decode_specialist_task(row) for row in rows)
+        task_ids = [value.task_id for value in values]
+        if len(task_ids) != len(set(task_ids)):
+            raise ValueError("specialist task_id values must be unique")
+        return values
+
+    @classmethod
+    def _read_specialist_memos_for_item(cls, item_workspace: ItemWorkspace) -> tuple[SpecialistMemo, ...]:
+        if not isinstance(item_workspace, ItemWorkspace):
+            raise TypeError("item_workspace must be an ItemWorkspace")
+        rows = item_workspace._read_work_records(  # noqa: SLF001 - public facade owns validation
+            _SPECIALIST_MEMOS_FILENAME,
+            label="specialist memo",
+        )
+        values = tuple(cls._decode_specialist_memo(row) for row in rows)
+        memo_ids = [value.memo_id for value in values]
+        if len(memo_ids) != len(set(memo_ids)):
+            raise ValueError("specialist memo_id values must be unique")
+        task_ids = [value.task_id for value in values]
+        if len(task_ids) != len(set(task_ids)):
+            raise ValueError("each specialist task may have at most one memo")
+        return values
+
+    def specialist_tasks(self) -> tuple[SpecialistTask, ...]:
+        """Read the current typed specialist assignments for this item."""
+
+        self._assert_owner()
+        return self._read_specialist_tasks_for_item(self.item_workspace)
+
+    def specialist_memos(self) -> tuple[SpecialistMemo, ...]:
+        """Read the current typed specialist memos for this item."""
+
+        self._assert_owner()
+        return self._read_specialist_memos_for_item(self.item_workspace)
+
+    def unresolved_specialist_tasks(self) -> tuple[SpecialistTask, ...]:
+        """Return assigned tasks that have not yet received a memo."""
+
+        tasks = self.specialist_tasks()
+        memo_task_ids = {memo.task_id for memo in self.specialist_memos()}
+        return tuple(task for task in tasks if task.task_id not in memo_task_ids)
+
+    @classmethod
+    def read_specialist_tasks_for_item(cls, item_workspace: ItemWorkspace) -> tuple[SpecialistTask, ...]:
+        """Read typed specialist tasks without binding a second owner.
+
+        Planner/coordinator status views use this read-only public facade while
+        the Analytical Owner remains the sole writer of task assignments.
+        """
+
+        return cls._read_specialist_tasks_for_item(item_workspace)
+
+    @classmethod
+    def read_specialist_memos_for_item(cls, item_workspace: ItemWorkspace) -> tuple[SpecialistMemo, ...]:
+        """Read typed specialist memos without binding a second owner."""
+
+        return cls._read_specialist_memos_for_item(item_workspace)
+
     def record_specialist_memo(self, memo: SpecialistMemo) -> None:
         self._assert_owner()
         if not isinstance(memo, SpecialistMemo):
             raise TypeError("memo must be a SpecialistMemo")
-        tasks = self._work_records(_SPECIALIST_TASKS_FILENAME)
-        if memo.task_id not in {str(value.get("task_id")) for value in tasks}:
+        tasks = self._read_specialist_tasks_for_item(self.item_workspace)
+        if memo.task_id not in {value.task_id for value in tasks}:
             raise ValueError("specialist memo references an unknown task_id")
-        existing = self._work_records(_SPECIALIST_MEMOS_FILENAME)
-        if memo.memo_id in {str(value.get("memo_id")) for value in existing}:
+        existing = self._read_specialist_memos_for_item(self.item_workspace)
+        if memo.memo_id in {value.memo_id for value in existing}:
             raise ValueError("specialist memo_id is already recorded")
-        if memo.task_id in {str(value.get("task_id")) for value in existing}:
+        if memo.task_id in {value.task_id for value in existing}:
             raise ValueError("specialist task already has a memo")
         self.item_workspace.append_specialist_memo(memo.to_dict())
 
@@ -2251,13 +2789,12 @@ class AnalystWorkspace:
         output_bytes: int | None = None,
     ) -> ScriptRunReport:
         self._assert_owner()
-        if (
-            self.item_workspace.mode == "requirement"
-            and not self._has_current_semantic_scope_decision()
-        ):
-            raise ValueError(
-                "requirement calculation requires an explicit semantic scope decision for the current snapshot"
-            )
+        if self.item_workspace.mode == "requirement":
+            self._require_requirement_plan(operation="calculation")
+            if not self._has_current_semantic_scope_decision():
+                raise ValueError(
+                    "requirement calculation requires an explicit semantic scope decision for the current snapshot"
+                )
         return self.context.script_runner.run_pipeline(
             script,
             allowed_outputs=outputs,
@@ -2276,6 +2813,7 @@ class AnalystWorkspace:
         """Materialize an item-local prepared candidate through the bound context."""
 
         self._assert_owner()
+        self._require_requirement_plan(operation="data preparation")
         prepared_asset_id = _required_text(prepared_asset_id, field_name="prepared_asset_id")
         return self.context.save_prepared_candidate(prepared_asset_id, rows, **metadata)
 
@@ -2306,16 +2844,6 @@ class AnalystWorkspace:
             conclusion.to_dict(),
             owner_ref=self.owner_ref,
         )
-
-    def accept(
-        self,
-        *,
-        knowledge_delta: str = "no_change",
-        accepted_refs: tuple[str, ...] = (),
-    ) -> AcceptedSnapshot:
-        self._assert_owner()
-        return self.item_workspace.accept(knowledge_delta=knowledge_delta, accepted_refs=accepted_refs)
-
 
 __all__ = [
     "AnalystAnswer",

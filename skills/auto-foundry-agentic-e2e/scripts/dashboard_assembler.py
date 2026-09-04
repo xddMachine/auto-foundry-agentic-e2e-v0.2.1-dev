@@ -11,7 +11,12 @@ from __future__ import annotations
 
 import argparse
 import copy
+import csv
+from contextlib import contextmanager
+import fcntl
 import hashlib
+import io
+import importlib.util
 import json
 import math
 import os
@@ -36,93 +41,59 @@ ASSEMBLER_SCHEMA = "dashboard.assembler_receipt.v1"
 FIXTURE_SCHEMA = "dashboard.reviewed_fixture.v4"
 CHART_MAP_SCHEMA = "dashboard.chart_map.v4"
 REGISTRY_SCHEMA = "dashboard.chart_registry.v1"
-PRESENTATION_PLAN_SCHEMA = "dashboard.business_presentation_plan.v1"
+RENDERING_IDENTITY_SCHEMA = "dashboard.rendering_identity.v1"
+SKILL_NAME = "auto-foundry-agentic-e2e"
+CORE_NAME = "auto_foundry_core"
 PRESENTATION_PLAN_V2_SCHEMA = "dashboard.business_presentation_plan.v2"
 PRESENTATION_PLAN_FILENAME = "business_presentation_plan.json"
+BLUEPRINT_FILENAME = "dashboard_blueprint_v2.json"
 
-# Reviewed visual partition for the current G-0003 migration.  These IDs are
-# intentionally ordered: reviewer order is part of the durable presentation
-# contract and must survive writer, fixture, receipt, and renderer paths.
-V2_MANAGER_VISUAL_WIDGET_IDS = [
-    "REQ-01-REQ-01.metric.carrier-late-queue",
-    "REQ-01-REQ-01.metric.erp-delivery-late-rate",
-    "REQ-01-REQ-01.metric.erp-shipment-late",
-    "REQ-01-REQ-01.metric.erp-wms-state-conflicts",
-    "REQ-01-REQ-01.metric.tms-delayed-erp-on-time",
-    "REQ-01-REQ-01.metric.wms-dispatch-late",
-    "REQ-01-REQ-01.metric.wms-tms-state-conflicts",
-    "REQ-03-REQ-03.metric.cleaned-complaint-statuses",
-    "REQ-03-REQ-03.metric.finance-pending-refunds",
-    "REQ-03-REQ-03.metric.policy-window-days",
-    "REQ-03-REQ-03.metric.representative-approval-to-refund",
-    "REQ-03-REQ-03.metric.support-urgent-high-open",
-    "REQ-12-REQ-12.metric.closed-tickets",
-    "REQ-12-REQ-12.metric.support-tickets-as-of",
-    "REQ-04-REQ-04.metric.delay-tracker-status",
-    "REQ-04-REQ-04.metric.late-latest-receipt",
-    "REQ-04-REQ-04.metric.on-before-promise",
-    "REQ-04-REQ-04.metric.supplier-late-queues",
-    "REQ-04-REQ-04.metric.wms-receipt-reasons",
-    "REQ-06-req06-metric-movement-population-movement_quantity_by_type",
-    "REQ-08-req08-metric-payment-ledger-posted_amount_variance_by_currency",
-    "REQ-11-REQ-11.metric.finance_pending_distinct_refs",
-    "REQ-11-REQ-11.metric.finance_pending_exact_rows",
-    "REQ-11-REQ-11.metric.finance_settled_distinct_refs",
-    "REQ-11-REQ-11.metric.finance_settled_exact_rows",
-    "REQ-11-REQ-11.metric.numeric_sale_return_qty",
-    "REQ-11-REQ-11.metric.sale_return_movement_rows",
-]
-V2_AUDIT_VISUAL_WIDGET_IDS = [
-    "REQ-02-REQ-02.metric.ecommerce-promotion-groups",
-    "REQ-02-REQ-02.metric.erp-promotion-groups",
-    "REQ-02-REQ-02.metric.promotion-discount-partition-total",
-    "REQ-02-REQ-02.metric.refund-reference-coverage",
-    "REQ-02-REQ-02.metric.refund-value-matched",
-    "REQ-03-REQ-03.metric.support-missing-closed-at",
-    "REQ-12-REQ-12.dashboard.V-REQ12-A002-COVERAGE-001",
-    "REQ-12-REQ-12.metric.mapped-order-linked-rows",
-    "REQ-12-REQ-12.metric.mapped-order-references",
-    "REQ-12-REQ-12.metric.open-or-unknown-tickets",
-    "REQ-12-REQ-12.metric.terminal-milestone-rows",
-    "REQ-12-REQ-12.metric.unresolved-order-linked-rows",
-    "REQ-12-REQ-12.metric.unresolved-order-references",
-    "REQ-04-REQ-04.metric.policy-tolerance",
-    "REQ-05-req05-metric-control-queues-control_exception_counts",
-    "REQ-05-req05-metric-invoice-ledger-status_counts",
-    "REQ-05-req05-metric-payment-terms-supplier_master_term_distribution_for_matched_invoices",
-    "REQ-05-req05-metric-populations",
-    "REQ-06-req06-metric-adjustment-controls",
-    "REQ-06-req06-metric-erp-wms-available_qty_to_available",
-    "REQ-06-req06-metric-erp-wms-damaged_qty_to_damaged",
-    "REQ-06-req06-metric-erp-wms-in_transit_qty_to_inbound",
-    "REQ-06-req06-metric-erp-wms-reserved_qty_to_reserved",
-    "REQ-06-req06-metric-erp-wms-unrestricted_qty_to_on_hand",
-    "REQ-06-req06-metric-movement-population-movement_types",
-    "REQ-06-req06-metric-physical-count",
-    "REQ-06-req06-metric-policy-watchlist-watchlist_action_counts",
-    "REQ-07-req07-metric-inventory-policy-trigger_counts",
-    "REQ-08-req08-metric-collection-emails-action_counts",
-    "REQ-08-req08-metric-invoice-ledger-currency_counts",
-    "REQ-08-req08-metric-invoice-ledger-outstanding_by_currency",
-    "REQ-08-req08-metric-invoice-ledger-overdue_age_buckets",
-    "REQ-08-req08-metric-invoice-ledger-overdue_currency_counts",
-    "REQ-08-req08-metric-invoice-ledger-status_counts",
-    "REQ-08-req08-metric-payment-ledger-posted_amount_by_currency",
-    "REQ-11-REQ-11.metric.available_positive_damaged_zero_keys",
-    "REQ-11-REQ-11.metric.available_positive_keys",
-    "REQ-11-REQ-11.metric.both_available_damaged_keys",
-    "REQ-11-REQ-11.metric.damaged_positive_keys",
-    "REQ-11-REQ-11.metric.distinct_return_refund_references",
-    "REQ-11-REQ-11.metric.finance_refund_ledger_rows",
-    "REQ-11-REQ-11.metric.movement_linked_keys",
-    "REQ-11-REQ-11.metric.parsed_worklist_rows",
-    "REQ-11-REQ-11.metric.sale_return_rows_on_cutoff_date",
-    "REQ-11-REQ-11.metric.wms_snapshot_rows",
-    "REQ-11-REQ-11.metric.worklist_source_rows",
-    "REQ-14-REQ-14-fact-V-REQ14-WATCHLIST",
-    "REQ-17-REQ17-metric-anchor-connectivity",
-]
 
+def _dashboard_runtime() -> Any:
+    """Load the single portable blueprint/runtime helper from this skill."""
+
+    module_name = "auto_foundry_dashboard_runtime"
+    loaded = sys.modules.get(module_name)
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve().with_name("dashboard_runtime.py")
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise AssemblyError("dashboard runtime cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+# Every presentation plan carries the same complete accepted / committed input
+# projection.  The analytical-artifact list is part of the immutable binding,
+# rather than an optional receipt-only extension: a plan must describe exactly
+# the records that the canonical assembler will use.
+_PRESENTATION_INPUT_KEYS = frozenset(
+    {
+        "item_id",
+        "accepted_content_hash",
+        "accepted_manifest_hash",
+        "integration_manifest_hash",
+        "record_count",
+        "analytical_artifacts",
+    }
+)
+_PRESENTATION_ARTIFACT_KEYS = frozenset(
+    {
+        "item_id",
+        "artifact_id",
+        "artifact_type",
+        "schema_version",
+        "requirement_id",
+        "content_hash",
+        "envelope_hash",
+        "canonical_bytes_sha256",
+        "artifact_ref",
+        "integration_record_id",
+        "integration_record_hash",
+    }
+)
 
 class AssemblyError(ValueError):
     """Raised when frozen presentation inputs are incomplete or inconsistent."""
@@ -146,6 +117,17 @@ def _sha256_bytes(value: bytes) -> str:
 
 def _canonical_bytes(value: Any) -> bytes:
     return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _blueprint_fixture_digest(fixture: Mapping[str, Any]) -> str:
+    """Hash fixture semantics without the non-semantic blueprint backpointer."""
+
+    payload = {
+        key: copy.deepcopy(value)
+        for key, value in fixture.items()
+        if key not in {"blueprint_ref", "blueprint_sha256"}
+    }
+    return _sha256_bytes(_canonical_bytes(payload))
 
 
 def _slug(value: Any) -> str:
@@ -308,8 +290,134 @@ def _is_sha256(value: Any) -> bool:
     return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{64}", value))
 
 
+def _validate_presentation_input_binding(item: Mapping[str, Any], *, label: str) -> None:
+    """Validate one canonical plan input binding.
+
+    The nested artifact provenance is deliberately carried in the public plan
+    so the plan, receipt, and assembler all bind the same accepted analytical
+    output.  There is one shape: omitting the list is not an alternate legacy
+    form, and no field is inferred at assembly time.
+    """
+
+    if not isinstance(item, Mapping) or set(item) != _PRESENTATION_INPUT_KEYS:
+        raise BusinessPresentationPlanError(f"{label} input binding is invalid")
+    item_id = item.get("item_id")
+    if not isinstance(item_id, str) or not item_id.strip():
+        raise BusinessPresentationPlanError(f"{label} input binding item_id is invalid")
+    if any(not _is_sha256(item.get(key)) for key in (
+        "accepted_content_hash", "accepted_manifest_hash", "integration_manifest_hash",
+    )):
+        raise BusinessPresentationPlanError(f"{label} input hash is invalid")
+    record_count = item.get("record_count")
+    if isinstance(record_count, bool) or not isinstance(record_count, int) or record_count < 0:
+        raise BusinessPresentationPlanError(f"{label} input record_count is invalid")
+    artifacts = item.get("analytical_artifacts")
+    if not isinstance(artifacts, list):
+        raise BusinessPresentationPlanError(f"{label} input analytical_artifacts must be a list")
+    seen_ids: set[str] = set()
+    seen_records: set[str] = set()
+    for artifact in artifacts:
+        if not isinstance(artifact, Mapping) or set(artifact) != _PRESENTATION_ARTIFACT_KEYS:
+            raise BusinessPresentationPlanError(f"{label} analytical artifact binding is invalid")
+        if artifact.get("item_id") != item_id:
+            raise BusinessPresentationPlanError(f"{label} analytical artifact item binding is invalid")
+        for key in (
+            "artifact_id", "artifact_type", "schema_version", "requirement_id",
+            "artifact_ref", "integration_record_id",
+        ):
+            value = artifact.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise BusinessPresentationPlanError(f"{label} analytical artifact identity is invalid")
+        if artifact.get("requirement_id") != item_id:
+            raise BusinessPresentationPlanError(f"{label} analytical artifact requirement binding is invalid")
+        if any(not _is_sha256(artifact.get(key)) for key in (
+            "content_hash", "envelope_hash", "canonical_bytes_sha256", "integration_record_hash",
+        )):
+            raise BusinessPresentationPlanError(f"{label} analytical artifact hash is invalid")
+        artifact_ref = artifact["artifact_ref"]
+        if (
+            not artifact_ref.startswith("integration/committed/artifacts/")
+            or "\\" in artifact_ref
+            or "\x00" in artifact_ref
+            or Path(artifact_ref).is_absolute()
+            or ".." in Path(artifact_ref).parts
+        ):
+            raise BusinessPresentationPlanError(f"{label} analytical artifact reference is invalid")
+        artifact_id = artifact["artifact_id"]
+        record_id = artifact["integration_record_id"]
+        if artifact_id in seen_ids or record_id in seen_records:
+            raise BusinessPresentationPlanError(f"{label} analytical artifact bindings are duplicated")
+        seen_ids.add(artifact_id)
+        seen_records.add(record_id)
+
+
 def _json_hash(value: Any) -> str:
     return _sha256_bytes(_canonical_bytes(value))
+
+
+def _preflight_input_fingerprint(
+    input_items: Sequence[Mapping[str, Any]],
+    rendering_identity: Mapping[str, Any],
+) -> str:
+    """Bind preflight cache identity to both frozen inputs and renderer code.
+
+    The fixture/chart bytes are a source inventory rather than a published
+    product.  Reusing them is nevertheless a semantic cache hit: a renderer
+    repair must invalidate an older inventory even when accepted inputs are
+    unchanged.  Keep the binding deterministic and source-bound while leaving
+    final product input hashes unchanged.
+    """
+
+    if not isinstance(rendering_identity, Mapping):
+        raise AssemblyError("preflight rendering identity is invalid")
+    return _json_hash({
+        "input_items": copy.deepcopy(list(input_items)),
+        "rendering_identity": copy.deepcopy(dict(rendering_identity)),
+    })
+
+
+def _rendering_identity(context: RunContext) -> dict[str, Any]:
+    """Return the exact source/release identity used by dashboard rendering.
+
+    The root product is reusable only when the same renderer release is still
+    loaded.  Version strings alone cannot detect a repaired renderer shipped
+    under the same release pair, so bind the skill's canonical source tree and
+    the core implementation identity already tracked by the lifecycle module.
+    The tree is read-only and contains only the local skill package; no run
+    data or generated product bytes participate in this identity.
+    """
+
+    if not isinstance(context, RunContext):
+        raise TypeError("dashboard rendering identity requires a RunContext")
+    skill_root = Path(__file__).resolve().parents[1]
+    files: dict[str, str] = {}
+    for path in sorted(skill_root.rglob("*"), key=lambda value: value.relative_to(skill_root).as_posix()):
+        if "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"} or path.name == ".DS_Store":
+            continue
+        relative = path.relative_to(skill_root).as_posix()
+        if path.is_symlink():
+            raise AssemblyError(f"dashboard skill source contains a symlink: {relative}")
+        if path.is_file():
+            files[relative] = _sha256_bytes(path.read_bytes())
+    if not files:
+        raise AssemblyError("dashboard skill source manifest is empty")
+    try:
+        from auto_foundry_core.lifecycle import current_implementation_identity
+
+        core_sha, core_tree = current_implementation_identity(context)
+    except Exception as exc:
+        raise AssemblyError("dashboard core implementation identity is unavailable") from exc
+    return {
+        "schema_version": RENDERING_IDENTITY_SCHEMA,
+        "skill_name": SKILL_NAME,
+        "skill_version": context.skill_version or "0.7.2",
+        "core_name": CORE_NAME,
+        "core_version": str(context.core_version),
+        "skill_tree_sha256": _json_hash(files),
+        "skill_file_count": len(files),
+        "core_implementation_sha": core_sha,
+        "core_implementation_tree": core_tree,
+    }
 
 
 def _safe_record_ref(value: Any) -> str:
@@ -327,6 +435,33 @@ def _read_bytes(context: RunContext, reference: str | Path, *, label: str) -> tu
         return path, path.read_bytes()
     except OSError as exc:
         raise AssemblyError(f"{label} cannot be read: {reference}") from exc
+
+
+def _assert_no_symlink_chain(context: RunContext, reference: str | Path, *, label: str) -> None:
+    """Reject lexical symlinks in a committed reference's parent chain.
+
+    ``RunContext.resolve_run_path`` deliberately resolves links to enforce
+    containment.  Product provenance additionally requires the committed
+    namespace itself to be symlink-free, including parent directories, so a
+    link that happens to stay inside the run cannot replace the immutable
+    artifact boundary.
+    """
+
+    raw = Path(reference)
+    if raw.is_absolute():
+        try:
+            relative = raw.relative_to(context.run_root)
+        except ValueError as exc:
+            raise AssemblyError(f"{label} is outside the run root: {reference}") from exc
+    else:
+        relative = raw
+    current = context.run_root
+    for component in relative.parts:
+        if component in {"", "."}:
+            continue
+        current = current / component
+        if current.is_symlink():
+            raise AssemblyError(f"{label} is symlinked: {reference}")
 
 
 def _validate_product_asset_reference(reference: str) -> str:
@@ -372,8 +507,8 @@ def _load_public_accepted_bundle(context: RunContext, item_id: str) -> tuple[Map
         raise AssemblyError(f"{item_id} item state identity/mode mismatch")
     if state.get("lifecycle_state") not in {"accepted", "integrated", "complete"}:
         raise AssemblyError(f"{item_id} is not terminally accepted")
-    if state.get("integration_state") != "integrated":
-        raise AssemblyError(f"{item_id} is not integrated")
+    if state.get("integration_state") not in {"integrated", "technical_failure"}:
+        raise AssemblyError(f"{item_id} has no settled integration boundary")
     workspace = ItemWorkspace(
         context,
         item_id,
@@ -400,6 +535,130 @@ def _load_public_accepted_bundle(context: RunContext, item_id: str) -> tuple[Map
     if terminal.get("outcome") != bundle.outcome:
         raise AssemblyError(f"{item_id} terminal intent outcome mismatch")
     return content, manifest, {"state": state, "envelope": envelope, "bundle": bundle}
+
+
+def _load_technical_failure_manifest(
+    context: RunContext,
+    item_id: str,
+    accepted_meta: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Validate one explicit exhausted integration-failure boundary."""
+
+    reference = f"requirements/{item_id}/integration/technical_failure/manifest.json"
+    _path, payload = _read_bytes(context, reference, label=f"{item_id} technical failure manifest")
+    try:
+        manifest = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AssemblyError(f"{item_id} technical failure manifest is invalid") from exc
+    required = {
+        "schema_version", "session_id", "item_id", "owner_id", "status",
+        "accepted_content_hash", "reason", "created_at", "recovery_exhausted", "manifest_hash",
+    }
+    if not isinstance(manifest, Mapping) or set(manifest) != required:
+        raise AssemblyError(f"{item_id} technical failure manifest fields are invalid")
+    if manifest.get("schema_version") != "1" or manifest.get("status") != "technical_failure" or manifest.get("recovery_exhausted") is not True:
+        raise AssemblyError(f"{item_id} technical failure manifest is not an exhausted boundary")
+    bundle = accepted_meta.get("bundle")
+    if manifest.get("item_id") != item_id or manifest.get("accepted_content_hash") != getattr(bundle, "content_hash", None):
+        raise AssemblyError(f"{item_id} technical failure accepted hash binding mismatch")
+    unsigned = {key: value for key, value in manifest.items() if key != "manifest_hash"}
+    if manifest.get("manifest_hash") != _json_hash(unsigned):
+        raise AssemblyError(f"{item_id} technical failure manifest hash mismatch")
+    state = accepted_meta.get("state")
+    if not isinstance(state, Mapping) or state.get("integration_state") != "technical_failure" or state.get("integration_manifest_hash") != manifest.get("manifest_hash") or state.get("integration_manifest_ref") != "integration/technical_failure/manifest.json":
+        raise AssemblyError(f"{item_id} technical failure item binding is stale")
+    return dict(manifest)
+
+
+def _load_item_technical_failure_manifest(
+    context: RunContext,
+    item_id: str,
+    state: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Validate a pre-acceptance item terminal-failure snapshot."""
+
+    reference = f"requirements/{item_id}/accepted/manifest.json"
+    _path, payload = _read_bytes(context, reference, label=f"{item_id} terminal failure manifest")
+    try:
+        manifest = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AssemblyError(f"{item_id} terminal failure manifest is invalid") from exc
+    required = {
+        "item_id", "outcome", "reason", "recovery_exhausted", "hashes",
+        "artifact_progress", "refs", "content_hash", "manifest_hash",
+    }
+    if not isinstance(manifest, Mapping) or set(manifest) != required:
+        raise AssemblyError(f"{item_id} terminal failure manifest fields are invalid")
+    if manifest.get("item_id") != item_id or manifest.get("outcome") != "technical_failure" or manifest.get("recovery_exhausted") is not True:
+        raise AssemblyError(f"{item_id} terminal failure manifest is not exhausted")
+    content_hash = manifest.get("content_hash")
+    if not _is_sha256(content_hash):
+        raise AssemblyError(f"{item_id} terminal failure content hash is invalid")
+    unsigned_content = {
+        key: value
+        for key, value in manifest.items()
+        if key not in {"content_hash", "manifest_hash"}
+    }
+    if content_hash != _json_hash(unsigned_content):
+        raise AssemblyError(f"{item_id} terminal failure content hash mismatch")
+    progress = manifest.get("artifact_progress")
+    if not isinstance(progress, Mapping) or set(progress) != {
+        "files", "hashes", "finding_count", "source_map_count", "script_count", "draft_count", "handoff_present"
+    }:
+        raise AssemblyError(f"{item_id} terminal failure artifact progress is invalid")
+    files = progress.get("files")
+    hashes = progress.get("hashes")
+    if not isinstance(files, list) or files != sorted(set(files)) or any(
+        not isinstance(path, str) or not path or Path(path).is_absolute() or ".." in Path(path).parts
+        for path in files
+    ):
+        raise AssemblyError(f"{item_id} terminal failure artifact progress files are invalid")
+    if not isinstance(hashes, Mapping) or set(hashes) != set(files) or any(not _is_sha256(value) for value in hashes.values()):
+        raise AssemblyError(f"{item_id} terminal failure artifact progress hashes are invalid")
+    if manifest.get("hashes") != dict(hashes):
+        raise AssemblyError(f"{item_id} terminal failure hashes are inconsistent")
+    for field in ("finding_count", "source_map_count", "script_count", "draft_count"):
+        value = progress.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise AssemblyError(f"{item_id} terminal failure artifact progress counts are invalid")
+    if not isinstance(progress.get("handoff_present"), bool):
+        raise AssemblyError(f"{item_id} terminal failure artifact progress handoff is invalid")
+    refs = manifest.get("refs")
+    if not isinstance(refs, list) or any(not isinstance(ref, str) or not ref for ref in refs):
+        raise AssemblyError(f"{item_id} terminal failure refs are invalid")
+    terminal = state.get("terminal_outcome")
+    if state.get("lifecycle_state") != "technical_failure" or not isinstance(terminal, Mapping) or terminal.get("outcome") != "technical_failure":
+        raise AssemblyError(f"{item_id} terminal failure item binding is stale")
+    if state.get("integration_state") != "pending" or state.get("integration_manifest_hash") is not None or state.get("integration_manifest_ref") is not None:
+        raise AssemblyError(f"{item_id} terminal failure integration binding is stale")
+    integration_root = context.resolve_run_path(f"requirements/{item_id}/integration")
+    if integration_root.is_symlink() or (integration_root.exists() and not integration_root.is_dir()):
+        raise AssemblyError(f"{item_id} terminal failure integration root is invalid")
+    for leaf in ("committed", "technical_failure", "staging"):
+        residue = integration_root / leaf
+        if residue.exists() or residue.is_symlink():
+            raise AssemblyError(f"{item_id} terminal failure has integration residue")
+    unsigned = {key: value for key, value in manifest.items() if key != "manifest_hash"}
+    if manifest.get("manifest_hash") != _json_hash(unsigned):
+        raise AssemblyError(f"{item_id} terminal failure manifest hash mismatch")
+    terminal_ref = terminal.get("manifest_path") if isinstance(terminal, Mapping) else None
+    terminal_path_matches = (
+        isinstance(terminal_ref, str)
+        and (
+            terminal_ref == reference
+            or (Path(terminal_ref).is_absolute() and Path(terminal_ref).resolve(strict=False) == _path.resolve(strict=False))
+        )
+    )
+    if (
+        not isinstance(terminal, Mapping)
+        or terminal.get("status") != "technical_failure"
+        or terminal.get("outcome") != "technical_failure"
+        or terminal.get("item_id") != item_id
+        or terminal.get("content_hash") != manifest.get("content_hash")
+        or not terminal_path_matches
+    ):
+        raise AssemblyError(f"{item_id} terminal failure binding is stale")
+    return dict(manifest)
 
 
 def _load_committed_records(
@@ -458,7 +717,80 @@ def _load_committed_records(
         records.append(record.to_dict())
     if len(records) != integration_manifest["records_count"]:
         raise AssemblyError(f"{item_id} committed integration records_count does not match bytes")
+    _validate_committed_analytical_artifacts(context, item_id, records)
     return dict(integration_manifest), records
+
+
+def _validate_committed_analytical_artifacts(
+    context: RunContext,
+    item_id: str,
+    records: Sequence[Mapping[str, Any]],
+) -> None:
+    """Verify typed artifact files before they can become dashboard inputs.
+
+    Product assembly is deliberately read-only over the committed namespace.
+    An ``analytical_artifact`` record carries the canonical wire document and
+    an immutable committed reference; this check verifies that the referenced
+    bytes still match both before mapping and on every retry.  No work/raw
+    paths are consulted and no analytics are run here.
+    """
+
+    try:
+        from auto_foundry_core.analytical_artifacts import AnalyticalArtifact
+    except ModuleNotFoundError as exc:  # pragma: no cover - package guard
+        raise AssemblyError("auto_foundry_core analytical artifact types are unavailable") from exc
+    prefix = "integration/committed/artifacts/"
+    seen_ids: dict[str, tuple[str, str, str]] = {}
+    seen_refs: set[str] = set()
+    for record in records:
+        if _text(record.get("kind")) != "analytical_artifact":
+            continue
+        payload = record.get("payload")
+        if not isinstance(payload, Mapping):
+            raise AssemblyError(f"{item_id} analytical artifact payload is invalid")
+        try:
+            # IntegrationRecord.from_dict already validates the exact payload
+            # shape; parse once more here so this module's committed-file
+            # authority is explicit and independent of staging/work paths.
+            artifact = AnalyticalArtifact.from_dict(payload.get("artifact"))
+        except Exception as exc:
+            raise AssemblyError(f"{item_id} analytical artifact payload is invalid") from exc
+        if artifact.requirement_id != item_id:
+            raise AssemblyError(f"{item_id} analytical artifact requirement binding is invalid")
+        if payload.get("artifact_id") != artifact.artifact_id or payload.get("artifact_type") != artifact.artifact_type or payload.get("schema_version") != artifact.schema_version or payload.get("requirement_id") != artifact.requirement_id:
+            raise AssemblyError(f"{item_id} analytical artifact identity binding is invalid")
+        if payload.get("content_hash") != artifact.content_hash or payload.get("envelope_hash") != artifact.envelope_hash:
+            raise AssemblyError(f"{item_id} analytical artifact typed hash binding is invalid")
+        artifact_bytes = artifact.to_json().encode("utf-8")
+        if payload.get("canonical_bytes_sha256") != _sha256_bytes(artifact_bytes):
+            raise AssemblyError(f"{item_id} analytical artifact canonical bytes hash is invalid")
+        artifact_ref = payload.get("artifact_ref")
+        if not isinstance(artifact_ref, str) or not artifact_ref.startswith(prefix) or not artifact_ref.endswith(".json") or artifact_ref in seen_refs:
+            raise AssemblyError(f"{item_id} analytical artifact committed reference is invalid")
+        relative = artifact_ref[len(prefix):]
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+\.json", relative):
+            raise AssemblyError(f"{item_id} analytical artifact committed reference is invalid")
+        seen_refs.add(artifact_ref)
+        identity = (
+            artifact.content_hash,
+            artifact.envelope_hash,
+            str(payload["canonical_bytes_sha256"]),
+        )
+        prior = seen_ids.get(artifact.artifact_id)
+        if prior is not None and prior != identity:
+            raise AssemblyError(f"{item_id} analytical artifact ID collision")
+        seen_ids[artifact.artifact_id] = identity
+        ref = f"requirements/{item_id}/{artifact_ref}"
+        _assert_no_symlink_chain(context, ref, label=f"{item_id} committed analytical artifact")
+        path, actual = _read_bytes(context, ref, label=f"{item_id} committed analytical artifact")
+        if actual != artifact_bytes or _sha256_bytes(actual) != payload.get("canonical_bytes_sha256"):
+            raise AssemblyError(f"{item_id} committed analytical artifact bytes do not match record")
+        try:
+            restored = AnalyticalArtifact.from_json(actual.decode("utf-8"))
+        except Exception as exc:
+            raise AssemblyError(f"{item_id} committed analytical artifact JSON is invalid") from exc
+        if restored.to_dict() != artifact.to_dict():
+            raise AssemblyError(f"{item_id} committed analytical artifact content drifted")
 
 
 def _discover_item_ids(context: RunContext, explicit: Sequence[str] | None, plan: Mapping[str, Any] | None) -> list[str]:
@@ -567,6 +899,17 @@ def _presentation_parent_binding(context: RunContext, generation_id: str, metada
         parent_id = f"G-{ordinal - 1:04d}"
     manifest_ref = f"products/generations/{parent_id}/product_manifest.json"
     manifest_path = context.resolve_run_path(manifest_ref)
+    # The first appended generation may not have a generation-scoped product
+    # bridge: its immutable parent product is still the legacy root manifest.
+    # Resolve that one canonical parent boundary exactly as the generation
+    # delta assembler does, without manufacturing a G-0001 successor path.
+    if (
+        parent_id == "G-0001"
+        and not manifest_path.is_file()
+        and not manifest_path.is_symlink()
+    ):
+        manifest_ref = "products/product_manifest.json"
+        manifest_path = context.resolve_run_path(manifest_ref)
     if not manifest_path.is_file() or manifest_path.is_symlink():
         raise BusinessPresentationPlanError("immediate parent product manifest is missing or symlinked")
     parent = _read_json(context, manifest_ref, label="presentation parent product manifest")
@@ -591,20 +934,51 @@ def _presentation_input_bindings(context: RunContext, item_ids: Sequence[str]) -
 
     bindings: list[dict[str, Any]] = []
     for item_id in item_ids:
-        content, accepted_manifest, accepted_meta = _load_public_accepted_bundle(context, item_id)
-        integration_manifest, records = _load_committed_records(
-            context,
-            item_id,
-            accepted_manifest,
-            accepted_meta["bundle"],
-        )
-        bindings.append({
+        state = _read_json(context, f"requirements/{item_id}/item_state.json", label=f"{item_id} item state")
+        if state.get("lifecycle_state") == "technical_failure":
+            # A pre-acceptance terminal failure has no accepted bundle or
+            # committed integration.  Its validated public terminal manifest
+            # is the only source-bound input available to a limited dashboard.
+            terminal_manifest = _load_item_technical_failure_manifest(context, item_id, state)
+            accepted_content_hash = terminal_manifest["content_hash"]
+            accepted_manifest_hash = terminal_manifest["manifest_hash"]
+            integration_manifest_hash = terminal_manifest["manifest_hash"]
+            records: list[Mapping[str, Any]] = []
+            artifact_bindings: list[dict[str, Any]] = []
+        else:
+            content, accepted_manifest, accepted_meta = _load_public_accepted_bundle(context, item_id)
+            accepted_bundle = accepted_meta["bundle"]
+            accepted_content_hash = accepted_bundle.content_hash
+            accepted_manifest_hash = accepted_bundle.manifest_hash
+            if state.get("integration_state") == "technical_failure":
+                # Accepted content remains immutable, while the exhausted
+                # integration failure manifest is the settled integration
+                # boundary; no unavailable records are inferred.
+                failure_manifest = _load_technical_failure_manifest(context, item_id, accepted_meta)
+                integration_manifest_hash = failure_manifest["manifest_hash"]
+                records = []
+            else:
+                integration_manifest, records = _load_committed_records(
+                    context,
+                    item_id,
+                    accepted_manifest,
+                    accepted_bundle,
+                )
+                integration_manifest_hash = integration_manifest["manifest_hash"]
+            # Typed analytical artifacts are accepted business outputs too.
+            # Keep their complete provenance in the plan input binding so the
+            # writer and assembler share one authoritative projection.
+            artifact_bindings = _analytical_artifact_input_entries({item_id: records})
+        binding = {
             "item_id": item_id,
-            "accepted_content_hash": accepted_meta["bundle"].content_hash,
-            "accepted_manifest_hash": accepted_meta["bundle"].manifest_hash,
-            "integration_manifest_hash": integration_manifest["manifest_hash"],
+            "accepted_content_hash": accepted_content_hash,
+            "accepted_manifest_hash": accepted_manifest_hash,
+            "integration_manifest_hash": integration_manifest_hash,
             "record_count": len(records),
-        })
+            "analytical_artifacts": artifact_bindings,
+        }
+        _validate_presentation_input_binding(binding, label="presentation plan")
+        bindings.append(binding)
     return bindings
 
 
@@ -626,18 +1000,25 @@ def _presentation_widget_binding(widget: Mapping[str, Any]) -> dict[str, Any]:
         for value in (_as_list(widget.get("integration_record_refs")) or [widget.get("integration_record_ref")])
         if _text(value).strip()
     })
-    return {
+    binding = {
         "widget_id": _text(widget.get("id")),
         "requirement_id": _text(widget.get("requirement_id")),
         "presentation_role": _text(widget.get("presentation_role") or "decision_view"),
         "integration_record_ids": record_ids,
         "integration_record_refs": record_refs,
     }
+    # Preserve explicit origin metadata in the public inventory.  No
+    # classification is inferred from labels, values, roles, or chart kind.
+    if "technical_surface" in widget:
+        binding["technical_surface"] = widget.get("technical_surface") is True
+    if _text(widget.get("technical_surface_reason")).strip():
+        binding["technical_surface_reason"] = _text(widget.get("technical_surface_reason"))
+    return binding
 
 
 _PRESENTATION_PROJECTION_FIELDS = frozenset({
     "title", "label", "body", "value", "display_value", "denominator", "unit",
-    "rows", "period", "as_of", "status", "note", "subtitle",
+    "rows", "period", "as_of", "status", "note", "subtitle", "scope", "answer_scope",
 })
 
 
@@ -733,8 +1114,8 @@ def _visual_snapshot_hash(widget: Mapping[str, Any]) -> str:
 
 def _visual_chart_hash(chart: Mapping[str, Any]) -> str:
     # Chart role/tier are plan-derived metadata, not chart geometry or values.
-    # Keep the hash stable when a V1 fixture is rebound to the reviewed V2
-    # visual partition while retaining exact type/fields/provenance binding.
+    # Keep the hash stable when a fixture is rebound to the reviewed visual
+    # partition while retaining exact type/fields/provenance binding.
     snapshot = copy.deepcopy(dict(chart))
     fields = snapshot.get("fields_or_values_used")
     if isinstance(fields, Mapping):
@@ -753,7 +1134,12 @@ def _visual_entry_shape(entry: Mapping[str, Any]) -> None:
         "chart_entry_sha256", "allowed_visual_fields", "title_projection",
         "visual_projection",
     }
-    if set(entry) != required:
+    optional = {
+        "recipe_id", "layout", "renderer_type", "accepted_visual_pointer",
+        "accepted_content_hash", "accepted_manifest_hash", "accepted_artifact_ref",
+        "accepted_artifact_sha256",
+    }
+    if not required <= set(entry) <= required | optional:
         raise BusinessPresentationPlanError("v2 visual entry fields are invalid")
     if not isinstance(entry.get("widget_id"), str) or not entry["widget_id"].strip():
         raise BusinessPresentationPlanError("v2 visual entry widget identity is invalid")
@@ -772,6 +1158,15 @@ def _visual_entry_shape(entry: Mapping[str, Any]) -> None:
     for field in ("widget_snapshot_sha256", "chart_entry_sha256"):
         if not _is_sha256(entry.get(field)):
             raise BusinessPresentationPlanError(f"v2 visual entry {field} is invalid")
+    if "accepted_visual_pointer" in entry:
+        pointer = entry.get("accepted_visual_pointer")
+        if not isinstance(pointer, str) or not re.fullmatch(r"/accepted/visuals/(?:0|[1-9][0-9]*)", pointer):
+            raise BusinessPresentationPlanError("v2 accepted visual pointer is invalid")
+        if not _is_sha256(entry.get("accepted_content_hash")) or not _is_sha256(entry.get("accepted_manifest_hash")):
+            raise BusinessPresentationPlanError("v2 accepted visual content/manifest hash is invalid")
+    if "accepted_artifact_ref" in entry:
+        if not isinstance(entry.get("accepted_artifact_ref"), str) or not entry["accepted_artifact_ref"].strip() or not _is_sha256(entry.get("accepted_artifact_sha256")):
+            raise BusinessPresentationPlanError("v2 accepted visual artifact binding is invalid")
     allowed = entry.get("allowed_visual_fields")
     projection = entry.get("visual_projection")
     if not isinstance(allowed, list) or len(set(allowed)) != len(allowed) or any(not isinstance(value, str) or not value for value in allowed):
@@ -784,12 +1179,133 @@ def _visual_entry_shape(entry: Mapping[str, Any]) -> None:
     for field, binding in projection.items():
         if not isinstance(binding, Mapping) or set(binding) != {"pointer", "value"} or not isinstance(binding.get("pointer"), str):
             raise BusinessPresentationPlanError(f"v2 visual entry projection is invalid: {field}")
+    if "recipe_id" in entry and (not isinstance(entry.get("recipe_id"), str) or not entry["recipe_id"].strip()):
+        raise BusinessPresentationPlanError("v2 visual entry recipe_id is invalid")
+    if "layout" in entry:
+        layouts = getattr(_dashboard_runtime(), "SUPPORTED_LAYOUTS", {"full", "wide", "half", "compact"})
+        if not isinstance(entry.get("layout"), str) or entry["layout"] not in layouts:
+            raise BusinessPresentationPlanError("v2 visual entry layout is invalid")
+    if "renderer_type" in entry:
+        renderer_types = getattr(_dashboard_runtime(), "SUPPORTED_RENDERER_TYPES", set())
+        if not isinstance(entry.get("renderer_type"), str) or entry["renderer_type"] not in renderer_types:
+            raise BusinessPresentationPlanError("v2 visual entry renderer_type is invalid")
+
+
+def _candidate_recipe_ids(candidate: Mapping[str, Any]) -> list[str]:
+    """Return registry recipe IDs marked eligible by the read-only inventory."""
+
+    recipes = candidate.get("recipes")
+    if not isinstance(recipes, list):
+        return []
+    return [
+        _text(recipe.get("id")).strip()
+        for recipe in recipes
+        if isinstance(recipe, Mapping)
+        and recipe.get("eligible") is True
+        and _text(recipe.get("id")).strip()
+    ]
+
+
+def _default_recipe_id(candidate: Mapping[str, Any]) -> str | None:
+    """Choose a semantic/data-shape default for an initial plan only."""
+
+    eligible = _candidate_recipe_ids(candidate)
+    current = _text(candidate.get("chart_family")).strip()
+    # A Product Agent may explicitly retain the reviewed family, but the
+    # inventory's initial choice should expose an executable business chart
+    # whenever the exact supplied shape supports one.  Historically this
+    # helper preferred ``table`` whenever the accepted declaration's family
+    # was table, which made richer source-bound bars/lines invisible to the
+    # plan author even though the registry had already proved them eligible.
+    # Registry order is committed and deterministic; choosing its first
+    # non-table recipe is therefore a stable semantic preference rather than
+    # a per-requirement chart rule.  Tables remain the truthful fallback when
+    # no chart family can consume the exact values.
+    richer = [recipe_id for recipe_id in eligible if recipe_id != "table"]
+    if current in eligible and current != "table":
+        return current
+    if richer:
+        return richer[0]
+    if current in eligible:
+        return current
+    if "table" in eligible:
+        return "table"
+    # No eligible recipe means the visual has no executable geometry.  Leave
+    # it as an audit-only declaration rather than inventing a table choice;
+    # the one requirement fallback carries any reviewed findings/limitations.
+    return eligible[0] if eligible else None
+
+
+def _validated_plan_selection(
+    candidate: Mapping[str, Any],
+    requested: Mapping[str, Any] | None = None,
+    *,
+    require_explicit: bool = False,
+) -> tuple[str, str, str]:
+    """Validate Product Agent recipe/layout/type choices against inventory."""
+
+    requested = requested or {}
+    if require_explicit:
+        missing = [
+            key
+            for key in ("recipe_id", "layout", "renderer_type")
+            if not isinstance(requested.get(key), str) or not requested[key].strip()
+        ]
+        if missing:
+            raise BusinessPresentationPlanError(
+                "v2 successor visual selection requires explicit "
+                f"recipe_id, layout, and renderer_type: {_text(candidate.get('widget_id'))}"
+            )
+    eligible = _candidate_recipe_ids(candidate)
+    requested_recipe = _text(requested.get("recipe_id")).strip()
+    recipe_id = requested_recipe or _default_recipe_id(candidate)
+    # A malformed/empty visual still receives the canonical table recipe as a
+    # truthful empty-state fallback.  An explicit Product Agent choice must,
+    # however, be present in the eligible inventory.
+    if recipe_id not in eligible and not (not requested_recipe and recipe_id == "table" and not eligible):
+        raise BusinessPresentationPlanError(
+            f"visual recipe is not eligible for exact supplied shape: {_text(candidate.get('widget_id'))}:{recipe_id or '<missing>'}"
+        )
+    layout = _text(requested.get("layout")).strip() or _dashboard_runtime().default_layout_for_recipe(recipe_id)
+    layouts = getattr(_dashboard_runtime(), "SUPPORTED_LAYOUTS", {"full", "wide", "half", "compact"})
+    if layout not in layouts:
+        raise BusinessPresentationPlanError(
+            f"visual layout is not supported: {_text(candidate.get('widget_id'))}:{layout}"
+        )
+    recipe_entry = next(
+        (
+            recipe for recipe in candidate.get("recipes", [])
+            if isinstance(recipe, Mapping) and _text(recipe.get("id")) == recipe_id
+        ),
+        None,
+    )
+    renderer_types = (
+        tuple(_text(value) for value in recipe_entry.get("renderer_types", []) if _text(value).strip())
+        if isinstance(recipe_entry, Mapping)
+        else tuple()
+    )
+    if not renderer_types:
+        # A table fallback is always executable; for current recipes this
+        # branch is only reachable with a private predecessor inventory that
+        # predates renderer metadata, so derive the closed default from the
+        # same runtime helper used by the design inventory.
+        renderer_types = _dashboard_runtime().renderer_types_for_recipe(
+            recipe_id,
+            candidate.get("widget") if isinstance(candidate.get("widget"), Mapping) else None,
+        ) or (("table",) if recipe_id == "table" else tuple())
+    requested_renderer = _text(requested.get("renderer_type")).strip()
+    renderer_type = requested_renderer or (renderer_types[0] if renderer_types else "")
+    if renderer_type not in renderer_types:
+        raise BusinessPresentationPlanError(
+            f"visual renderer_type is not eligible for exact recipe: {_text(candidate.get('widget_id'))}:{recipe_id}:{renderer_type or '<missing>'}"
+        )
+    return recipe_id, layout, renderer_type
 
 
 def _v2_manager_entry_from_visual(entry: Mapping[str, Any]) -> dict[str, Any]:
     """Convert one visual entry into the renderer's manager envelope binding."""
 
-    return {
+    result = {
         "widget_id": entry["widget_id"],
         "requirement_id": entry["requirement_id"],
         "record_ids": list(entry["record_ids"]),
@@ -802,72 +1318,19 @@ def _v2_manager_entry_from_visual(entry: Mapping[str, Any]) -> dict[str, Any]:
         "title_projection": copy.deepcopy(entry["title_projection"]),
         "visual_projection": copy.deepcopy(entry["visual_projection"]),
     }
-
-
-_V1_MANAGER_ENTRY_FIELDS = (
-    "widget_id",
-    "record_id",
-    "requirement_id",
-    "presentation_role",
-    "file_sha256",
-    "canonical_payload_sha256",
-    "display_projection",
-)
-
-
-def _v2_predecessor_manager_contract(plan: Mapping[str, Any]) -> tuple[list[str], list[dict[str, Any]]]:
-    """Return the exact V1 manager envelope retained by a V2 successor.
-
-    V2 is a one-time successor to a plan-bearing V1 product.  The successor
-    therefore carries an explicit predecessor binding rather than asking a
-    delta caller to infer old IDs from the visual partition.  The copied V1
-    entries are the immutable record/file/projection contract; V2 may augment
-    the overlapping pending-refunds entry with visual fields, but it may not
-    rewrite any V1 field.
-    """
-
-    source = plan.get("source_bindings")
-    if not isinstance(source, Mapping):
-        raise BusinessPresentationPlanError("v2 predecessor manager binding is missing")
-    ids = source.get("previous_manager_widget_ids")
-    entries = source.get("previous_manager_entries")
-    if (
-        not isinstance(ids, list)
-        or not ids
-        or len(set(ids)) != len(ids)
-        or any(not isinstance(value, str) or not value.strip() for value in ids)
-        or not isinstance(entries, list)
-        or len(entries) != len(ids)
+    # Recipe/layout are declarative plan choices.  Keep them optional for
+    # private predecessor fixtures that predate the choice contract, while
+    # every current writer-produced V2 visual carries both fields.
+    for key in ("recipe_id", "layout", "renderer_type"):
+        if key in entry:
+            result[key] = copy.deepcopy(entry[key])
+    for key in (
+        "accepted_visual_pointer", "accepted_content_hash", "accepted_manifest_hash",
+        "accepted_artifact_ref", "accepted_artifact_sha256",
     ):
-        raise BusinessPresentationPlanError("v2 predecessor manager binding is invalid")
-    if [entry.get("widget_id") for entry in entries if isinstance(entry, Mapping)] != ids:
-        raise BusinessPresentationPlanError("v2 predecessor manager entries do not match IDs")
-    predecessor_entries: list[dict[str, Any]] = []
-    for raw_entry in entries:
-        if not isinstance(raw_entry, Mapping):
-            raise BusinessPresentationPlanError("v2 predecessor manager entry is invalid")
-        entry = {key: copy.deepcopy(raw_entry.get(key)) for key in _V1_MANAGER_ENTRY_FIELDS}
-        if set(raw_entry) != set(_V1_MANAGER_ENTRY_FIELDS):
-            raise BusinessPresentationPlanError("v2 predecessor manager entry fields are invalid")
-        _presentation_entry_shape(entry)
-        predecessor_entries.append(entry)
-
-    manager_by_id = {
-        _text(entry.get("widget_id")): entry
-        for entry in plan.get("manager_entries", [])
-        if isinstance(entry, Mapping)
-    }
-    for widget_id, predecessor in zip(ids, predecessor_entries):
-        candidate = manager_by_id.get(widget_id)
-        if not isinstance(candidate, Mapping):
-            raise BusinessPresentationPlanError(f"v2 manager entries omit predecessor widget: {widget_id}")
-        candidate_base = {key: copy.deepcopy(candidate.get(key)) for key in _V1_MANAGER_ENTRY_FIELDS}
-        if set(_V1_MANAGER_ENTRY_FIELDS) - set(candidate):
-            raise BusinessPresentationPlanError(f"v2 predecessor projection is missing: {widget_id}")
-        _presentation_entry_shape(candidate_base)
-        if candidate_base != predecessor:
-            raise BusinessPresentationPlanError(f"v2 predecessor projection drifted: {widget_id}")
-    return list(ids), predecessor_entries
+        if key in entry:
+            result[key] = copy.deepcopy(entry[key])
+    return result
 
 
 def _v2_predecessor_plan_manager_contract(
@@ -875,14 +1338,11 @@ def _v2_predecessor_plan_manager_contract(
 ) -> tuple[list[str], list[dict[str, Any]]]:
     """Validate the complete manager envelope of a V2 predecessor.
 
-    ``previous_manager_*`` is deliberately retained as the small V1
-    migration contract (the six reviewed conclusion entries).  Once a V2
-    plan is itself succeeded, however, the predecessor manager surface also
-    contains its visual projection envelopes.  Those entries have a
-    different, richer shape and cannot be validated through the V1 helper.
-    Bind that full prior manager order and byte-level entry shape separately
-    so a generation successor cannot silently drop, reorder, or rewrite an
-    inherited manager entry.
+    ``previous_plan_manager_*`` binds the complete manager envelope of a V2
+    predecessor.  The entries may contain visual projection fields in
+    addition to pointer-bound record fields, so the exact prior manager order
+    and bytes are retained for CAS verification without constraining the
+    successor's new manager selection.
     """
 
     source = plan.get("source_bindings")
@@ -907,20 +1367,15 @@ def _v2_predecessor_plan_manager_contract(
         if not isinstance(raw_entry, Mapping) or not raw_entry.get("widget_id"):
             raise BusinessPresentationPlanError("v2 predecessor plan-manager entry is invalid")
         # Keep the exact key/value envelope.  V2 visual entries intentionally
-        # carry projection fields in addition to the V1 record projection;
-        # validating the mapping as a whole prevents a candidate from
+        # carry visual projection fields in addition to pointer-bound record
+        # fields; validating the mapping as a whole prevents a candidate from
         # replacing one with a semantically similar but structurally weaker
         # entry.
         predecessor_entries.append(copy.deepcopy(dict(raw_entry)))
-    manager_by_id = {
-        _text(entry.get("widget_id")): entry
-        for entry in plan.get("manager_entries", [])
-        if isinstance(entry, Mapping)
-    }
-    for widget_id, predecessor in zip(ids, predecessor_entries):
-        candidate = manager_by_id.get(widget_id)
-        if not isinstance(candidate, Mapping) or dict(candidate) != predecessor:
-            raise BusinessPresentationPlanError(f"v2 predecessor plan-manager drifted: {widget_id}")
+    # This is an immutable source binding for the predecessor plan, not a
+    # successor selection constraint.  Membership/order can change when the
+    # Product Agent regenerates the manager surface; CAS validation below
+    # checks that this envelope names the actual predecessor bytes.
     return list(ids), predecessor_entries
 
 
@@ -933,7 +1388,8 @@ def _v2_predecessor_visual_contract(
     for that already-frozen plan.  A successor plan writes them explicitly;
     when present they bind the predecessor's ordered manager/audit partition
     and every pointer/hash entry, preventing a same-generation rebuild from
-    silently changing an inherited audience or visual payload.
+    silently changing an inherited visual payload while allowing its audience
+    and declarative presentation recipe to be reconsidered.
     """
 
     source = plan.get("source_bindings")
@@ -978,14 +1434,17 @@ def _v2_predecessor_visual_contract(
         current = current_by_id.get(widget_id)
         if not isinstance(current, Mapping):
             raise BusinessPresentationPlanError(f"v2 successor omits predecessor visual: {widget_id}")
-        # Audience and exact visual bindings are immutable across a
-        # generation successor.  The successor may add new visuals only.
+        # Source/widget/chart/value bindings are immutable across a successor;
+        # manager audience and recipe/layout/renderer choices are deliberately
+        # free to change with the new explicit Product selection.
         for field in (
-            "requirement_id", "record_ids", "presentation_audience", "visual_type",
-            "chart_family", "widget_snapshot_sha256", "chart_entry_sha256",
+            "requirement_id", "record_ids", "visual_type", "chart_family",
+            "widget_snapshot_sha256", "chart_entry_sha256",
             "allowed_visual_fields", "title_projection", "visual_projection",
+            "accepted_visual_pointer", "accepted_content_hash", "accepted_manifest_hash",
+            "accepted_artifact_ref", "accepted_artifact_sha256",
         ):
-            if current.get(field) != predecessor.get(field):
+            if field in predecessor and current.get(field) != predecessor.get(field):
                 raise BusinessPresentationPlanError(f"v2 predecessor visual drifted: {widget_id}:{field}")
     return list(manager), list(audit), [copy.deepcopy(dict(entry)) for entry in entries]
 
@@ -1000,34 +1459,25 @@ def _presentation_authoritative_root(
     return root
 
 
-def _presentation_record_id_for_widget(widget: Mapping[str, Any]) -> str:
-    record_ids = _presentation_widget_binding(widget)["integration_record_ids"]
-    if len(record_ids) != 1:
-        raise BusinessPresentationPlanError(
-            f"manager presentation widget must bind exactly one committed record: {_text(widget.get('id'))}"
-        )
-    return record_ids[0]
-
-
-def _presentation_entry_shape(entry: Mapping[str, Any]) -> None:
+def _manager_entry_shape(entry: Mapping[str, Any]) -> None:
     required = {
         "widget_id", "record_id", "requirement_id", "presentation_role",
         "file_sha256", "canonical_payload_sha256", "display_projection",
     }
     if set(entry) != required:
-        raise BusinessPresentationPlanError("presentation plan manager entry fields are invalid")
+        raise BusinessPresentationPlanError("v2 manager entry fields are invalid")
     for key in ("widget_id", "record_id", "requirement_id", "presentation_role"):
         if not isinstance(entry.get(key), str) or not entry[key].strip():
-            raise BusinessPresentationPlanError("presentation plan manager entry identity is invalid")
+            raise BusinessPresentationPlanError("v2 manager entry identity is invalid")
     if not _is_sha256(entry.get("file_sha256")) or not _is_sha256(entry.get("canonical_payload_sha256")):
-        raise BusinessPresentationPlanError("presentation plan manager entry hashes are invalid")
+        raise BusinessPresentationPlanError("v2 manager entry hashes are invalid")
     projection = entry.get("display_projection")
     if not isinstance(projection, Mapping) or "title" not in projection:
-        raise BusinessPresentationPlanError("presentation plan manager entry requires a title projection")
+        raise BusinessPresentationPlanError("v2 manager entry requires a title projection")
     if not ("body" in projection or "value" in projection or "rows" in projection or "display_value" in projection):
-        raise BusinessPresentationPlanError("presentation plan manager entry requires a display projection")
+        raise BusinessPresentationPlanError("v2 manager entry requires a display projection")
     if any(not isinstance(key, str) or key not in _PRESENTATION_PROJECTION_FIELDS for key in projection):
-        raise BusinessPresentationPlanError("presentation plan display projection field is unsupported")
+        raise BusinessPresentationPlanError("v2 manager display projection field is unsupported")
     for field, binding in projection.items():
         if not isinstance(binding, Mapping) or set(binding) != {"pointer", "value"}:
             raise BusinessPresentationPlanError(f"presentation plan projection {field} must bind pointer and value")
@@ -1077,6 +1527,56 @@ def _candidate_display_projection(
     return projection
 
 
+def _accepted_evidence_display_projection(
+    widget: Mapping[str, Any],
+) -> dict[str, dict[str, Any]] | None:
+    """Expose one exact, source-bound projection for an accepted ledger row.
+
+    Accepted-evidence widgets do not have committed integration record IDs,
+    but their audit payload is the exact hash-bound ledger record.  The public
+    inventory therefore exposes the same pointer/value envelope used by
+    ordinary record candidates, using only the ledger's own fields.  The
+    renderer consumes the V2 visual projection; this envelope exists so a
+    Product Agent can select the candidate without guessing an ID or value.
+    """
+
+    payload = widget.get("audit_payload")
+    if not isinstance(payload, Mapping):
+        return None
+    conclusion = payload.get("conclusion")
+    if isinstance(conclusion, str) and conclusion.strip():
+        projection: dict[str, dict[str, Any]] = {
+            "title": {"pointer": "/payload/conclusion", "value": copy.deepcopy(conclusion)},
+            "body": {"pointer": "/payload/conclusion", "value": copy.deepcopy(conclusion)},
+        }
+    else:
+        # Evidence IDs remain metadata/provenance only.  They are a truthful
+        # source field for identifying a ledger row when it has no conclusion;
+        # the manager-facing title remains the pointer-derived widget title
+        # and never uses this value.
+        evidence_id = payload.get("evidence_id")
+        if not isinstance(evidence_id, str) or not evidence_id.strip():
+            return None
+        projection = {
+            "title": {
+                "pointer": "/widget_snapshot/title",
+                "value": copy.deepcopy(widget.get("title") or "Business metrics"),
+            },
+        }
+        facts = payload.get("facts")
+        if facts is not None:
+            projection["value"] = {"pointer": "/payload/facts", "value": copy.deepcopy(facts)}
+    candidate_kind = _text(widget.get("accepted_evidence_candidate_kind")).strip()
+    pointer = _text(widget.get("accepted_evidence_pointer")).strip()
+    rows = widget.get("rows")
+    if candidate_kind == "table" and pointer.startswith("/facts/") and isinstance(rows, list):
+        projection["rows"] = {
+            "pointer": f"/payload{pointer}",
+            "value": copy.deepcopy(rows),
+        }
+    return projection
+
+
 def _presentation_plan_ref(context: RunContext, generation_id: str, reference: str | Path | None = None) -> str:
     value = Path(reference or Path("extensions") / generation_id / PRESENTATION_PLAN_FILENAME)
     if value.is_absolute() or ".." in value.parts:
@@ -1089,55 +1589,6 @@ def _presentation_plan_ref(context: RunContext, generation_id: str, reference: s
     return value.as_posix()
 
 
-def _validate_presentation_plan_shape(plan: Mapping[str, Any]) -> None:
-    expected = {
-        "schema_version", "run_id", "generation_id", "supervisor_plan_ref", "supervisor_plan_sha256",
-        "item_order", "input_items", "parent", "reviewer_ref", "manager_widget_ids", "manager_entries",
-    }
-    if set(plan) != expected or plan.get("schema_version") != PRESENTATION_PLAN_SCHEMA:
-        raise BusinessPresentationPlanError("presentation plan fields are invalid")
-    if not isinstance(plan.get("run_id"), str) or not plan["run_id"]:
-        raise BusinessPresentationPlanError("presentation plan run_id is invalid")
-    if not isinstance(plan.get("generation_id"), str) or not re.fullmatch(r"G-[0-9]{4}", plan["generation_id"]):
-        raise BusinessPresentationPlanError("presentation plan generation_id is invalid")
-    if not _is_sha256(plan.get("supervisor_plan_sha256")):
-        raise BusinessPresentationPlanError("presentation plan supervisor hash is invalid")
-    item_order = plan.get("item_order")
-    if not isinstance(item_order, list) or len(set(item_order)) != len(item_order) or any(not isinstance(v, str) or not v for v in item_order):
-        raise BusinessPresentationPlanError("presentation plan item_order is invalid")
-    input_items = plan.get("input_items")
-    if not isinstance(input_items, list) or [v.get("item_id") for v in input_items if isinstance(v, Mapping)] != item_order:
-        raise BusinessPresentationPlanError("presentation plan input bindings do not match item_order")
-    for item in input_items:
-        if not isinstance(item, Mapping) or set(item) != {"item_id", "accepted_content_hash", "accepted_manifest_hash", "integration_manifest_hash", "record_count"}:
-            raise BusinessPresentationPlanError("presentation plan input binding is invalid")
-        if not all(_is_sha256(item.get(key)) for key in ("accepted_content_hash", "accepted_manifest_hash", "integration_manifest_hash")):
-            raise BusinessPresentationPlanError("presentation plan input hash is invalid")
-        if isinstance(item.get("record_count"), bool) or not isinstance(item.get("record_count"), int) or item["record_count"] < 0:
-            raise BusinessPresentationPlanError("presentation plan input record_count is invalid")
-    parent = plan.get("parent")
-    if parent is not None:
-        if not isinstance(parent, Mapping) or set(parent) != {"generation_id", "product_manifest_ref", "product_manifest_sha256", "receipt_ref", "receipt_sha256"}:
-            raise BusinessPresentationPlanError("presentation plan parent binding is invalid")
-        if not _is_sha256(parent.get("product_manifest_sha256")) or not _is_sha256(parent.get("receipt_sha256")):
-            raise BusinessPresentationPlanError("presentation plan parent hash is invalid")
-    reviewer_ref = plan.get("reviewer_ref")
-    if not isinstance(reviewer_ref, str) or not reviewer_ref.strip():
-        raise BusinessPresentationPlanError("presentation plan reviewer_ref is required")
-    widget_ids = plan.get("manager_widget_ids")
-    if not isinstance(widget_ids, list) or len(set(widget_ids)) != len(widget_ids) or any(not isinstance(v, str) or not v for v in widget_ids):
-        raise BusinessPresentationPlanError("presentation plan manager_widget_ids are invalid")
-    entries = plan.get("manager_entries")
-    if not isinstance(entries, list) or [v.get("widget_id") for v in entries if isinstance(v, Mapping)] != widget_ids:
-        raise BusinessPresentationPlanError("presentation plan manager entries do not match manager_widget_ids")
-    if len(set(widget_ids)) != len(entries):
-        raise BusinessPresentationPlanError("presentation plan manager entries must be unique")
-    for entry in entries:
-        if not isinstance(entry, Mapping):
-            raise BusinessPresentationPlanError("presentation plan manager entry is invalid")
-        _presentation_entry_shape(entry)
-
-
 def _validate_presentation_plan_v2_shape(plan: Mapping[str, Any]) -> None:
     expected = {
         "schema_version", "run_id", "generation_id", "supervisor_plan_ref", "supervisor_plan_sha256",
@@ -1147,8 +1598,8 @@ def _validate_presentation_plan_v2_shape(plan: Mapping[str, Any]) -> None:
     if set(plan) != expected or plan.get("schema_version") != PRESENTATION_PLAN_V2_SCHEMA:
         raise BusinessPresentationPlanError("v2 presentation plan fields are invalid")
     # Validate the immutable lifecycle/input envelope directly.  V2 manager
-    # entries may carry visual projection fields, so they must not be passed
-    # through the stricter V1 manager-entry shape.
+    # entries may carry visual projection fields, so only non-visual entries
+    # use the pointer-bound manager record shape below.
     if not isinstance(plan.get("run_id"), str) or not plan["run_id"]:
         raise BusinessPresentationPlanError("v2 presentation plan run_id is invalid")
     if not isinstance(plan.get("generation_id"), str) or not re.fullmatch(r"G-[0-9]{4}", plan["generation_id"]):
@@ -1162,12 +1613,7 @@ def _validate_presentation_plan_v2_shape(plan: Mapping[str, Any]) -> None:
     if not isinstance(input_items, list) or [value.get("item_id") for value in input_items if isinstance(value, Mapping)] != item_order:
         raise BusinessPresentationPlanError("v2 input bindings do not match item_order")
     for item in input_items:
-        if not isinstance(item, Mapping) or set(item) != {"item_id", "accepted_content_hash", "accepted_manifest_hash", "integration_manifest_hash", "record_count"}:
-            raise BusinessPresentationPlanError("v2 input binding is invalid")
-        if any(not _is_sha256(item.get(key)) for key in ("accepted_content_hash", "accepted_manifest_hash", "integration_manifest_hash")):
-            raise BusinessPresentationPlanError("v2 input binding hash is invalid")
-        if isinstance(item.get("record_count"), bool) or not isinstance(item.get("record_count"), int) or item["record_count"] < 0:
-            raise BusinessPresentationPlanError("v2 input binding record_count is invalid")
+        _validate_presentation_input_binding(item, label="v2 presentation plan")
     parent = plan.get("parent")
     if parent is not None and (not isinstance(parent, Mapping) or set(parent) != {"generation_id", "product_manifest_ref", "product_manifest_sha256", "receipt_ref", "receipt_sha256"}):
         raise BusinessPresentationPlanError("v2 parent binding is invalid")
@@ -1184,8 +1630,6 @@ def _validate_presentation_plan_v2_shape(plan: Mapping[str, Any]) -> None:
         or len(set(audit_visual)) != len(audit_visual)
         or set(manager_visual).intersection(audit_visual)
         or any(not isinstance(value, str) or not value.strip() for value in manager_visual + audit_visual)
-        or not manager_visual
-        or not audit_visual
     ):
         raise BusinessPresentationPlanError("v2 visual partition is invalid")
     entries = plan.get("visual_entries")
@@ -1215,16 +1659,25 @@ def _validate_presentation_plan_v2_shape(plan: Mapping[str, Any]) -> None:
         if widget_id in manager_visual_set:
             visual = visual_by_id[widget_id]
             # Every visual manager entry must carry the exact chart projection
-            # in addition to its immutable envelope.  Existing V1 entries may
-            # retain their reviewed record projection on the overlap card.
-            for key in ("visual_type", "chart_family", "widget_snapshot_sha256", "chart_entry_sha256", "allowed_visual_fields", "title_projection", "visual_projection"):
+            # in addition to its immutable envelope.  A non-visual manager
+            # entry retains its pointer-bound record projection.
+            visual_keys = ("visual_type", "chart_family", "widget_snapshot_sha256", "chart_entry_sha256", "allowed_visual_fields", "title_projection", "visual_projection")
+            for accepted_key in ("accepted_visual_pointer", "accepted_content_hash", "accepted_manifest_hash", "accepted_artifact_ref", "accepted_artifact_sha256"):
+                if accepted_key in visual or accepted_key in entry:
+                    visual_keys += (accepted_key,)
+            if "recipe_id" in visual or "recipe_id" in entry:
+                visual_keys += ("recipe_id",)
+            if "layout" in visual or "layout" in entry:
+                visual_keys += ("layout",)
+            if "renderer_type" in visual or "renderer_type" in entry:
+                visual_keys += ("renderer_type",)
+            for key in visual_keys:
                 if entry.get(key) != visual.get(key):
                     raise BusinessPresentationPlanError(f"v2 manager visual entry drifted: {widget_id}:{key}")
         else:
-            # The six pre-existing conclusion entries intentionally retain the
-            # V1 pointer projection shape.  They are not chart entries except
-            # for the pending-refunds overlap, which is checked above.
-            _presentation_entry_shape(entry)
+            # Non-visual manager entries retain the pointer-bound record
+            # projection; they are not chart entries.
+            _manager_entry_shape(entry)
     source_bindings = plan.get("source_bindings")
     if not isinstance(source_bindings, Mapping):
         raise BusinessPresentationPlanError("v2 source bindings are invalid")
@@ -1234,16 +1687,13 @@ def _validate_presentation_plan_v2_shape(plan: Mapping[str, Any]) -> None:
     for key in ("fixture_sha256", "chart_map_sha256"):
         if not _is_sha256(source_bindings.get(key)):
             raise BusinessPresentationPlanError(f"v2 source binding hash is invalid: {key}")
-    # The successor must carry the exact V1 manager contract it claims to
-    # preserve.  This is intentionally validated from the plan bytes rather
-    # than inferred from non-empty IDs in an existing receipt.
-    _v2_predecessor_manager_contract(plan)
-    # A V2 successor also binds the complete manager envelope of its
-    # immediate V2 predecessor.  Keep this separate from the six-entry V1
-    # migration binding above because visual manager entries have richer
-    # projection fields.
-    _v2_predecessor_plan_manager_contract(plan)
-    _v2_predecessor_visual_contract(plan)
+    # V2 is the canonical declarative blueprint. It is valid as a direct root
+    # contract; no predecessor is required. When an older V2 successor carries
+    # an explicit predecessor envelope, validate that envelope as an integrity
+    # check, but never require or synthesize one for a new root blueprint.
+    if isinstance(source_bindings, Mapping) and "previous_plan_manager_widget_ids" in source_bindings:
+        _v2_predecessor_plan_manager_contract(plan)
+        _v2_predecessor_visual_contract(plan)
 
 
 def _validate_business_presentation_plan_v2(
@@ -1278,6 +1728,15 @@ def _validate_business_presentation_plan_v2(
     current_visual_ids = set(_true_visual_ids(widgets_by_id, charts_by_id))
     if current_visual_ids != visual_ids:
         raise BusinessPresentationPlanError("v2 visual partition does not cover the current fixture visual universe")
+    # Recipe/layout choices are validated against the exact fixture/chart
+    # containers and the committed registry before a site can be rendered.
+    # Older private shape fixtures may omit the optional fields; current
+    # writer-produced V2 plans always include them and therefore take this
+    # strict path.
+    registry: Mapping[str, Any] | None = None
+    registry_ref = _text(chart_map.get("chart_registry_ref") or fixture.get("chart_registry_ref")).strip()
+    if registry_ref:
+        registry = _read_json(context, registry_ref, label="v2 visual chart registry")
     visual_by_id = {entry["widget_id"]: entry for entry in plan["visual_entries"]}
     for widget_id in visual_ids:
         widget = widgets_by_id.get(widget_id)
@@ -1287,6 +1746,24 @@ def _validate_business_presentation_plan_v2(
             raise BusinessPresentationPlanError(f"v2 visual widget is missing: {widget_id}")
         if _visual_snapshot_hash(widget) != entry["widget_snapshot_sha256"] or _visual_chart_hash(chart) != entry["chart_entry_sha256"]:
             raise BusinessPresentationPlanError(f"v2 visual snapshot/chart hash drifted: {widget_id}")
+        if "recipe_id" in entry or "layout" in entry or "renderer_type" in entry:
+            if registry is None:
+                raise BusinessPresentationPlanError(f"v2 visual recipe registry is missing: {widget_id}")
+            candidate = {
+                "widget_id": widget_id,
+                "chart_family": _text(chart.get("family")),
+                "recipes": _dashboard_runtime().eligible_chart_recipes(widget, chart, registry),
+            }
+            try:
+                selected_recipe, selected_layout, selected_renderer_type = _validated_plan_selection(candidate, entry)
+            except BusinessPresentationPlanError:
+                raise
+            if (
+                entry.get("recipe_id") != selected_recipe
+                or entry.get("layout") != selected_layout
+                or entry.get("renderer_type") != selected_renderer_type
+            ):
+                raise BusinessPresentationPlanError(f"v2 visual recipe/layout/renderer selection drifted: {widget_id}")
         if entry["requirement_id"] != _text(widget.get("requirement_id")) or entry["visual_type"] != _text(widget.get("type") or widget.get("kind")):
             raise BusinessPresentationPlanError(f"v2 visual identity drifted: {widget_id}")
         record_ids = sorted({
@@ -1342,110 +1819,6 @@ def _validate_v2_plan_lineage(
         raise BusinessPresentationPlanError("v2 immediate parent lineage drifted")
 
 
-def _validate_business_presentation_plan(
-    context: RunContext,
-    plan: Mapping[str, Any],
-    *,
-    generation_id: str,
-    supervisor_ref: str,
-    supervisor_plan: Mapping[str, Any],
-    input_items: Sequence[Mapping[str, Any]],
-    parent: Mapping[str, Any] | None,
-    widgets: Sequence[Mapping[str, Any]] | None = None,
-    authoritative_roots: Mapping[str, Mapping[str, Any]] | None = None,
-    record_file_hashes: Mapping[str, str] | None = None,
-) -> list[str]:
-    _validate_presentation_plan_shape(plan)
-    if plan.get("run_id") != context.run_id or plan.get("generation_id") != generation_id:
-        raise BusinessPresentationPlanError("presentation plan run/generation binding is stale")
-    if plan.get("supervisor_plan_ref") != supervisor_ref or plan.get("supervisor_plan_sha256") != _sha256_bytes(context.resolve_run_path(supervisor_ref).read_bytes()):
-        raise BusinessPresentationPlanError("presentation plan supervisor binding drifted")
-    # ``item_order`` is the reviewed supervisor/display order, not an
-    # identity binding for the cumulative input set.  Fresh and delta builds
-    # may legitimately discover the same accepted/committed items in a
-    # different order (for example, a delta starts with its immediate
-    # parent's receipt order and appends the new item).  Compare the
-    # immutable bindings as an identity map instead: exact cardinality,
-    # unique item IDs, and the complete per-item hash/count record must all
-    # agree.  This keeps the security boundary (no missing, foreign,
-    # duplicated, or changed accepted/integration input) without making
-    # supervisor order a false integrity constraint.
-    planned_items = plan.get("input_items")
-    current_items = [dict(value) for value in input_items if isinstance(value, Mapping)]
-    if not isinstance(planned_items, list) or len(current_items) != len(input_items):
-        raise BusinessPresentationPlanError("presentation plan accepted/committed input bindings drifted")
-
-    def _binding_map(values: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]] | None:
-        result: dict[str, dict[str, Any]] = {}
-        for value in values:
-            item_id = value.get("item_id")
-            if not isinstance(item_id, str) or not item_id or item_id in result:
-                return None
-            result[item_id] = dict(value)
-        return result
-
-    planned_map = _binding_map([value for value in planned_items if isinstance(value, Mapping)])
-    current_map = _binding_map(current_items)
-    if planned_map is None or current_map is None or set(planned_map) != set(current_map) or any(
-        planned_map[item_id] != current_map[item_id] for item_id in planned_map
-    ):
-        raise BusinessPresentationPlanError("presentation plan accepted/committed input bindings drifted")
-    if plan.get("parent") != parent:
-        raise BusinessPresentationPlanError("presentation plan immediate parent lineage drifted")
-    entries = {entry["widget_id"]: entry for entry in plan["manager_entries"]}
-    if widgets is None:
-        if authoritative_roots is not None:
-            for entry in entries.values():
-                root = authoritative_roots.get(entry["record_id"])
-                if not isinstance(root, Mapping):
-                    raise BusinessPresentationPlanError(f"presentation plan record is not authoritative: {entry['record_id']}")
-                payload = root.get("payload")
-                if not isinstance(payload, Mapping) or entry["canonical_payload_sha256"] != _sha256_bytes(_canonical_bytes(payload)):
-                    raise BusinessPresentationPlanError(f"presentation plan canonical payload hash drifted: {entry['record_id']}")
-                if record_file_hashes is not None and entry["file_sha256"] != record_file_hashes.get(entry["record_id"]):
-                    raise BusinessPresentationPlanError(f"presentation plan committed records file hash drifted: {entry['record_id']}")
-                for field, binding in entry["display_projection"].items():
-                    actual_value = _presentation_pointer_value(root, binding["pointer"])
-                    if not _presentation_projection_value_equal(actual_value, binding["value"]):
-                        raise BusinessPresentationPlanError(f"presentation plan projection value drifted: {entry['record_id']}:{field}")
-        return list(plan["manager_widget_ids"])
-    by_id = {_text(widget.get("id")): widget for widget in widgets if _text(widget.get("id"))}
-    if set(plan["manager_widget_ids"]) - set(by_id):
-        missing = sorted(set(plan["manager_widget_ids"]) - set(by_id))
-        raise BusinessPresentationPlanError(f"presentation plan references unknown widget IDs: {missing[:5]}")
-    for widget_id in plan["manager_widget_ids"]:
-        widget = by_id[widget_id]
-        entry = entries[widget_id]
-        actual = _presentation_widget_binding(widget)
-        if entry["requirement_id"] != actual["requirement_id"] or entry["presentation_role"] != actual["presentation_role"]:
-            raise BusinessPresentationPlanError(f"presentation plan widget identity drifted: {widget_id}")
-        record_id = _presentation_record_id_for_widget(widget)
-        if entry["record_id"] != record_id:
-            raise BusinessPresentationPlanError(f"presentation plan manager record drifted: {widget_id}")
-        if authoritative_roots is not None:
-            root = authoritative_roots.get(record_id)
-            if not isinstance(root, Mapping):
-                raise BusinessPresentationPlanError(f"presentation plan record is not authoritative: {record_id}")
-            payload = root.get("payload")
-            if not isinstance(payload, Mapping):
-                raise BusinessPresentationPlanError(f"presentation plan record payload is invalid: {record_id}")
-            expected_payload_hash = _sha256_bytes(_canonical_bytes(payload))
-            if entry["canonical_payload_sha256"] != expected_payload_hash:
-                raise BusinessPresentationPlanError(f"presentation plan canonical payload hash drifted: {record_id}")
-            if record_file_hashes is not None and entry["file_sha256"] != record_file_hashes.get(record_id):
-                raise BusinessPresentationPlanError(f"presentation plan committed records file hash drifted: {record_id}")
-            projection = entry["display_projection"]
-            for field, binding in projection.items():
-                actual_value = _presentation_pointer_value(root, binding["pointer"])
-                if not _presentation_projection_value_equal(actual_value, binding["value"]):
-                    raise BusinessPresentationPlanError(f"presentation plan projection value drifted: {record_id}:{field}")
-        # Attach the exact entry to the widget.  The renderer consumes this
-        # projection and never reconstructs manager text from the raw widget.
-        if widget.get("manager_presentation") != dict(entry):
-            raise BusinessPresentationPlanError(f"presentation plan widget projection is not bound: {widget_id}")
-    return list(plan["manager_widget_ids"])
-
-
 def _load_business_presentation_plan(context: RunContext, reference: str | Path) -> tuple[Mapping[str, Any], str]:
     path = context.resolve_run_path(reference)
     if path.is_symlink() or not path.is_file():
@@ -1456,10 +1829,15 @@ def _load_business_presentation_plan(context: RunContext, reference: str | Path)
         raise BusinessPresentationPlanError("presentation plan is invalid") from exc
     if not isinstance(raw, Mapping):
         raise BusinessPresentationPlanError("presentation plan must be an object")
-    if raw.get("schema_version") == PRESENTATION_PLAN_V2_SCHEMA:
-        _validate_presentation_plan_v2_shape(raw)
-    else:
-        _validate_presentation_plan_shape(raw)
+    if raw.get("schema_version") != PRESENTATION_PLAN_V2_SCHEMA:
+        # Older plan shapes are never migration inputs.  Keep the binding
+        # phrase in the diagnostic so callers can classify a stale
+        # accepted/committed contract; no legacy bytes are consumed or
+        # rewritten.
+        raise BusinessPresentationPlanError(
+            "presentation plan must use V2 schema; accepted/committed input bindings drifted"
+        )
+    _validate_presentation_plan_v2_shape(raw)
     return dict(raw), _sha256_bytes(path.read_bytes())
 
 
@@ -1468,6 +1846,7 @@ def business_presentation_inventory(
     *,
     fixture_ref: str | Path,
     generation_id: str | None = None,
+    item_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Return a read-only exact widget inventory for reviewer selection."""
 
@@ -1479,7 +1858,11 @@ def business_presentation_inventory(
     widgets = fixture.get("widgets")
     if not isinstance(widgets, list):
         raise BusinessPresentationPlanError("presentation inventory fixture widgets are invalid")
-    item_order = _discover_item_ids(context, None, supervisor_plan)
+    # A preview inventory may intentionally cover only the currently
+    # committed subset while later requirements remain non-terminal.  The
+    # caller-provided IDs are still validated by the same safe discovery
+    # boundary; omitting them retains the cumulative/final behaviour.
+    item_order = _discover_item_ids(context, item_ids, supervisor_plan)
     input_items = _presentation_input_bindings(context, item_order)
     parent = _presentation_parent_binding(context, generation, metadata)
     # Build the authoritative record index once.  Inventory values are
@@ -1488,8 +1871,26 @@ def business_presentation_inventory(
     authoritative: dict[str, dict[str, Any]] = {}
     record_file_hashes: dict[str, str] = {}
     for item_id in item_order:
+        state_probe = _read_json(context, f"requirements/{item_id}/item_state.json", label=f"{item_id} item state")
+        if state_probe.get("lifecycle_state") == "technical_failure":
+            # Pre-acceptance terminal failures intentionally have no accepted
+            # bundle/records.  Their validated manifest is represented by the
+            # limited empty-state widget, not by an invented inventory row.
+            _load_item_technical_failure_manifest(context, item_id, state_probe)
+            continue
         content, accepted_manifest, accepted_meta = _load_public_accepted_bundle(context, item_id)
-        _integration_manifest, records = _load_committed_records(context, item_id, accepted_manifest, accepted_meta["bundle"])
+        if state_probe.get("integration_state") == "technical_failure":
+            _load_technical_failure_manifest(context, item_id, accepted_meta)
+            records = []
+        else:
+            _integration_manifest, records = _load_committed_records(
+                context,
+                item_id,
+                accepted_manifest,
+                accepted_meta["bundle"],
+            )
+        if not records:
+            continue
         records_ref = f"requirements/{item_id}/integration/committed/records.jsonl"
         records_path = context.resolve_run_path(records_ref)
         records_file_sha = _sha256_bytes(records_path.read_bytes())
@@ -1513,9 +1914,68 @@ def business_presentation_inventory(
         binding["value"] = widget.get("value") if "value" in widget else None
         binding["unit"] = widget.get("unit")
         binding["denominator"] = widget.get("denominator")
+        if "scale_groups" in widget:
+            binding["scale_groups"] = copy.deepcopy(widget.get("scale_groups"))
         binding["evidence_refs"] = list(_as_list(widget.get("evidence_refs")))
         binding["trace_refs"] = list(_as_list(widget.get("trace_refs")))
         binding["audit_payload"] = copy.deepcopy(widget.get("audit_payload"))
+        # Product Agent quality metadata is descriptive only: all values and
+        # source hashes still come from the exact fixture/widget binding.  No
+        # derived semantic key or content score is used for selection.
+        binding["technical_surface"] = _presentation_surface_is_technical(widget)
+        if _text(widget.get("technical_surface_reason")).strip():
+            binding["technical_surface_reason"] = _text(widget.get("technical_surface_reason"))
+        # Geometry-less duplicate declarations are intentionally audit-only;
+        # expose that deterministic marker to Product selection so an
+        # explicit V2 request cannot re-promote them.
+        if widget.get("no_geometry_fallback_duplicate") is True:
+            binding["no_geometry_fallback_duplicate"] = True
+        if widget.get("accepted_visual"):
+            binding.update({
+                "accepted_visual": True,
+                "accepted_visual_index": widget.get("accepted_visual_index"),
+                "accepted_visual_pointer": _text(widget.get("accepted_visual_pointer")),
+                "accepted_visual_type": _text(widget.get("accepted_visual_type")),
+                "accepted_content_hash": _text(widget.get("accepted_content_hash")),
+                "accepted_manifest_hash": _text(widget.get("accepted_manifest_hash")),
+            })
+            for accepted_key in ("accepted_source_ref", "accepted_artifact_ref", "accepted_artifact_sha256"):
+                accepted_value = _text(widget.get(accepted_key)).strip()
+                if accepted_value:
+                    binding[accepted_key] = accepted_value
+        if widget.get("accepted_evidence"):
+            # Accepted evidence is a first-class source-bound Product input,
+            # even when integration produced no committed records.  Keep the
+            # evidence ID/ref/hash in inventory metadata while exposing a
+            # pointer-bound projection so the Product Agent can select the
+            # table or fact sheet without interpreting opaque identifiers.
+            binding.update({
+                "accepted_evidence": True,
+                "accepted_evidence_id": _text(widget.get("accepted_evidence_id")),
+                "accepted_evidence_candidate_kind": _text(widget.get("accepted_evidence_candidate_kind")),
+                "accepted_evidence_pointer": _text(widget.get("accepted_evidence_pointer")),
+                "accepted_evidence_source_pointer": _text(widget.get("accepted_evidence_source_pointer")),
+                "accepted_evidence_table_pointer": _text(widget.get("accepted_evidence_table_pointer")),
+                "accepted_evidence_ref": _text(widget.get("accepted_evidence_ref")),
+                "accepted_evidence_sha256": _text(widget.get("accepted_evidence_sha256")),
+                "source_type": "accepted_evidence",
+                "source_bound": bool(widget.get("source_bound")),
+                "title": _text(widget.get("title") or widget.get("label")),
+                "rows": copy.deepcopy(widget.get("rows")),
+                "manager_rows": copy.deepcopy(widget.get("manager_rows")),
+            })
+            raw_payload = widget.get("audit_payload")
+            evidence_ref = _text(widget.get("accepted_evidence_ref")).strip()
+            evidence_sha = _text(widget.get("accepted_evidence_sha256")).strip()
+            projection = _accepted_evidence_display_projection(widget)
+            if isinstance(raw_payload, Mapping) and evidence_ref and _is_sha256(evidence_sha) and projection:
+                # The ledger ref is the stable source record key.  Its file
+                # hash and canonical row hash are exact source bindings, not
+                # inferred integration identities.
+                binding["record_id"] = evidence_ref
+                binding["file_sha256"] = evidence_sha
+                binding["canonical_payload_sha256"] = _sha256_bytes(_canonical_bytes(raw_payload))
+                binding["display_projection"] = projection
         record_ids = binding["integration_record_ids"]
         if len(record_ids) == 1 and record_ids[0] in authoritative:
             details = authoritative[record_ids[0]]
@@ -1526,8 +1986,63 @@ def business_presentation_inventory(
             binding["accepted_fields"] = copy.deepcopy(details["root"].get("accepted", {}))
             binding["display_projection"] = _candidate_display_projection(details["root"], details["record"])
         candidates.append(binding)
+    # The read-only inventory carries both exact committed facts and the
+    # executable recipe choices exposed by the canonical registry.  Recipes
+    # are advisory; plan recording still revalidates every pointer/hash.
+    design_inventory: dict[str, Any] | None = None
+    chart_map_ref = _text(fixture.get("chart_map_ref")).strip()
+    registry_ref = _text(fixture.get("chart_registry_ref")).strip()
+    if chart_map_ref and registry_ref:
+        try:
+            chart_map = _read_json(context, chart_map_ref, label="presentation inventory chart map")
+            registry = _read_json(context, registry_ref, label="presentation inventory chart registry")
+            design_inventory = _dashboard_runtime().design_inventory(fixture, chart_map, registry)
+            design_inventory["chart_map_ref"] = chart_map_ref
+            design_inventory["chart_registry_ref"] = registry_ref
+            recipes_by_id = {
+                _text(entry.get("widget_id")): entry.get("recipes", [])
+                for entry in design_inventory.get("visuals", [])
+                if isinstance(entry, Mapping)
+            }
+            for candidate in candidates:
+                candidate_chart_family = next(
+                    (
+                        chart.get("family")
+                        for chart in _as_list(chart_map.get("charts"))
+                        if isinstance(chart, Mapping)
+                        and _text(chart.get("id")) == _text(candidate.get("widget_id"))
+                    ),
+                    "table",
+                )
+                candidate["chart_family"] = _text(candidate_chart_family, "table")
+                candidate["recipes"] = copy.deepcopy(recipes_by_id.get(_text(candidate.get("widget_id")), []))
+                # The inventory's first eligible recipe is a deterministic
+                # semantic/data-shape default.  A Product Agent may replace
+                # it with any other eligible ID when recording the plan.
+                default_recipe = _default_recipe_id(candidate)
+                if default_recipe:
+                    candidate["recipe_id"] = default_recipe
+                    candidate["layout"] = _dashboard_runtime().default_layout_for_recipe(default_recipe)
+                    selected_recipe = next(
+                        (
+                            recipe for recipe in candidate.get("recipes", [])
+                            if isinstance(recipe, Mapping) and _text(recipe.get("id")) == default_recipe
+                        ),
+                        None,
+                    )
+                    candidate["renderer_type"] = _text(
+                        selected_recipe.get("default_renderer_type")
+                        if isinstance(selected_recipe, Mapping)
+                        else ""
+                    ).strip() or "table"
+        except (AssemblyError, OSError, ValueError, TypeError):
+            # A manually authored pre-runtime fixture may not expose a chart
+            # map/registry.  Keep its exact inventory usable; canonical V4
+            # assembly always supplies both and therefore never takes this
+            # fallback.
+            design_inventory = None
     return {
-        "schema_version": PRESENTATION_PLAN_SCHEMA,
+        "schema_version": PRESENTATION_PLAN_V2_SCHEMA,
         "run_id": context.run_id,
         "generation_id": generation,
         "supervisor_plan_ref": supervisor_ref,
@@ -1538,6 +2053,277 @@ def business_presentation_inventory(
         "inventory_widget_count": len(candidates),
         "record_file_hashes": record_file_hashes,
         "candidates": candidates,
+        "design_inventory": design_inventory,
+    }
+
+
+def _preflight_ref(generation_id: str, filename: str) -> str:
+    """Return the deterministic non-product source-inventory reference."""
+
+    if not re.fullmatch(r"G-[0-9]{4}", generation_id):
+        raise BusinessPresentationPlanError("preflight generation_id is invalid")
+    if filename not in {
+        "dashboard_fixture_v4.json",
+        "dashboard_chart_map_v4.json",
+        "dashboard_chart_registry_v4.json",
+        "preflight_manifest.json",
+    }:
+        raise BusinessPresentationPlanError("preflight filename is invalid")
+    return f"extensions/{generation_id}/dashboard_preflight/{filename}"
+
+
+def _validate_existing_preflight(
+    context: RunContext,
+    root: Path,
+    manifest_ref: str,
+    *,
+    expected_input_fingerprint: str,
+    expected_item_ids: Sequence[str],
+    expected_rendering_identity: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Validate an existing preflight namespace before idempotent reuse.
+
+    A malformed or tampered source inventory is never overwritten.  A valid
+    inventory whose accepted/committed input fingerprint changed is returned
+    as ``None`` so the caller can perform the narrowly-scoped refresh swap.
+    """
+
+    if not root.exists():
+        return None
+    if root.is_symlink() or not root.is_dir():
+        raise BusinessPresentationPlanError("existing presentation preflight is not a regular directory")
+    _assert_no_symlink_chain(context, manifest_ref, label="presentation preflight manifest")
+    manifest_path = context.resolve_run_path(manifest_ref)
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise BusinessPresentationPlanError("existing presentation preflight manifest is missing or symlinked")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BusinessPresentationPlanError("existing presentation preflight manifest is invalid") from exc
+    if not isinstance(manifest, Mapping) or manifest.get("schema_version") != "dashboard.presentation_preflight.v1":
+        raise BusinessPresentationPlanError("existing presentation preflight manifest schema is invalid")
+    if manifest.get("run_id") != context.run_id or manifest.get("item_ids") != list(expected_item_ids):
+        # A valid old input set is replaceable only through the explicit
+        # changed-fingerprint refresh path.  Keep this branch strict so a
+        # caller cannot repurpose an arbitrary preflight directory.
+        if manifest.get("run_id") != context.run_id:
+            raise BusinessPresentationPlanError("existing presentation preflight run binding is stale")
+    outputs = manifest.get("outputs")
+    input_items = manifest.get("input_items")
+    if not isinstance(outputs, Mapping) or not isinstance(input_items, list) or not _is_sha256(manifest.get("input_fingerprint")):
+        raise BusinessPresentationPlanError("existing presentation preflight binding is invalid")
+    expected_files = {
+        "fixture": (outputs.get("fixture_ref"), outputs.get("fixture_sha256")),
+        "chart_map": (outputs.get("chart_map_ref"), outputs.get("chart_map_sha256")),
+        "chart_registry": (outputs.get("chart_registry_ref"), outputs.get("chart_registry_sha256")),
+    }
+    for label, (reference, expected_hash) in expected_files.items():
+        if not isinstance(reference, str) or not reference or not _is_sha256(expected_hash):
+            raise BusinessPresentationPlanError(f"existing presentation preflight {label} binding is invalid")
+        _assert_no_symlink_chain(context, reference, label=f"presentation preflight {label}")
+        path = context.resolve_run_path(reference)
+        if path.is_symlink() or not path.is_file() or _sha256_bytes(path.read_bytes()) != expected_hash:
+            raise BusinessPresentationPlanError(f"existing presentation preflight {label} hash mismatch")
+    if (
+        manifest.get("input_fingerprint") == expected_input_fingerprint
+        and manifest.get("item_ids") == list(expected_item_ids)
+        and manifest.get("rendering_identity") == dict(expected_rendering_identity)
+    ):
+        fixture_ref = expected_files["fixture"][0]
+        chart_map_ref = expected_files["chart_map"][0]
+        inventory = business_presentation_inventory(
+            context,
+            fixture_ref=fixture_ref,
+            generation_id=_text(manifest.get("generation_id")),
+            item_ids=expected_item_ids,
+        )
+        return {"manifest": dict(manifest), "inventory": inventory}
+    return None
+
+
+def business_presentation_preflight(
+    context: RunContext,
+    *,
+    item_ids: Sequence[str],
+    generation_id: str | None = None,
+) -> dict[str, Any]:
+    """Build a deterministic read-only source inventory before final assembly.
+
+    The helper stages the exact accepted/committed fixture, chart map, and
+    registry without rendering a site or publishing a product namespace.  It
+    atomically refreshes only ``extensions/<G>/dashboard_preflight`` when the
+    input bindings change, and returns the inventory that a Product Agent may
+    use to author explicit V2 recipe/layout/renderer choices.
+    """
+
+    if not isinstance(context, RunContext):
+        raise TypeError("business_presentation_preflight requires one RunContext")
+    generation, _metadata = _presentation_generation_metadata(context, generation_id)
+    # Validate IDs up front using the same boundary as canonical assembly.
+    plan = _load_plan(context, None)
+    # Preflight is a source-inventory cache, not a caller-order presentation
+    # request.  Canonicalize the validated set before assembling its fixture,
+    # input bindings, and fingerprint so probes with a different item order
+    # are true idempotent cache hits rather than semantic rewrites.
+    selected_ids = sorted(_discover_item_ids(context, item_ids, plan))
+    # The private assembler branch builds source bytes only.  Its temporary
+    # product staging directory is deleted before it returns.
+    preflight_output = Path("generations") / generation / ".dashboard-preflight"
+    result = assemble_dashboard(
+        context,
+        output_dir=preflight_output,
+        item_ids=selected_ids,
+        _preflight_only=True,
+    )
+    fixture = copy.deepcopy(result.get("fixture"))
+    chart_map = copy.deepcopy(result.get("chart_map"))
+    registry = copy.deepcopy(result.get("registry"))
+    input_items = copy.deepcopy(result.get("input_items"))
+    rendering_identity = copy.deepcopy(result.get("rendering_identity"))
+    input_fingerprint = _text(result.get("input_fingerprint")).strip()
+    if not isinstance(fixture, Mapping) or not isinstance(chart_map, Mapping) or not isinstance(registry, Mapping):
+        raise BusinessPresentationPlanError("preflight source builder returned invalid inputs")
+    if not isinstance(input_items, list) or not isinstance(rendering_identity, Mapping) or not _is_sha256(input_fingerprint):
+        raise BusinessPresentationPlanError("preflight input binding is invalid")
+
+    fixture_ref = _preflight_ref(generation, "dashboard_fixture_v4.json")
+    chart_map_ref = _preflight_ref(generation, "dashboard_chart_map_v4.json")
+    registry_ref = _preflight_ref(generation, "dashboard_chart_registry_v4.json")
+    manifest_ref = _preflight_ref(generation, "preflight_manifest.json")
+    root = context.resolve_run_path(Path(manifest_ref).parent)
+    for reference, label in (
+        (fixture_ref, "presentation preflight fixture"),
+        (chart_map_ref, "presentation preflight chart map"),
+        (registry_ref, "presentation preflight chart registry"),
+        (manifest_ref, "presentation preflight manifest"),
+    ):
+        _assert_no_symlink_chain(context, reference, label=label)
+    root.parent.mkdir(parents=True, exist_ok=True)
+    existing = _validate_existing_preflight(
+        context,
+        root,
+        manifest_ref,
+        expected_input_fingerprint=input_fingerprint,
+        expected_item_ids=selected_ids,
+        expected_rendering_identity=rendering_identity,
+    )
+    if existing is not None:
+        manifest = existing["manifest"]
+        inventory = existing["inventory"]
+        return {
+            **dict(manifest.get("outputs", {})),
+            "schema_version": PRESENTATION_PLAN_V2_SCHEMA,
+            "run_id": context.run_id,
+            "generation_id": generation,
+            "item_ids": list(selected_ids),
+            "input_items": input_items,
+            "input_fingerprint": input_fingerprint,
+            "rendering_identity": copy.deepcopy(manifest.get("rendering_identity")),
+            "inventory": inventory,
+        }
+
+    # Bind the copied source references to their deterministic extension
+    # namespace before hashing.  No site/receipt bytes are emitted here.
+    fixture = dict(fixture)
+    chart_map = dict(chart_map)
+    fixture["chart_registry_ref"] = registry_ref
+    fixture["chart_map_ref"] = chart_map_ref
+    chart_map["chart_registry_ref"] = registry_ref
+    chart_map["fixture_ref"] = fixture_ref
+    fixture_payload = _canonical_bytes(fixture)
+    chart_map_payload = _canonical_bytes(chart_map)
+    registry_payload = _canonical_bytes(registry)
+    outputs = {
+        "fixture_ref": fixture_ref,
+        "fixture_sha256": _sha256_bytes(fixture_payload),
+        "chart_map_ref": chart_map_ref,
+        "chart_map_sha256": _sha256_bytes(chart_map_payload),
+        "chart_registry_ref": registry_ref,
+        "chart_registry_sha256": _sha256_bytes(registry_payload),
+    }
+    manifest = {
+        "schema_version": "dashboard.presentation_preflight.v1",
+        "run_id": context.run_id,
+        "generation_id": generation,
+        "item_ids": list(selected_ids),
+        "input_items": input_items,
+        "input_fingerprint": input_fingerprint,
+        "rendering_identity": copy.deepcopy(rendering_identity),
+        "outputs": outputs,
+    }
+    manifest_payload = _canonical_bytes(manifest)
+    staging = root.parent / f".{root.name}.staging"
+    if staging.exists() or staging.is_symlink():
+        raise BusinessPresentationPlanError("presentation preflight staging namespace already exists")
+    staging.mkdir(parents=True, exist_ok=False)
+    try:
+        (staging / "dashboard_fixture_v4.json").write_bytes(fixture_payload)
+        (staging / "dashboard_chart_map_v4.json").write_bytes(chart_map_payload)
+        (staging / "dashboard_chart_registry_v4.json").write_bytes(registry_payload)
+        (staging / "preflight_manifest.json").write_bytes(manifest_payload)
+        backup = root.parent / f".{root.name}.previous"
+        if backup.exists() or backup.is_symlink():
+            raise BusinessPresentationPlanError("presentation preflight backup namespace already exists")
+        moved = False
+        published = False
+        try:
+            if root.exists() or root.is_symlink():
+                os.replace(root, backup)
+                moved = True
+            os.replace(staging, root)
+            published = True
+        except BaseException as original:
+            # A signal can arrive after either atomic rename, including
+            # between ``os.replace`` returning and the state assignment above.
+            # Derive the durable boundary from the three sibling paths so the
+            # original interruption is preserved while the namespace is left
+            # in a deterministic recoverable state.
+            moved = moved or (
+                (backup.exists() or backup.is_symlink())
+                and not (root.exists() or root.is_symlink())
+            )
+            candidate_published = (
+                (root.exists() or root.is_symlink())
+                and not (staging.exists() or staging.is_symlink())
+            )
+            if candidate_published:
+                published = True
+            elif moved and not (root.exists() or root.is_symlink()) and (
+                backup.exists() or backup.is_symlink()
+            ):
+                restore_error: BaseException | None = None
+                try:
+                    os.replace(backup, root)
+                except BaseException as exc:
+                    restore_error = exc
+                if restore_error is not None:
+                    # Keep the original interruption visible.  Retain the
+                    # backup for explicit recovery if restoration itself was
+                    # interrupted; the outer cleanup still removes staging.
+                    raise original from restore_error
+            raise
+        finally:
+            if published and moved and backup.exists() and backup.is_dir() and not backup.is_symlink():
+                shutil.rmtree(backup, ignore_errors=True)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    inventory = business_presentation_inventory(
+        context,
+        fixture_ref=fixture_ref,
+        generation_id=generation,
+        item_ids=selected_ids,
+    )
+    return {
+        **outputs,
+        "schema_version": PRESENTATION_PLAN_V2_SCHEMA,
+        "run_id": context.run_id,
+        "generation_id": generation,
+        "item_ids": list(selected_ids),
+        "input_items": input_items,
+        "input_fingerprint": input_fingerprint,
+        "rendering_identity": copy.deepcopy(rendering_identity),
+        "inventory": inventory,
     }
 
 
@@ -1587,6 +2373,17 @@ def business_presentation_visual_inventory(
     }
     if set(widgets_by_id) != set(charts_by_id):
         raise BusinessPresentationPlanError("v2 visual inventory fixture/chart map IDs drifted")
+    registry_ref = _text(fixture.get("chart_registry_ref")).strip()
+    registry: Mapping[str, Any] | None = None
+    design: Mapping[str, Any] | None = None
+    if registry_ref:
+        registry = _read_json(context, registry_ref, label="v2 visual inventory chart registry")
+        design = _dashboard_runtime().design_inventory(fixture, chart_map, registry)
+    recipes_by_id = {
+        _text(value.get("widget_id")): value.get("recipes", [])
+        for value in _as_list((design or {}).get("visuals"))
+        if isinstance(value, Mapping) and _text(value.get("widget_id"))
+    }
     visual_ids = _true_visual_ids(widgets_by_id, charts_by_id)
     if not visual_ids:
         raise BusinessPresentationPlanError("v2 visual inventory has no supported visual charts")
@@ -1614,7 +2411,15 @@ def business_presentation_visual_inventory(
         if widget is None or chart is None:
             raise BusinessPresentationPlanError(f"v2 visual inventory widget is missing: {widget_id}")
         kind = _text(widget.get("type") or widget.get("kind")).strip()
-        reviewed_table_fact = bool(widget.get("dashboard_fact")) and kind == "table"
+        reviewed_table_fact = (
+            bool(
+                widget.get("dashboard_fact")
+                or widget.get("limited_empty_state")
+                or widget.get("accepted_visual")
+                or widget.get("accepted_evidence")
+            )
+            and kind == "table"
+        )
         if (kind in {"status_table", ""} or (kind == "table" and not reviewed_table_fact) or _text(chart.get("type")) != kind):
             raise BusinessPresentationPlanError(f"v2 visual inventory widget type is invalid: {widget_id}")
         fields = chart.get("fields_or_values_used")
@@ -1631,8 +2436,8 @@ def business_presentation_visual_inventory(
         }
         for field, value in fields.items():
             # Presentation role/tier are plan-derived envelope metadata, not
-            # visual geometry or a reviewed value.  Excluding them keeps a
-            # V1 fixture rebinding stable while every chart field remains
+            # visual geometry or a reviewed value.  Excluding them keeps
+            # fixture rebinding stable while every chart field remains
             # pointer-bound and exact.
             if field in {"presentation_role", "presentation_tier"}:
                 continue
@@ -1641,7 +2446,7 @@ def business_presentation_visual_inventory(
                 "value": copy.deepcopy(value),
             }
         audience = "business_manager" if widget_id in manager_visual_ids else "technical_audit_gallery"
-        entries.append({
+        entry = {
             "widget_id": widget_id,
             "requirement_id": _text(widget.get("requirement_id")),
             "record_ids": record_ids,
@@ -1656,7 +2461,39 @@ def business_presentation_visual_inventory(
                 "value": copy.deepcopy(widget.get("title") or widget.get("label") or widget_id),
             },
             "visual_projection": visual_projection,
-        })
+        }
+        if widget.get("accepted_visual"):
+            entry.update({
+                "accepted_visual_pointer": _text(widget.get("accepted_visual_pointer")),
+                "accepted_content_hash": _text(widget.get("accepted_content_hash")),
+                "accepted_manifest_hash": _text(widget.get("accepted_manifest_hash")),
+            })
+            if widget.get("accepted_artifact_ref"):
+                entry["accepted_artifact_ref"] = _text(widget.get("accepted_artifact_ref"))
+                entry["accepted_artifact_sha256"] = _text(widget.get("accepted_artifact_sha256"))
+        if registry is not None:
+            candidate = {
+                "widget_id": widget_id,
+                "chart_family": _text(chart.get("family")),
+                "recipes": recipes_by_id.get(widget_id, []),
+            }
+            recipe_id = _default_recipe_id(candidate)
+            if recipe_id:
+                entry["recipe_id"] = recipe_id
+                entry["layout"] = _dashboard_runtime().default_layout_for_recipe(recipe_id)
+                selected_recipe = next(
+                    (
+                        recipe for recipe in recipes_by_id.get(widget_id, [])
+                        if isinstance(recipe, Mapping) and _text(recipe.get("id")) == recipe_id
+                    ),
+                    None,
+                )
+                entry["renderer_type"] = _text(
+                    selected_recipe.get("default_renderer_type")
+                    if isinstance(selected_recipe, Mapping)
+                    else ""
+                ).strip() or "table"
+        entries.append(entry)
     try:
         fixture_run_ref = fixture_path.relative_to(context.run_root).as_posix()
         chart_run_ref = chart_path.relative_to(context.run_root).as_posix()
@@ -1674,6 +2511,7 @@ def business_presentation_visual_inventory(
         "manager_visual_widget_ids": manager_visual_ids,
         "audit_visual_widget_ids": audit_visual_ids,
         "visual_entries": entries,
+        "design_inventory": design,
     }
 
 
@@ -1683,6 +2521,7 @@ def write_business_presentation_plan_v2(
     fixture_ref: str | Path,
     chart_map_ref: str | Path | None = None,
     previous_plan_ref: str | Path,
+    manager_entries: Sequence[Mapping[str, Any]],
     reviewer_ref: str,
     presentation_plan_ref: str | Path | None = None,
     _lock_held: bool = False,
@@ -1693,11 +2532,9 @@ def write_business_presentation_plan_v2(
     callers may write it to a temporary path for independent review first.
     """
 
-    visual_inventory = business_presentation_visual_inventory(context, fixture_ref=fixture_ref, chart_map_ref=chart_map_ref)
-    raw_previous_ref = Path(previous_plan_ref).as_posix()
-    old_plan, old_hash = _load_business_presentation_plan(context, raw_previous_ref)
-    if old_plan.get("schema_version") not in {PRESENTATION_PLAN_SCHEMA, PRESENTATION_PLAN_V2_SCHEMA}:
-        raise BusinessPresentationPlanError("v2 successor requires a V1 or V2 predecessor plan")
+    old_plan, old_hash = _load_business_presentation_plan(context, previous_plan_ref)
+    if old_plan.get("schema_version") != PRESENTATION_PLAN_V2_SCHEMA:
+        raise BusinessPresentationPlanError("v2 successor requires a V2 predecessor plan")
 
     generation_id, metadata = _presentation_generation_metadata(context, _lock_held=_lock_held)
     supervisor_ref, supervisor_plan, supervisor_hash = _presentation_supervisor_binding(context, generation_id, metadata)
@@ -1705,115 +2542,72 @@ def write_business_presentation_plan_v2(
     current_input_items = _presentation_input_bindings(context, current_item_order)
     current_parent = _presentation_parent_binding(context, generation_id, metadata)
 
-    old_order = [_text(entry.get("widget_id")) for entry in old_plan.get("manager_entries", [])]
-    manager_entries_by_id: dict[str, dict[str, Any]] = {
-        _text(entry.get("widget_id")): copy.deepcopy(dict(entry))
-        for entry in old_plan.get("manager_entries", [])
+    # Reuse the initial V2 inventory/selection policy, but require the
+    # successor caller to make every visual presentation choice explicitly.
+    inventory = business_presentation_inventory(
+        context,
+        fixture_ref=fixture_ref,
+        generation_id=generation_id,
+    )
+    visual_inventory = business_presentation_visual_inventory(
+        context,
+        fixture_ref=fixture_ref,
+        chart_map_ref=chart_map_ref or _text((inventory.get("design_inventory") or {}).get("chart_map_ref")) or None,
+    )
+    selection = _v2_manager_selection(
+        inventory,
+        visual_inventory,
+        manager_entries,
+        require_explicit_visual_choices=True,
+    )
+
+    # Keep the predecessor's source/widget/chart/value bindings immutable while
+    # allowing the new selection to change visual audience, membership/order,
+    # and recipe/layout/renderer choices.
+    previous_manager_visual_ids = list(old_plan.get("manager_visual_widget_ids") or [])
+    previous_audit_visual_ids = list(old_plan.get("audit_visual_widget_ids") or [])
+    previous_visual_entries = [copy.deepcopy(dict(entry)) for entry in old_plan.get("visual_entries", [])]
+    current_visual_by_id = {
+        _text(entry.get("widget_id")): entry
+        for entry in selection["visual_entries"]
         if isinstance(entry, Mapping)
     }
-    current_visual_by_id = {entry["widget_id"]: entry for entry in visual_inventory["visual_entries"]}
-    current_visual_ids = list(visual_inventory.get("all_visual_widget_ids") or [
-        *visual_inventory["manager_visual_widget_ids"],
-        *visual_inventory["audit_visual_widget_ids"],
-    ])
-
-    if old_plan.get("schema_version") == PRESENTATION_PLAN_V2_SCHEMA:
-        previous_manager_visual_ids = list(old_plan.get("manager_visual_widget_ids") or [])
-        previous_audit_visual_ids = list(old_plan.get("audit_visual_widget_ids") or [])
-        previous_visual_entries = [copy.deepcopy(dict(entry)) for entry in old_plan.get("visual_entries", [])]
-    else:
-        # V1 has no visual partition.  For the one-time G3 migration the
-        # reviewed constants remain the predecessor contract; later
-        # generation successors inherit the V2 partition above.
-        previous_manager_visual_ids = [widget_id for widget_id in V2_MANAGER_VISUAL_WIDGET_IDS if widget_id in current_visual_ids]
-        previous_audit_visual_ids = [widget_id for widget_id in V2_AUDIT_VISUAL_WIDGET_IDS if widget_id in current_visual_ids]
-        previous_visual_entries = []
-
-    previous_visual_set = set(previous_manager_visual_ids + previous_audit_visual_ids)
-    if not previous_visual_set.issubset(set(current_visual_ids)):
-        missing = sorted(previous_visual_set - set(current_visual_ids))
-        raise BusinessPresentationPlanError(f"v2 predecessor visual IDs are missing from the successor fixture: {missing[:5]}")
-    new_visual_ids = [widget_id for widget_id in current_visual_ids if widget_id not in previous_visual_set]
-    manager_visual_ids = previous_manager_visual_ids + new_visual_ids
-    audit_visual_ids = list(previous_audit_visual_ids)
-    if set(manager_visual_ids).intersection(audit_visual_ids) or set(manager_visual_ids + audit_visual_ids) != set(current_visual_ids):
-        raise BusinessPresentationPlanError("v2 successor visual partition does not cover the current fixture")
-
     previous_visual_by_id = {
         _text(entry.get("widget_id")): entry
         for entry in previous_visual_entries
         if isinstance(entry, Mapping)
     }
-    visual_entries: list[dict[str, Any]] = []
-    for widget_id in manager_visual_ids + audit_visual_ids:
-        visual = copy.deepcopy(current_visual_by_id[widget_id])
-        if widget_id in previous_visual_by_id:
-            predecessor = previous_visual_by_id[widget_id]
-            # Preserve the full predecessor binding.  A changed snapshot,
-            # title, value, or geometry is a semantic review event, not an
-            # implicit rebind during product assembly.
-            for key in (
-                "requirement_id", "record_ids", "visual_type", "chart_family",
-                "widget_snapshot_sha256", "chart_entry_sha256", "allowed_visual_fields",
-                "title_projection", "visual_projection",
-            ):
-                if visual.get(key) != predecessor.get(key):
-                    raise BusinessPresentationPlanError(f"v2 predecessor visual drifted: {widget_id}:{key}")
-            visual["presentation_audience"] = predecessor["presentation_audience"]
-        else:
-            visual["presentation_audience"] = "business_manager" if widget_id in manager_visual_ids else "technical_audit_gallery"
-        visual_entries.append(visual)
-
-    # Keep inherited manager entries byte-compatible at the V1 envelope while
-    # attaching the exact current visual projection for visual overlaps.
-    visual_by_id = {entry["widget_id"]: entry for entry in visual_entries}
-    for widget_id in manager_visual_ids:
-        visual = visual_by_id[widget_id]
-        visual_manager = _v2_manager_entry_from_visual(visual)
-        if widget_id in manager_entries_by_id:
-            manager_entries_by_id[widget_id].update(visual_manager)
-            manager_entries_by_id[widget_id]["widget_id"] = widget_id
-            manager_entries_by_id[widget_id]["requirement_id"] = visual["requirement_id"]
-        else:
-            manager_entries_by_id[widget_id] = visual_manager
-    manager_order = old_order + [widget_id for widget_id in manager_visual_ids if widget_id not in old_order]
-
-    if old_plan.get("schema_version") == PRESENTATION_PLAN_V2_SCHEMA:
-        # V2 predecessors carry two manager contracts: the original six
-        # V1 conclusion entries used for the one-time migration guard, and
-        # the complete prior V2 manager envelope (including visual entries).
-        # Preserve both explicitly; never reinterpret the richer manager
-        # entries as the V1 shape.
-        old_source = old_plan.get("source_bindings")
-        if not isinstance(old_source, Mapping):
-            raise BusinessPresentationPlanError("v2 predecessor source bindings are missing")
-        previous_manager_widget_ids = copy.deepcopy(old_source.get("previous_manager_widget_ids"))
-        previous_manager_entries = copy.deepcopy(old_source.get("previous_manager_entries"))
-        if previous_manager_widget_ids is None or previous_manager_entries is None:
-            raise BusinessPresentationPlanError("v2 predecessor V1 manager binding is missing")
-    else:
-        previous_manager_widget_ids = list(old_order)
-        previous_manager_entries = copy.deepcopy(old_plan["manager_entries"])
+    for widget_id, predecessor in previous_visual_by_id.items():
+        current = current_visual_by_id.get(widget_id)
+        if not isinstance(current, Mapping):
+            raise BusinessPresentationPlanError(f"v2 successor omits predecessor visual: {widget_id}")
+        for field in (
+            "requirement_id", "record_ids", "visual_type", "chart_family",
+            "widget_snapshot_sha256", "chart_entry_sha256", "allowed_visual_fields",
+            "title_projection", "visual_projection", "accepted_visual_pointer",
+            "accepted_content_hash", "accepted_manifest_hash", "accepted_artifact_ref",
+            "accepted_artifact_sha256",
+        ):
+            if field in predecessor and current.get(field) != predecessor.get(field):
+                raise BusinessPresentationPlanError(f"v2 predecessor visual drifted: {widget_id}:{field}")
 
     source_bindings = {
         "fixture_ref": visual_inventory["fixture_ref"],
         "fixture_sha256": visual_inventory["fixture_sha256"],
         "chart_map_ref": visual_inventory["chart_map_ref"],
         "chart_map_sha256": visual_inventory["chart_map_sha256"],
-        "previous_plan_ref": raw_previous_ref,
+        "previous_plan_ref": Path(previous_plan_ref).as_posix(),
         "previous_plan_sha256": old_hash,
-        "previous_manager_widget_ids": previous_manager_widget_ids,
-        "previous_manager_entries": previous_manager_entries,
-        "previous_manager_visual_widget_ids": list(previous_manager_visual_ids),
-        "previous_audit_visual_widget_ids": list(previous_audit_visual_ids),
-        "previous_visual_entries": copy.deepcopy(previous_visual_entries or [
-            current_visual_by_id[widget_id]
-            for widget_id in previous_manager_visual_ids + previous_audit_visual_ids
-        ]),
+        "previous_manager_visual_widget_ids": previous_manager_visual_ids,
+        "previous_audit_visual_widget_ids": previous_audit_visual_ids,
+        "previous_visual_entries": copy.deepcopy(previous_visual_entries),
+        "previous_plan_manager_widget_ids": [
+            _text(entry.get("widget_id"))
+            for entry in old_plan.get("manager_entries", [])
+            if isinstance(entry, Mapping)
+        ],
+        "previous_plan_manager_entries": copy.deepcopy(old_plan.get("manager_entries", [])),
     }
-    if old_plan.get("schema_version") == PRESENTATION_PLAN_V2_SCHEMA:
-        source_bindings["previous_plan_manager_widget_ids"] = list(old_order)
-        source_bindings["previous_plan_manager_entries"] = copy.deepcopy(old_plan["manager_entries"])
     plan = {
         "schema_version": PRESENTATION_PLAN_V2_SCHEMA,
         "run_id": context.run_id,
@@ -1824,11 +2618,11 @@ def write_business_presentation_plan_v2(
         "input_items": copy.deepcopy(current_input_items),
         "parent": copy.deepcopy(current_parent),
         "reviewer_ref": _text(reviewer_ref).strip(),
-        "manager_widget_ids": manager_order,
-        "manager_entries": [manager_entries_by_id[widget_id] for widget_id in manager_order],
-        "manager_visual_widget_ids": manager_visual_ids,
-        "audit_visual_widget_ids": audit_visual_ids,
-        "visual_entries": visual_entries,
+        "manager_widget_ids": selection["manager_widget_ids"],
+        "manager_entries": selection["manager_entries"],
+        "manager_visual_widget_ids": selection["manager_visual_widget_ids"],
+        "audit_visual_widget_ids": selection["audit_visual_widget_ids"],
+        "visual_entries": selection["visual_entries"],
         "source_bindings": source_bindings,
     }
     _validate_presentation_plan_v2_shape(plan)
@@ -1843,10 +2637,10 @@ def _revise_business_presentation_plan_v2_unlocked(
     expected_successor_plan_sha256: str,
     presentation_plan_ref: str | Path,
 ) -> dict[str, Any]:
-    """CAS-replace a V1 plan with one validated V2 successor atomically.
+    """CAS-replace one V2 blueprint with a validated V2 successor atomically.
 
     This public mutation is intentionally narrow: it accepts exactly the
-    expected current V1 bytes and expected canonical successor bytes.  A
+    expected current V2 bytes and expected canonical successor bytes.  A
     retry against already-published successor bytes is idempotent; any other
     current/successor combination fails before touching the plan file.
     """
@@ -1886,21 +2680,35 @@ def _revise_business_presentation_plan_v2_unlocked(
             raise BusinessPresentationPlanError("v2 successor hash matches but bytes differ")
         return dict(candidate)
     if current_hash != expected_current_plan_sha256:
-        raise BusinessPresentationPlanError("v2 revision current plan hash does not match expected V1")
+        raise BusinessPresentationPlanError("v2 revision current plan hash does not match expected V2")
     try:
         current = json.loads(current_bytes.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise BusinessPresentationPlanError("v2 revision current plan is invalid") from exc
-    if not isinstance(current, Mapping) or current.get("schema_version") != PRESENTATION_PLAN_SCHEMA:
-        raise BusinessPresentationPlanError("v2 revision current plan must be V1")
-    predecessor_ids, predecessor_entries = _v2_predecessor_manager_contract(candidate)
-    current_ids = current.get("manager_widget_ids")
-    current_entries = current.get("manager_entries")
-    if current_ids != predecessor_ids or current_entries != predecessor_entries:
-        raise BusinessPresentationPlanError("v2 successor does not preserve the exact V1 manager contract")
+    if not isinstance(current, Mapping) or current.get("schema_version") != PRESENTATION_PLAN_V2_SCHEMA:
+        raise BusinessPresentationPlanError("v2 revision current plan must be V2")
     source_bindings = candidate.get("source_bindings")
     if not isinstance(source_bindings, Mapping):
         raise BusinessPresentationPlanError("v2 successor source bindings are missing")
+    predecessor_ids = source_bindings.get("previous_plan_manager_widget_ids")
+    predecessor_entries = source_bindings.get("previous_plan_manager_entries")
+    if not isinstance(predecessor_ids, list) or not isinstance(predecessor_entries, list):
+        raise BusinessPresentationPlanError("v2 successor previous-plan manager binding is missing")
+    current_ids = current.get("manager_widget_ids")
+    current_entries = current.get("manager_entries")
+    # The successor must bind the actual predecessor bytes, but it is allowed
+    # to choose a wholly new manager membership/order.  Compare the source
+    # envelope with the currently installed predecessor, not with the
+    # successor's newly selected manager entries.
+    if current_ids != predecessor_ids or current_entries != predecessor_entries:
+        raise BusinessPresentationPlanError("v2 successor previous-plan manager binding is not the actual predecessor")
+    predecessor_visual_bindings = {
+        "previous_manager_visual_widget_ids": current.get("manager_visual_widget_ids"),
+        "previous_audit_visual_widget_ids": current.get("audit_visual_widget_ids"),
+        "previous_visual_entries": current.get("visual_entries"),
+    }
+    if any(source_bindings.get(key) != value for key, value in predecessor_visual_bindings.items()):
+        raise BusinessPresentationPlanError("v2 successor previous-plan visual binding is not the actual predecessor")
     previous_ref = Path(_text(source_bindings.get("previous_plan_ref"))).as_posix()
     if previous_ref != path_ref or source_bindings.get("previous_plan_sha256") != expected_current_plan_sha256:
         raise BusinessPresentationPlanError("v2 successor previous-plan CAS binding is invalid")
@@ -1953,7 +2761,7 @@ def revise_business_presentation_plan_v2(
     expected_successor_plan_sha256: str,
     presentation_plan_ref: str | Path,
 ) -> dict[str, Any]:
-    """CAS-replace a V1 plan with one validated V2 successor under run lock.
+    """CAS-replace the current V2 plan with one validated V2 successor under run lock.
 
     The compare/read/validate/replace sequence is serialized with dashboard
     delta and lifecycle publication through the same run lock.  This keeps a
@@ -2093,6 +2901,7 @@ def _record_business_presentation_plan_v2_unlocked(
     fixture_ref: str | Path,
     chart_map_ref: str | Path,
     previous_plan_ref: str | Path,
+    manager_entries: Sequence[Mapping[str, Any]],
     reviewer_ref: str,
     expected_fixture_sha256: str,
     expected_chart_map_sha256: str,
@@ -2145,7 +2954,7 @@ def _record_business_presentation_plan_v2_unlocked(
     if target_path.exists() and not target_path.is_file():
         raise BusinessPresentationPlanError("direct V2 target is not a regular file")
     reviewer = _text(reviewer_ref).strip()
-    if not reviewer or reviewer != _text(reviewer_ref) or not re.fullmatch(r"[A-Za-z0-9_.:-]+", reviewer):
+    if not reviewer or reviewer != _text(reviewer_ref) or not re.fullmatch(r"[A-Za-z0-9_./:-]+", reviewer):
         raise BusinessPresentationPlanError("direct V2 reviewer_ref is invalid")
     for label, value in (
         ("fixture", expected_fixture_sha256),
@@ -2167,9 +2976,9 @@ def _record_business_presentation_plan_v2_unlocked(
     chart_map_bytes = _check_source(chart_map_path, expected_chart_map_sha256, "chart map")
     previous_plan_bytes = _check_source(previous_plan_path, expected_previous_plan_sha256, "predecessor plan")
 
-    # This is a direct successor path, not the one-time V1 migration route.
-    # Reject a V1 (or otherwise non-V2) predecessor before invoking the
-    # builder, so callers cannot bootstrap a new generation through this API.
+    # This direct successor path requires a V2 predecessor before invoking the
+    # builder, so callers cannot bootstrap a new generation through an older
+    # plan shape.
     try:
         previous_plan = json.loads(previous_plan_bytes.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -2182,6 +2991,7 @@ def _record_business_presentation_plan_v2_unlocked(
         fixture_ref=fixture_ref,
         chart_map_ref=chart_map_ref,
         previous_plan_ref=previous_plan_ref,
+        manager_entries=manager_entries,
         reviewer_ref=reviewer,
         presentation_plan_ref=target_ref,
         _lock_held=True,
@@ -2246,6 +3056,7 @@ def record_business_presentation_plan_v2(
     fixture_ref: str | Path,
     chart_map_ref: str | Path,
     previous_plan_ref: str | Path,
+    manager_entries: Sequence[Mapping[str, Any]],
     reviewer_ref: str,
     expected_fixture_sha256: str,
     expected_chart_map_sha256: str,
@@ -2265,6 +3076,7 @@ def record_business_presentation_plan_v2(
             fixture_ref=fixture_ref,
             chart_map_ref=chart_map_ref,
             previous_plan_ref=previous_plan_ref,
+            manager_entries=manager_entries,
             reviewer_ref=reviewer_ref,
             expected_fixture_sha256=expected_fixture_sha256,
             expected_chart_map_sha256=expected_chart_map_sha256,
@@ -2274,6 +3086,218 @@ def record_business_presentation_plan_v2(
         )
 
 
+def _v2_manager_selection(
+    inventory: Mapping[str, Any],
+    visual_inventory: Mapping[str, Any],
+    manager_entries: Sequence[Mapping[str, Any]],
+    *,
+    require_explicit_visual_choices: bool = False,
+) -> dict[str, Any]:
+    """Validate one complete manager selection against read-only inventories.
+
+    Initial admission and same-run successor generation share this policy.  A
+    caller supplies the entire ordered manager envelope; all executable visuals
+    omitted from it are retained in the technical-audit gallery rather than
+    being implicitly promoted.  ``require_explicit_visual_choices`` is enabled
+    only for successor candidates, where recipe/layout/renderer values are
+    part of the new Product decision rather than inherited defaults.
+    """
+
+    visual_entries = [copy.deepcopy(dict(entry)) for entry in visual_inventory.get("visual_entries", [])]
+    visual_by_id = {_text(entry.get("widget_id")): entry for entry in visual_entries}
+    candidates_by_id = {
+        _text(entry.get("widget_id")): entry
+        for entry in inventory.get("candidates", [])
+        if isinstance(entry, Mapping) and _text(entry.get("widget_id"))
+    }
+    requested = [dict(value) for value in manager_entries if isinstance(value, Mapping)]
+    if len(requested) != len(manager_entries):
+        raise BusinessPresentationPlanError("manager_entries must contain objects")
+    requested_ids = [_text(value.get("widget_id")).strip() for value in requested]
+    if len(requested_ids) != len(set(requested_ids)) or any(not value for value in requested_ids):
+        raise BusinessPresentationPlanError("manager_entries widget IDs must be unique and non-empty")
+    unknown = sorted(set(requested_ids) - set(candidates_by_id))
+    if unknown:
+        raise BusinessPresentationPlanError(f"manager_entries reference unknown widgets: {unknown[:5]}")
+
+    # A geometry-less visual after the one requirement fallback is an
+    # audit-only declaration, even if a stale/over-eager Product request names
+    # its ID.  Drop that integrity duplicate before deriving manager IDs and
+    # partition; no semantic field is inspected.
+    effective_requested = [
+        entry
+        for entry in requested
+        if candidates_by_id[_text(entry.get("widget_id")).strip()].get("no_geometry_fallback_duplicate") is not True
+    ]
+    requested = effective_requested
+    requested_ids = [_text(value.get("widget_id")).strip() for value in requested]
+
+    # Keep only source/data integrity checks here.  Product Agent membership is
+    # the semantic decision; titles, content, roles, kinds, technical
+    # annotations, and prior presentation metadata never veto a selected ID.
+
+    # A V2 visual partition covers every executable chart, while the selected
+    # manager IDs define the business audience.  Remaining visuals stay in the
+    # technical audit gallery; they are never promoted implicitly.
+    all_visual_ids = list(visual_inventory.get("all_visual_widget_ids") or [])
+    manager_visual_ids = [widget_id for widget_id in requested_ids if widget_id in visual_by_id]
+    audit_visual_ids = [widget_id for widget_id in all_visual_ids if widget_id not in manager_visual_ids]
+    visual_by_id_final: dict[str, dict[str, Any]] = {}
+    for widget_id in all_visual_ids:
+        visual = copy.deepcopy(visual_by_id[widget_id])
+        visual["presentation_audience"] = (
+            "business_manager" if widget_id in manager_visual_ids else "technical_audit_gallery"
+        )
+        visual_by_id_final[widget_id] = visual
+    # Persist the reviewed partition order explicitly: manager visuals first,
+    # followed by the remaining technical-audit visuals.
+    visual_entries = [visual_by_id_final[widget_id] for widget_id in manager_visual_ids + audit_visual_ids]
+
+    manager_entries_v2: list[dict[str, Any]] = []
+    for widget_id, requested_entry in zip(requested_ids, requested):
+        candidate = candidates_by_id[widget_id]
+        if candidate.get("record_id") != requested_entry.get("record_id"):
+            raise BusinessPresentationPlanError(f"manager entry record does not match inventory: {widget_id}")
+        if (
+            candidate.get("file_sha256") != requested_entry.get("file_sha256")
+            or candidate.get("canonical_payload_sha256") != requested_entry.get("canonical_payload_sha256")
+        ):
+            raise BusinessPresentationPlanError(f"manager entry hash does not match inventory: {widget_id}")
+        if (
+            candidate.get("requirement_id") != requested_entry.get("requirement_id")
+            or candidate.get("presentation_role") != requested_entry.get("presentation_role")
+        ):
+            raise BusinessPresentationPlanError(f"manager entry identity does not match inventory: {widget_id}")
+        if requested_entry.get("display_projection") != candidate.get("display_projection"):
+            raise BusinessPresentationPlanError(
+                f"manager entry display projection does not match inventory: {widget_id}"
+            )
+        if widget_id in visual_by_id_final:
+            recipe_id, layout, renderer_type = _validated_plan_selection(
+                candidate,
+                requested_entry,
+                require_explicit=require_explicit_visual_choices,
+            )
+            visual_by_id_final[widget_id]["recipe_id"] = recipe_id
+            visual_by_id_final[widget_id]["layout"] = layout
+            visual_by_id_final[widget_id]["renderer_type"] = renderer_type
+        entry = copy.deepcopy(requested_entry)
+        if widget_id in visual_by_id_final:
+            entry.update(_v2_manager_entry_from_visual(visual_by_id_final[widget_id]))
+            entry["display_projection"] = copy.deepcopy(requested_entry.get("display_projection", {}))
+        manager_entries_v2.append(entry)
+    return {
+        "manager_widget_ids": requested_ids,
+        "manager_entries": manager_entries_v2,
+        "manager_visual_widget_ids": manager_visual_ids,
+        "audit_visual_widget_ids": audit_visual_ids,
+        "visual_entries": visual_entries,
+    }
+
+
+def _write_business_presentation_blueprint_v2(
+    context: RunContext,
+    *,
+    manager_entries: Sequence[Mapping[str, Any]],
+    reviewer_ref: str,
+    fixture_ref: str | Path,
+    chart_map_ref: str | Path | None,
+    item_ids: Sequence[str] | None,
+    generation_id: str | None,
+    presentation_plan_ref: str | Path | None,
+) -> dict[str, Any]:
+    """Record one V2 blueprint from exact inventory entries.
+
+    This is the sole public writer implementation.  ``manager_entries`` may
+    still carry the familiar pointer-bound display projection, but the
+    persisted contract is always the V2 visual/source blueprint.
+    """
+
+    reviewer = _text(reviewer_ref).strip()
+    if not reviewer or reviewer != _text(reviewer_ref) or not re.fullmatch(r"[A-Za-z0-9_./:-]+", reviewer):
+        raise BusinessPresentationPlanError("reviewer_ref is invalid")
+    inventory = business_presentation_inventory(
+        context,
+        fixture_ref=fixture_ref,
+        generation_id=generation_id,
+        item_ids=item_ids,
+    )
+    visual_inventory = business_presentation_visual_inventory(
+        context,
+        fixture_ref=fixture_ref,
+        chart_map_ref=chart_map_ref or _text((inventory.get("design_inventory") or {}).get("chart_map_ref")) or None,
+    )
+    selection = _v2_manager_selection(inventory, visual_inventory, manager_entries)
+
+    generation, metadata = _presentation_generation_metadata(context, generation_id)
+    supervisor_ref, supervisor_plan, supervisor_hash = _presentation_supervisor_binding(context, generation, metadata)
+    input_items = _presentation_input_bindings(
+        context,
+        _discover_item_ids(context, item_ids, supervisor_plan),
+    )
+    parent = _presentation_parent_binding(context, generation, metadata)
+    source = {
+        "fixture_ref": visual_inventory["fixture_ref"],
+        "fixture_sha256": visual_inventory["fixture_sha256"],
+        "chart_map_ref": visual_inventory["chart_map_ref"],
+        "chart_map_sha256": visual_inventory["chart_map_sha256"],
+    }
+    plan: dict[str, Any] = {
+        "schema_version": PRESENTATION_PLAN_V2_SCHEMA,
+        "run_id": context.run_id,
+        "generation_id": generation,
+        "supervisor_plan_ref": supervisor_ref,
+        "supervisor_plan_sha256": supervisor_hash,
+        "item_order": [item["item_id"] for item in input_items],
+        "input_items": input_items,
+        "parent": parent,
+        "reviewer_ref": reviewer,
+        "manager_widget_ids": selection["manager_widget_ids"],
+        "manager_entries": selection["manager_entries"],
+        "manager_visual_widget_ids": selection["manager_visual_widget_ids"],
+        "audit_visual_widget_ids": selection["audit_visual_widget_ids"],
+        "visual_entries": selection["visual_entries"],
+        "source_bindings": source,
+    }
+    _validate_presentation_plan_v2_shape(plan)
+    reference = _presentation_plan_ref(context, generation, presentation_plan_ref)
+    path = context.resolve_run_path(reference)
+    payload = _canonical_bytes(plan)
+    if path.is_file() or path.is_symlink():
+        if path.is_symlink():
+            raise BusinessPresentationPlanError("existing presentation blueprint is symlinked")
+        current_bytes = path.read_bytes()
+        if current_bytes == payload:
+            return plan
+        # Preview plans are the only mutable presentation-plan namespace.  A
+        # changed preflight source fingerprint permits one explicit refresh;
+        # ordinary/final plan targets remain immutable and fail closed.
+        source = plan.get("source_bindings")
+        try:
+            current = json.loads(current_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise BusinessPresentationPlanError("existing presentation blueprint is invalid") from exc
+        current_source = current.get("source_bindings") if isinstance(current, Mapping) else None
+        source_ref = _text(source.get("fixture_ref") if isinstance(source, Mapping) else "").strip()
+        current_ref = _text(current_source.get("fixture_ref") if isinstance(current_source, Mapping) else "").strip()
+        is_preflight_target = (
+            reference == f"extensions/{generation}/business_presentation_plan.json"
+            and source_ref == current_ref
+            and source_ref == _preflight_ref(generation, "dashboard_fixture_v4.json")
+        )
+        if not is_preflight_target or not isinstance(source, Mapping) or not isinstance(current_source, Mapping):
+            raise BusinessPresentationPlanError("existing presentation blueprint conflicts with the requested admission")
+        if source.get("fixture_sha256") == current_source.get("fixture_sha256") and source.get("chart_map_sha256") == current_source.get("chart_map_sha256"):
+            raise BusinessPresentationPlanError("existing preview blueprint conflicts without a changed preflight source")
+        _assert_no_symlink_chain(context, reference, label="presentation blueprint")
+        _atomic_replace_plan_bytes(path, payload)
+        return plan
+    _assert_no_symlink_chain(context, reference, label="presentation blueprint")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_replace_plan_bytes(path, payload)
+    return plan
+
+
 def write_business_presentation_plan(
     context: RunContext,
     *,
@@ -2281,94 +3305,32 @@ def write_business_presentation_plan(
     manager_widget_ids: Sequence[str] | None = None,
     reviewer_ref: str,
     fixture_ref: str | Path,
+    chart_map_ref: str | Path | None = None,
+    item_ids: Sequence[str] | None = None,
     generation_id: str | None = None,
     presentation_plan_ref: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Atomically record one explicit generation-scoped manager admission."""
+    """Atomically record one explicit generation-scoped V2 manager admission."""
 
-    inventory = business_presentation_inventory(context, fixture_ref=fixture_ref, generation_id=generation_id)
-    if manager_entries is None:
-        # Bare IDs are intentionally no longer a plan API.  They cannot bind
-        # exact reviewed display fields and would reintroduce renderer-side
-        # inference; callers must provide pointer-bound entries.
-        raise BusinessPresentationPlanError("manager_entries with pointer-bound projections are required")
     if manager_widget_ids not in (None, []):
-        raise BusinessPresentationPlanError("manager_widget_ids are derived from manager_entries, not accepted as input")
-    requested_entries = [dict(value) for value in manager_entries if isinstance(value, Mapping)]
-    if len(requested_entries) != len(manager_entries):
-        raise BusinessPresentationPlanError("manager_entries must contain objects")
-    requested_ids = [_text(value.get("widget_id")).strip() for value in requested_entries]
-    if len(requested_ids) != len(set(requested_ids)) or any(not value for value in requested_ids):
-        raise BusinessPresentationPlanError("manager_entries widget IDs must be unique and non-empty")
-    # Reviewer order is part of the plan contract.  Preserve the caller's
-    # deterministic sequence through validation, fixture, receipt, and site
-    # metadata; do not impose lexical ordering at the product boundary.
-    selected = list(requested_ids)
-    by_id = {value["widget_id"]: value for value in inventory["candidates"]}
-    unknown = sorted(set(selected) - set(by_id))
-    if unknown:
-        raise BusinessPresentationPlanError(f"manager_entries reference unknown widgets: {unknown[:5]}")
-    entries_by_id = {entry["widget_id"]: entry for entry in requested_entries}
-    entries: list[dict[str, Any]] = []
-    for widget_id in selected:
-        candidate = by_id[widget_id]
-        entry = entries_by_id[widget_id]
-        _presentation_entry_shape(entry)
-        if candidate.get("record_id") != entry.get("record_id"):
-            raise BusinessPresentationPlanError(f"manager entry record does not match inventory: {widget_id}")
-        # Replace caller-supplied hashes with no implicit values: an incorrect
-        # hash must fail validation rather than being silently repaired.
-        if entry.get("file_sha256") != candidate.get("file_sha256") or entry.get("canonical_payload_sha256") != candidate.get("canonical_payload_sha256"):
-            raise BusinessPresentationPlanError(f"manager entry hash does not match inventory: {widget_id}")
-        if entry.get("requirement_id") != candidate.get("requirement_id") or entry.get("presentation_role") != candidate.get("presentation_role"):
-            raise BusinessPresentationPlanError(f"manager entry identity does not match inventory: {widget_id}")
-        root = {
-            "payload": candidate.get("authoritative_payload", {}),
-            "accepted": candidate.get("accepted_fields", {}),
-        }
-        for field, projection in entry["display_projection"].items():
-            actual_value = _presentation_pointer_value(root, projection["pointer"])
-            if not _presentation_projection_value_equal(actual_value, projection["value"]):
-                raise BusinessPresentationPlanError(f"manager entry projection does not match inventory: {widget_id}:{field}")
-        entries.append(entry)
-    plan: dict[str, Any] = {
-        "schema_version": PRESENTATION_PLAN_SCHEMA,
-        "run_id": inventory["run_id"],
-        "generation_id": inventory["generation_id"],
-        "supervisor_plan_ref": inventory["supervisor_plan_ref"],
-        "supervisor_plan_sha256": inventory["supervisor_plan_sha256"],
-        "item_order": inventory["item_order"],
-        "input_items": inventory["input_items"],
-        "parent": inventory["parent"],
-        "reviewer_ref": _text(reviewer_ref).strip(),
-        "manager_widget_ids": selected,
-        "manager_entries": entries,
-    }
-    _validate_presentation_plan_shape(plan)
-    reference = _presentation_plan_ref(context, inventory["generation_id"], presentation_plan_ref)
-    path = context.resolve_run_path(reference)
-    payload = _canonical_bytes(plan)
-    if path.is_file() or path.is_symlink():
-        if path.is_symlink() or path.read_bytes() != payload:
-            raise BusinessPresentationPlanError("existing presentation plan conflicts with the requested admission")
-        return plan
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        temporary.unlink(missing_ok=True)
-    return plan
+        raise BusinessPresentationPlanError(
+            "manager_widget_ids are derived from V2 manager_entries, not accepted as input"
+        )
+    if manager_entries is None:
+        raise BusinessPresentationPlanError(
+            "manager_entries with pointer-bound projections are required"
+        )
+
+    return _write_business_presentation_blueprint_v2(
+        context,
+        manager_entries=manager_entries,
+        reviewer_ref=reviewer_ref,
+        fixture_ref=fixture_ref,
+        chart_map_ref=chart_map_ref,
+        item_ids=item_ids,
+        generation_id=generation_id,
+        presentation_plan_ref=presentation_plan_ref,
+    )
 
 
 def _group_definitions(plan: Mapping[str, Any] | None, item_ids: Sequence[str]) -> list[dict[str, Any]]:
@@ -2391,17 +3353,89 @@ def _group_definitions(plan: Mapping[str, Any] | None, item_ids: Sequence[str]) 
                 "order": index,
                 "requirement_ids": ids,
                 "summary": _text(raw.get("summary") or raw.get("rationale")),
+                # Planner decision-flow scope is kept exact.  It is used only
+                # for syntactic presentation-label extraction below; rationale
+                # remains the group's summary/description.
+                "scope": _text(raw.get("scope") or raw.get("decision_flow_scope")),
             })
     for item_id in item_ids:
         if item_id not in assigned:
             index = len(groups) + 1
-            groups.append({"id": f"group-{index:02d}", "title": item_id, "order": index, "requirement_ids": [item_id], "summary": ""})
+            groups.append({"id": f"group-{index:02d}", "title": item_id, "order": index, "requirement_ids": [item_id], "summary": "", "scope": ""})
             assigned.add(item_id)
     # A plan may mention an item that was not requested; do not silently read it.
     for group in groups:
         group["requirement_ids"] = [item_id for item_id in group["requirement_ids"] if item_id in item_ids]
     groups = [group for group in groups if group["requirement_ids"]]
     return groups
+
+
+_PRESENTATION_ATX_HEADING_RE = re.compile(
+    r"^\s*(?:[-*+]\s+)?#{1,6}\s+(?P<label>.+?)\s*(?:#+\s*)?$"
+)
+_PRESENTATION_BOLD_HEADING_RE = re.compile(
+    r"^\s*(?:[-*+]\s+)?\*\*(?P<label>.+?)\*\*\s*$"
+)
+# Presentation ordinals are intentionally bounded to one or two digits.  A
+# four-digit year at the start of a heading is content, not an ordinal.
+_PRESENTATION_ORDINAL_RE = re.compile(r"^\s*(?:[1-9]|[1-9]\d)(?:[.)]\s*|\s+)")
+_PRESENTATION_COMPACT_ORDINAL_RE = re.compile(r"^\s*(?:[1-9]|[1-9]\d)(?=[A-Z][a-z])")
+
+
+def _presentation_heading_labels(scopes: Iterable[Any], *, limit: int = 2) -> list[str]:
+    """Extract at most two exact markdown heading labels syntactically."""
+
+    labels: list[str] = []
+    for scope in scopes:
+        for line in _text(scope).splitlines():
+            candidate = line.strip()
+            if not candidate:
+                continue
+            match = _PRESENTATION_ATX_HEADING_RE.fullmatch(candidate)
+            if match is None:
+                match = _PRESENTATION_BOLD_HEADING_RE.fullmatch(candidate)
+            if match is None:
+                continue
+            label = match.group("label").strip()
+            label = _PRESENTATION_ORDINAL_RE.sub("", label, count=1).strip()
+            label = _PRESENTATION_COMPACT_ORDINAL_RE.sub("", label, count=1).strip()
+            if label and label not in labels:
+                labels.append(label)
+            if len(labels) >= limit:
+                return labels
+    return labels
+
+
+def _presentation_domain_title(group: Mapping[str, Any], flow_defs: Sequence[Mapping[str, Any]]) -> str:
+    """Choose a concise domain label from exact flow scope headings."""
+
+    heading_labels = _presentation_heading_labels(
+        [group.get("scope"), *(flow.get("scope") for flow in flow_defs)]
+    )
+    if heading_labels:
+        return " · ".join(heading_labels)
+    # No heading: preserve up to two already-concise, distinct flow titles
+    # rather than slicing a rationale sentence.  A group title is the final
+    # concise fallback.
+    flow_titles: list[str] = []
+    for flow in flow_defs:
+        candidate = _text(flow.get("title")).strip()
+        if (
+            candidate
+            and "\n" not in candidate
+            and len(candidate) <= 80
+            and not _RAW_REQUIREMENT_TITLE_RE.fullmatch(candidate)
+            and candidate not in flow_titles
+        ):
+            flow_titles.append(candidate)
+            if len(flow_titles) >= 2:
+                break
+    if flow_titles:
+        return " · ".join(flow_titles)
+    group_title = _text(group.get("title")).strip()
+    if group_title and "\n" not in group_title and len(group_title) <= 80 and not _RAW_REQUIREMENT_TITLE_RE.fullmatch(group_title):
+        return group_title
+    return "Decision domain"
 
 
 def _manager_requirement_title(
@@ -2417,6 +3451,13 @@ def _manager_requirement_title(
     never hard-slice or ellipsize a sentence.  The complete original scope is
     carried separately in ``requirement_scope``/the technical audit.
     """
+
+    # Real supervisor-shaped runs keep the exact markdown heading in
+    # ``item_state.original_text`` while group scope is empty.  Prefer that
+    # syntactic heading over the surrounding request/rationale prose.
+    heading = _presentation_heading_labels([original_text], limit=1)
+    if heading:
+        return heading[0]
 
     lexical = re.sub(r"\s+", " ", _text(original_text)).strip(" \t\r\n.:;,-")
     if lexical:
@@ -2529,17 +3570,27 @@ def _requirement_limitations(records: Sequence[Mapping[str, Any]]) -> list[str]:
 
 
 def _manager_takeaway(content: Mapping[str, Any], scope: str) -> str:
-    """Choose one exact business headline clause for the manager header."""
+    """Return one reviewed headline verbatim when supplied.
+
+    Semantic selection belongs to the Product Agent.  The assembler does not
+    inspect or rewrite headline text to decide whether a surface is business
+    or technical.
+    """
 
     for value in _as_list(content.get("headline_findings")):
-        clauses = _manager_business_clauses(value, subject_context=scope)
-        if clauses:
-            return clauses[0]
+        if isinstance(value, Mapping):
+            value = next(
+                (value.get(key) for key in ("finding", "claim", "text", "body", "message", "title", "label", "value") if value.get(key) not in (None, "")),
+                None,
+            )
+        text = _text(value).strip()
+        if text:
+            return text
     return ""
 
 
 def _manager_limitations(content: Mapping[str, Any], records: Sequence[Mapping[str, Any]], scope: str) -> list[str]:
-    """Keep only exact limitations that state a business-facing boundary."""
+    """Return reviewed limitations verbatim, without semantic filtering."""
 
     values: list[str] = []
     candidates: list[Any] = [*_as_list(content.get("limitations"))]
@@ -2549,10 +3600,9 @@ def _manager_limitations(content: Mapping[str, Any], records: Sequence[Mapping[s
         if _text(record.get("kind")) == "limitation":
             candidates.append(payload.get("limitation"))
     for value in candidates:
-        clauses = _manager_business_clauses(value, subject_context=scope)
-        for clause in clauses:
-            if clause not in values:
-                values.append(clause)
+        text = _text(value).strip()
+        if text and text not in values:
+            values.append(text)
     return values
 
 
@@ -2595,137 +3645,15 @@ def _record_payload(record: Mapping[str, Any]) -> Mapping[str, Any]:
     return payload if isinstance(payload, Mapping) else {}
 
 
-# Presentation admission is intentionally conservative.  The assembler owns
-# the policy so that the renderer does not need to infer business meaning from
-# arbitrary labels or payload shapes.  A record is manager-facing only when its
-# reviewed text names a business subject and an explicit outcome/exposure,
-# action, or magnitude.  Data-quality/model mechanics veto unless a separate
-# clause carries that business implication; the exact original payload remains
-# in ``audit_payload`` either way.
-_MANAGER_BUSINESS_SUBJECT_RE = re.compile(
-    r"\b(?:order|orders|delivery|deliveries|shipment|shipments|invoice|invoices|"
-    r"cash|payment|payments|refund|refunds|return|returns|support|ticket|tickets|"
-    r"inventory|stock|warehouse|supplier|suppliers|vendor|vendors|customer|customers|"
-    r"cost|costs|revenue|service|services|purchase|purchases|receivable|receivables|"
-    r"forecast|forecasts|demand|promotion|promotions|collection|collections|"
-    r"erp|wms|tms|warehouse|"
-    r"late|lateness|overdue|terms|fulfil|fulfill|fulfillment|margin|expense|expenses)\b",
-    flags=re.IGNORECASE,
-)
-_MANAGER_BUSINESS_SIGNAL_RE = re.compile(
-    r"\b(?:outcome|outcomes|risk|risks|exposure|exposures|action|actions|decision|"
-    r"decisions|magnitude|amount|amounts|value|values|late|lateness|overdue|"
-    r"disputed|matched|paid|pending|closed|open|urgent|priority|exception|"
-    r"exceptions|divergen(?:ce|ces)|shortage|shortages|delay|delays|queue|queues|"
-    r"lead[- ]?time|deviation|deviations|settlement|reconcile|reconciled|"
-    r"on[- ]?time|unpaid|unresolved|watchlist|watchlists|threshold|thresholds|"
-    r"count|counts|total|totals|amount|amounts|percent|rate|rates|ratio|"
-    r"loss|losses|margin|cost|costs|revenue|service|services|closure|closed|"
-    r"status|milestone|availability|available|stock|shortfall|shortfalls|terms|"
-    r"diverge|diverges|divergence|bottleneck|handoff|handoffs|recovery|"
-    r"settlement|settled)\b",
-    flags=re.IGNORECASE,
-)
-_MANAGER_TECHNICAL_VETO_RE = re.compile(
-    r"\b(?:mapping|mapped|mappings|coverage|covered|source|sources|source[- ]local|"
-    r"schema|schemas|row|rows|distinct|identity|identities|id|ids|identifier|identifiers|key|keys|join|joins|"
-    r"namespace|namespaces|ontology|ontologies|connectivity|connected|relationship|"
-    r"relationships|diagnostic|diagnostics|method|methodology|model|models|"
-    r"canonical|normalization|normalisation|lineage|provenance|evidence|record|"
-    r"records|field|fields|column|columns|endpoint|endpoints|edge|edges|fanout|"
-    r"recheck|raw|population|populations|reference|references|parse|parsed|numeric|non[- ]?negative|"
-    r"data[- ]?quality|nonpublishable|unresolved namespace|"
-    # Bounded schema-field vocabulary that otherwise makes a technical
-    # closure/coverage diagnostic look like a manager conclusion.  The
-    # original reviewed sentence remains byte-identical in audit_payload.
-    r"closed[_ ]at|case[_ ]status|source[_ ]population|source[_ ]coverage|"
-    r"target[_ ]population|target[_ ]coverage|watchlist[_ ]rows|order[_ ]created[_ ]at|"
-    r"promised[_ ]ship[_ ]by|qty[_ ]delta|start[_ ]date|end[_ ]date|"
-    r"distinct[_ ](?:id|ids|reference|references|key|keys)|"
-    r"available[_ ](?:gt|lt|eq|gte|lte)[_ ]\d+|"
-    r"(?:field|row|column)[_ ](?:count|name|value|type))\b",
-    flags=re.IGNORECASE,
-)
-_MANAGER_CLAUSE_SPLIT_RE = re.compile(r"(?:;|\n+|\s+[—–-]\s+|\.(?=\s+[A-Z]))")
-_MANAGER_PURE_TECHNICAL_CONTEXT_RE = re.compile(
-    r"\b(?:ontology|ontologies|master[- ]data|identity recovery|canonical identities|"
-    r"identity|model stress|"
-    r"semantic connectivity|relationship graph)\b",
-    flags=re.IGNORECASE,
-)
-_MANAGER_SCHEMA_TITLE_RE = re.compile(
-    r"\b(?:count|counts|coverage|distribution|status|statuses|population|populations|"
-    r"reconciliation|reconcile|qty|quantity|rows?|snapshot|by|to|from|in|out|"
-    r"source|field|fields|key|keys|mapping|mapped|reference|references)\b",
-    flags=re.IGNORECASE,
-)
+def _presentation_surface_is_technical(widget: Mapping[str, Any]) -> bool:
+    """Expose only an explicit origin flag; never infer from presentation text.
 
-
-def _manager_text_parts(value: Any) -> list[str]:
-    """Return bounded lexical fragments from a reviewed presentation value."""
-
-    if value is None:
-        return []
-    if isinstance(value, Mapping):
-        parts: list[str] = []
-        for key, child in value.items():
-            parts.extend(_manager_text_parts(key))
-            parts.extend(_manager_text_parts(child))
-        return parts
-    if isinstance(value, (list, tuple)):
-        parts: list[str] = []
-        for child in value:
-            parts.extend(_manager_text_parts(child))
-        return parts
-    text = _text(value).strip()
-    return [text] if text else []
-
-
-def _manager_schema_like_title(value: Any) -> bool:
-    """Recognize schema/projection headings without classifying free prose."""
-
-    title = _text(value).strip()
-    if not title or not re.search(r"[_./]", title):
-        return False
-    semantic = re.sub(r"[_./:]+", " ", title)
-    return bool(_MANAGER_SCHEMA_TITLE_RE.search(semantic))
-
-
-def _manager_business_clauses(
-    value: Any,
-    *,
-    subject_context: str = "",
-    context_requires_magnitude: bool = False,
-) -> list[str]:
-    """Select exact reviewed clauses that are safe for a business manager.
-
-    No values are recalculated or paraphrased.  A clause survives only when it
-    contains both a business subject and an explicit business signal and does
-    not contain data/model mechanics.  Splitting at reviewed punctuation lets
-    a mixed claim expose its separable business sentence while retaining the
-    complete original claim in the audit payload.
+    The flag is carried for audit/provenance consumers.  It is deliberately
+    not an admission gate: Product Agent plan membership is the sole semantic
+    choice for the manager surface.
     """
 
-    output: list[str] = []
-    for raw in _manager_text_parts(value):
-        for fragment in _MANAGER_CLAUSE_SPLIT_RE.split(raw):
-            clause = re.sub(r"\s+", " ", fragment).strip(" \t\r\n,.:;-")
-            if not clause:
-                continue
-            semantic = re.sub(r"[_./:]+", " ", clause)
-            has_subject = bool(_MANAGER_BUSINESS_SUBJECT_RE.search(semantic))
-            if not has_subject and subject_context:
-                # A requirement scope may supply the subject for a terse
-                # reviewed headline (for example ``707 physical-count pairs
-                # diverge``), but method/queue prose without an explicit
-                # magnitude must not inherit that subject by accident.
-                has_subject = bool(_MANAGER_BUSINESS_SUBJECT_RE.search(subject_context)) and (
-                    not context_requires_magnitude or bool(re.search(r"\d", clause))
-                )
-            if has_subject and _MANAGER_BUSINESS_SIGNAL_RE.search(semantic) and not _MANAGER_TECHNICAL_VETO_RE.search(semantic):
-                if clause not in output:
-                    output.append(clause)
-    return output
+    return widget.get("technical_surface") is True
 
 
 def _manager_admission(
@@ -2733,170 +3661,44 @@ def _manager_admission(
     widget: Mapping[str, Any],
     *,
     subject_context: str = "",
-) -> dict[str, Any]:
-    """Return one explicit, deterministic manager-admission classification."""
+ ) -> dict[str, Any]:
+    """Return neutral baseline metadata; Product plan decides membership.
 
-    role = _text(widget.get("presentation_role")).lower()
-    if role == "relationship_matrix":
-        return {
-            "status": "audit_only",
-            "presentation_audience": "technical_audit",
-            "role": "technical_audit",
-            "reasons": ["relationship matrices are retained only for technical audit"],
-        }
-    if _MANAGER_PURE_TECHNICAL_CONTEXT_RE.search(subject_context):
-        subject_context = ""
-    title = _text(widget.get("title") or widget.get("label") or widget.get("display_title")).strip()
-    title_clauses = _manager_business_clauses([title], subject_context=subject_context)
-    title_veto = bool(_MANAGER_TECHNICAL_VETO_RE.search(re.sub(r"[_./:]+", " ", title))) or _manager_schema_like_title(title)
-    candidates: list[Any] = [title]
-    if role == "finding_list":
-        candidates.extend(
-            finding.get("finding")
-            for finding in _as_list(widget.get("manager_findings"))
-            if isinstance(finding, Mapping)
-        )
-    else:
-        candidates.extend([widget.get("manager_rows"), widget.get("rows"), widget.get("tiles"), widget.get("bars"), widget.get("categories"), widget.get("segments")])
-    clauses = _manager_business_clauses(
-        candidates,
-        subject_context=subject_context,
-        context_requires_magnitude=role == "finding_list",
-    )
-    # A fact/table title is the reviewed semantic admission boundary.  Do not
-    # let a row label such as ``WMS stock SKU`` turn a source/mapping/ontology
-    # card into a business conclusion.  Finding lists and the aggregated
-    # ``Key signals`` strip are the only composite roles whose rows are allowed
-    # to carry a separately reviewed business clause.
-    if role not in {"finding_list"} and title != "Key signals" and (title_veto or not title_clauses):
-        clauses = []
-    # A compact scalar metric can have a business title but no repeated row
-    # labels; the title/value remains the supplied reviewed signal.
-    if not clauses and role in {"finding_list"}:
-        title = _text(widget.get("title") or widget.get("label"))
-        payload = widget.get("audit_payload")
-        clauses = _manager_business_clauses(
-            [title, payload],
-            subject_context=subject_context,
-            context_requires_magnitude=role == "finding_list",
-        )
-    admitted = bool(clauses)
-    # Keep a technical veto visible in the reason even when another exact
-    # clause was admitted; this is useful for the manifest and audit review.
-    all_text = " ".join(_manager_text_parts(candidates)).lower()
-    veto = bool(_MANAGER_TECHNICAL_VETO_RE.search(all_text))
-    reasons: list[str] = []
-    if admitted:
-        reasons.append("explicit reviewed business subject and outcome/exposure/action/magnitude")
-        if veto:
-            reasons.append("technical clauses excluded from the manager projection")
-    else:
-        reasons.append("no explicit reviewed business implication; retained for technical audit")
-    return {
-        "status": "admitted" if admitted else "audit_only",
-        "presentation_audience": "business_manager" if admitted else "technical_audit",
-        "role": "business_outcome" if admitted else "technical_audit",
-        "reasons": reasons,
-        "business_clauses": clauses,
+    Before a plan is attached every reviewed widget remains a candidate.  The
+    only deterministic exception is a geometry-less fallback duplicate, which
+    is an integrity marker rather than a semantic judgement.  No titles,
+    labels, rows, values, roles, or chart kinds are inspected here.
+    """
+
+    technical = _presentation_surface_is_technical(widget)
+    reason = _text(widget.get("technical_surface_reason")).strip()
+    admission = {
+        "status": "audit_only" if widget.get("no_geometry_fallback_duplicate") is True else "admitted",
+        "presentation_audience": "technical_audit" if widget.get("no_geometry_fallback_duplicate") is True else "business_manager",
+        "role": _text(widget.get("presentation_role") or "decision_view")
+        if widget.get("no_geometry_fallback_duplicate") is not True
+        else "technical_audit",
+        "reasons": [
+            "geometry-less fallback duplicate retained in audit"
+            if widget.get("no_geometry_fallback_duplicate") is True
+            else "candidate retained; Product presentation plan controls manager membership",
+        ],
+        "technical_surface": technical,
     }
-
-
-def _manager_row_is_technical(row: Mapping[str, Any], *, metric_tile: bool = False) -> bool:
-    # KPI tiles carry useful denominator/unit/period metadata; those field
-    # names are not themselves business conclusions and must not cause the
-    # whole scalar tile to disappear.  Table rows, by contrast, treat those
-    # labels as audit mechanics and filter them from the manager projection.
-    if metric_tile:
-        metadata_keys = {
-            "value", "display_value", "denominator", "denominator_value", "numerator",
-            "population", "unit", "units", "period", "as_of", "date_authority",
-            "size", "share", "percent", "rate",
-        }
-        parts: list[Any] = []
-        for key, value in row.items():
-            if _text(key).strip().lower() in metadata_keys:
-                continue
-            parts.extend(_manager_text_parts(key))
-            parts.extend(_manager_text_parts(value))
-    else:
-        parts = _manager_text_parts(row)
-    semantic = re.sub(r"[_./:]+", " ", " ".join(parts))
-    return bool(_MANAGER_TECHNICAL_VETO_RE.search(semantic))
-
-
-def _filter_manager_projection(widget: dict[str, Any]) -> None:
-    """Remove raw/schema rows from an admitted table without touching audit."""
-
-    kind = _text(widget.get("type") or widget.get("kind")).lower()
-    # A reviewed dashboard_fact already has an explicit, lossless projection
-    # built by ``_structured_fact_projection``.  Keep that projection intact
-    # while the planless candidate is inventoried; plan membership (not this
-    # lexical legacy filter) decides whether it is visible later.  Legacy G3
-    # status tables continue through the existing sanitation path.
-    if widget.get("dashboard_fact") is True and kind in {"bar", "column", "scatter", "table"}:
-        return
-    if kind in {"table", "status_table"}:
-        for key in ("manager_rows", "rows"):
-            raw = widget.get(key)
-            if isinstance(raw, list):
-                widget[key] = [row for row in raw if isinstance(row, Mapping) and not _manager_row_is_technical(row)]
+    if reason:
+        admission["technical_surface_reason"] = reason
+    return admission
 
 
 def _apply_manager_admission(widgets: list[dict[str, Any]], *, subject_context: str = "") -> None:
-    """Attach admission metadata and fail closed for non-business widgets."""
+    """Attach neutral candidate metadata without inspecting content."""
 
     for widget in widgets:
-        _filter_manager_projection(widget)
         admission = _manager_admission(_text(widget.get("requirement_id")), widget, subject_context=subject_context)
-        kind = _text(widget.get("type") or widget.get("kind")).lower()
-        if kind in {"table", "status_table"}:
-            # A table/grid whose manager projection became empty after the
-            # technical-row filter is audit-only.  This prevents a blank
-            # manager card while preserving the exact raw payload below.
-            projection_keys = ("manager_rows", "rows", "data")
-            supplied_projection = any(isinstance(widget.get(key), list) for key in projection_keys)
-            has_projection = any(
-                isinstance(widget.get(key), list)
-                and any(isinstance(row, Mapping) for row in widget.get(key, []))
-                for key in projection_keys
-            )
-            if supplied_projection and not has_projection:
-                admission = dict(admission)
-                admission["status"] = "audit_only"
-                admission["presentation_audience"] = "technical_audit"
-                admission["role"] = "technical_audit"
-                admission.setdefault("reasons", []).append("manager projection contains no business rows")
-        if _text(widget.get("presentation_role")).lower() == "finding_list":
-            safe_findings: list[dict[str, Any]] = []
-            for finding in _as_list(widget.get("manager_findings")):
-                if not isinstance(finding, Mapping):
-                    continue
-                for clause in _manager_business_clauses(
-                    finding.get("finding"),
-                    subject_context=subject_context,
-                    context_requires_magnitude=True,
-                ):
-                    entry = dict(finding)
-                    entry["finding"] = clause
-                    safe_findings.append(entry)
-            widget["manager_findings"] = safe_findings
-            if safe_findings:
-                admission = dict(admission)
-                admission["status"] = "admitted"
-                admission["presentation_audience"] = "business_manager"
-                admission["role"] = "business_outcome"
-                admission["business_clauses"] = [entry["finding"] for entry in safe_findings]
-            else:
-                admission = dict(admission)
-                admission["status"] = "audit_only"
-                admission["presentation_audience"] = "technical_audit"
-                admission["role"] = "technical_audit"
         widget["manager_admission"] = admission
         widget["presentation_audience"] = admission["presentation_audience"]
         if admission["status"] != "admitted":
             widget["presentation_tier"] = "audit"
-            if widget.get("presentation_role") == "decision_view" and not widget.get("_legacy_presentation_role"):
-                widget["presentation_role"] = "support_metric"
         elif widget.get("presentation_tier") is None:
             widget["presentation_tier"] = "primary"
 
@@ -2910,7 +3712,19 @@ def _apply_explicit_manager_admission(
 
     for widget in widgets:
         widget_id = _text(widget.get("id")).strip()
-        admitted = widget_id in manager_widget_ids
+        requested = widget_id in manager_widget_ids
+        entry = manager_entries.get(widget_id) if isinstance(manager_entries, Mapping) else None
+        fallback_duplicate = widget.get("no_geometry_fallback_duplicate") is True
+        technical = _presentation_surface_is_technical(widget)
+        # Product Agent membership is authoritative.  The one geometry-less
+        # fallback marker is an exact representation integrity rule; no prior
+        # semantic metadata may veto a selected ID.
+        admitted = requested and not fallback_duplicate
+        reasons: list[str] = ["explicit_business_presentation_plan"]
+        if fallback_duplicate:
+            reasons.append("duplicate geometry-less visual retains the requirement fallback in audit")
+        if technical:
+            reasons.append("explicit technical_surface metadata carried from origin")
         role = _text(widget.get("presentation_role") or "decision_view")
         widget["manager_admission"] = {
             "status": "admitted" if admitted else "audit_only",
@@ -2918,6 +3732,8 @@ def _apply_explicit_manager_admission(
             "policy": "explicit_business_presentation_plan",
             "role": role if admitted else "technical_audit",
             "plan_membership": admitted,
+            "technical_surface": technical,
+            "reasons": reasons,
         }
         widget["presentation_audience"] = "business_manager" if admitted else "technical_audit"
         widget["presentation_tier"] = "primary" if admitted else "audit"
@@ -3817,6 +4633,10 @@ def _record_refs(item_id: str, record: Mapping[str, Any]) -> tuple[list[str], li
         f"requirements/{item_id}/integration/committed/manifest.json",
         f"requirements/{item_id}/integration/committed/records.jsonl",
     ]
+    payload = _record_payload(record)
+    artifact_ref = payload.get("artifact_ref") if _text(record.get("kind")) == "analytical_artifact" else None
+    if isinstance(artifact_ref, str) and artifact_ref.strip():
+        trace.append(f"requirements/{item_id}/{artifact_ref.strip()}")
     return evidence, trace
 
 
@@ -3868,7 +4688,7 @@ def _audit_record_entries(
             evidence_refs, trace_refs = _record_refs(item_id, record)
             references = sorted(set(evidence_refs) | set(trace_refs))
             payload = copy.deepcopy(dict(_record_payload(record)))
-            entries.append({
+            entry = {
                 "item_id": item_id,
                 "record_id": record_id,
                 "kind": _text(record.get("kind") or record.get("record_type") or payload.get("kind") or "reviewed_output"),
@@ -3879,8 +4699,36 @@ def _audit_record_entries(
                 "trace_refs": sorted(set(trace_refs)),
                 "reference_union": references,
                 "widget_ids": sorted(widget_record_ids.get(record_id, set())),
-            })
+            }
+            if entry["kind"] == "analytical_artifact":
+                entry["artifact_provenance"] = {
+                    key: payload.get(key)
+                    for key in (
+                        "artifact_id", "artifact_type", "schema_version", "requirement_id",
+                        "content_hash", "envelope_hash", "canonical_bytes_sha256", "artifact_ref",
+                    )
+                    if payload.get(key) is not None
+                }
+            entries.append(entry)
     return entries
+
+
+def _analytical_artifact_input_entries(
+    records_by_item: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Return deterministic per-item artifact bindings for fixture/receipt."""
+
+    entries: list[dict[str, Any]] = []
+    for item_id, records in records_by_item.items():
+        for record in records:
+            if _text(record.get("kind")) != "analytical_artifact":
+                continue
+            provenance = _analytical_artifact_provenance(record)
+            entries.append({
+                "item_id": item_id,
+                **provenance,
+            })
+    return sorted(entries, key=lambda value: (_text(value.get("item_id")), _text(value.get("artifact_id"))))
 
 
 def _audit_widget_entries(widgets: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -3977,6 +4825,13 @@ def _widget_base(item_id: str, content: Mapping[str, Any], record: Mapping[str, 
     for key in ("source", "as_of", "date_authority", "distinct_unit"):
         if key in payload and payload[key] not in (None, ""):
             base[key] = payload[key]
+    for key in (
+        "technical_surface", "technical_surface_reason", "presentation_audience",
+        "presentation_tier", "presentation_role", "kind", "manager_admission",
+        "no_geometry_fallback_duplicate", "presentation_deduplication",
+    ):
+        if key in payload:
+            base[key] = copy.deepcopy(payload[key])
     return {key: value for key, value in base.items() if value not in (None, "", [])}
 
 
@@ -3984,6 +4839,1723 @@ def _table_widget(item_id: str, content: Mapping[str, Any], record: Mapping[str,
     widget = _widget_base(item_id, content, record, title=title)
     widget.update({"type": "table", "rows": rows, "presentation_tier": "primary", "presentation_role": "decision_view"})
     return widget
+
+
+# Accepted answer contracts use all three labels for the same reviewed local
+# evidence boundary.  ``evidence_ref`` is included only as this semantic alias;
+# every reference still must resolve beneath the requirement and be hash-bound
+# by that requirement's accepted manifest before any bytes are read.
+_ACCEPTED_VISUAL_REF_KEYS = ("source_ref", "artifact_ref", "evidence_ref")
+_ACCEPTED_VISUAL_TYPE_ALIASES = {
+    "line": "line",
+    "line_chart": "line",
+    "dual_line": "line",
+    "dual_line_chart": "line",
+    "small_multiple_line_charts": "line",
+    "small_multiples": "line",
+    "diverging_bar": "diverging_bar",
+    "diverging_bar_table": "diverging_bar",
+    "bar": "bar",
+    "horizontal_bar": "bar",
+    "paired_bar": "grouped_bar",
+    "grouped_bar": "grouped_bar",
+    "funnel": "funnel",
+    "funnel_or_kpi_strip": "funnel",
+    "pareto": "pareto",
+    "heatmap": "heatmap",
+    "relationship_matrix": "table",
+    "ranked_table": "table",
+    "table": "table",
+    "callout": "table",
+    "evidence_callout": "table",
+}
+_ACCEPTED_VISUAL_COLLECTION_KEYS = (
+    "rows", "values", "data", "points", "series", "cells", "stages", "bars", "panels",
+)
+
+
+def _accepted_visual_ref(item_id: str, reference: Any) -> tuple[str, str]:
+    """Validate one accepted visual artifact ref within its requirement.
+
+    Accepted visual references are deliberately less restrictive than product
+    asset references: accepted answer contracts commonly bind reviewed files
+    below ``work/``.  They still may not escape the requirement namespace or
+    use an absolute/symlinked path.
+    """
+
+    value = _text(reference).strip()
+    if not value or "\x00" in value or "\\" in value:
+        raise AssemblyError(f"{item_id} accepted visual reference is invalid")
+    path = Path(value)
+    if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+        raise AssemblyError(f"{item_id} accepted visual reference is invalid")
+    # A visual ref is resolved below requirements/<item_id>; callers must not
+    # provide a second requirement prefix or a product/external path.
+    if path.parts[0] in {"requirements", "products"}:
+        raise AssemblyError(f"{item_id} accepted visual reference is invalid")
+    return value, f"requirements/{item_id}/{path.as_posix()}"
+
+
+def _accepted_visual_artifact(
+    context: RunContext,
+    item_id: str,
+    accepted_manifest: Mapping[str, Any],
+    reference: Any,
+) -> tuple[Any, str]:
+    """Load one hash-bound accepted visual artifact without running analytics."""
+
+    ref, run_ref = _accepted_visual_ref(item_id, reference)
+    progress = accepted_manifest.get("artifact_progress")
+    hashes = progress.get("hashes") if isinstance(progress, Mapping) else None
+    expected = hashes.get(ref) if isinstance(hashes, Mapping) else None
+    if not _is_sha256(expected):
+        raise AssemblyError(f"{item_id} accepted visual reference is not hash-bound: {ref}")
+    _assert_no_symlink_chain(context, run_ref, label=f"{item_id} accepted visual artifact")
+    _path, payload = _read_bytes(context, run_ref, label=f"{item_id} accepted visual artifact")
+    actual = _sha256_bytes(payload)
+    if actual != expected:
+        raise AssemblyError(f"{item_id} accepted visual artifact hash mismatch: {ref}")
+    suffix = Path(ref).suffix.lower()
+    if suffix not in {".csv", ".json", ".jsonl"}:
+        raise AssemblyError(f"{item_id} accepted visual artifact format is unsupported: {ref}")
+    try:
+        if suffix == ".csv":
+            text = payload.decode("utf-8")
+            rows = list(csv.DictReader(io.StringIO(text, newline="")))
+            if rows and any(not isinstance(row, Mapping) for row in rows):
+                raise ValueError("CSV rows are not objects")
+            value: Any = [dict(row) for row in rows]
+        elif suffix in {".json", ".jsonl"}:
+            text = payload.decode("utf-8")
+            if suffix == ".jsonl":
+                value = [json.loads(line) for line in text.splitlines() if line.strip()]
+            else:
+                value = json.loads(text)
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise AssemblyError(f"{item_id} accepted visual artifact is invalid: {ref}") from exc
+    return value, expected
+
+
+def _accepted_visual_source_rows(
+    visual: Mapping[str, Any],
+    artifact_value: Any = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Copy inline/source rows and a bounded source-shape reason.
+
+    This helper intentionally performs only structural projection.  It never
+    aggregates values, computes rates, or invents geometry.
+    """
+
+    fields: list[str] = []
+    for key in ("fields", "columns", "dimensions", "measures", "labels"):
+        for value in _as_list(visual.get(key)):
+            if isinstance(value, str) and value.strip() and value not in fields:
+                fields.append(value)
+    for key in ("measure", "x"):
+        value = visual.get(key)
+        if isinstance(value, str) and value.strip() and value not in fields:
+            fields.append(value)
+    for value in _as_list(visual.get("secondary_measures")):
+        if isinstance(value, str) and value.strip() and value not in fields:
+            fields.append(value)
+    for value in _as_list(visual.get("series")):
+        if isinstance(value, str) and value.strip() and value not in fields:
+            fields.append(value)
+    raw: Any = None
+    # A hash-bound artifact is authoritative for source-bound visuals.  Do not
+    # mistake declarative metadata such as ``series: ["orders", "lines"]``
+    # or ``facets`` for the reviewed data rows when that artifact is present.
+    # Inline rows/values are considered only when no external source was
+    # declared.
+    if artifact_value is None:
+        for key in _ACCEPTED_VISUAL_COLLECTION_KEYS:
+            candidate = visual.get(key)
+            if isinstance(candidate, list):
+                raw = candidate
+                break
+            if isinstance(candidate, Mapping) and key in {"rows", "data", "values", "cells", "stages", "bars"}:
+                raw = [candidate]
+                break
+    if raw is None and artifact_value is not None:
+        # Recursively discover list-of-object tables.  When a visual declares
+        # fields, prefer the candidate exposing the greatest exact field
+        # coverage; ties are ambiguous and become an explicit limitation.
+        candidates: list[tuple[str, list[Any]]] = []
+
+        def column_names(value: Any) -> list[str]:
+            """Return an explicit column declaration without coercing values."""
+
+            names: list[str] = []
+            for item in _as_list(value):
+                if isinstance(item, str) and item.strip() and item not in names:
+                    names.append(item)
+                elif isinstance(item, Mapping):
+                    name = item.get("name") or item.get("field") or item.get("id")
+                    if isinstance(name, str) and name.strip() and name not in names:
+                        names.append(name)
+            return names
+
+        def materialize_matrix(columns: Sequence[str], matrix: Any) -> list[dict[str, Any]] | None:
+            """Materialize a reviewed column matrix, preserving every cell exactly."""
+
+            if not columns or not isinstance(matrix, list) or not matrix:
+                return None
+            if not all(isinstance(row, (list, tuple)) for row in matrix):
+                return None
+            width = len(columns)
+            if any(len(row) != width for row in matrix):
+                return None
+            return [
+                {column: _artifact_json_value(cell) for column, cell in zip(columns, row)}
+                for row in matrix
+            ]
+
+        matrix_candidates: list[tuple[str, list[dict[str, Any]] | None]] = []
+
+        def discover_matrix(value: Any, path: str = "") -> None:
+            if isinstance(value, Mapping):
+                columns = column_names(value.get("columns"))
+                if columns:
+                    for key in ("rows", "data", "values", "records", "items"):
+                        child = value.get(key)
+                        if isinstance(child, list) and child and all(isinstance(row, (list, tuple)) for row in child):
+                            matrix_candidates.append(
+                                (
+                                    f"{path}.{key}" if path else key,
+                                    materialize_matrix(columns, child),
+                                )
+                            )
+                for key, child in value.items():
+                    discover_matrix(child, f"{path}.{key}" if path else str(key))
+
+        # A top-level matrix uses the visual declaration as its source schema;
+        # nested matrices carry their own reviewed ``columns`` declaration.
+        if isinstance(artifact_value, list) and artifact_value and all(
+            isinstance(row, (list, tuple)) for row in artifact_value
+        ):
+            visual_columns = column_names(visual.get("columns") or visual.get("fields"))
+            matrix_candidates.append(("<root>", materialize_matrix(visual_columns, artifact_value)))
+        elif isinstance(artifact_value, Mapping):
+            discover_matrix(artifact_value)
+
+        def discover(value: Any, path: str = "") -> None:
+            if isinstance(value, list) and value and all(isinstance(row, Mapping) for row in value):
+                candidates.append((path, value))
+                return
+            if isinstance(value, Mapping):
+                for key, child in value.items():
+                    discover(child, f"{path}.{key}" if path else str(key))
+
+        discover(artifact_value)
+        if candidates:
+            if fields:
+                scored = [
+                    (sum(1 for row in rows if set(fields).issubset(set(row))), path, rows)
+                    for path, rows in candidates
+                ]
+                best_score = max(score for score, _path, _rows in scored)
+                best = [(path, rows) for score, path, rows in scored if score == best_score]
+                if best_score == 0:
+                    # Typed artifacts commonly carry one semantic ``rows``
+                    # table alongside metric-definition/metadata arrays.  A
+                    # single conventional rows/data/results path is a safe
+                    # source-bound choice even when the visual declaration
+                    # uses aliases absent from that artifact; the missing
+                    # fields remain an explicit limitation below.  Multiple
+                    # equally plausible tables stay fail-closed.
+                    preferred = [
+                        item for item in candidates
+                        if item[0].split(".")[-1]
+                        in {"rows", "data", "values", "results", "records", "items"}
+                    ]
+                    if len(preferred) == 1:
+                        _path, raw = preferred[0]
+                    elif len(candidates) > 1:
+                        return [], "accepted visual source table selection is ambiguous"
+                    else:
+                        _path, raw = candidates[0]
+                elif len(best) == 1:
+                    _path, raw = best[0]
+                else:
+                    return [], "accepted visual source table selection is ambiguous"
+            else:
+                preferred = [item for item in candidates if item[0].split(".")[-1] in {"rows", "data", "values", "results", "records", "items"}]
+                if len(preferred) == 1:
+                    _path, raw = preferred[0]
+                elif len(candidates) == 1:
+                    _path, raw = candidates[0]
+                else:
+                    return [], "accepted visual source contains multiple structured tables without a field binding"
+        elif matrix_candidates:
+            valid_matrices = [item for item in matrix_candidates if item[1] is not None]
+            if not valid_matrices:
+                return [], "accepted visual source rows do not match declared columns"
+            if len(valid_matrices) != 1:
+                return [], "accepted visual source table selection is ambiguous"
+            _path, raw = valid_matrices[0]
+        elif isinstance(artifact_value, Mapping):
+            scalar = {
+                str(key): _artifact_json_value(value)
+                for key, value in artifact_value.items()
+                if not isinstance(value, (Mapping, list, tuple))
+            }
+            if scalar:
+                raw = [scalar]
+    if raw is None:
+        return [], "accepted visual specification has no inline rows or hash-bound structured values"
+    rows: list[dict[str, Any]] = []
+    for index, value in enumerate(raw, 1):
+        if isinstance(value, Mapping):
+            copied = _artifact_json_value(value)
+            if not isinstance(copied, Mapping):
+                return [], f"accepted visual row {index} is not a structured object"
+            # Explicit visual fields narrow the copied table to reviewed
+            # columns.  Missing requested columns remain a limitation below;
+            # no alternate field is silently substituted.
+            if fields:
+                # Retain only the small set of source-local identity/axis
+                # columns needed to label a generic chart.  These are not
+                # derived values; they are exact reviewed fields that let a
+                # declaration name ``measure``/``series`` while the artifact
+                # supplies its segment, period, or row/column key.
+                geometry_labels = (
+                    "label", "category", "stage", "exception", "segment", "name",
+                    "customer_id", "customer_name", "role", "period", "time", "month",
+                    "date", "year", "row", "row_label", "column", "column_label", "x", "y",
+                )
+                projection_fields = list(fields)
+                projection_fields.extend(
+                    field for field in geometry_labels if field not in projection_fields and field in copied
+                )
+                copied = {field: copied[field] for field in projection_fields if field in copied}
+            rows.append(dict(copied))
+        else:
+            rows.append({"value": _artifact_json_value(value)})
+    if not rows:
+        return [], "accepted visual source supplied no rows"
+    if fields and not any(set(fields) <= set(row) for row in rows):
+        return rows, "accepted visual source does not expose all requested fields"
+    return rows, None
+
+
+_ACCEPTED_EVIDENCE_REF = "work/evidence.jsonl"
+
+
+def _accepted_evidence_scope(
+    content: Mapping[str, Any],
+    accepted_manifest: Mapping[str, Any],
+) -> tuple[str, set[str]] | None:
+    """Return the hash-bound evidence ledger and optional record IDs.
+
+    Accepted answer bundles sometimes expose an evidence *ID* rather than a
+    filesystem path in ``evidence_refs``.  The accepted manifest remains the
+    authority for resolving that ID: only its standard ``work/evidence.jsonl``
+    entry is eligible, and a fragment/ID narrows the record set without
+    selecting any unrelated artifact.  No visual-to-record relationship is
+    inferred here.
+    """
+
+    requested = False
+    record_ids: set[str] = set()
+
+    def collect(values: Any) -> None:
+        nonlocal requested
+        for raw in _as_list(values):
+            text = _text(raw).strip()
+            if not text:
+                continue
+            path, separator, fragment = text.partition("#")
+            path = path.strip()
+            fragment = fragment.strip()
+            if path == _ACCEPTED_EVIDENCE_REF:
+                requested = True
+                if fragment:
+                    record_ids.add(fragment)
+                continue
+            # Evidence contracts may carry stable IDs instead of paths.  Keep
+            # the ID opaque and match it only against the hash-bound ledger's
+            # explicit ``evidence_id`` field below.
+            if not separator and "/" not in text and "\\" not in text:
+                record_ids.add(text)
+
+    collect(content.get("evidence_refs"))
+    for visual in _as_list(content.get("visuals")):
+        if not isinstance(visual, Mapping):
+            continue
+        collect(visual.get("evidence_refs"))
+        collect(visual.get("evidence_ref"))
+    if not requested and not record_ids:
+        return None
+    progress = accepted_manifest.get("artifact_progress")
+    hashes = progress.get("hashes") if isinstance(progress, Mapping) else None
+    if not isinstance(hashes, Mapping) or not _is_sha256(hashes.get(_ACCEPTED_EVIDENCE_REF)):
+        return None
+    return _ACCEPTED_EVIDENCE_REF, record_ids
+
+
+def _accepted_evidence_rows(record: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return only a lossless fact-sheet projection, never a chosen table.
+
+    The assembler uses :func:`_accepted_evidence_candidates` directly.  This
+    narrow helper remains for older callers but deliberately returns no rows
+    when a record contains table candidates, avoiding any position/title
+    based table selection.
+    """
+
+    candidates = _accepted_evidence_candidates(record)
+    if any(candidate["kind"] == "table" for candidate in candidates):
+        return []
+    fact_sheet = next((candidate for candidate in candidates if candidate["kind"] == "fact_sheet"), None)
+    return copy.deepcopy(fact_sheet["rows"]) if fact_sheet is not None else []
+
+
+def _json_pointer_escape(value: Any) -> str:
+    """Escape one JSON-pointer path component without interpreting its value."""
+
+    return str(value).replace("~", "~0").replace("/", "~1")
+
+
+def _json_pointer_unescape(value: Any) -> str:
+    """Decode one JSON-pointer path component for presentation labels only."""
+
+    return _text(value).replace("~1", "/").replace("~0", "~")
+
+
+def _accepted_evidence_pointer_segments(pointer: Any) -> list[str]:
+    """Return non-numeric JSON-pointer segments without exposing the pointer."""
+
+    segments = [_json_pointer_unescape(part) for part in _text(pointer).split("/") if part]
+    # ``facts`` is the structural root, not a business label.  Array indexes
+    # are likewise identity mechanics rather than useful manager copy.
+    return [
+        segment
+        for index, segment in enumerate(segments)
+        if not (index == 0 and segment == "facts")
+        and not re.fullmatch(r"\d+", segment)
+    ]
+
+
+def _accepted_evidence_pointer_label(pointer: Any) -> str:
+    """Humanize a source pointer without interpreting its business meaning."""
+
+    segments = _accepted_evidence_pointer_segments(pointer)
+    if not segments:
+        return "Business metric"
+    return " · ".join(_humanize_label(segment) for segment in segments)
+
+
+def _accepted_evidence_manager_rows(rows: Sequence[Any]) -> list[dict[str, Any]]:
+    """Build a presentation-only fact-sheet projection from exact path/value rows.
+
+    The source-bound ``rows`` list remains untouched for audit/hash binding.
+    Mapping/list values are represented by canonical JSON text so the generic
+    table renderer can display them without dropping a container.  Scalars are
+    copied without coercion or semantic normalization.
+    """
+
+    projected: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, Mapping) or "path" not in row or "value" not in row:
+            continue
+        value = _artifact_json_value(row.get("value"))
+        if isinstance(value, (Mapping, list, tuple)):
+            value = _canonical_bytes(value).decode("utf-8").rstrip("\n")
+        projected.append({
+            "label": _accepted_evidence_pointer_label(row.get("path")),
+            "value": value,
+        })
+    return projected
+
+
+def _accepted_evidence_title(pointer: Any, candidate_kind: str) -> str:
+    """Return a neutral pointer-derived title for one accepted candidate."""
+
+    if candidate_kind == "fact_sheet" and _text(pointer).strip() == "/facts":
+        return "Business metrics"
+    segments = _accepted_evidence_pointer_segments(pointer)
+    return _humanize_label(segments[-1]) if segments else "Business metrics"
+
+
+def _accepted_evidence_candidates(record: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Enumerate every structural evidence surface without semantic guesses.
+
+    A reviewed ``facts`` object can contain several independent tables next to
+    scalar/context facts.  Earlier code selected one table and dropped the
+    siblings.  This projection keeps each non-empty list-of-objects at its
+    exact JSON pointer and places every sibling scalar/container in a separate
+    fact-sheet candidate.  Values are copied only; no narrative parsing or
+    calculation occurs.
+    """
+
+    facts = record.get("facts")
+    if facts is None:
+        return []
+
+    table_candidates: list[tuple[str, list[dict[str, Any]]]] = []
+
+    def discover_tables(value: Any, pointer: str) -> None:
+        if isinstance(value, list):
+            if value and all(isinstance(row, Mapping) for row in value):
+                copied = _artifact_json_value(value)
+                table_candidates.append(
+                    (
+                        pointer,
+                        [dict(row) for row in copied if isinstance(row, Mapping)],
+                    )
+                )
+            # Do not stop at a table: a reviewed row may itself carry a
+            # nested list-of-objects table, which also has an exact pointer.
+            for index, child in enumerate(value):
+                discover_tables(child, f"{pointer}/{index}")
+            return
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                discover_tables(child, f"{pointer}/{_json_pointer_escape(key)}")
+
+    discover_tables(facts, "/facts")
+    table_roots = tuple(pointer for pointer, _rows in table_candidates)
+
+    def under_table(pointer: str) -> bool:
+        return any(pointer == root or pointer.startswith(root + "/") for root in table_roots)
+
+    fact_rows: list[dict[str, Any]] = []
+
+    def add_fact(pointer: str, value: Any) -> None:
+        # ``path`` is an exact source pointer.  ``value`` is copied as-is,
+        # including empty containers; neither field carries inferred meaning.
+        fact_rows.append({"path": pointer, "value": _artifact_json_value(value)})
+
+    def discover_facts(value: Any, pointer: str) -> None:
+        if under_table(pointer):
+            return
+        if isinstance(value, Mapping):
+            if not value:
+                add_fact(pointer, value)
+                return
+            # Recurse through every non-empty mapping so scalar siblings keep
+            # their own exact JSON pointers (for example denominator or
+            # observed_count). Empty mappings remain explicit containers.
+            for key, child in value.items():
+                discover_facts(child, f"{pointer}/{_json_pointer_escape(key)}")
+            return
+        if isinstance(value, list):
+            if not value:
+                add_fact(pointer, value)
+                return
+            # Non-table arrays (including mixed/scalar arrays) are preserved as
+            # one exact container.  Non-empty object arrays are table roots and
+            # are already represented above.
+            if not any(root == pointer for root in table_roots):
+                add_fact(pointer, value)
+            return
+        add_fact(pointer, value)
+
+    discover_facts(facts, "/facts")
+
+    candidates: list[dict[str, Any]] = [
+        {"kind": "table", "pointer": pointer, "rows": rows}
+        for pointer, rows in table_candidates
+    ]
+    if fact_rows:
+        candidates.append({"kind": "fact_sheet", "pointer": "/facts", "rows": fact_rows})
+    # Pointer order is the source's structural order.  Keep it stable and
+    # independent of any evidence-ledger/title/position preference.
+    return candidates
+
+
+def _accepted_evidence_widgets(
+    context: RunContext,
+    item_id: str,
+    content: Mapping[str, Any],
+    accepted_manifest: Mapping[str, Any],
+    accepted_content_hash: str | None,
+    accepted_manifest_hash: str | None,
+) -> list[dict[str, Any]]:
+    """Build generic source-bound candidates from accepted evidence records.
+
+    These candidates are deliberately independent of accepted visual
+    declarations: a visual without an explicit source binding remains a
+    limitation/placeholder, while the evidence ledger can still expose its
+    exact reviewed rows for Product selection.  Integration records are never
+    consulted, so a technical integration failure cannot erase accepted
+    business evidence.
+    """
+
+    scope = _accepted_evidence_scope(content, accepted_manifest)
+    if scope is None:
+        return []
+    reference, selected_ids = scope
+    artifact_value, artifact_sha = _accepted_visual_artifact(
+        context,
+        item_id,
+        accepted_manifest,
+        reference,
+    )
+    if not isinstance(artifact_value, list):
+        return []
+    source_ref = f"requirements/{item_id}/{reference}"
+    accepted_ref = f"{source_ref}"
+    widgets: list[dict[str, Any]] = []
+    record_ids: dict[str, int] = {}
+    eligible_records: list[tuple[Mapping[str, Any], str]] = []
+    for raw_record in artifact_value:
+        if not isinstance(raw_record, Mapping):
+            continue
+        evidence_id = _text(raw_record.get("evidence_id")).strip()
+        if not evidence_id or (selected_ids and evidence_id not in selected_ids):
+            continue
+        record_ids[evidence_id] = record_ids.get(evidence_id, 0) + 1
+        eligible_records.append((raw_record, evidence_id))
+    for raw_record, evidence_id in eligible_records:
+        # Duplicate IDs cannot be bound to one exact ledger record.  Omit all
+        # candidates for that ID while retaining every other unique record.
+        if record_ids.get(evidence_id, 0) != 1:
+            continue
+        candidates = _accepted_evidence_candidates(raw_record)
+        if not candidates:
+            # Empty/unsupported facts remain represented by the original
+            # accepted visual limitation and are not turned into guesses.
+            continue
+        record_evidence_refs = [
+            _text(value).strip()
+            for value in _as_list(raw_record.get("evidence_refs"))
+            if _text(value).strip()
+        ]
+        limitations = [
+            _text(value).strip()
+            for value in [*_as_list(content.get("limitations")), *_as_list(raw_record.get("limitations"))]
+            if _text(value).strip()
+        ]
+        record_ref = f"{accepted_ref}#{evidence_id}"
+        for candidate in candidates:
+            pointer = _text(candidate.get("pointer")).strip()
+            rows = candidate.get("rows")
+            if not pointer or not isinstance(rows, list):
+                continue
+            candidate_kind = _text(candidate.get("kind")).strip() or "fact_sheet"
+            # The pointer, rather than ledger order or a title, determines the
+            # candidate identity.  A short digest prevents collisions from
+            # unusual JSON keys while the exact pointer remains inspectable.
+            pointer_digest = _sha256_bytes(pointer.encode("utf-8"))[:12]
+            candidate_id = (
+                f"{_slug(item_id)}-accepted-evidence-{_slug(evidence_id)}-"
+                f"{_slug(candidate_kind)}-{pointer_digest}"
+            )
+            widget = {
+                "id": candidate_id,
+                "type": "table",
+                "title": _accepted_evidence_title(pointer, candidate_kind),
+                "accepted_evidence": True,
+                "accepted_evidence_id": evidence_id,
+                "accepted_evidence_candidate_kind": candidate_kind,
+                "accepted_evidence_pointer": pointer,
+                "accepted_evidence_source_pointer": pointer,
+                "accepted_evidence_ref": record_ref,
+                "accepted_evidence_sha256": artifact_sha,
+                "accepted_content_hash": accepted_content_hash,
+                "accepted_manifest_hash": accepted_manifest_hash,
+                "reviewed_item_ref": f"requirements/{item_id}/accepted/manifest.json",
+                "reviewed_output_ref": f"requirements/{item_id}/accepted/answer_content.json",
+                "evidence_refs": [record_ref, *record_evidence_refs],
+                "trace_refs": [
+                    f"requirements/{item_id}/accepted/manifest.json",
+                    f"requirements/{item_id}/accepted/answer_content.json",
+                    source_ref,
+                    record_ref,
+                ],
+                "review_status": "accepted",
+                "presentation_role": "decision_view",
+                "presentation_tier": "primary",
+                "limitations": list(dict.fromkeys(limitations)),
+                "audit_payload": copy.deepcopy(dict(raw_record)),
+                "accepted_evidence_conclusion": copy.deepcopy(raw_record.get("conclusion")),
+                "source_bound": True,
+                "rows": copy.deepcopy(rows),
+                "manager_rows": (
+                    _accepted_evidence_manager_rows(rows)
+                    if candidate_kind == "fact_sheet"
+                    else copy.deepcopy(rows)
+                ),
+            }
+            # Carry explicit origin metadata when the accepted evidence
+            # record provides it.  The renderer and Product plan may inspect
+            # these fields for provenance, but they never override plan
+            # membership or rewrite the selected projection.
+            for key in (
+                "technical_surface", "technical_surface_reason",
+                "presentation_audience", "presentation_tier", "presentation_role",
+                "kind", "manager_admission", "no_geometry_fallback_duplicate",
+                "presentation_deduplication",
+            ):
+                if key in raw_record:
+                    widget[key] = copy.deepcopy(raw_record[key])
+            if "scope" in content:
+                # Keep answer-level scope exact for accepted-evidence
+                # projections as well; it is presentation context, not a
+                # value inferred from the ledger row.
+                widget["answer_scope"] = copy.deepcopy(content.get("scope"))
+            if candidate_kind == "fact_sheet":
+                widget["accepted_evidence_fact_sheet"] = True
+            else:
+                widget["accepted_evidence_table_pointer"] = pointer
+            widgets.append(widget)
+    return widgets
+
+
+def _accepted_visual_percent(value: Any) -> Any:
+    """Return reviewed share geometry in renderer format when unambiguous."""
+
+    if isinstance(value, bool) or value in (None, ""):
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.endswith("%"):
+            return stripped
+        try:
+            number = float(stripped)
+        except ValueError:
+            return None
+    elif isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    # Accepted answer contracts commonly encode shares as fractions.  The
+    # conversion is CSS geometry only; the original share remains in rows.
+    if number <= 1:
+        number *= 100
+    if number > 100:
+        return None
+    return f"{number:.6f}".rstrip("0").rstrip(".") + "%"
+
+
+def _accepted_visual_numeric(value: Any) -> float | None:
+    if isinstance(value, bool) or value in (None, ""):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _accepted_visual_derived_size(value: Any, values: Sequence[Any]) -> str | None:
+    """Scale a supplied numeric value for CSS geometry without changing it."""
+
+    numeric = _accepted_visual_numeric(value)
+    magnitudes = [abs(number) for number in (_accepted_visual_numeric(item) for item in values) if number is not None]
+    maximum = max(magnitudes, default=0.0)
+    if numeric is None or maximum <= 0:
+        return None
+    return f"{max(0.0, min(100.0, abs(numeric) / maximum * 100.0)):.6f}".rstrip("0").rstrip(".") + "%"
+
+
+def _accepted_visual_scale_group_specs(
+    scale_groups: Any,
+) -> list[tuple[str, tuple[str, ...], dict[str, Any]]]:
+    """Read explicit accepted-visual scale-group declarations syntactically.
+
+    A declaration maps a group label to the exact series/measure labels that
+    belong to it.  Optional ``domain``/``basis`` fields are copied as context;
+    neither labels nor metadata are interpreted as business semantics.
+    """
+
+    specs: list[tuple[str, tuple[str, ...], dict[str, Any]]] = []
+
+    def member_values(raw: Any) -> tuple[list[str], dict[str, Any]]:
+        if isinstance(raw, Mapping):
+            metadata = copy.deepcopy(dict(raw))
+            for key in ("series", "labels", "measures", "fields", "members"):
+                declared = raw.get(key)
+                if declared is None:
+                    continue
+                values = [
+                    _text(value).strip()
+                    for value in _as_list(declared)
+                    if not isinstance(value, (Mapping, list, tuple, set, frozenset))
+                    and _text(value).strip()
+                ]
+                return values, metadata
+            return [], metadata
+        values = [
+            _text(value).strip()
+            for value in _as_list(raw)
+            if not isinstance(value, (Mapping, list, tuple, set, frozenset))
+            and _text(value).strip()
+        ]
+        return values, {}
+
+    if isinstance(scale_groups, Mapping):
+        nested_groups = scale_groups.get("groups")
+        if isinstance(nested_groups, (Mapping, list, tuple)):
+            scale_groups = nested_groups
+        else:
+            for raw_group, raw_members in scale_groups.items():
+                group = _text(raw_group).strip()
+                if not group:
+                    continue
+                members, metadata = member_values(raw_members)
+                specs.append((group, tuple(members), metadata))
+            return specs
+    if isinstance(scale_groups, (list, tuple)):
+        for raw_group in scale_groups:
+            if not isinstance(raw_group, Mapping):
+                continue
+            group = next(
+                (
+                    _text(raw_group.get(key)).strip()
+                    for key in ("group", "id", "name", "label", "key")
+                    if _text(raw_group.get(key)).strip()
+                ),
+                "",
+            )
+            if not group:
+                continue
+            members, metadata = member_values(raw_group)
+            specs.append((group, tuple(members), metadata))
+    return specs
+
+
+def _accepted_visual_scale_group_for_label(
+    label: Any,
+    scale_groups: Any,
+) -> tuple[str, dict[str, Any]] | None:
+    """Return the explicitly declared group for one exact series label."""
+
+    text = _text(label).strip()
+    if not text:
+        return None
+    folded = text.casefold()
+    for group, members, metadata in _accepted_visual_scale_group_specs(scale_groups):
+        if any(text == member or folded == member.casefold() for member in members):
+            return group, copy.deepcopy(metadata)
+    return None
+
+
+def _accepted_visual_scale_group_context(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy optional scale-domain/basis context under renderer field names."""
+
+    context: dict[str, Any] = {}
+    for output_key, aliases in (
+        ("scale_domain", ("scale_domain", "domain")),
+        ("scale_basis", ("scale_basis", "basis")),
+        ("scale_facet", ("scale_facet", "facet")),
+    ):
+        for key in aliases:
+            if key in metadata and metadata.get(key) not in (None, ""):
+                context[output_key] = copy.deepcopy(metadata.get(key))
+                break
+    return context
+
+
+_ACCEPTED_TABLE_DIMENSION_ALIASES = frozenset({
+    "label", "category", "stage", "exception", "segment", "name", "key", "id",
+    "customer_id", "customer_name", "derived_plant", "plant", "carrier", "role", "period",
+    "time", "month", "date", "year",
+})
+_ACCEPTED_TABLE_MEASURE_ALIASES = frozenset({
+    "value", "count", "amount", "measure", "n", "total", "quantity", "rate", "share",
+    "percent", "percentage", "observations", "activity_count",
+})
+
+
+def _accepted_visual_table_chart_projection(
+    visual: Mapping[str, Any],
+    rows: Sequence[Mapping[str, Any]],
+) -> tuple[str, list[dict[str, Any]]] | None:
+    """Expose a lossless quantitative table as optional chart geometry.
+
+    Tables remain the exact detail view in ``rows``.  When the reviewed table
+    contains one unambiguous dimension and one measure, or explicitly names
+    several same-unit measures, this helper adds a chart projection over the
+    same supplied values.  It only renames fields and derives CSS width
+    percentages; it never aggregates, sorts, or changes a value.  Ambiguous
+    tables intentionally remain table-only so a Product Agent cannot be led to
+    a silently selected metric.
+    """
+
+    source_rows = [row for row in rows if isinstance(row, Mapping)]
+    if not source_rows:
+        return None
+    keys: list[str] = []
+    for row in source_rows:
+        for key in row:
+            key_text = _text(key).strip()
+            if key_text and key_text not in keys:
+                keys.append(key_text)
+
+    def declared_names(*names: str) -> list[str]:
+        result: list[str] = []
+        for name in names:
+            value = visual.get(name)
+            for item in _as_list(value):
+                if isinstance(item, str) and item.strip() and item not in result:
+                    result.append(item)
+        return [name for name in result if name in keys]
+
+    dimensions = declared_names("dimension", "dimensions", "label")
+    declared_fields = declared_names("fields", "columns")
+    measures = declared_names("measure", "measures")
+
+    def all_present(name: str) -> bool:
+        return all(name in row and row.get(name) not in (None, "") for row in source_rows)
+
+    def all_numeric(name: str) -> bool:
+        return all(_accepted_visual_numeric(row.get(name)) is not None for row in source_rows)
+
+    if dimensions and not all_present(dimensions[0]):
+        dimensions = []
+    if measures and not all(all_present(name) and all_numeric(name) for name in measures):
+        measures = []
+    if not dimensions:
+        candidates = [
+            key for key in keys
+            if key.lower() in _ACCEPTED_TABLE_DIMENSION_ALIASES and all_present(key)
+        ]
+        # A declared field name is semantic dimension metadata even when its
+        # values are numeric-looking business codes (for example plant IDs).
+        # Keep such codes exact rather than treating them as measures.
+        declared_candidates = [
+            key for key in declared_fields
+            if key in candidates or key.lower().endswith(("_id", "_name")) and key in keys and all_present(key)
+        ]
+        if declared_candidates:
+            candidates = declared_candidates
+        else:
+            candidates = [key for key in candidates if not all_numeric(key)]
+        if len(candidates) == 1:
+            dimensions = candidates
+        elif len(candidates) > 1:
+            # Keep a human-readable name as the chart label when an accepted
+            # table also carries a stable ID.  The ID remains in each exact
+            # detail row and is never discarded from the source projection.
+            name_candidates = [
+                key for key in candidates
+                if key.lower() == "name" or key.lower().endswith("_name")
+            ]
+            if len(name_candidates) == 1:
+                dimensions = name_candidates
+        # A source-bound table may declare arbitrary business columns rather
+        # than one of the conventional aliases.  When that declaration names
+        # exactly one non-numeric field, it is an unambiguous chart dimension;
+        # preserve all other source columns in the detail rows.
+        if not dimensions and declared_fields:
+            declared_dimensions = [
+                key for key in declared_fields
+                if key in keys and all_present(key) and not all_numeric(key)
+            ]
+            if len(declared_dimensions) == 1:
+                dimensions = declared_dimensions
+    if not measures:
+        candidates = [
+            key for key in keys
+            if key.lower() in _ACCEPTED_TABLE_MEASURE_ALIASES and all_present(key) and all_numeric(key)
+        ]
+        # A declaration-free table is chartable only when exactly one
+        # semantic numeric field is present.  This prevents rank, IDs, and
+        # multiple mixed-unit measures from becoming an arbitrary bar.
+        if len(candidates) == 1:
+            measures = candidates
+        else:
+            numeric_fields = [
+                key for key in keys
+                if all_present(key)
+                and all_numeric(key)
+                and key not in dimensions
+                and key.lower() not in _ACCEPTED_TABLE_DIMENSION_ALIASES
+                and not key.lower().endswith(("_id", "_name"))
+            ]
+            if len(numeric_fields) == 1:
+                measures = numeric_fields
+        if not measures and declared_fields:
+            declared_measures = [
+                key for key in declared_fields
+                if key in keys
+                and key not in dimensions
+                and all_present(key)
+                and all_numeric(key)
+            ]
+            if len(declared_measures) == 1:
+                measures = declared_measures
+
+    if len(dimensions) != 1 or not measures:
+        return None
+    dimension = dimensions[0]
+    if len(measures) == 1:
+        measure = measures[0]
+        values = [row.get(measure) for row in source_rows]
+        chart_rows: list[dict[str, Any]] = []
+        for source_row in source_rows:
+            row = dict(source_row)
+            row["label"] = source_row.get(dimension)
+            row["value"] = source_row.get(measure)
+            row["size"] = _accepted_visual_derived_size(row["value"], values)
+            if row["label"] in (None, "") or row["size"] in (None, ""):
+                return None
+            chart_rows.append(row)
+        return "bar", chart_rows
+
+    # Grouped bars are offered only when the accepted declaration supplies a
+    # same-unit label.  Without that reviewed semantic boundary, several
+    # numeric columns are an ambiguous table rather than a truthful chart.
+    if not _text(visual.get("unit")).strip():
+        return None
+    values = [row.get(measure) for row in source_rows for measure in measures]
+    group_values: dict[str, list[Any]] = {}
+    for measure in measures:
+        found = _accepted_visual_scale_group_for_label(measure, visual.get("scale_groups"))
+        if found is None:
+            continue
+        group_values.setdefault(found[0], []).extend(
+            row.get(measure)
+            for row in source_rows
+            if row.get(measure) not in (None, "")
+        )
+    chart_rows = []
+    for source_row in source_rows:
+        row = dict(source_row)
+        row["label"] = source_row.get(dimension)
+        series = []
+        for measure in measures:
+            value = source_row.get(measure)
+            found = _accepted_visual_scale_group_for_label(measure, visual.get("scale_groups"))
+            group = found[0] if found is not None else ""
+            size_values = group_values.get(group) if len(group_values) > 1 and group else values
+            size = _accepted_visual_derived_size(value, size_values or values)
+            if size in (None, ""):
+                return None
+            item = {"label": measure, "value": value, "size": size}
+            if found is not None:
+                item["scale_group"] = group
+                item.update(_accepted_visual_scale_group_context(found[1]))
+            series.append(item)
+        if row["label"] in (None, "") or not series:
+            return None
+        row["series"] = series
+        chart_rows.append(row)
+    return "grouped_bar", chart_rows
+
+
+def _accepted_visual_limitations(
+    visual: Mapping[str, Any],
+    source_reason: str | None,
+) -> list[str]:
+    values: list[str] = []
+    for value in _as_list(visual.get("limitations")):
+        text = _text(value).strip()
+        if text and text not in values:
+            values.append(text)
+    for key in ("limitation", "note"):
+        text = _text(visual.get(key)).strip()
+        if text and text not in values:
+            values.append(text)
+    if source_reason and source_reason not in values:
+        values.append(source_reason)
+    return values
+
+
+def _accepted_visual_widgets(
+    context: RunContext,
+    item_id: str,
+    content: Mapping[str, Any],
+    accepted_manifest: Mapping[str, Any],
+    accepted_content_hash: str | None,
+    accepted_manifest_hash: str | None,
+) -> list[dict[str, Any]]:
+    """Build source-bound presentation candidates from accepted answer visuals."""
+
+    raw_visuals = content.get("visuals")
+    # Older/compact accepted answers may omit a visual declaration while
+    # still carrying committed typed records; those records already provide
+    # the normal decision surface.  Do not manufacture a duplicate visual for
+    # that shape.  An explicitly empty ``visuals`` list, in contrast, is a
+    # reviewed declaration with no geometry and receives a bounded limitation
+    # candidate below.
+    if raw_visuals is None:
+        return []
+    visuals = [value for value in _as_list(raw_visuals) if isinstance(value, Mapping)]
+    if raw_visuals is not None and len(visuals) != len(_as_list(raw_visuals)):
+        raise AssemblyError(f"{item_id} accepted visuals must be objects")
+    if not visuals:
+        visuals = [{"title": "Accepted business visual", "type": "table"}]
+    # A requirement-level answer may carry one reviewed headline list while
+    # declaring several visuals whose optional geometry is unavailable.  Keep
+    # that list for one deterministic fallback surface only; later empty
+    # declarations remain audit records instead of repeating the same claims.
+    requirement_headline_rows: list[dict[str, Any]] = []
+    for finding in _as_list(content.get("headline_findings")):
+        if isinstance(finding, Mapping):
+            value = next(
+                (
+                    finding.get(key)
+                    for key in ("finding", "claim", "text", "body", "message", "title", "label", "value")
+                    if finding.get(key) not in (None, "")
+                ),
+                None,
+            )
+        else:
+            value = finding
+        if value not in (None, ""):
+            requirement_headline_rows.append({"claim": copy.deepcopy(value)})
+    # Keep answer-level limitations separate from each visual's own notes so
+    # they can be shown once on the single geometry-less fallback surface.
+    answer_limitations: list[Any] = []
+    for value in _as_list(content.get("limitations")):
+        if _text(value).strip() and value not in answer_limitations:
+            answer_limitations.append(copy.deepcopy(value))
+    fallback_emitted = False
+    widgets: list[dict[str, Any]] = []
+    for index, visual in enumerate(visuals):
+        declared_context: dict[str, Any] = {}
+        raw_type = _text(visual.get("type") or visual.get("kind") or visual.get("chart")).strip().lower()
+        normalized_type = _ACCEPTED_VISUAL_TYPE_ALIASES.get(raw_type, "table")
+        title = _text(visual.get("title") or visual.get("label") or f"Accepted visual {index + 1}").strip()
+        if not title:
+            title = f"Accepted visual {index + 1}"
+        refs = [visual.get(key) for key in _ACCEPTED_VISUAL_REF_KEYS if visual.get(key) not in (None, "")]
+        artifact_value: Any = None
+        artifact_ref: str | None = None
+        artifact_sha: str | None = None
+        if refs:
+            # Only one source/artifact ref is meaningful for one accepted
+            # visual.  Multiple refs are retained in audit payload but are
+            # rejected at the source boundary instead of choosing silently.
+            if len(refs) > 1:
+                raise AssemblyError(f"{item_id} accepted visual has multiple source references")
+            artifact_ref = _text(refs[0]).strip()
+            artifact_value, artifact_sha = _accepted_visual_artifact(context, item_id, accepted_manifest, artifact_ref)
+        rows, source_reason = _accepted_visual_source_rows(visual, artifact_value)
+        # Keep reviewer-declared limitations available to a manager projection;
+        # source/shape diagnostics are audit context and must not become
+        # visible business claims when a visual has no geometry.
+        limitations = _accepted_visual_limitations(visual, None)
+        audit_limitations = []
+        if source_reason:
+            audit_limitations.append(source_reason)
+        # Preserve explicitly declared business context verbatim.  These
+        # fields are presentation metadata, not inferred values; copying them
+        # into the candidate lets a V2 plan bind the same context beside its
+        # selected chart while the immutable declaration remains in audit.
+        for key in (
+            "period", "population", "denominator", "unit", "units", "grain",
+            "proxy", "proxy_or_limit", "limit", "descriptive", "descriptive_only",
+            "causal_status", "as_of", "date_authority", "coverage", "coverage_note",
+            "scope", "scope_note", "assumptions", "annotation", "scale_groups",
+            # Structural provenance is copied from the accepted origin when
+            # present.  It is descriptive metadata only; Product plan
+            # membership remains authoritative for manager visibility.
+            "technical_surface", "technical_surface_reason",
+            "presentation_audience", "presentation_tier", "presentation_role",
+            "kind", "manager_admission", "no_geometry_fallback_duplicate",
+            "presentation_deduplication",
+        ):
+            if key in visual:
+                # ``base`` is initialized immediately below; stash the exact
+                # value until then without normalizing its representation.
+                declared_context[key] = copy.deepcopy(visual.get(key))
+        # Preserve the answer-level scope independently of a more specific
+        # visual scope.  The renderer prefers typed visual scope when present,
+        # while this exact prose remains available to a selected fallback or
+        # visual without any semantic parsing.
+        if "scope" in content:
+            declared_context["answer_scope"] = copy.deepcopy(content.get("scope"))
+        base: dict[str, Any] = {
+            "id": f"{_slug(item_id)}-accepted-visual-{index + 1:02d}",
+            "type": normalized_type,
+            "title": title,
+            "accepted_visual": True,
+            "accepted_visual_index": index,
+            "accepted_visual_pointer": f"/accepted/visuals/{index}",
+            "accepted_visual_type": raw_type or "table",
+            "accepted_content_hash": accepted_content_hash,
+            "accepted_manifest_hash": accepted_manifest_hash,
+            "reviewed_item_ref": f"requirements/{item_id}/accepted/manifest.json",
+            "reviewed_output_ref": f"requirements/{item_id}/accepted/answer_content.json",
+            "evidence_refs": [
+                _text(value).strip()
+                for value in _as_list(visual.get("evidence_refs") or visual.get("evidence_ref"))
+                if _text(value).strip()
+            ],
+            "trace_refs": [
+                f"requirements/{item_id}/accepted/manifest.json",
+                f"requirements/{item_id}/accepted/answer_content.json",
+            ],
+            "review_status": "accepted",
+            "presentation_role": "decision_view",
+            "presentation_tier": "primary",
+            "limitations": limitations,
+            "audit_payload": copy.deepcopy(dict(visual)),
+            "source_bound": True,
+        }
+        base.update(declared_context)
+        if artifact_ref is not None:
+            base["accepted_artifact_ref"] = artifact_ref
+            base["accepted_artifact_sha256"] = artifact_sha
+            base["accepted_source_ref"] = artifact_ref
+            base["trace_refs"].append(f"requirements/{item_id}/{artifact_ref}")
+        # Optional integration hints are useful only for audit association.
+        # Keep them source-local and let the accepted-only quarantine below
+        # remove malformed values before any strict identity path sees them.
+        for key in (
+            "integration_record_id",
+            "integration_record_ids",
+            "integration_record_ref",
+            "integration_record_refs",
+        ):
+            if key in visual:
+                base[key] = copy.deepcopy(visual[key])
+        # Copy only declared inline/source values.  Semantic normalization
+        # below changes field names for the renderer but never changes the
+        # supplied business values kept in ``audit_payload``.
+        if normalized_type == "funnel":
+            stages: list[dict[str, Any]] = []
+            supplied_values = [row.get("count", row.get("population", row.get("value"))) for row in rows]
+            denominator_number = _accepted_visual_numeric(visual.get("denominator"))
+            for row in rows:
+                copied = dict(row)
+                if "label" not in copied:
+                    copied["label"] = copied.get("stage") or copied.get("name")
+                if "value" not in copied:
+                    if "count" in copied:
+                        copied["value"] = copied.get("count")
+                    elif "population" in copied:
+                        copied["value"] = copied.get("population")
+                if "size" not in copied:
+                    share_value = copied.get("share") if copied.get("share") is not None else copied.get("percent")
+                    copied["size"] = _accepted_visual_percent(share_value)
+                if copied.get("size") in (None, ""):
+                    value_number = _accepted_visual_numeric(copied.get("value"))
+                    if denominator_number and value_number is not None:
+                        copied["size"] = _accepted_visual_derived_size(value_number, [denominator_number])
+                    else:
+                        copied["size"] = _accepted_visual_derived_size(copied.get("value"), supplied_values)
+                if copied.get("label") not in (None, "") and copied.get("value") not in (None, "") and copied.get("size") not in (None, ""):
+                    stages.append(copied)
+            if stages:
+                base["stages"] = stages
+                base["denominator"] = visual.get("denominator")
+            else:
+                base["type"] = "table"
+                if rows:
+                    base["rows"] = rows
+                audit_limitations.append("Accepted funnel specification lacks explicit stage geometry; reviewed values remain in a table.")
+        elif normalized_type == "line":
+            points: list[dict[str, Any]] = []
+            series_names = [value for value in _as_list(visual.get("series")) if isinstance(value, str) and value.strip()]
+            if not series_names:
+                series_names = [value for value in _as_list(visual.get("measures")) if isinstance(value, str) and value.strip()]
+            if not series_names:
+                measure = visual.get("measure")
+                if isinstance(measure, str) and measure.strip():
+                    series_names = [measure]
+            if not series_names:
+                series_names = ["value"]
+            for row in rows:
+                period = row.get("period") or row.get("time") or row.get("month") or row.get("date") or row.get("year") or row.get("x")
+                for name in series_names:
+                    if name not in row or row.get(name) in (None, "") or period in (None, ""):
+                        continue
+                    point = dict(row)
+                    point.update({"label": period, "period": period, "x": period, "value": row[name], "series": name})
+                    points.append(point)
+            if len(points) >= 2:
+                base["points"] = points
+                base["time"] = visual.get("x") or "period"
+            else:
+                base["type"] = "table"
+                if rows:
+                    base["rows"] = rows
+                audit_limitations.append("Accepted line specification lacks at least two supplied points; reviewed values remain in a table.")
+        elif normalized_type in {"bar", "grouped_bar", "diverging_bar", "pareto", "heatmap"}:
+            chart_rows: list[dict[str, Any]] = []
+            source_values: list[Any] = []
+            for source_row in rows:
+                source_value = source_row.get("value")
+                if source_value in (None, ""):
+                    source_value = next(
+                        (source_row.get(key) for key in ("count", "amount", "measure", "activity_count", "observations") if key in source_row),
+                        None,
+                    )
+                source_values.append(source_value)
+            grouped_values: list[Any] = []
+            grouped_values_by_group: dict[str, list[Any]] = {}
+            ungrouped_values: list[Any] = []
+            scale_group_metadata = {
+                group: metadata
+                for group, _members, metadata in _accepted_visual_scale_group_specs(visual.get("scale_groups"))
+            }
+
+            def series_group(item: Mapping[str, Any] | None, label: Any = None) -> tuple[str, dict[str, Any]]:
+                explicit = _text(item.get("scale_group") if isinstance(item, Mapping) else "").strip()
+                if explicit:
+                    metadata = scale_group_metadata.get(explicit, {})
+                    if not metadata:
+                        metadata = next(
+                            (value for key, value in scale_group_metadata.items() if key.casefold() == explicit.casefold()),
+                            {},
+                        )
+                    return explicit, copy.deepcopy(metadata)
+                found = _accepted_visual_scale_group_for_label(
+                    label if label is not None else (item.get("label") if isinstance(item, Mapping) else None),
+                    visual.get("scale_groups"),
+                )
+                if found is None:
+                    return "", {}
+                return found
+
+            def grouped_size(value: Any, group: str = "") -> str | None:
+                if len(grouped_values_by_group) > 1 and group:
+                    values = grouped_values_by_group.get(group)
+                    if values:
+                        return _accepted_visual_derived_size(value, values)
+                if len(grouped_values_by_group) > 1 and ungrouped_values:
+                    return _accepted_visual_derived_size(value, ungrouped_values)
+                return _accepted_visual_derived_size(value, grouped_values)
+
+            if normalized_type == "grouped_bar":
+                declared_series = [
+                    value for value in _as_list(visual.get("series"))
+                    if isinstance(value, str) and value.strip()
+                ]
+                declared_series.extend(
+                    value for value in _as_list(visual.get("measures"))
+                    if isinstance(value, str) and value.strip() and value not in declared_series
+                )
+                for source_row in rows:
+                    nested_series = source_row.get("series")
+                    if isinstance(nested_series, list):
+                        for item in nested_series:
+                            if not isinstance(item, Mapping) or item.get("value") in (None, ""):
+                                continue
+                            group, _metadata = series_group(
+                                item,
+                                item.get("label") or item.get("field") or item.get("name"),
+                            )
+                            value = item.get("value")
+                            grouped_values.append(value)
+                            if group:
+                                grouped_values_by_group.setdefault(group, []).append(value)
+                            else:
+                                ungrouped_values.append(value)
+                    for name in declared_series:
+                        if name not in source_row or source_row.get(name) in (None, ""):
+                            continue
+                        group, _metadata = series_group(None, name)
+                        value = source_row.get(name)
+                        grouped_values.append(value)
+                        if group:
+                            grouped_values_by_group.setdefault(group, []).append(value)
+                        else:
+                            ungrouped_values.append(value)
+                    if source_row.get("value") not in (None, ""):
+                        value = source_row.get("value")
+                        grouped_values.append(value)
+                        ungrouped_values.append(value)
+                if not grouped_values:
+                    grouped_values = list(source_values)
+            for row in rows:
+                copied = dict(row)
+                if "label" not in copied:
+                    label_keys = ["category", "stage", "exception", "segment", "name"]
+                    dimension = visual.get("dimension")
+                    if isinstance(dimension, str) and dimension.strip():
+                        label_keys.append(dimension)
+                    for dimension in _as_list(visual.get("dimensions")):
+                        if isinstance(dimension, str) and dimension.strip():
+                            label_keys.append(dimension)
+                    copied["label"] = next(
+                        (copied.get(key) for key in label_keys if copied.get(key) not in (None, "")),
+                        None,
+                    )
+                if "value" not in copied:
+                    for key in ("count", "amount", "measure", "activity_count", "observations"):
+                        if key in copied:
+                            copied["value"] = copied[key]
+                            break
+                if "value" not in copied:
+                    measure = visual.get("measure")
+                    if isinstance(measure, str) and measure in copied:
+                        copied["value"] = copied[measure]
+                if "value" not in copied:
+                    measures = [
+                        value for value in _as_list(visual.get("measures"))
+                        if isinstance(value, str) and value in copied
+                    ]
+                    if measures:
+                        copied["value"] = copied[measures[0]]
+                if "size" not in copied:
+                    share_value = copied.get("share") if copied.get("share") is not None else copied.get("percent")
+                    copied["size"] = _accepted_visual_percent(share_value)
+                if copied.get("size") in (None, "") and normalized_type in {"bar", "grouped_bar", "diverging_bar", "pareto"}:
+                    copied["size"] = _accepted_visual_derived_size(copied.get("value"), source_values)
+                if normalized_type == "diverging_bar" and "signed_size" not in copied:
+                    raw_signed = copied.get("signed_size")
+                    if raw_signed is None:
+                        raw_signed = copied.get("value")
+                    try:
+                        numeric_signed = float(raw_signed)
+                    except (TypeError, ValueError):
+                        numeric_signed = None
+                    if numeric_signed is not None and math.isfinite(numeric_signed):
+                        signed_percent = numeric_signed * 100 if abs(numeric_signed) <= 1 else numeric_signed
+                        if not -100 <= signed_percent <= 100:
+                            magnitudes = [abs(number) for number in (_accepted_visual_numeric(item) for item in source_values) if number is not None]
+                            maximum = max(magnitudes, default=0.0)
+                            if maximum > 0:
+                                signed_percent = numeric_signed / maximum * 100
+                        if -100 <= signed_percent <= 100:
+                            copied["signed_size"] = f"{signed_percent:.6f}".rstrip("0").rstrip(".") + "%"
+                if normalized_type == "grouped_bar" and not isinstance(copied.get("series"), list):
+                    series_names = [
+                        value for value in declared_series
+                        if isinstance(value, str) and value.strip() and value in copied
+                    ]
+                    if series_names:
+                        projected_series: list[dict[str, Any]] = []
+                        for name in series_names:
+                            group, metadata = series_group(None, name)
+                            series_item = {
+                                "label": name,
+                                "value": copied.get(name),
+                                # The source values remain exact; only this
+                                # CSS geometry is normalized.  Explicit scale
+                                # groups use their own reviewed maximum.
+                                "size": grouped_size(copied.get(name), group),
+                            }
+                            if group:
+                                series_item["scale_group"] = group
+                                series_item.update(_accepted_visual_scale_group_context(metadata))
+                            projected_series.append(series_item)
+                        copied["series"] = projected_series
+                elif normalized_type == "grouped_bar" and isinstance(copied.get("series"), list):
+                    normalized_series: list[dict[str, Any]] = []
+                    for item in copied["series"]:
+                        if not isinstance(item, Mapping):
+                            continue
+                        series_item = dict(item)
+                        group, metadata = series_group(
+                            series_item,
+                            series_item.get("label") or series_item.get("field") or series_item.get("name"),
+                        )
+                        if group:
+                            series_item.setdefault("scale_group", group)
+                            for key, value in _accepted_visual_scale_group_context(metadata).items():
+                                series_item.setdefault(key, value)
+                        if series_item.get("size") in (None, ""):
+                            series_item["size"] = grouped_size(series_item.get("value"), group)
+                        normalized_series.append(series_item)
+                    copied["series"] = normalized_series
+                chart_rows.append(copied)
+            required_ok = bool(chart_rows) and all(row.get("label") not in (None, "") and row.get("value") not in (None, "") for row in chart_rows)
+            if normalized_type == "bar":
+                required_ok = required_ok and all(row.get("size") not in (None, "") for row in chart_rows)
+                if required_ok:
+                    base["bars"] = chart_rows
+                else:
+                    base["type"] = "table"
+                    if rows:
+                        base["rows"] = rows
+                    audit_limitations.append("Accepted bar specification lacks supplied bounded geometry; reviewed values remain in a table.")
+            elif normalized_type == "grouped_bar":
+                required_ok = bool(chart_rows) and all(
+                    row.get("label") not in (None, "")
+                    and isinstance(row.get("series"), list)
+                    and bool(row.get("series"))
+                    and all(
+                        isinstance(series_item, Mapping)
+                        and series_item.get("value") not in (None, "")
+                        and series_item.get("size") not in (None, "")
+                        for series_item in row.get("series", [])
+                    )
+                    for row in chart_rows
+                )
+                if required_ok:
+                    base["bars"] = chart_rows
+                else:
+                    base["type"] = "table"
+                    if rows:
+                        base["rows"] = rows
+                    audit_limitations.append("Accepted paired-bar specification lacks explicit grouped geometry; reviewed values remain in a table.")
+            elif normalized_type == "diverging_bar":
+                required_ok = required_ok and all(row.get("signed_size") not in (None, "") for row in chart_rows)
+                if required_ok:
+                    base["bars"] = chart_rows
+                else:
+                    base["type"] = "table"
+                    if rows:
+                        base["rows"] = rows
+                    audit_limitations.append("Accepted diverging-bar specification lacks supplied signed geometry; reviewed values remain in a table.")
+            elif normalized_type == "pareto":
+                required_ok = required_ok and all(
+                    row.get("size") not in (None, "")
+                    and any(row.get(key) not in (None, "") for key in ("cumulative_size", "cumulative_percent", "cumulative_share"))
+                    for row in chart_rows
+                )
+                if required_ok:
+                    base["rows"] = chart_rows
+                else:
+                    base["type"] = "table"
+                    if rows:
+                        base["rows"] = rows
+                    audit_limitations.append("Accepted Pareto specification lacks supplied cumulative geometry; reviewed values remain in a table.")
+            else:  # heatmap
+                cells = []
+                for row in chart_rows:
+                    if any(row.get(key) not in (None, "") for key in ("row", "row_label", "y")) and any(row.get(key) not in (None, "") for key in ("column", "column_label", "x")):
+                        cells.append(row)
+                if cells:
+                    base["cells"] = cells
+                else:
+                    base["type"] = "table"
+                    if rows:
+                        base["rows"] = rows
+                    audit_limitations.append("Accepted heatmap specification lacks explicit row/column cells; reviewed values remain in a table.")
+        else:
+            if rows:
+                base["rows"] = rows
+            if normalized_type != "table":
+                base["type"] = "table"
+            else:
+                # Keep the accepted table as the exact detail surface while
+                # exposing an optional chart projection when the reviewed
+                # rows have one unambiguous dimension/measure shape.  The
+                # Product Agent may choose that recipe; no metric is selected
+                # or recomputed here.
+                if raw_type not in {"relationship_matrix", "callout", "evidence_callout"}:
+                    projection = _accepted_visual_table_chart_projection(visual, rows)
+                    if projection is not None:
+                        projection_type, chart_rows = projection
+                        base["bars"] = chart_rows
+                        if projection_type == "grouped_bar" and _text(visual.get("unit")).strip():
+                            base["unit"] = copy.deepcopy(visual.get("unit"))
+            audit_limitations.append("Accepted visual specification is retained as a source-bound table/callout; no additional analytics were computed.")
+        # Preserve the accepted content limitation alongside shape-specific
+        # caveats; deduplicate while retaining reviewed order.
+        base["limitations"] = list(dict.fromkeys(value for value in limitations if _text(value).strip()))
+        if audit_limitations:
+            base["audit_limitations"] = list(dict.fromkeys(value for value in audit_limitations if _text(value).strip()))
+        if not base.get("rows") and not any(base.get(key) for key in ("bars", "points", "stages", "cells")):
+            # A visual declaration may be accepted even when its optional
+            # geometry source is unavailable/ambiguous.  Expose the exact
+            # reviewed headline findings (or stated limits) once as a
+            # source-bound decision card rather than a renderer placeholder.
+            # No narrative numbers are mined and no metric is synthesized.
+            if not fallback_emitted:
+                fallback_rows = copy.deepcopy(requirement_headline_rows)
+                if not fallback_rows:
+                    fallback_rows = [
+                        {"claim": copy.deepcopy(value)}
+                        for value in answer_limitations
+                        if _text(value).strip()
+                    ]
+                if not fallback_rows:
+                    fallback_rows = [
+                        {"claim": copy.deepcopy(value)}
+                        for value in limitations
+                        if _text(value).strip()
+                    ]
+                if not fallback_rows:
+                    fallback_rows = [{"claim": "No reviewed values were supplied for this view."}]
+                base["presentation_role"] = "finding_list"
+                base["rows"] = fallback_rows
+                # Requirement-level limitations belong to this one fallback
+                # card.  Subsequent geometry-less declarations retain only
+                # their own visual-specific limitations in audit.
+                base["limitations"] = list(
+                    dict.fromkeys(
+                        value
+                        for value in [*answer_limitations, *limitations]
+                        if _text(value).strip()
+                    )
+                )
+                fallback_emitted = True
+            else:
+                # Preserve the declaration and its exact audit payload, but
+                # keep additional geometry-less visuals out of manager cards.
+                base["presentation_role"] = "finding_record"
+                base["presentation_tier"] = "audit"
+                base["no_geometry_fallback_duplicate"] = True
+        _quarantine_accepted_visual_integration_hints(base)
+        widgets.append(base)
+    return widgets
+
+
+def _analytical_artifact_provenance(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the immutable artifact lineage envelope carried by a record."""
+
+    payload = _record_payload(record)
+    if _text(record.get("kind")) != "analytical_artifact" or not isinstance(payload.get("artifact"), Mapping):
+        return {}
+    return {
+        "artifact_id": payload.get("artifact_id"),
+        "artifact_type": payload.get("artifact_type"),
+        "schema_version": payload.get("schema_version"),
+        "requirement_id": payload.get("requirement_id"),
+        "content_hash": payload.get("content_hash"),
+        "envelope_hash": payload.get("envelope_hash"),
+        "canonical_bytes_sha256": payload.get("canonical_bytes_sha256"),
+        "artifact_ref": payload.get("artifact_ref"),
+        "integration_record_id": record.get("record_id"),
+        "integration_record_hash": record.get("record_hash"),
+    }
+
+
+def _artifact_json_value(value: Any) -> Any:
+    """Copy immutable artifact values into ordinary JSON containers."""
+
+    if isinstance(value, Mapping):
+        return {str(key): _artifact_json_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_artifact_json_value(item) for item in value]
+    return value
+
+
+def _artifact_rows(value: Any) -> list[Mapping[str, Any]]:
+    """Project supplied artifact values into lossless table rows.
+
+    The assembler only changes presentation shape: it never sums, divides,
+    normalizes, or otherwise calculates from the typed artifact payload.
+    """
+
+    if isinstance(value, Mapping):
+        return [{"field": str(key), "value": _artifact_json_value(item)} for key, item in value.items()]
+    if isinstance(value, (list, tuple)):
+        rows: list[Mapping[str, Any]] = []
+        for index, item in enumerate(value):
+            if isinstance(item, Mapping):
+                rows.append(_artifact_json_value(item))
+            else:
+                rows.append({"index": index, "value": _artifact_json_value(item)})
+        return rows
+    if value is None:
+        return []
+    return [{"value": _artifact_json_value(value)}]
+
+
+def _artifact_widget_base(
+    item_id: str,
+    content: Mapping[str, Any],
+    record: Mapping[str, Any],
+    artifact: Any,
+    *,
+    title: str,
+    suffix: str | None = None,
+) -> dict[str, Any]:
+    widget = _widget_base(item_id, content, record, title=title)
+    if suffix:
+        widget["id"] = f"{widget['id']}-{_slug(suffix)}"
+    provenance = _analytical_artifact_provenance(record)
+    widget["artifact_provenance"] = provenance
+    # Flat aliases keep provenance easy to inspect in fixture/chart-map output
+    # while the mapping above remains the canonical grouped envelope.
+    widget["analytical_artifact_id"] = artifact.artifact_id
+    widget["analytical_artifact_type"] = artifact.artifact_type
+    widget["analytical_artifact_ref"] = provenance.get("artifact_ref")
+    widget["analytical_artifact_content_hash"] = artifact.content_hash
+    widget["analytical_artifact_envelope_hash"] = artifact.envelope_hash
+    widget["analytical_artifact_canonical_bytes_sha256"] = provenance.get("canonical_bytes_sha256")
+    widget["artifact_type"] = artifact.artifact_type
+    widget["artifact_ref"] = provenance.get("artifact_ref")
+    return widget
+
+
+def _analytical_artifact_widgets(
+    item_id: str,
+    content: Mapping[str, Any],
+    record: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Build presentation-only widgets from one committed typed artifact."""
+
+    payload = _record_payload(record)
+    raw_artifact = payload.get("artifact")
+    try:
+        from auto_foundry_core.analytical_artifacts import AnalyticalArtifact
+
+        artifact = AnalyticalArtifact.from_dict(raw_artifact)
+    except Exception as exc:  # pragma: no cover - committed loader catches first
+        raise AssemblyError(f"analytical artifact record is invalid: {_text(record.get('record_id'))}") from exc
+    artifact_type = artifact.artifact_type
+    title = _text(artifact.metadata.get("title") if isinstance(artifact.metadata, Mapping) else "") or artifact_type.replace("_", " ").title()
+    provenance = _analytical_artifact_provenance(record)
+    widgets: list[dict[str, Any]] = []
+
+    def table(value: Any, label: str, suffix: str) -> None:
+        rows = _artifact_rows(value)
+        widget = _artifact_widget_base(item_id, content, record, artifact, title=label, suffix=suffix)
+        widget.update({"type": "table", "rows": rows, "presentation_role": "decision_view", "presentation_tier": "primary"})
+        widgets.append(widget)
+
+    if artifact_type == "data_profile":
+        table(artifact.payload.get("profile"), title, "profile")
+        return widgets
+    if artifact_type == "kpi_table":
+        table(artifact.payload.get("rows"), title, "kpi-table")
+        return widgets
+    if artifact_type == "segment_profiles":
+        table(artifact.payload.get("profiles"), title, "segment-profiles")
+        return widgets
+    if artifact_type != "segmentation_model":
+        # Future typed artifact kinds remain visible as a lossless table; the
+        # strict integration contract still owns their schema/hash checks.
+        table(artifact.payload, title, "artifact")
+        return widgets
+
+    model = artifact.payload.get("model")
+    profile_payload = artifact.payload.get("segment_profiles")
+    segment_sizes = profile_payload.get("segment_sizes") if isinstance(profile_payload, Mapping) else None
+    explicit_sizes = isinstance(segment_sizes, Mapping) and bool(segment_sizes)
+    explicit_numeric_sizes = explicit_sizes and all(
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and 0 <= float(value)
+        for value in segment_sizes.values()
+    )
+    # Segment sizes are population counts, never percentages.  The horizontal
+    # bar family interprets ``size`` as a bounded percentage, so it cannot
+    # represent these values faithfully even when every count happens to be
+    # <=100.  Always use the existing column family's raw-count mode and copy
+    # exact supplied values without normalization, shares, or aggregation.
+    if explicit_numeric_sizes:
+        column = _artifact_widget_base(item_id, content, record, artifact, title=f"{title} · segment counts", suffix="segment-counts")
+        column.update({
+            "type": "column",
+            "categories": [
+                {
+                    "label": _text(key),
+                    "series": [{"label": "Count", "value": copy.deepcopy(segment_sizes[key])}],
+                }
+                for key in sorted(segment_sizes, key=_text)
+            ],
+            "presentation_geometry_only": True,
+            "geometry_basis": "explicit supplied segment counts",
+            "geometry_mode": "raw_counts",
+        })
+        widgets.append(column)
+    else:
+        # Never invent a share/ratio when the artifact did not provide segment
+        # counts.  Keep the model payload visible and state why no geometry is
+        # shown.
+        table(model, f"{title} · model", "model")
+        widgets[-1]["limitations"] = list(widgets[-1].get("limitations", [])) + [
+            "No explicit segment counts were supplied; no share or ratio was calculated."
+        ]
+
+    if isinstance(model, Mapping):
+        assignments = model.get("assignments")
+        if isinstance(assignments, (list, tuple)) and assignments:
+            table(assignments, f"{title} · assignments", "assignments")
+        candidate_validation = model.get("candidate_k_validation")
+        if isinstance(candidate_validation, (list, tuple)) and candidate_validation:
+            table(candidate_validation, f"{title} · validation", "validation")
+    if isinstance(profile_payload, Mapping):
+        profiles = profile_payload.get("segment_profiles")
+        if isinstance(profiles, (list, tuple)) and profiles:
+            table(profiles, f"{title} · profiles", "profiles")
+    if not widgets:
+        table(model or profile_payload or artifact.payload, title, "artifact")
+    return widgets
 
 
 def _metric_widget(item_id: str, content: Mapping[str, Any], record: Mapping[str, Any]) -> dict[str, Any]:
@@ -4071,9 +6643,10 @@ def _metric_widget(item_id: str, content: Mapping[str, Any], record: Mapping[str
         )
         if explicit_part_to_whole and 2 <= len(numeric_map) <= 5:
             categories = [{"label": key, "value": value[key], "size": _format_geometry((numeric_map[key] / denominator) * 100 if denominator else 0)} for key in sorted(numeric_map)]
-            composition_families = ("donut", "waffle", "stacked_composition")
-            family_index = int(_sha256_bytes(_safe_record_ref(record.get("record_id")).encode("utf-8"))[:8], 16) % len(composition_families)
-            family = composition_families[family_index]
+            # Semantic/data-shape default for an initial plan.  Product Agent
+            # may select another eligible composition recipe later; record IDs
+            # never influence chart family selection.
+            family = "donut"
             widget.update({"type": family, "denominator_value": payload.get("denominator") or payload.get("population"), "denominator_label": _text(payload.get("denominator_label") or payload.get("units") or "rows"), "presentation_geometry_only": True, "geometry_basis": "explicit denominator composition"})
             if family == "stacked_composition":
                 widget["segments"] = categories
@@ -4081,8 +6654,11 @@ def _metric_widget(item_id: str, content: Mapping[str, Any], record: Mapping[str
                 widget["categories"] = categories
             return widget
         maximum = max(abs(item) for item in numeric_map.values())
-        families = ("column", "lollipop", "bar")
-        kind = families[int(_sha256_bytes(_safe_record_ref(record.get("record_id")).encode("utf-8"))[:8], 16) % len(families)]
+        # A flat comparable map has no reviewed ranking or time semantics, so
+        # use the neutral vertical category comparison as its deterministic
+        # initial chart default.  Alternate eligible recipes remain a plan
+        # choice, never a record-ID hash.
+        kind = "column"
         rows = [{"label": key, "value": value[key], "size": _format_geometry((abs(item) / maximum) * 100 if maximum else 0)} for key, item in sorted(numeric_map.items())]
         widget.update({"type": kind, "bars": rows, "presentation_geometry_only": True, "geometry_basis": "stable max normalization; values remain exact"})
         return widget
@@ -4491,11 +7067,16 @@ def _fact_widget(item_id: str, content: Mapping[str, Any], record: Mapping[str, 
         "presentation_geometry_only", "geometry_basis",
         "denominator_value", "denominator_label", "chart_notes", "notes", "layout", "span", "overview",
         "small_multiple_group", "small_multiple_label", "series", "sample_policy", "sample_rows", "visual_id",
-        "columns",
+        "columns", "scale_groups",
+        # Preserve any explicit origin classification for inventory/audit.
+        # These fields do not veto a Product plan selection.
+        "technical_surface", "technical_surface_reason", "presentation_audience",
+        "presentation_tier", "presentation_role", "kind", "manager_admission",
+        "no_geometry_fallback_duplicate", "presentation_deduplication",
     }
     base.update({key: candidate[key] for key in sorted(presentation_fields) if key in candidate})
-    base["presentation_role"] = "decision_view"
-    base["presentation_tier"] = "primary"
+    base.setdefault("presentation_role", "decision_view")
+    base.setdefault("presentation_tier", "primary")
     base["audit_payload"] = dict(candidate)
     raw_type = _text(candidate.get("type")).lower()
     if raw_type in {"kpi", "kpi_grid", "metric_grid"}:
@@ -4621,13 +7202,16 @@ def _collision_safe_widget_ids(
 _LEGACY_CHART_TYPES = frozenset({
     "kpi", "bar", "column", "lollipop", "donut", "metric_grid", "kpi_grid",
     "waffle", "diverging_bar", "stacked_composition", "line", "heatmap",
-    "scatter", "leaderboard", "progress",
+    "scatter", "leaderboard", "progress", "area", "stacked_area", "grouped_bar",
+    "stacked_bar", "normalized_stacked_bar", "funnel", "histogram", "box_plot",
+    "pareto", "waterfall", "pie",
 })
 _LEGACY_CHART_FIELDS = frozenset({
     "type", "title", "value", "manager_display_value", "bars", "categories", "tiles",
     "segments", "points", "cells", "data", "presentation_geometry_only",
     "geometry_basis", "denominator_value", "denominator_label", "chart_notes",
     "small_multiple_group", "small_multiple_label", "scale_policy",
+    "scale_groups",
     # These fields are still presentation-envelope material (not a source or
     # identity decision) and are required to reproduce an inherited aggregate
     # metric grid exactly, e.g. REQ12's closed/open signal strip.
@@ -4647,9 +7231,12 @@ def _true_visual_ids(
     chart type is eligible for exactly one manager/audit partition entry.
     Ordinary table/status-table projections remain record/widget audit only;
     a reviewed ``dashboard_fact`` whose accepted chart type is ``table`` is
-    an explicit visual contract and is included as-is.  This keeps inherited
-    G3 status tables out of the chart partition while preserving new fact
-    types without lexical admission.
+    an explicit visual contract and is included as-is.  The one
+    ``limited_empty_state`` status table is also explicit: it is the
+    source-bound terminal outcome visual selected by an all-failed V2 plan,
+    not an analytical table.  This keeps inherited G3 status tables out of
+    the chart partition while preserving new fact types without lexical
+    admission.
     """
 
     result: list[str] = []
@@ -4657,20 +7244,7 @@ def _true_visual_ids(
         chart = charts_by_id.get(widget_id)
         if not isinstance(chart, Mapping):
             continue
-        widget_type = _text(widget.get("type") or widget.get("kind")).strip().lower()
-        chart_type = _text(chart.get("type")).strip().lower()
-        is_legacy_chart = (
-            widget_type
-            and chart_type == widget_type
-            and chart_type in _LEGACY_CHART_TYPES
-            and chart_type not in {"table", "status_table"}
-        )
-        is_reviewed_table_fact = (
-            bool(widget.get("dashboard_fact"))
-            and widget_type == "table"
-            and chart_type == "table"
-        )
-        if is_legacy_chart or is_reviewed_table_fact:
+        if _dashboard_runtime().is_partition_visual(widget, chart):
             result.append(widget_id)
     return result
 
@@ -4702,217 +7276,85 @@ def _apply_legacy_chart_hint(widget: dict[str, Any], hint: Mapping[str, Any] | N
     elif hint_type != "table":
         widget["presentation_role"] = "decision_view"
     if inherited_role:
-        # Carry the inherited role through the lexical admission pass without
+        # Carry the inherited role through the neutral candidate pass without
         # persisting an internal marker into the visual snapshot.
         widget["_legacy_presentation_role"] = inherited_role
 
 
-def _metric_record_ids(widget: Mapping[str, Any]) -> set[str]:
-    values = _as_list(widget.get("integration_record_ids"))
-    if not values and widget.get("integration_record_id") not in (None, ""):
-        values = [widget.get("integration_record_id")]
-    return {_safe_record_ref(value) for value in values if _text(value).strip()}
+_OPTIONAL_INTEGRATION_PROJECTION_LIMITATION = (
+    "Optional integration projection is unavailable for this accepted visual; "
+    "the accepted business values remain source-bound."
+)
 
 
-def _schema_only_metric_widget(widget: Mapping[str, Any]) -> bool:
-    """Identify support tables that expose only metric schema metadata."""
+def _quarantine_accepted_visual_integration_hints(widget: dict[str, Any]) -> None:
+    """Scrub malformed optional integration hints before identity/projection.
 
-    if _text(widget.get("presentation_role")).lower() in {"finding_list", "finding_record", "relationship_matrix"}:
-        return False
-    kind = _text(widget.get("type") or widget.get("kind")).lower()
-    if kind not in {"table", "status_table"}:
-        return False
-    rows = widget.get("manager_rows")
-    if not isinstance(rows, list):
-        rows = widget.get("rows")
-    label_value_rows = [row for row in _as_list(rows) if isinstance(row, Mapping)]
-    if label_value_rows and all(set(row) <= {"Label", "Value"} for row in label_value_rows):
-        labels = {_text(row.get("Label")).strip().lower() for row in label_value_rows}
-        if labels and labels <= {"label", "name", "units", "unit", "source", "metric"}:
-            return True
-    normalized: set[str] = set()
-    for row in _as_list(rows):
-        if not isinstance(row, Mapping):
-            continue
-        normalized.update(re.sub(r"[^a-z0-9]+", "_", _text(key).lower()).strip("_") for key in row)
-    if not normalized:
-        return True
-    return normalized <= {"label", "name", "units", "unit", "source", "metric"}
-
-
-def _consolidate_metric_widgets_without_facts(widgets: list[dict[str, Any]]) -> None:
-    """Keep at most one meaningful primary projection per metric record."""
-
-    hinted_aggregates = [
-        widget for widget in widgets
-        if _text(widget.get("type") or widget.get("kind")).lower() in {"metric_grid", "kpi_grid"}
-        and isinstance(widget.get("tiles"), list)
-        and _text(widget.get("_legacy_presentation_role") or widget.get("presentation_role")).lower() == "decision_view"
-        and (len(_metric_record_ids(widget)) > 1 or len(widget.get("tiles") or []) > 1)
-    ]
-    if hinted_aggregates:
-        primary_ids = {id(widget) for widget in hinted_aggregates}
-        for widget in widgets:
-            if id(widget) in primary_ids:
-                widget["presentation_tier"] = "primary"
-                widget["presentation_role"] = _text(widget.get("_legacy_presentation_role"), "decision_view")
-            elif _text(widget.get("type") or widget.get("kind")).lower() in {"kpi", "progress", "metric_grid", "kpi_grid"}:
-                widget["presentation_tier"] = "audit"
-                widget["presentation_role"] = "support_metric"
-        return
-
-    groups: dict[str, list[dict[str, Any]]] = {}
-    for widget in widgets:
-        if widget.get("presentation_role") in {"finding_list", "finding_record", "relationship_matrix"}:
-            continue
-        for record_id in sorted(_metric_record_ids(widget)):
-            groups.setdefault(record_id, []).append(widget)
-    for group in groups.values():
-        candidates = [
-            widget for widget in group
-            if not _schema_only_metric_widget(widget)
-            and _text(widget.get("manager_admission", {}).get("status"), "admitted") == "admitted"
-        ]
-        if not candidates:
-            for widget in group:
-                widget["presentation_tier"] = "audit"
-                widget["presentation_role"] = "support_metric"
-            continue
-        # Explicit chart projections outrank raw table/support projections;
-        # otherwise retain the first deterministic widget for this record.
-        primary = next(
-            (widget for widget in candidates if _text(widget.get("type")).lower() in _LEGACY_CHART_TYPES),
-            candidates[0],
-        )
-        for widget in group:
-            if widget is primary:
-                widget.setdefault("presentation_tier", "primary")
-                if _schema_only_metric_widget(widget):
-                    widget["presentation_tier"] = "audit"
-                    widget["presentation_role"] = "support_metric"
-                continue
-            widget["presentation_tier"] = "audit"
-            widget["presentation_role"] = "support_metric"
-
-
-def _aggregate_scalar_metric_widgets(
-    widgets: list[dict[str, Any]],
-    records: Sequence[Mapping[str, Any]],
-) -> None:
-    """Collapse scalar KPI/progress metrics into one reviewed signal strip.
-
-    Dashboard facts are already the primary decision views.  Keeping every
-    scalar metric as a separate card makes a requirement page noisy, so the
-    first scalar metric's stable ID becomes the aggregate ``metric_grid`` and
-    all remaining scalar metric records move to audit.  Values, units,
-    denominators, and provenance remain supplied fields; no totals or ratios
-    are calculated here.
+    Accepted visual content is authoritative for presentation.  Its optional
+    integration IDs/refs may enrich the audit, but malformed values must not
+    reach strict identity, collision, or metric-consolidation paths.  Keep
+    valid hints in deterministic order and retain one source-bound audit
+    limitation for every rejected value.  Committed record bindings are not
+    passed through this helper and remain strict elsewhere.
     """
 
-    record_by_id = {
-        _safe_record_ref(record.get("record_id")): record
-        for record in records
-        if _safe_record_ref(record.get("record_id"))
-    }
-    # A legacy chart hint may already carry the reviewed aggregate metric
-    # grid (for example REQ-12's closed/open tiles).  Keep that stable
-    # envelope as the primary projection instead of promoting whichever
-    # scalar happens to be encountered last during a cumulative rebuild.
-    hinted_aggregate = next(
-        (
-            widget for widget in widgets
-            if _text(widget.get("type")).lower() in {"metric_grid", "kpi_grid"}
-            and isinstance(widget.get("tiles"), list)
-            and _text(widget.get("_legacy_presentation_role") or widget.get("presentation_role")).lower() == "decision_view"
-            and (len(_metric_record_ids(widget)) > 1 or len(widget.get("tiles") or []) > 1)
-        ),
-        None,
-    )
-    if hinted_aggregate is not None:
-        related = _metric_record_ids(hinted_aggregate)
-        for widget in widgets:
-            if widget is hinted_aggregate:
-                widget["presentation_tier"] = "primary"
-                widget["presentation_role"] = "decision_view"
+    if not widget.get("accepted_visual"):
+        return
+    def sanitize_container(container: dict[str, Any]) -> bool:
+        rejected = False
+        for plural_key, singular_key in (
+            ("integration_record_ids", "integration_record_id"),
+            ("integration_record_refs", "integration_record_ref"),
+        ):
+            plural_present = plural_key in container
+            singular_present = singular_key in container
+            if not plural_present and not singular_present:
                 continue
-            if (
-                related.intersection(_metric_record_ids(widget))
-                or _text(widget.get("type") or widget.get("kind")).lower() in {"kpi", "progress", "metric_grid", "kpi_grid"}
-            ):
-                widget["presentation_tier"] = "audit"
-                widget["presentation_role"] = "support_metric"
-        return
+            values: list[Any] = []
+            if plural_present:
+                values.extend(_as_list(container.get(plural_key)))
+            if singular_present:
+                values.append(container.get(singular_key))
+            valid: list[str] = []
+            for value in values:
+                if not _text(value).strip():
+                    continue
+                try:
+                    normalized = _safe_record_ref(value)
+                except AssemblyError:
+                    rejected = True
+                    continue
+                if normalized not in valid:
+                    valid.append(normalized)
+            # Canonicalize to one plural list so every downstream path
+            # observes exactly the same validated values and cannot fall back
+            # to a rejected singular hint.
+            container.pop(singular_key, None)
+            if valid:
+                container[plural_key] = valid
+            else:
+                container.pop(plural_key, None)
+        return rejected
 
-    scalar: list[dict[str, Any]] = []
-    for widget in widgets:
-        kind = _text(widget.get("type") or widget.get("kind")).lower()
-        if kind not in {"kpi", "progress"}:
-            continue
-        if _text(widget.get("manager_admission", {}).get("status"), "admitted") != "admitted":
-            continue
-        record_ids = [_safe_record_ref(value) for value in _as_list(widget.get("integration_record_ids"))]
-        if not record_ids and _text(widget.get("integration_record_id")):
-            record_ids = [_safe_record_ref(widget.get("integration_record_id"))]
-        if not any(_text(record_by_id.get(record_id, {}).get("kind")) == "metric" for record_id in record_ids):
-            continue
-        value = widget.get("value")
-        if value in (None, ""):
-            continue
-        scalar.append(widget)
-    if not scalar:
-        return
-
-    primary = scalar[0]
-    tiles: list[dict[str, Any]] = []
-    ordered_ids: list[str] = []
-    ordered_refs: list[str] = []
-    ordered_evidence: list[str] = []
-    ordered_trace: list[str] = []
-    ordered_hashes: list[str] = []
-    audit_payloads: list[Any] = []
-
-    def extend_unique(target: list[str], values: Iterable[Any]) -> None:
-        for value in values:
-            text = _text(value).strip()
-            if text and text not in target:
-                target.append(text)
-
-    for widget in scalar:
-        label = _text(widget.get("title") or widget.get("label") or widget.get("id"))
-        tile: dict[str, Any] = {"label": label, "value": widget.get("value")}
-        if widget.get("manager_display_value") not in (None, ""):
-            tile["display_value"] = widget.get("manager_display_value")
-        for key in ("denominator", "population", "unit", "period", "as_of", "date_authority"):
-            if widget.get(key) not in (None, ""):
-                tile[key] = widget[key]
-        tiles.append(tile)
-        extend_unique(ordered_ids, widget.get("integration_record_ids") or [widget.get("integration_record_id")])
-        extend_unique(ordered_refs, widget.get("integration_record_refs") or [widget.get("integration_record_ref")])
-        extend_unique(ordered_evidence, widget.get("evidence_refs"))
-        extend_unique(ordered_trace, widget.get("trace_refs"))
-        extend_unique(ordered_hashes, [widget.get("integration_record_hash")])
-        payload = widget.get("audit_payload")
-        if payload is None:
-            record_id = _text(widget.get("integration_record_id"))
-            payload = _record_payload(record_by_id.get(record_id, {}))
-        audit_payloads.append(payload)
-
-    primary["type"] = "metric_grid"
-    primary.pop("value", None)
-    primary["tiles"] = tiles
-    primary["title"] = "Key signals"
-    primary["presentation_role"] = "decision_view"
-    primary["presentation_tier"] = "primary"
-    primary["integration_record_ids"] = ordered_ids
-    primary["integration_record_refs"] = ordered_refs
-    primary["evidence_refs"] = ordered_evidence
-    primary["trace_refs"] = ordered_trace
-    primary["integration_record_hashes"] = ordered_hashes
-    primary["audit_payload"] = audit_payloads
-    primary["aggregated_metric_ids"] = [_text(widget.get("id")) for widget in scalar]
-    for widget in scalar[1:]:
-        widget["presentation_tier"] = "audit"
-        widget["presentation_role"] = "support_metric"
+    rejected = sanitize_container(widget)
+    # The raw visual declaration is retained for audit context, but optional
+    # integration hints are not business evidence.  Apply the same scrub to
+    # that nested snapshot so a rejected absolute/path-like value cannot leak
+    # through later audit serialization or HTML rendering.
+    audit_payload = widget.get("audit_payload")
+    if isinstance(audit_payload, Mapping):
+        audit_payload_copy = copy.deepcopy(dict(audit_payload))
+        rejected = sanitize_container(audit_payload_copy) or rejected
+        widget["audit_payload"] = audit_payload_copy
+    if rejected:
+        limitations = [
+            _text(value).strip()
+            for value in _as_list(widget.get("audit_limitations"))
+            if _text(value).strip()
+        ]
+        if _OPTIONAL_INTEGRATION_PROJECTION_LIMITATION not in limitations:
+            limitations.append(_OPTIONAL_INTEGRATION_PROJECTION_LIMITATION)
+        widget["audit_limitations"] = limitations
 
 
 def _build_widgets(
@@ -4920,16 +7362,19 @@ def _build_widgets(
     content: Mapping[str, Any],
     records: Sequence[Mapping[str, Any]],
     *,
+    accepted_visuals: Sequence[Mapping[str, Any]] = (),
     legacy_hints: Mapping[str, Mapping[str, Any]] | None = None,
     manager_widget_ids: Sequence[str] | None = None,
     manager_entries: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    widgets: list[dict[str, Any]] = []
+    widgets: list[dict[str, Any]] = [copy.deepcopy(dict(widget)) for widget in accepted_visuals if isinstance(widget, Mapping)]
     relationship_records: list[Mapping[str, Any]] = []
     for record in sorted(records, key=lambda value: (_text(value.get("kind")), _text(value.get("record_id")))):
         kind = _text(record.get("kind"))
         if kind == "metric":
             widgets.extend(_metric_widgets(item_id, content, record))
+        elif kind == "analytical_artifact":
+            widgets.extend(_analytical_artifact_widgets(item_id, content, record))
         elif kind == "relationship":
             relationship_records.append(record)
         elif kind == "dashboard_fact":
@@ -4950,41 +7395,33 @@ def _build_widgets(
         for record in records:
             if _text(record.get("kind")) == "limitation":
                 widgets.append(_claim_widget(item_id, content, record))
-    # Aggregate claims into one manager-facing finding list while retaining
-    # every original claim widget/record as an audit item.  The first claim's
-    # stable ID remains the primary binding; no synthetic record or ID is
-    # introduced.
-    claim_widgets = [widget for widget in widgets if widget.get("presentation_role") == "finding_record"]
-    if claim_widgets:
-        record_by_id = {_safe_record_ref(record.get("record_id")): record for record in records}
-        primary = claim_widgets[0]
-        findings: list[dict[str, Any]] = []
-        for claim_widget in claim_widgets:
-            record_id = _text(claim_widget.get("integration_record_id"))
-            payload = _record_payload(record_by_id.get(record_id, {}))
-            claim = payload.get("claim")
-            if claim is None:
-                continue
-            findings.append({
-                "finding": claim,
-                "status": payload.get("status"),
-                "period": payload.get("period") or payload.get("as_of"),
-            })
-        primary["title"] = "Reviewed findings"
-        primary["presentation_role"] = "finding_list"
-        primary["presentation_tier"] = "primary"
-        primary["manager_findings"] = findings
-        for audit_widget in claim_widgets[1:]:
-            audit_widget["presentation_role"] = "finding_record"
-            audit_widget["presentation_tier"] = "audit"
-
     for widget in widgets:
         hint = legacy_hints.get(_text(widget.get("id"))) if legacy_hints else None
         _apply_legacy_chart_hint(widget, hint)
+        # Legacy chart hints may carry optional integration metadata.  Run the
+        # accepted-only quarantine after that merge as well as on the original
+        # visual so malformed values cannot reach collision/metric identity.
+        _quarantine_accepted_visual_integration_hints(widget)
 
-    # Classify the raw reviewed projections before consolidating scalar metrics
-    # so technical metrics can never be folded into a manager-facing signal
-    # strip.  The second pass below refreshes the aggregate widget metadata.
+    # Bind every constructor-produced widget to the requirement before the
+    # semantic echo pass.  The outer fixture assembly repeats these immutable
+    # fields for its final envelope, but this early source-bound binding keeps
+    # dedupe reachable for normal accepted-visual/fact construction without
+    # inferring any missing metric, scope, grain, entity, or dimension.
+    bound_scope = _text(
+        content.get("__manager_requirement_scope")
+        or content.get("requirement_scope")
+        or content.get("scope")
+        or content.get("method")
+    ).strip()
+    for widget in widgets:
+        widget["requirement_id"] = item_id
+        if bound_scope:
+            widget["requirement_scope"] = bound_scope
+
+    # Attach neutral candidate metadata before applying any explicit Product
+    # plan.  This pass does not classify titles, fields, values, or chart
+    # kinds; every original candidate remains available for plan selection.
     _apply_manager_admission(
         widgets,
         subject_context=" ".join(
@@ -4994,46 +7431,12 @@ def _build_widgets(
         ),
     )
 
-    # When dashboard facts exist, metrics are supporting evidence rather than
-    # competing primary cards.  Mark every metric-derived widget audit-first;
-    # the scalar aggregation below then restores one stable ``Key signals``
-    # strip to primary.  This keeps structured tables from inflating the
-    # manager surface while retaining their exact rows in the audit tier.
-    has_dashboard_fact = any(_text(record.get("kind")) == "dashboard_fact" for record in records)
-    if has_dashboard_fact:
-        metric_record_ids = {
-            _safe_record_ref(record.get("record_id"))
-            for record in records
-            if _text(record.get("kind")) == "metric" and _safe_record_ref(record.get("record_id"))
-        }
-        for widget in widgets:
-            widget_record_ids = {
-                _safe_record_ref(value)
-                for value in (_as_list(widget.get("integration_record_ids")) or [widget.get("integration_record_id")])
-                if _safe_record_ref(value)
-            }
-            if widget.get("aggregated_metric_ids"):
-                continue
-            if widget.get("presentation_role") == "support_metric" or metric_record_ids.intersection(widget_record_ids):
-                widget["presentation_tier"] = "audit"
-                widget["presentation_role"] = "support_metric"
-        _aggregate_scalar_metric_widgets(widgets, records)
-    else:
-        _consolidate_metric_widgets_without_facts(widgets)
-    _apply_manager_admission(
-        widgets,
-        subject_context=" ".join(
-            _text(content.get(key))
-            for key in ("__manager_requirement_scope", "scope", "method")
-            if _text(content.get(key)).strip()
-        ),
-    )
     for widget in widgets:
         widget.setdefault("presentation_tier", "primary")
         widget.setdefault("presentation_role", "decision_view")
-    # Public assembly always supplies an explicit set (possibly empty).  The
-    # lexical classifier above remains available to focused low-level helper
-    # callers only; it is never the effective product admission boundary.
+    # Public assembly supplies an explicit plan set (possibly empty).  The
+    # Product Agent's persisted membership is the only semantic manager
+    # admission decision.
     if manager_widget_ids is not None:
         _apply_explicit_manager_admission(widgets, manager_widget_ids, manager_entries)
     for widget in widgets:
@@ -5043,27 +7446,42 @@ def _build_widgets(
     return widgets
 
 
-def _apply_overview_selection(widgets: list[dict[str, Any]]) -> list[str]:
-    """Mark a deterministic subset of existing, non-null KPI cards."""
+def _apply_overview_selection(
+    widgets: list[dict[str, Any]],
+    manager_widget_ids: Sequence[str] | None = None,
+) -> list[str]:
+    """Project Product-selected manager IDs into the overview in plan order.
+
+    Overview membership is declarative: this helper only follows the ordered
+    manager IDs supplied by the Product plan (or existing admission metadata
+    for direct fixture calls).  It never examines widget kind, content,
+    titles, semantic keys, duplicates, or a fixed count.
+    """
+
+    by_id = {_text(widget.get("id")).strip(): widget for widget in widgets if _text(widget.get("id")).strip()}
+    if manager_widget_ids is None:
+        selected = [
+            widget
+            for widget in widgets
+            if isinstance(widget.get("manager_admission"), Mapping)
+            and _text(widget.get("manager_admission", {}).get("status")) == "admitted"
+            and _text(widget.get("presentation_audience")) == "business_manager"
+        ]
+        selected_ids = [_text(widget.get("id")).strip() for widget in selected]
+    else:
+        selected_ids = [_text(value).strip() for value in manager_widget_ids]
+        if len(selected_ids) != len(set(selected_ids)) or any(not value for value in selected_ids):
+            raise AssemblyError("manager widget IDs must be unique and non-empty")
+        unknown = [value for value in selected_ids if value not in by_id]
+        if unknown:
+            raise AssemblyError(f"manager widget IDs reference unknown widgets: {unknown[:5]}")
+        selected = [by_id[value] for value in selected_ids]
 
     for widget in widgets:
         widget.pop("overview", None)
-    selected = [
-        widget for widget in widgets
-        if _text(widget.get("type") or widget.get("kind")).lower() == "kpi"
-        and widget.get("value") is not None
-        and not (isinstance(widget.get("value"), str) and not widget["value"].strip())
-        and (
-            not isinstance(widget.get("manager_admission"), Mapping)
-            or (
-                _text(widget.get("presentation_audience")) == "business_manager"
-                and _text(widget.get("manager_admission", {}).get("status")) == "admitted"
-            )
-        )
-    ][:4]
     for widget in selected:
         widget["overview"] = True
-    return [_text(widget.get("id")) for widget in selected]
+    return selected_ids
 
 
 def _ontology_projection(all_records: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -5141,8 +7559,22 @@ def _load_projection_metadata(context: RunContext, item_ids: Sequence[str]) -> t
         from auto_foundry_core.prepared import PreparedAssetRegistry
     except ModuleNotFoundError as exc:  # pragma: no cover - package install guard
         raise AssemblyError("public LEM/prepared registry types are unavailable") from exc
+    # The LEM projector is authoritative for accepted/committed records, but
+    # terminal technical-failure items deliberately have no accepted bundle
+    # or committed records.  Passing those IDs through would make a bounded
+    # limited dashboard impossible even though their validated terminal
+    # manifests are a legitimate source-bound lifecycle input.  The assembler
+    # has already validated those manifests in its item loop; project only the
+    # accepted/integrated subset and retain the lifecycle order in the
+    # projector's result.  This is selection, not synthetic analytics.
+    projection_item_ids: list[str] = []
+    for item_id in item_ids:
+        state = _read_json(context, f"requirements/{item_id}/item_state.json", label=f"{item_id} item state")
+        if state.get("lifecycle_state") == "technical_failure" or state.get("integration_state") == "technical_failure":
+            continue
+        projection_item_ids.append(item_id)
     try:
-        projection = LivingEnterpriseModelProjector.project(context, item_ids=item_ids)
+        projection = LivingEnterpriseModelProjector.project(context, item_ids=projection_item_ids)
     except Exception as exc:
         raise AssemblyError("accepted/committed LEM projection validation failed") from exc
     exported = projection.model.export()
@@ -5226,7 +7658,7 @@ def _load_projection_metadata(context: RunContext, item_ids: Sequence[str]) -> t
     freeze_markers = {
         "answers_frozen": True,
         "living_enterprise_model_frozen": True,
-        "prepared_data_registry_frozen": bool(registry_present or (not descriptors and product_manifest_markers.get("prepared_data_registry_frozen") is True)),
+        "prepared_data_registry_frozen": bool(registry_present or not descriptors),
         "dashboard_frozen": True,
         "telemetry_frozen": bool(telemetry_hashes),
     }
@@ -5273,8 +7705,12 @@ def _chart_map_entry(widget: Mapping[str, Any], requirement_id: str, item: Mappi
         "kpi": "kpi_card", "bar": "horizontal_bar", "column": "column", "lollipop": "lollipop",
         "diverging_bar": "diverging_bar", "waffle": "waffle", "donut": "donut_pie", "stacked_composition": "stacked_bar", "progress": "horizontal_bar",
         "metric_grid": "metric_grid", "kpi_grid": "metric_grid", "table": "table", "status_table": "table", "line": "line_area_slope", "scatter": "scatter_bubble",
+        "area": "line_area_slope", "stacked_area": "line_area_slope", "grouped_bar": "grouped_bar",
+        "stacked_bar": "stacked_bar", "normalized_stacked_bar": "stacked_bar", "funnel": "funnel",
+        "histogram": "histogram_box", "box_plot": "histogram_box", "pareto": "pareto",
+        "waterfall": "waterfall", "pie": "donut_pie",
     }.get(kind, "table")
-    fields: dict[str, Any] = {key: value for key, value in widget.items() if key in {"value", "manager_display_value", "bars", "tiles", "categories", "segments", "points", "series", "rows", "manager_rows", "population", "denominator", "unit", "period", "presentation_geometry_only", "geometry_basis", "denominator_value", "denominator_label", "grain", "integration_record_id", "integration_record_ids", "integration_record_ref", "integration_record_refs", "presentation_role", "presentation_tier"}}
+    fields: dict[str, Any] = {key: value for key, value in widget.items() if key in {"value", "manager_display_value", "bars", "tiles", "categories", "segments", "points", "series", "rows", "manager_rows", "stages", "bins", "boxes", "steps", "data", "values", "population", "denominator", "unit", "units", "period", "grain", "data_grain", "row_grain", "proxy", "proxy_or_limit", "limit", "descriptive", "descriptive_only", "causal_status", "as_of", "date_authority", "assumptions", "annotation", "dimensions", "measures", "time", "coverage", "coverage_note", "scope", "answer_scope", "scope_note", "limitations", "filters", "drilldown", "empty_state", "presentation_geometry_only", "geometry_basis", "denominator_value", "denominator_label", "grain", "integration_record_id", "integration_record_ids", "integration_record_ref", "integration_record_refs", "presentation_role", "presentation_tier", "technical_surface", "technical_surface_reason", "artifact_type", "artifact_ref", "analytical_artifact_id", "analytical_artifact_ref", "analytical_artifact_content_hash", "analytical_artifact_envelope_hash", "analytical_artifact_canonical_bytes_sha256", "artifact_provenance", "accepted_visual", "accepted_visual_index", "accepted_visual_pointer", "accepted_visual_type", "accepted_evidence", "accepted_evidence_id", "accepted_evidence_candidate_kind", "accepted_evidence_pointer", "accepted_evidence_source_pointer", "accepted_evidence_table_pointer", "accepted_evidence_ref", "accepted_evidence_sha256", "accepted_evidence_conclusion", "accepted_content_hash", "accepted_manifest_hash", "accepted_source_ref", "accepted_artifact_ref", "accepted_artifact_sha256", "source_bound", "scale_groups"}}
     return {
         "id": _text(widget.get("id")),
         "type": kind,
@@ -5290,9 +7726,92 @@ def _chart_map_entry(widget: Mapping[str, Any], requirement_id: str, item: Mappi
             "integration_record_id": _text(widget.get("integration_record_id")),
             "integration_record_ids": list(widget.get("integration_record_ids", [])),
             "integration_record_ref": _text(widget.get("integration_record_ref")),
+            "accepted_visual": bool(widget.get("accepted_visual")),
+            "accepted_visual_index": widget.get("accepted_visual_index"),
+            "accepted_visual_pointer": _text(widget.get("accepted_visual_pointer")),
+            "accepted_evidence": bool(widget.get("accepted_evidence")),
+            "accepted_evidence_id": _text(widget.get("accepted_evidence_id")),
+            "accepted_evidence_candidate_kind": _text(widget.get("accepted_evidence_candidate_kind")),
+            "accepted_evidence_pointer": _text(widget.get("accepted_evidence_pointer")),
+            "accepted_evidence_source_pointer": _text(widget.get("accepted_evidence_source_pointer")),
+            "accepted_evidence_table_pointer": _text(widget.get("accepted_evidence_table_pointer")),
+            "accepted_evidence_ref": _text(widget.get("accepted_evidence_ref")),
+            "accepted_evidence_sha256": _text(widget.get("accepted_evidence_sha256")),
+            "accepted_content_hash": _text(widget.get("accepted_content_hash")),
+            "accepted_manifest_hash": _text(widget.get("accepted_manifest_hash")),
+            "accepted_source_ref": _text(widget.get("accepted_source_ref")),
+            "accepted_artifact_ref": _text(widget.get("accepted_artifact_ref")),
+            "accepted_artifact_sha256": _text(widget.get("accepted_artifact_sha256")),
             "evidence_refs": list(widget.get("evidence_refs", [])),
             "trace_refs": list(widget.get("trace_refs", [])),
+            "artifact_provenance": copy.deepcopy(widget.get("artifact_provenance", {})),
         },
+    }
+
+
+def _limited_availability_widget(
+    context: RunContext,
+    failed_items: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Build one explicit non-analytical empty state for all-terminal runs.
+
+    The card is a status table, not a fabricated KPI or success signal.  Its
+    visible row states only that no accepted business visual is available;
+    terminal manifest/reason hashes remain in the exact audit payload and
+    trace references for technical review.
+    """
+
+    refs = sorted({
+        _text(item.get("manifest_ref")).strip()
+        for item in failed_items
+        if isinstance(item, Mapping) and _text(item.get("manifest_ref")).strip()
+    })
+    if not refs:
+        raise AssemblyError("all-terminal empty-state requires validated terminal manifest references")
+    widget_id = "business-availability-empty-state"
+    return {
+        "id": widget_id,
+        "type": "table",
+        "title": "Business visual availability",
+        "label": "Business visual availability",
+        "requirement_id": "business-availability",
+        "requirement_title": "Business visual availability",
+        "requirement_order": 1,
+        "domain_id": "business-availability",
+        "manager_anchor": "business-availability-empty-state",
+        "presentation_role": "decision_view",
+        "presentation_tier": "primary",
+        "presentation_audience": "business_manager",
+        "manager_admission": {
+            "status": "admitted",
+            "presentation_audience": "business_manager",
+            "policy": "terminal_limited_dashboard",
+            "role": "business_outcome",
+            "plan_membership": True,
+        },
+        "limited_empty_state": True,
+        "empty_state": "No accepted business visual is available for this run.",
+        # Keep this an explicit lifecycle status row.  A count of failed
+        # requirements would be a derived metric, and this limited widget is
+        # intentionally not an analytical result.  Per-item terminal reasons
+        # remain available in ``audit_payload``/``evidence_refs``.
+        "rows": [{
+            "status": "No accepted business visual is available for this run.",
+        }],
+        "manager_rows": [{
+            "status": "No accepted business visual is available for this run.",
+        }],
+        "audit_payload": copy.deepcopy(list(failed_items)),
+        "reviewed_item_ref": refs[0],
+        "reviewed_output_ref": refs[0],
+        "evidence_refs": refs,
+        "trace_refs": refs,
+        "integration_record_ids": [],
+        "integration_record_refs": [],
+        "limitations": [
+            "No accepted business visual is available because every selected requirement reached a terminal failure or limitation state.",
+            "No KPI, metric, row, or analytical success has been fabricated.",
+        ],
     }
 
 
@@ -5307,6 +7826,120 @@ def _product_ref(context: RunContext, value: str | Path) -> tuple[Path, str]:
     path = context.resolve_product_path(raw)
     relative = path.relative_to(context.run_root).as_posix()
     return path, relative
+
+
+def _revision_output_root(
+    context: RunContext,
+    revision_id: str | None,
+    output_root_ref: str | Path | None,
+) -> tuple[Path, str] | None:
+    """Resolve the store-authoritative Product revision output namespace."""
+
+    if revision_id is None and output_root_ref is None:
+        return None
+    if revision_id is None or output_root_ref is None:
+        raise AssemblyError("product revision output binding is incomplete")
+    if not re.fullmatch(r"rev-[0-9]{4,}", str(revision_id).strip()):
+        raise AssemblyError("product revision_id is invalid")
+    # Resolve the store from the canonical run-relative namespace itself.  A
+    # freshly seeded/replayed context may not yet expose ``active_generation``
+    # even though the durable Product revision does; relying on that optional
+    # projection would make an otherwise valid bound action fail before the
+    # store can validate its lineage.  The exact shape is checked before any
+    # filesystem resolution so caller-controlled paths cannot select another
+    # generation or revision.
+    output_ref = Path(str(output_root_ref))
+    if output_ref.is_absolute() or len(output_ref.parts) != 6:
+        raise AssemblyError("product revision output root binding is invalid")
+    if output_ref.parts[0] != "products" or output_ref.parts[1] != "generations":
+        raise AssemblyError("product revision output root binding is invalid")
+    generation_id = output_ref.parts[2]
+    if not re.fullmatch(r"G-[0-9]{4,}", generation_id):
+        raise AssemblyError("product revision output root binding is invalid")
+    if output_ref.parts[3] != "product_revisions" or output_ref.parts[4] != str(revision_id).strip() or output_ref.parts[5] != "artifacts":
+        raise AssemblyError("product revision output root binding is invalid")
+    active_generation = _active_generation_id(context)
+    if active_generation and active_generation != generation_id:
+        raise AssemblyError("product revision output generation does not match active generation")
+    try:
+        from auto_foundry_core.product_review import ProductReviewStore
+
+        store = ProductReviewStore(context, generation_id)
+        revision = store.load_revision(str(revision_id).strip())
+        expected_ref = store.revision_artifacts_ref(revision.revision_id)
+        root = store.revision_artifacts_root(revision.revision_id)
+    except Exception as exc:
+        raise AssemblyError("product revision output namespace is unavailable") from exc
+    if Path(str(output_root_ref)).as_posix() != Path(expected_ref).as_posix():
+        raise AssemblyError("product revision output root binding is invalid")
+    if revision.status not in {"pending", "candidate", "reviewed"}:
+        raise AssemblyError("product revision is not accepting product output")
+    if root.is_symlink() or (root.exists() and not root.is_dir()):
+        raise AssemblyError("product revision output namespace is invalid")
+    return root, expected_ref
+
+
+def _is_canonical_preview_namespace(
+    context: RunContext,
+    output_root: Path,
+    output_run_ref: str,
+    generation_id: str,
+    output_refs: Mapping[str, str],
+) -> bool:
+    """Return whether *output_root* is the lifecycle-owned preview namespace.
+
+    Preview refresh is deliberately an implicit capability of the canonical
+    ``generations/<G>/preview`` output only.  Reusing the ordinary assembler
+    API for any other namespace keeps its existing fail-closed drift checks.
+    All child output references must also be the canonical names so a caller
+    cannot opt an arbitrary product tree into refresh semantics.
+    """
+
+    expected_prefix = f"products/generations/{generation_id}/preview"
+    try:
+        expected_root = context.resolve_product_path(Path("generations") / generation_id / "preview")
+    except (AllowedRootError, OSError, ValueError):
+        return False
+    expected_refs = {
+        "fixture_ref": f"{expected_prefix}/dashboard_fixture_v4.json",
+        "chart_map_ref": f"{expected_prefix}/dashboard_chart_map_v4.json",
+        "chart_registry_ref": f"{expected_prefix}/dashboard_chart_registry_v4.json",
+        "blueprint_ref": f"{expected_prefix}/{BLUEPRINT_FILENAME}",
+        "site_ref": f"{expected_prefix}/site",
+        "receipt_ref": f"{expected_prefix}/build_receipt.json",
+    }
+    return output_root == expected_root and output_run_ref == expected_prefix and all(
+        output_refs.get(key) == value for key, value in expected_refs.items()
+    )
+
+
+def _canonical_preview_request_has_symlink(context: RunContext, output_dir: str | Path, generation_id: str) -> bool:
+    """Detect aliases in the lifecycle-owned preview path before resolution.
+
+    ``RunContext.resolve_product_path`` intentionally resolves symlinks before
+    checking containment.  That is the right boundary for ordinary product
+    paths, but it would make a symlink at ``generations/<G>/preview`` appear as
+    its target and could let a refresh replace the target behind a tampered
+    canonical path.  Preview refresh therefore rejects symlink components in
+    the exact lexical namespace requested by the lifecycle.
+    """
+
+    raw = Path(output_dir).expanduser()
+    if raw.is_absolute():
+        requested = raw
+    else:
+        if raw.parts and raw.parts[0] == "products":
+            raw = Path(*raw.parts[1:]) if len(raw.parts) > 1 else Path(".")
+        requested = context.run_root / "products" / raw
+    canonical = context.run_root / "products" / "generations" / generation_id / "preview"
+    if requested != canonical:
+        return False
+    current = context.run_root
+    for component in canonical.relative_to(context.run_root).parts:
+        current = current / component
+        if current.is_symlink():
+            return True
+    return False
 
 
 def _replace_prefix(root: Path, old: str, new: str) -> None:
@@ -5340,9 +7973,40 @@ def _publish_staged_output(staging_root: Path, output_root: Path, *, retain_back
             moved_previous = True
         os.replace(staging_root, output_root)
         published = True
-    except Exception:
-        if moved_previous and not output_root.exists() and (backup_root.exists() or backup_root.is_symlink()):
-            os.replace(backup_root, output_root)
+    except BaseException as original:
+        # ``KeyboardInterrupt`` (and a hard-to-schedule signal between the
+        # second rename and ``published = True``) is a real publication
+        # boundary, not an ordinary ``Exception``.  Inspect both lexical
+        # paths after the interruption so we can distinguish a failed second
+        # rename from a completed one and leave exactly one authoritative
+        # namespace.
+        # A signal can arrive after ``os.replace(output, backup)`` returns but
+        # before the following ``moved_previous = True`` assignment.  Derive
+        # ownership from the durable paths as well as the in-memory flag.
+        moved_previous = moved_previous or (
+            (backup_root.exists() or backup_root.is_symlink())
+            and not (output_root.exists() or output_root.is_symlink())
+        )
+        candidate_published = (
+            (output_root.exists() or output_root.is_symlink())
+            and not (staging_root.exists() or staging_root.is_symlink())
+        )
+        if candidate_published:
+            published = True
+        elif moved_previous and not (output_root.exists() or output_root.is_symlink()) and (
+            backup_root.exists() or backup_root.is_symlink()
+        ):
+            restore_error: BaseException | None = None
+            try:
+                os.replace(backup_root, output_root)
+            except BaseException as exc:
+                restore_error = exc
+            if restore_error is not None:
+                # The interruption that caused publication to fail remains
+                # the caller-visible error; the restore failure is attached as
+                # its cause for diagnosis and the durable backup is retained
+                # for a subsequent, explicit recovery attempt.
+                raise original from restore_error
         raise
     finally:
         if published and moved_previous and not retain_backup and (backup_root.exists() or backup_root.is_symlink()):
@@ -5350,6 +8014,59 @@ def _publish_staged_output(staging_root: Path, output_root: Path, *, retain_back
                 shutil.rmtree(backup_root, ignore_errors=True)
             else:
                 backup_root.unlink(missing_ok=True)
+
+
+@contextmanager
+def _assembly_lock(lock_path: Path) -> Iterable[None]:
+    """Serialize one output namespace across processes and threads.
+
+    The full/root assembler predates the generation transaction lock used by
+    the delta assembler.  Its deterministic staging name therefore doubles
+    as a collision guard, but a process death can leave that name behind and
+    make an otherwise safe retry fail before it can rebuild.  A stable
+    advisory lock gives the staging namespace one owner at a time; once the
+    lock is held, a leftover staging directory is known to be an orphan from
+    an earlier attempt and can be cleaned before rebuilding.
+    """
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if lock_path.is_symlink():
+        raise AssemblyError(f"assembly lock cannot be a symlink: {lock_path}")
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise AssemblyError(f"cannot open assembly lock: {lock_path}") from exc
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _remove_orphan_staging(staging_root: Path) -> None:
+    """Remove one owned staging namespace after the assembly lock is held."""
+
+    if staging_root.is_symlink():
+        raise AssemblyError(f"staging namespace is symlinked: {staging_root.name}")
+    if not staging_root.exists():
+        return
+    if not staging_root.is_dir():
+        raise AssemblyError(f"staging namespace is not a directory: {staging_root.name}")
+    # Never recurse through an alias while cleaning a crashed candidate.  A
+    # malformed/tampered staging tree remains fail-closed instead of turning
+    # cleanup into an arbitrary filesystem delete.
+    for entry in staging_root.rglob("*"):
+        if entry.is_symlink():
+            raise AssemblyError(f"staging namespace contains a symlink: {entry.relative_to(staging_root)}")
+        if not entry.is_file() and not entry.is_dir():
+            raise AssemblyError(f"staging namespace contains an unsupported entry: {entry.relative_to(staging_root)}")
+    shutil.rmtree(staging_root)
 
 
 def _site_tree_binding(site_root: Path, *, exclude: set[str] | None = None) -> dict[str, Any]:
@@ -5376,27 +8093,233 @@ def _site_tree_binding(site_root: Path, *, exclude: set[str] | None = None) -> d
     return {"files": files, "tree_sha256": _json_hash(files), "file_count": len(files)}
 
 
-def assemble_dashboard(
+def _validate_site_manifest_binding(
+    site_root: Path,
+    *,
+    expected_blueprint_ref: str | None = None,
+    expected_blueprint_sha256: str | None = None,
+    expected_chart_map_ref: str | None = None,
+) -> dict[str, Any]:
+    """Validate the renderer's self-excluding site-manifest binding.
+
+    The renderer writes a manifest *inside* the site tree.  Its
+    ``site_file_hashes``/``site_tree_sha256`` therefore intentionally exclude
+    that manifest so the manifest can describe the tree without a
+    self-reference.  The assembler receipt has a separate complete
+    ``site_binding`` that includes ``site_manifest.json``.  Keep this
+    distinction in one program-owned validator so callers never need to
+    compare the two domains themselves.
+    """
+
+    if not site_root.is_dir() or site_root.is_symlink():
+        raise AssemblyError("site output directory is missing or symlinked")
+    manifest_path = site_root / "site_manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise AssemblyError("site manifest is missing or symlinked")
+    try:
+        raw = manifest_path.read_bytes()
+        value = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AssemblyError("site manifest is invalid") from exc
+    if not isinstance(value, Mapping) or raw != _canonical_bytes(value):
+        raise AssemblyError("site manifest is not canonical")
+    non_manifest = _site_tree_binding(site_root, exclude={"site_manifest.json"})
+    if value.get("site_file_hashes") != non_manifest["files"]:
+        raise AssemblyError("site manifest file binding does not match site")
+    if value.get("site_tree_sha256") != non_manifest["tree_sha256"]:
+        raise AssemblyError("site manifest tree binding does not match site")
+    if value.get("site_tree_file_count") != non_manifest["file_count"]:
+        raise AssemblyError("site manifest file count does not match site")
+    if expected_blueprint_ref is not None and value.get("blueprint_ref") != expected_blueprint_ref:
+        raise AssemblyError("site manifest blueprint reference is stale")
+    if expected_blueprint_sha256 is not None and value.get("blueprint_sha256") != expected_blueprint_sha256:
+        raise AssemblyError("site manifest blueprint hash is stale")
+    if expected_chart_map_ref is not None and value.get("chart_map_ref") != expected_chart_map_ref:
+        raise AssemblyError("site manifest chart map reference is stale")
+    return {
+        "ref": "site_manifest.json",
+        "sha256": _sha256_bytes(raw),
+        "files": dict(non_manifest["files"]),
+        "tree_sha256": non_manifest["tree_sha256"],
+        "file_count": non_manifest["file_count"],
+    }
+
+
+def _validate_site_links_in_tree(site_root: Path) -> None:
+    """Run the canonical offline renderer link validator over one site tree."""
+
+    renderer_path = Path(__file__).resolve().with_name("dashboard_renderer.py")
+    spec = importlib.util.spec_from_file_location("dashboard_renderer_for_receipt_validation", renderer_path)
+    if spec is None or spec.loader is None:
+        raise AssemblyError("dashboard renderer cannot be loaded for receipt validation")
+    renderer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(renderer)
+    pages: dict[str, bytes] = {}
+    for path in sorted(site_root.rglob("*")):
+        if path.is_symlink():
+            raise AssemblyError(f"assembled receipt site contains symlink: {path.relative_to(site_root)}")
+        if path.is_file():
+            pages[path.relative_to(site_root).as_posix()] = path.read_bytes()
+    try:
+        renderer._validate_site_links(pages)
+    except Exception as exc:
+        raise AssemblyError("assembled receipt site links are invalid") from exc
+
+
+def _validate_assembled_receipt(context: RunContext, receipt: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate one completed root assembler receipt and both site trees.
+
+    This is intentionally an internal helper for the generation-aware public
+    validator.  It performs no writes and returns only canonical, validated
+    bindings that the Product Agent can hand to the existing candidate store.
+    """
+
+    if not isinstance(context, RunContext):
+        raise TypeError("receipt validation requires a RunContext")
+    if not isinstance(receipt, Mapping):
+        raise AssemblyError("assembled receipt must be an object")
+    value = dict(receipt)
+    if value.get("schema_version") != ASSEMBLER_SCHEMA or value.get("status") != "complete":
+        raise AssemblyError("assembled receipt is incomplete or has an unsupported schema")
+    if value.get("run_id") != context.run_id or value.get("new_analytics") is not False:
+        raise AssemblyError("assembled receipt run/new_analytics binding is invalid")
+    outputs = value.get("outputs")
+    output_hashes = value.get("output_hashes")
+    expected_outputs = {
+        "fixture_ref",
+        "chart_map_ref",
+        "chart_registry_ref",
+        "blueprint_ref",
+        "site_ref",
+        "receipt_ref",
+    }
+    expected_hashes = {
+        "fixture_sha256",
+        "chart_map_sha256",
+        "chart_registry_sha256",
+        "blueprint_sha256",
+        "site_manifest_sha256",
+    }
+    if not isinstance(outputs, Mapping) or set(outputs) != expected_outputs:
+        raise AssemblyError("assembled receipt output bindings are not exact")
+    if not isinstance(output_hashes, Mapping) or set(output_hashes) != expected_hashes:
+        raise AssemblyError("assembled receipt output hashes are not exact")
+
+    receipt_ref = outputs.get("receipt_ref")
+    if not isinstance(receipt_ref, str) or not receipt_ref.strip():
+        raise AssemblyError("assembled receipt reference is missing")
+    _assert_no_symlink_chain(context, receipt_ref, label="assembled receipt reference")
+    receipt_path = context.resolve_run_path(receipt_ref)
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise AssemblyError("assembled receipt reference is missing or symlinked")
+    try:
+        receipt_bytes = receipt_path.read_bytes()
+    except OSError as exc:
+        raise AssemblyError("assembled receipt cannot be read") from exc
+    if receipt_bytes != _canonical_bytes(value):
+        raise AssemblyError("assembled receipt is not canonical or differs from its output")
+
+    file_outputs = (
+        ("fixture_ref", "fixture_sha256"),
+        ("chart_map_ref", "chart_map_sha256"),
+        ("chart_registry_ref", "chart_registry_sha256"),
+        ("blueprint_ref", "blueprint_sha256"),
+    )
+    resolved_outputs: dict[str, Path] = {}
+    for ref_key, hash_key in file_outputs:
+        reference = outputs.get(ref_key)
+        digest = output_hashes.get(hash_key)
+        if not isinstance(reference, str) or not reference.strip() or not _is_sha256(digest):
+            raise AssemblyError(f"assembled receipt output binding is invalid: {ref_key}")
+        _assert_no_symlink_chain(context, reference, label=f"assembled {ref_key}")
+        target = context.resolve_run_path(reference)
+        if target.is_symlink() or not target.is_file() or _sha256_bytes(target.read_bytes()) != digest:
+            raise AssemblyError(f"assembled receipt output hash mismatch: {ref_key}")
+        resolved_outputs[ref_key] = target
+
+    site_ref = outputs.get("site_ref")
+    if not isinstance(site_ref, str) or not site_ref.strip():
+        raise AssemblyError("assembled receipt site reference is missing")
+    _assert_no_symlink_chain(context, site_ref, label="assembled site reference")
+    site_root = context.resolve_run_path(site_ref)
+    if site_root.is_symlink() or not site_root.is_dir():
+        raise AssemblyError("assembled receipt site is missing or symlinked")
+    actual_site_binding = _site_tree_binding(site_root)
+    supplied_site_binding = value.get("site_binding")
+    if not isinstance(supplied_site_binding, Mapping) or dict(supplied_site_binding) != actual_site_binding:
+        raise AssemblyError("assembled receipt complete site binding does not match site")
+    blueprint_ref = outputs["blueprint_ref"]
+    blueprint_hash = output_hashes["blueprint_sha256"]
+    blueprint_binding = value.get("blueprint_binding")
+    if (
+        not isinstance(blueprint_binding, Mapping)
+        or blueprint_binding.get("ref") != blueprint_ref
+        or blueprint_binding.get("sha256") != blueprint_hash
+        or blueprint_binding.get("schema_version") != "dashboard.business_presentation_plan.v2"
+        or blueprint_binding.get("status") not in {"Preview", "Reviewed"}
+    ):
+        raise AssemblyError("assembled receipt blueprint binding is invalid")
+    site_manifest_binding = _validate_site_manifest_binding(
+        site_root,
+        expected_blueprint_ref=blueprint_ref,
+        expected_blueprint_sha256=blueprint_hash,
+        expected_chart_map_ref=outputs["chart_map_ref"],
+    )
+    if _sha256_bytes((site_root / "site_manifest.json").read_bytes()) != output_hashes["site_manifest_sha256"]:
+        raise AssemblyError("assembled receipt site manifest hash mismatch")
+
+    # The renderer's link validator is deliberately reused after the
+    # receipt/site binding checks.  Any tampered page or fragment therefore
+    # fails the same program-owned gate as a tree/hash mismatch.
+    _validate_site_links_in_tree(site_root)
+
+    return {
+        "valid": True,
+        "stage": "assembled",
+        "run_id": context.run_id,
+        "generation_id": value.get("generation_id"),
+        "receipt_ref": receipt_ref,
+        "receipt_sha256": _sha256_bytes(receipt_bytes),
+        "outputs": copy.deepcopy(dict(outputs)),
+        "output_hashes": copy.deepcopy(dict(output_hashes)),
+        "site_binding": copy.deepcopy(dict(actual_site_binding)),
+        "site_manifest_binding": site_manifest_binding,
+    }
+
+
+def _assemble_dashboard_locked(
     context: RunContext,
     *,
     output_dir: str | Path = "repro_dashboard_v4",
+    revision_id: str | None = None,
     item_ids: Sequence[str] | None = None,
     plan_ref: str | Path | None = None,
     fixture_ref: str | Path | None = None,
     chart_map_ref: str | Path | None = None,
     chart_registry_ref: str | Path | None = None,
+    blueprint_ref: str | Path | None = None,
     site_ref: str | Path | None = None,
     receipt_ref: str | Path | None = None,
     presentation_plan_ref: str | Path | None = None,
+    _preflight_only: bool = False,
 ) -> dict[str, Any]:
-    """Assemble a deterministic run-local V4 fixture, map, registry, and site."""
+    """Assemble a deterministic run-local V4 fixture, map, registry, and site.
+
+    ``_preflight_only`` is an internal source-inventory seam used by
+    :func:`business_presentation_preflight`.  It stops after the exact
+    fixture/chart-map/registry bytes are staged, before any site rendering or
+    product publication; callers should use the public preflight helper rather
+    than passing this private flag directly.
+    """
 
     if not isinstance(context, RunContext):
         raise TypeError("assemble_dashboard requires one RunContext")
+    rendering_identity = _rendering_identity(context)
     output_root, output_run_ref = _product_ref(context, output_dir)
     if output_root == context.run_root / "products":
         raise AssemblyError("output_dir must be a dedicated reproducibility namespace")
     output_root.parent.mkdir(parents=True, exist_ok=True)
+    staging_root = output_root.parent / f".{output_root.name}.staging"
     plan = _load_plan(context, plan_ref)
     selected_ids = _discover_item_ids(context, item_ids, plan)
     groups = _group_definitions(plan, selected_ids)
@@ -5433,18 +8356,98 @@ def assemble_dashboard(
         # committed bundles have been loaded below.
     loaded: dict[str, dict[str, Any]] = {}
     all_records: list[Mapping[str, Any]] = []
-    authoritative_roots: dict[str, Mapping[str, Any]] = {}
-    record_file_hashes: dict[str, str] = {}
+    failed_items: list[dict[str, Any]] = []
     for item_id in selected_ids:
-        content, accepted_manifest, accepted_meta = _load_public_accepted_bundle(context, item_id)
-        integration_manifest, records = _load_committed_records(context, item_id, accepted_manifest, accepted_meta["bundle"])
-        records_path = context.resolve_run_path(f"requirements/{item_id}/integration/committed/records.jsonl")
-        records_file_sha = _sha256_bytes(records_path.read_bytes())
-        for record in records:
-            record_id = _text(record.get("record_id")).strip()
-            if record_id:
-                authoritative_roots[record_id] = _presentation_authoritative_root(record, content)
-                record_file_hashes[record_id] = records_file_sha
+        state_probe = _read_json(context, f"requirements/{item_id}/item_state.json", label=f"{item_id} item state")
+        integration_failure = None
+        if state_probe.get("lifecycle_state") == "technical_failure":
+            terminal_manifest = _load_item_technical_failure_manifest(context, item_id, state_probe)
+            content = {}
+            accepted_manifest = terminal_manifest
+            accepted_meta = {
+                "state": state_probe,
+                "envelope": {},
+                "bundle": None,
+            }
+            integration_manifest = {"manifest_hash": terminal_manifest["manifest_hash"]}
+            records = []
+            integration_failure = {
+                "status": "technical_failure",
+                "recovery_exhausted": True,
+                "manifest_hash": terminal_manifest["manifest_hash"],
+                "manifest_ref": f"requirements/{item_id}/accepted/manifest.json",
+                "reason_hash": _json_hash({"reason": terminal_manifest.get("reason")}),
+            }
+            failed_items.append({"item_id": item_id, **integration_failure})
+        else:
+            content, accepted_manifest, accepted_meta = _load_public_accepted_bundle(context, item_id)
+        if state_probe.get("integration_state") == "technical_failure":
+            integration_manifest = _load_technical_failure_manifest(context, item_id, accepted_meta)
+            records = []
+            integration_failure = {
+                "status": "technical_failure",
+                "recovery_exhausted": True,
+                "manifest_hash": integration_manifest["manifest_hash"],
+                "manifest_ref": f"requirements/{item_id}/integration/technical_failure/manifest.json",
+                # Keep the failure visible without copying potentially
+                # sensitive role/error text into product metadata.
+                "reason_hash": _json_hash({"reason": integration_manifest.get("reason")}),
+            }
+            failed_items.append({"item_id": item_id, **integration_failure})
+        elif state_probe.get("lifecycle_state") != "technical_failure":
+            integration_manifest, records = _load_committed_records(context, item_id, accepted_manifest, accepted_meta["bundle"])
+            if not records:
+                # A settled requirement may carry only an explicit limitation
+                # answer and no committed analytical records.  Preserve that
+                # terminal state as a bounded failure/availability note so an
+                # all-limited run still produces a non-blank product without
+                # reclassifying it as analytical success.
+                failed_items.append({
+                    "item_id": item_id,
+                    "status": "limited_no_committed_records",
+                    "recovery_exhausted": False,
+                    "manifest_hash": _text(integration_manifest.get("manifest_hash")),
+                    "manifest_ref": f"requirements/{item_id}/integration/committed/manifest.json",
+                    "reason_hash": _json_hash({"reason": "no committed analytical records"}),
+                })
+        accepted_bundle = accepted_meta.get("bundle")
+        accepted_manifest_hash = (
+            accepted_bundle.manifest_hash
+            if accepted_bundle is not None
+            else accepted_manifest.get("manifest_hash")
+        )
+        accepted_content_hash = (
+            accepted_bundle.content_hash
+            if accepted_bundle is not None
+            else accepted_manifest.get("content_hash")
+        )
+        accepted_visual_widgets = (
+            _accepted_visual_widgets(
+                context,
+                item_id,
+                content,
+                accepted_manifest,
+                accepted_content_hash,
+                accepted_manifest_hash,
+            )
+            if accepted_bundle is not None
+            else []
+        )
+        if accepted_bundle is not None:
+            # Accepted evidence rows are an independent source-bound
+            # candidate universe.  They remain available even when the
+            # integration boundary is terminally technical-failed; no
+            # committed record is required to preserve the reviewed answer.
+            accepted_visual_widgets.extend(
+                _accepted_evidence_widgets(
+                    context,
+                    item_id,
+                    content,
+                    accepted_manifest,
+                    accepted_content_hash,
+                    accepted_manifest_hash,
+                )
+            )
         raw_scope = _text(content.get("scope") or content.get("method"))
         # The full reviewed scope is retained in ``requirement_scope`` and the
         # collapsed audit.  It is not a manager subtitle because method/source
@@ -5470,11 +8473,17 @@ def assemble_dashboard(
                 records,
                 _text(accepted_meta["state"].get("original_text") or content.get("scope") or item_id),
             ),
-            "accepted_manifest_hash": accepted_meta["bundle"].manifest_hash,
-            "accepted_content_hash": accepted_meta["bundle"].content_hash,
+            "accepted_manifest_hash": accepted_manifest_hash,
+            "accepted_content_hash": accepted_content_hash,
             "integration_manifest_hash": integration_manifest["manifest_hash"],
             "records": records,
+            "accepted_visual_widgets": accepted_visual_widgets,
         }
+        if integration_failure is not None:
+            loaded[item_id]["integration_failure"] = integration_failure
+            loaded[item_id]["limitations"] = tuple(
+                [*loaded[item_id]["limitations"], "Integration failed after recovery exhaustion; accepted business output is retained but no committed records feed analytics."]
+            )
         all_records.extend(records)
     lem_summary, projection_metadata = _load_projection_metadata(context, selected_ids)
     legacy_hints = _load_legacy_chart_hints(context)
@@ -5483,47 +8492,80 @@ def assemble_dashboard(
     fixture_path, fixture_run_ref = _product_ref(context, fixture_ref or (Path(output_dir) / "dashboard_fixture_v4.json"))
     chart_map_path, chart_map_run_ref = _product_ref(context, chart_map_ref or (Path(output_dir) / "dashboard_chart_map_v4.json"))
     registry_path, registry_run_ref = _product_ref(context, chart_registry_ref or (Path(output_dir) / "dashboard_chart_registry_v4.json"))
+    blueprint_path, blueprint_run_ref = _product_ref(context, blueprint_ref or (Path(output_dir) / BLUEPRINT_FILENAME))
     site_path, site_run_ref = _product_ref(context, site_ref or (Path(output_dir) / "site"))
     receipt_path, receipt_run_ref = _product_ref(context, receipt_ref or (Path(output_dir) / "build_receipt.json"))
-    for path, label in ((fixture_path, "fixture_ref"), (chart_map_path, "chart_map_ref"), (registry_path, "chart_registry_ref"), (site_path, "site_ref"), (receipt_path, "receipt_ref")):
+    output_refs = {
+        "fixture_ref": fixture_run_ref,
+        "chart_map_ref": chart_map_run_ref,
+        "chart_registry_ref": registry_run_ref,
+        "blueprint_ref": blueprint_run_ref,
+        "site_ref": site_run_ref,
+        "receipt_ref": receipt_run_ref,
+    }
+    if _canonical_preview_request_has_symlink(context, output_dir, generation_id):
+        raise AssemblyError("canonical preview namespace contains a symlink component")
+    canonical_preview = _is_canonical_preview_namespace(
+        context,
+        output_root,
+        output_run_ref,
+        generation_id,
+        output_refs,
+    )
+    for path, label in ((fixture_path, "fixture_ref"), (chart_map_path, "chart_map_ref"), (registry_path, "chart_registry_ref"), (blueprint_path, "blueprint_ref"), (site_path, "site_ref"), (receipt_path, "receipt_ref")):
         try:
             path.relative_to(output_root)
         except ValueError as exc:
             raise AssemblyError(f"{label} must remain inside output_dir") from exc
+    current_artifact_inputs = _analytical_artifact_input_entries(
+        {item_id: loaded[item_id]["records"] for item_id in selected_ids}
+    )
+    current_artifacts_by_item: dict[str, list[dict[str, Any]]] = {item_id: [] for item_id in selected_ids}
+    for binding in current_artifact_inputs:
+        current_artifacts_by_item.setdefault(_text(binding.get("item_id")), []).append(copy.deepcopy(binding))
     current_input_items = [
-        {"item_id": item_id, "accepted_content_hash": loaded[item_id]["accepted_content_hash"], "accepted_manifest_hash": loaded[item_id]["accepted_manifest_hash"], "integration_manifest_hash": loaded[item_id]["integration_manifest_hash"], "record_count": len(loaded[item_id]["records"])}
+        {
+            "item_id": item_id,
+            "accepted_content_hash": loaded[item_id]["accepted_content_hash"],
+            "accepted_manifest_hash": loaded[item_id]["accepted_manifest_hash"],
+            "integration_manifest_hash": loaded[item_id]["integration_manifest_hash"],
+            "record_count": len(loaded[item_id]["records"]),
+            # Keep an explicit empty list for requirements without typed
+            # artifacts: omission would create a second, ambiguous binding
+            # shape and make an accepted artifact appear only at receipt time.
+            "analytical_artifacts": copy.deepcopy(current_artifacts_by_item[item_id]),
+        }
         for item_id in selected_ids
     ]
     presentation_parent = _presentation_parent_binding(context, generation_id, generation_metadata)
     if presentation_plan is not None:
-        if presentation_plan.get("schema_version") == PRESENTATION_PLAN_V2_SCHEMA:
-            # V2 visual/source validation is completed after the candidate
-            # widgets and chart map have been rebuilt below.  Input/parent
-            # lineage is still checked before any staging namespace is made.
-            _validate_v2_plan_lineage(
-                context,
-                presentation_plan,
-                generation_id=generation_id,
-                supervisor_ref=supervisor_plan_ref,
-                input_items=current_input_items,
-                parent=presentation_parent,
-            )
-            manager_widget_ids = list(presentation_plan["manager_widget_ids"])
-        else:
-            manager_widget_ids = _validate_business_presentation_plan(
-                context,
-                presentation_plan,
-                generation_id=generation_id,
-                supervisor_ref=supervisor_plan_ref,
-                supervisor_plan=supervisor_plan,
-                input_items=current_input_items,
-                parent=presentation_parent,
-                authoritative_roots=authoritative_roots,
-                record_file_hashes=record_file_hashes,
-            )
+        # V2 visual/source validation is completed after the candidate
+        # widgets and chart map have been rebuilt below.  Input/parent
+        # lineage is still checked before any staging namespace is made.
+        _validate_v2_plan_lineage(
+            context,
+            presentation_plan,
+            generation_id=generation_id,
+            supervisor_ref=supervisor_plan_ref,
+            input_items=current_input_items,
+            parent=presentation_parent,
+        )
+        manager_widget_ids = list(presentation_plan["manager_widget_ids"])
         manager_entries = {entry["widget_id"]: entry for entry in presentation_plan["manager_entries"]}
     existing_receipt: dict[str, Any] | None = None
-    if output_root.exists():
+    # ``ProductReviewStore.begin_revision`` creates an empty, reserved
+    # artifact namespace before dispatch.  That directory is the only
+    # existing output root that may be treated as a fresh assembly target;
+    # every other pre-existing namespace still requires a complete receipt.
+    fresh_revision_namespace = (
+        revision_id is not None
+        and output_root.exists()
+        and output_root.is_dir()
+        and not any(output_root.iterdir())
+    )
+    if output_root.exists() and not fresh_revision_namespace:
+        if canonical_preview and (output_root.is_symlink() or not output_root.is_dir()):
+            raise AssemblyError("canonical preview namespace is not a regular directory")
         if not receipt_path.is_file() or receipt_path.is_symlink():
             raise AssemblyError(f"output namespace already exists without a valid receipt: {output_dir}")
         try:
@@ -5532,34 +8574,6 @@ def assemble_dashboard(
             raise AssemblyError(f"existing output receipt is invalid: {output_dir}") from exc
         if not isinstance(existing_receipt, Mapping) or existing_receipt.get("schema_version") != ASSEMBLER_SCHEMA or existing_receipt.get("status") != "complete":
             raise AssemblyError(f"existing output receipt is invalid: {output_dir}")
-        if existing_receipt.get("input_items") != current_input_items:
-            raise AssemblyError("existing output namespace input hashes do not match current accepted/committed inputs")
-        if existing_receipt.get("plan_binding") != plan_binding:
-            raise AssemblyError("existing output namespace supervisor plan/grouping hash does not match")
-        existing_presentation_ref = existing_receipt.get("presentation_plan_ref")
-        existing_presentation_hash = existing_receipt.get("presentation_plan_sha256")
-        existing_manager_ids = existing_receipt.get("manager_widget_ids")
-        if presentation_plan is None:
-            if existing_presentation_ref is not None or existing_presentation_hash is not None or existing_manager_ids not in (None, []):
-                raise AssemblyError("existing output namespace requires its explicit presentation plan")
-        elif (
-            existing_presentation_ref is not None
-            and (existing_presentation_ref != resolved_presentation_plan_ref or existing_presentation_hash != presentation_plan_sha256 or existing_manager_ids != list(manager_widget_ids))
-        ):
-            raise AssemblyError("existing output namespace presentation plan binding does not match")
-        existing_freeze = existing_receipt.get("freeze_inputs")
-        def _bound_hash(value: Any) -> Any:
-            return value.get("sha256") if isinstance(value, Mapping) else None
-
-        if (
-            not isinstance(existing_freeze, Mapping)
-            or existing_freeze.get("projection_hash") != projection_metadata["projection_hash"]
-            or _bound_hash(existing_freeze.get("prepared_registry")) != projection_metadata["prepared_registry"]["sha256"]
-            or _bound_hash(existing_freeze.get("prepared_index")) != projection_metadata["prepared_index"]["sha256"]
-            or _bound_hash(existing_freeze.get("telemetry")) != projection_metadata["telemetry"]["sha256"]
-            or existing_freeze.get("product_manifest_sha256") != projection_metadata.get("product_manifest_sha256")
-        ):
-            raise AssemblyError("existing output namespace frozen projection/metadata hashes do not match")
         hashes = existing_receipt.get("output_hashes")
         outputs = existing_receipt.get("outputs")
         if not isinstance(hashes, Mapping) or not isinstance(outputs, Mapping):
@@ -5575,35 +8589,94 @@ def assemble_dashboard(
             path = context.resolve_run_path(reference)
             if not path.is_file() or path.is_symlink() or _sha256_bytes(path.read_bytes()) != hashes.get(key):
                 raise AssemblyError(f"existing output hash mismatch: {key}")
+        existing_blueprint = existing_receipt.get("blueprint_binding")
+        existing_blueprint_ref = outputs.get("blueprint_ref")
+        if canonical_preview and not isinstance(existing_blueprint, Mapping):
+            raise AssemblyError("existing canonical preview blueprint binding is missing")
+        if isinstance(existing_blueprint, Mapping):
+            if existing_blueprint_ref != existing_blueprint.get("ref") or not isinstance(existing_blueprint.get("sha256"), str):
+                raise AssemblyError("existing output blueprint binding is invalid")
+            blueprint_target = context.resolve_run_path(existing_blueprint_ref)
+            if (
+                not blueprint_target.is_file()
+                or blueprint_target.is_symlink()
+                or _sha256_bytes(blueprint_target.read_bytes()) != existing_blueprint.get("sha256")
+            ):
+                raise AssemblyError("existing output blueprint hash mismatch")
         site_ref_value = outputs.get("site_ref")
         if not isinstance(site_ref_value, str) or not site_ref_value:
             raise AssemblyError("existing output receipt reference is missing: site_ref")
+        if canonical_preview:
+            if existing_receipt.get("run_id") != context.run_id or existing_receipt.get("generation_id") != generation_id or existing_receipt.get("new_analytics") is not False:
+                raise AssemblyError("existing canonical preview receipt lineage is invalid")
+            for key, expected in output_refs.items():
+                if outputs.get(key) != expected:
+                    raise AssemblyError(f"existing canonical preview output binding is invalid: {key}")
+            if any(not _is_sha256(hashes.get(key)) for key in ("fixture_sha256", "chart_map_sha256", "chart_registry_sha256", "site_manifest_sha256")):
+                raise AssemblyError("existing canonical preview output hashes are invalid")
         actual_site_binding = _site_tree_binding(context.resolve_run_path(site_ref_value))
         if actual_site_binding != existing_receipt.get("site_binding"):
             raise AssemblyError("existing output site file hash mismatch")
         site_manifest_path = context.resolve_run_path(f"{site_ref_value.rstrip('/')}/site_manifest.json")
+        if not site_manifest_path.is_file() or site_manifest_path.is_symlink():
+            raise AssemblyError("existing output site manifest is missing or symlinked")
         if _sha256_bytes(site_manifest_path.read_bytes()) != hashes.get("site_manifest_sha256"):
             raise AssemblyError("existing output hash mismatch: site_manifest_sha256")
+        if not canonical_preview:
+            if existing_receipt.get("input_items") != current_input_items:
+                raise AssemblyError("existing output namespace input hashes do not match current accepted/committed inputs")
+            if existing_receipt.get("plan_binding") != plan_binding:
+                raise AssemblyError("existing output namespace supervisor plan/grouping hash does not match")
+            existing_presentation_ref = existing_receipt.get("presentation_plan_ref")
+            existing_presentation_hash = existing_receipt.get("presentation_plan_sha256")
+            existing_manager_ids = existing_receipt.get("manager_widget_ids")
+            if presentation_plan is None:
+                if existing_presentation_ref is not None or existing_presentation_hash is not None or existing_manager_ids not in (None, []):
+                    raise AssemblyError("existing output namespace requires its explicit presentation plan")
+            elif (
+                existing_presentation_ref is not None
+                and (existing_presentation_ref != resolved_presentation_plan_ref or existing_presentation_hash != presentation_plan_sha256 or existing_manager_ids != list(manager_widget_ids))
+            ):
+                raise AssemblyError("existing output namespace presentation plan binding does not match")
+            existing_freeze = existing_receipt.get("freeze_inputs")
+
+            def _bound_hash(value: Any) -> Any:
+                return value.get("sha256") if isinstance(value, Mapping) else None
+
+            if (
+                not isinstance(existing_freeze, Mapping)
+                or existing_freeze.get("projection_hash") != projection_metadata["projection_hash"]
+                or _bound_hash(existing_freeze.get("prepared_registry")) != projection_metadata["prepared_registry"]["sha256"]
+                or _bound_hash(existing_freeze.get("prepared_index")) != projection_metadata["prepared_index"]["sha256"]
+            ):
+                raise AssemblyError("existing output namespace frozen projection/metadata hashes do not match")
         existing_receipt = dict(existing_receipt)
-    staging_root = output_root.parent / f".{output_root.name}.staging"
-    if staging_root.exists():
-        raise AssemblyError(f"staging namespace already exists: {staging_root.name}")
+    # The public wrapper holds the namespace lock before entering this
+    # function.  A prior process may have died after creating the deterministic
+    # staging directory (for example, a user KeyboardInterrupt during site
+    # rendering).  That directory is never authoritative until the final
+    # atomic rename, so remove only this exact, lock-owned namespace and rebuild
+    # from the immutable accepted/committed inputs below.
+    _remove_orphan_staging(staging_root)
     staging_root.mkdir(parents=True)
     staging_prefix = staging_root.relative_to(context.run_root).as_posix()
     final_prefix = output_root.relative_to(context.run_root).as_posix()
     fixture_rel = fixture_path.relative_to(output_root)
     chart_map_rel = chart_map_path.relative_to(output_root)
     registry_rel = registry_path.relative_to(output_root)
+    blueprint_rel = blueprint_path.relative_to(output_root)
     site_rel = site_path.relative_to(output_root)
     receipt_rel = receipt_path.relative_to(output_root)
     staged_fixture_path = staging_root / fixture_rel
     staged_map_path = staging_root / chart_map_rel
     staged_registry_path = staging_root / registry_rel
+    staged_blueprint_path = staging_root / blueprint_rel
     staged_site_path = staging_root / site_rel
     staged_receipt_path = staging_root / receipt_rel
     staged_fixture_ref = staged_fixture_path.relative_to(context.run_root).as_posix()
     staged_map_ref = staged_map_path.relative_to(context.run_root).as_posix()
     staged_registry_ref = staged_registry_path.relative_to(context.run_root).as_posix()
+    staged_blueprint_ref = staged_blueprint_path.relative_to(context.run_root).as_posix()
     staged_site_ref = staged_site_path.relative_to(context.run_root / "products").as_posix()
     try:
         registry_source = Path(__file__).resolve().parent.parent / "assets" / "dashboard_chart_registry.json"
@@ -5617,12 +8690,17 @@ def assemble_dashboard(
             flow_defs: list[dict[str, Any]] = []
             for flow_order, item_id in enumerate(group["requirement_ids"], 1):
                 item = loaded[item_id]
+                # Failed items are represented in ``failed_items`` rather
+                # than as empty decision flows; keep surviving flow order
+                # contiguous for the renderer's schema.
+                flow_order = len(flow_defs) + 1
                 widget_content = dict(item["content"])
                 widget_content["__manager_requirement_scope"] = item["requirement_scope"]
                 item_widgets = _build_widgets(
                     item_id,
                     widget_content,
                     item["records"],
+                    accepted_visuals=item.get("accepted_visual_widgets", ()),
                     legacy_hints=legacy_hints,
                     manager_widget_ids=manager_widget_ids,
                     manager_entries=manager_entries,
@@ -5664,6 +8742,8 @@ def assemble_dashboard(
                     chart_items.append(
                         copy.deepcopy(inherited_chart_entry)
                         if inherited_chart_entry is not None
+                        and _text(widget.get("integration_record_id"))
+                        and _text(widget.get("artifact_type")) == ""
                         else chart_entry
                     )
                 flow = {
@@ -5681,36 +8761,85 @@ def assemble_dashboard(
                     flow["subtitle"] = item["requirement_subtitle"]
                 if item["takeaway"]:
                     flow["takeaway"] = item["takeaway"]
-                if item["requirement_scope"]:
-                    flow["scope"] = item["requirement_scope"]
+                flow_scope = _text(group.get("scope")).strip() or item["requirement_scope"]
+                if flow_scope:
+                    flow["scope"] = flow_scope
                 if item["limitations"]:
                     flow["limitations"] = list(item["limitations"])
-                flow_defs.append(flow)
+                if item.get("integration_failure"):
+                    flow["failure"] = copy.deepcopy(item["integration_failure"])
+                # The renderer's decision-flow contract requires every flow
+                # to carry at least one typed widget.  A requirement that
+                # failed before acceptance or at the accepted integration
+                # boundary has no business/integration records to render;
+                # keep it visible through the fixture-level ``failed_items``
+                # and limitations projections instead of fabricating a
+                # placeholder widget or emitting an invalid empty flow.
+                if item_widgets:
+                    flow_defs.append(flow)
             if flow_defs:
-                domain_title = group["title"]
-                if len(flow_defs) == 1 and not _is_manager_title_candidate(domain_title):
-                    domain_title = loaded[group["requirement_ids"][0]]["requirement_title"]
+                domain_title = _presentation_domain_title(group, flow_defs)
                 domains.append({"id": group["id"], "title": domain_title, "summary": group.get("summary"), "order": group["order"], "decision_flow": flow_defs})
-        if presentation_plan is not None and presentation_plan.get("schema_version") != PRESENTATION_PLAN_V2_SCHEMA:
-            _validate_business_presentation_plan(
-                context,
-                presentation_plan,
-                generation_id=generation_id,
-                supervisor_ref=supervisor_plan_ref,
-                supervisor_plan=supervisor_plan,
-                input_items=current_input_items,
-                parent=presentation_parent,
-                widgets=widgets,
-                authoritative_roots=authoritative_roots,
-                record_file_hashes=record_file_hashes,
-            )
+        limited_dashboard = False
         if not widgets:
-            raise AssemblyError("accepted/integrated inputs produced no typed presentation widgets")
-        overview_widget_ids = _apply_overview_selection(widgets)
+            if not failed_items:
+                raise AssemblyError("accepted/integrated inputs produced no typed presentation widgets")
+            # All selected requirements are terminal failures.  Keep the
+            # product non-blank with one explicit source-bound status table;
+            # this is not an analytical result and carries no invented value.
+            empty_widget = _limited_availability_widget(context, failed_items)
+            # A V2 plan may explicitly select the limited availability visual
+            # from the preflight inventory.  Preserve that exact plan entry so
+            # the manager surface, Blueprint, site, and receipt all bind the
+            # same source-bound empty-state choice.  A planless legacy/manual
+            # invocation retains the deterministic table-only fallback below.
+            if presentation_plan is not None:
+                limited_id = _text(empty_widget.get("id")).strip()
+                selected_entry = manager_entries.get(limited_id)
+                if (
+                    list(manager_widget_ids) != [limited_id]
+                    or not isinstance(selected_entry, Mapping)
+                    or presentation_plan.get("manager_visual_widget_ids") != [limited_id]
+                    or presentation_plan.get("audit_visual_widget_ids") != []
+                ):
+                    raise BusinessPresentationPlanError(
+                        "v2 limited dashboard plan must select its source-bound empty-state visual"
+                    )
+                empty_widget["manager_presentation"] = copy.deepcopy(dict(selected_entry))
+                empty_widget["manager_admission"]["presentation_plan_ref"] = resolved_presentation_plan_ref
+                empty_widget["manager_admission"]["presentation_plan_sha256"] = presentation_plan_sha256
+            else:
+                manager_widget_ids = [empty_widget["id"]]
+                manager_entries = {}
+            widgets.append(empty_widget)
+            chart_items.append(_chart_map_entry(empty_widget, "business-availability", {"item_id": "business-availability"}))
+            domains = [{
+                "id": "business-availability",
+                "title": "Business availability",
+                "summary": "Terminal outcome only; no accepted business visual is available.",
+                "order": 1,
+                "decision_flow": [{
+                    "id": "business-availability-flow",
+                    "title": "Business visual availability",
+                    "order": 1,
+                    "widget_ids": [empty_widget["id"]],
+                    "manager_admission": copy.deepcopy(empty_widget["manager_admission"]),
+                    "presentation_audience": "business_manager",
+                }],
+            }]
+            if presentation_plan is None:
+                manager_widget_ids = [empty_widget["id"]]
+                manager_entries = {}
+            limited_dashboard = True
+        # Product plan order is authoritative for the manager overview; the
+        # helper only projects those selected IDs and never chooses by shape.
+        overview_widget_ids = _apply_overview_selection(widgets, manager_widget_ids)
         audit_records = _audit_record_entries(
             {item_id: loaded[item_id]["records"] for item_id in selected_ids},
             widgets,
         )
+        artifact_inputs = current_artifact_inputs
+        artifact_inputs_by_item = current_artifacts_by_item
         audit_widgets = _audit_widget_entries(widgets)
         fixture: dict[str, Any] = {
             "schema_version": FIXTURE_SCHEMA,
@@ -5719,7 +8848,11 @@ def assemble_dashboard(
             "title": "Reproducible reviewed decision workspace",
             "subtitle": "Deterministic presentation of accepted and committed results; no new analytics are calculated.",
             "run_id": context.run_id,
-            "skill_version": context.skill_version or "0.7.1",
+            "generation_id": generation_id,
+            "skill_name": SKILL_NAME,
+            "skill_version": context.skill_version or "0.7.2",
+            "core_name": CORE_NAME,
+            "core_version": context.core_version,
             "freeze_markers": dict(projection_metadata["freeze_markers"]),
             "chart_registry_ref": staged_registry_ref,
             "chart_map_ref": staged_map_ref,
@@ -5728,14 +8861,19 @@ def assemble_dashboard(
             "audit_records": audit_records,
             "audit_widgets": audit_widgets,
             "audit_widget_entry_count": len(audit_widgets),
+            "analytical_artifacts": artifact_inputs,
             "ontology_summary": lem_summary,
             "overview_widget_ids": overview_widget_ids,
             "presentation_plan_ref": resolved_presentation_plan_ref,
             "presentation_plan_sha256": presentation_plan_sha256,
             "manager_widget_ids": list(manager_widget_ids),
-            "manager_entries": [copy.deepcopy(manager_entries[key]) for key in manager_widget_ids],
+            "manager_entries": [
+                copy.deepcopy(manager_entries[key])
+                for key in manager_widget_ids
+                if key in manager_entries
+            ],
             "manager_admission": {
-                "policy": "explicit_business_presentation_plan",
+                "policy": "terminal_limited_dashboard" if limited_dashboard else "explicit_business_presentation_plan",
                 "presentation_plan_ref": resolved_presentation_plan_ref,
                 "presentation_plan_sha256": presentation_plan_sha256,
                 "business_requirements": sorted(
@@ -5755,14 +8893,22 @@ def assemble_dashboard(
             "ontology_relationships": relationships,
             "ontology_groups": ontology_groups,
             "limitations": ["Presentation values are copied from accepted answer/integration records only.", "Unknown, malformed, mixed-unit, and no-FX values remain visible as limitations or tables; no missing value is rendered as zero."],
+            "failed_items": copy.deepcopy(failed_items),
         }
-        if presentation_plan is not None and presentation_plan.get("schema_version") == PRESENTATION_PLAN_V2_SCHEMA:
+        if limited_dashboard:
+            fixture["limited_dashboard"] = True
+            fixture["limited_dashboard_reason"] = "all_selected_requirements_terminal"
+        if failed_items:
+            fixture["limitations"].append(
+                "Failed requirements are listed explicitly; their accepted outputs remain immutable and do not contribute fabricated analytics or ontology records."
+            )
+        if presentation_plan is not None:
             fixture["manager_visual_widget_ids"] = list(presentation_plan["manager_visual_widget_ids"])
             fixture["audit_visual_widget_ids"] = list(presentation_plan["audit_visual_widget_ids"])
             fixture["visual_entries"] = copy.deepcopy(presentation_plan["visual_entries"])
             fixture["presentation_plan_schema"] = PRESENTATION_PLAN_V2_SCHEMA
         chart_map = {"schema_version": CHART_MAP_SCHEMA, "chart_registry_ref": staged_registry_ref, "fixture_ref": staged_fixture_ref, "charts": chart_items}
-        if presentation_plan is not None and presentation_plan.get("schema_version") == PRESENTATION_PLAN_V2_SCHEMA:
+        if presentation_plan is not None:
             _validate_business_presentation_plan_v2(
                 context,
                 presentation_plan,
@@ -5775,6 +8921,56 @@ def assemble_dashboard(
             )
         _write_json(staged_fixture_path, fixture)
         _write_json(staged_map_path, chart_map)
+        if _preflight_only:
+            # Return only the source-bound in-memory inputs.  The temporary
+            # staging namespace is removed before returning, so a preflight
+            # cannot accidentally publish or leave behind an immutable
+            # dashboard/site candidate.
+            try:
+                registry_payload = json.loads(staged_registry_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise AssemblyError("preflight chart registry is invalid") from exc
+            if not isinstance(registry_payload, Mapping):
+                raise AssemblyError("preflight chart registry is invalid")
+            result = {
+                "schema_version": PRESENTATION_PLAN_V2_SCHEMA,
+                "run_id": context.run_id,
+                "generation_id": generation_id,
+                "item_ids": list(selected_ids),
+                "input_items": copy.deepcopy(current_input_items),
+                "input_fingerprint": _preflight_input_fingerprint(current_input_items, rendering_identity),
+                "rendering_identity": copy.deepcopy(rendering_identity),
+                "fixture": copy.deepcopy(fixture),
+                "chart_map": copy.deepcopy(chart_map),
+                "registry": copy.deepcopy(registry_payload),
+            }
+            shutil.rmtree(staging_root, ignore_errors=True)
+            return result
+        # Build the exact source-bound Blueprint before rendering.  The
+        # renderer validates this staged artifact and therefore consumes the
+        # Product Agent's selected recipe/layout/renderer_type rather than
+        # deriving a post-hoc presentation from fixture metadata.
+        blueprint_registry = _read_json(
+            context,
+            staged_registry_path.relative_to(context.run_root),
+            label="staged chart registry",
+        )
+        provisional_blueprint = _dashboard_runtime().build_blueprint(
+            fixture=fixture,
+            chart_map=chart_map,
+            registry=blueprint_registry,
+            fixture_ref=staged_fixture_ref,
+            chart_map_ref=staged_map_ref,
+            registry_ref=staged_registry_ref,
+            fixture_sha256=_sha256_bytes(staged_fixture_path.read_bytes()),
+            chart_map_sha256=_sha256_bytes(staged_map_path.read_bytes()),
+            registry_sha256=registry_info["sha256"],
+            blueprint_ref=staged_blueprint_ref,
+            presentation_plan_ref=resolved_presentation_plan_ref,
+            presentation_plan_sha256=presentation_plan_sha256,
+            review_status="Preview",
+        )
+        _write_json(staged_blueprint_path, provisional_blueprint)
         # render_site_fixture validates the fixture, chart map, registry, links,
         # and the offline stylesheet before the staging namespace is published.
         renderer_path = Path(__file__).resolve().with_name("dashboard_renderer.py")
@@ -5784,7 +8980,13 @@ def assemble_dashboard(
             raise AssemblyError("dashboard renderer cannot be loaded")
         renderer = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(renderer)
-        renderer.render_site_fixture(context, staged_fixture_ref, staged_site_ref, f"{staged_site_ref}/site_manifest.json")
+        renderer.render_site_fixture(
+            context,
+            staged_fixture_ref,
+            staged_site_ref,
+            f"{staged_site_ref}/site_manifest.json",
+            blueprint_ref=staged_blueprint_ref,
+        )
         _replace_prefix(staging_root, staging_prefix, final_prefix)
         fixture["chart_registry_ref"] = registry_run_ref
         fixture["chart_map_ref"] = chart_map_run_ref
@@ -5792,11 +8994,40 @@ def assemble_dashboard(
         chart_map["fixture_ref"] = fixture_run_ref
         _write_json(staged_fixture_path, fixture)
         _write_json(staged_map_path, chart_map)
+        # Persist the canonical source-bound V2 blueprint beside the rendered
+        # site.  It is built from the exact final fixture/map/registry bytes;
+        # the runtime never aggregates or invents rows.
+        blueprint_registry = _read_json(
+            context,
+            staged_registry_path.relative_to(context.run_root),
+            label="staged chart registry",
+        )
+        blueprint = _dashboard_runtime().build_blueprint(
+            fixture=fixture,
+            chart_map=chart_map,
+            registry=blueprint_registry,
+            fixture_ref=fixture_run_ref,
+            chart_map_ref=chart_map_run_ref,
+            registry_ref=registry_run_ref,
+            fixture_sha256=_sha256_bytes(staged_fixture_path.read_bytes()),
+            chart_map_sha256=_sha256_bytes(staged_map_path.read_bytes()),
+            registry_sha256=registry_info["sha256"],
+            blueprint_ref=blueprint_run_ref,
+            presentation_plan_ref=resolved_presentation_plan_ref,
+            presentation_plan_sha256=presentation_plan_sha256,
+            review_status="Preview",
+        )
+        _write_json(staged_blueprint_path, blueprint)
+        blueprint_sha256 = _sha256_bytes(staged_blueprint_path.read_bytes())
         staged_site_manifest_path = staged_site_path / "site_manifest.json"
         if not staged_site_manifest_path.is_file():
             raise AssemblyError("renderer did not produce site_manifest.json")
         site_manifest = _read_json(context, staged_site_manifest_path.relative_to(context.run_root), label="staged site manifest")
         site_manifest = dict(site_manifest)
+        site_manifest["blueprint_ref"] = blueprint_run_ref
+        site_manifest["blueprint_sha256"] = blueprint_sha256
+        site_manifest["blueprint_schema"] = blueprint.get("schema_version")
+        site_manifest["status"] = "Preview"
         site_manifest["chart_map_sha256"] = _sha256_bytes(staged_map_path.read_bytes())
         non_manifest_site_binding = _site_tree_binding(staged_site_path, exclude={"site_manifest.json"})
         site_manifest["site_file_hashes"] = non_manifest_site_binding["files"]
@@ -5804,6 +9035,12 @@ def assemble_dashboard(
         site_manifest["site_tree_file_count"] = non_manifest_site_binding["file_count"]
         _write_json(staged_site_manifest_path, site_manifest)
         site_binding = _site_tree_binding(staged_site_path)
+        # Keep the receipt/freeze schema stable for every run.  The artifact
+        # binding is an exact list even when no typed artifacts were supplied;
+        # consumers must not infer schema from whether a run happened to carry
+        # artifacts.
+        freeze_inputs = copy.deepcopy(projection_metadata)
+        freeze_inputs["analytical_artifacts"] = copy.deepcopy(artifact_inputs)
         receipt = {
             "schema_version": ASSEMBLER_SCHEMA,
             "status": "complete",
@@ -5811,20 +9048,21 @@ def assemble_dashboard(
             "generation_id": generation_id,
             "source_policy": "accepted_and_committed_only",
             "new_analytics": False,
-            "input_items": [
-                {"item_id": item_id, "accepted_content_hash": loaded[item_id]["accepted_content_hash"], "accepted_manifest_hash": loaded[item_id]["accepted_manifest_hash"], "integration_manifest_hash": loaded[item_id]["integration_manifest_hash"], "record_count": len(loaded[item_id]["records"])}
-                for item_id in selected_ids
-            ],
+            "input_items": copy.deepcopy(current_input_items),
+            "analytical_artifacts": artifact_inputs,
             "plan_binding": plan_binding,
-            "outputs": {"fixture_ref": fixture_run_ref, "chart_map_ref": chart_map_run_ref, "chart_registry_ref": registry_run_ref, "site_ref": site_run_ref, "receipt_ref": receipt_run_ref},
+            "outputs": {"fixture_ref": fixture_run_ref, "chart_map_ref": chart_map_run_ref, "chart_registry_ref": registry_run_ref, "blueprint_ref": blueprint_run_ref, "site_ref": site_run_ref, "receipt_ref": receipt_run_ref},
             "output_hashes": {
                 "fixture_sha256": _sha256_bytes(staged_fixture_path.read_bytes()),
                 "chart_map_sha256": _sha256_bytes(staged_map_path.read_bytes()),
                 "chart_registry_sha256": registry_info["sha256"],
+                "blueprint_sha256": blueprint_sha256,
                 "site_manifest_sha256": _sha256_bytes(staged_site_manifest_path.read_bytes()),
             },
+            "blueprint_binding": {"ref": blueprint_run_ref, "sha256": blueprint_sha256, "schema_version": blueprint.get("schema_version"), "status": "Preview"},
             "site_binding": site_binding,
-            "freeze_inputs": projection_metadata,
+            "rendering_identity": copy.deepcopy(rendering_identity),
+            "freeze_inputs": freeze_inputs,
             "widget_count": len(widgets),
             "ontology_counts": {"objects": len(nodes), "relationships": len(relationships), "groups": len(ontology_groups), "summary": lem_summary},
             "retry": "idempotent only when the existing receipt/input hashes match; conflicting output namespaces fail closed",
@@ -5857,9 +9095,61 @@ def assemble_dashboard(
             return existing_receipt
         _publish_staged_output(staging_root, output_root)
         return receipt
-    except Exception:
+    except BaseException:
         shutil.rmtree(staging_root, ignore_errors=True)
         raise
+
+
+def assemble_dashboard(
+    context: RunContext,
+    *,
+    output_dir: str | Path = "repro_dashboard_v4",
+    item_ids: Sequence[str] | None = None,
+    plan_ref: str | Path | None = None,
+    fixture_ref: str | Path | None = None,
+    chart_map_ref: str | Path | None = None,
+    chart_registry_ref: str | Path | None = None,
+    blueprint_ref: str | Path | None = None,
+    site_ref: str | Path | None = None,
+    receipt_ref: str | Path | None = None,
+    presentation_plan_ref: str | Path | None = None,
+    _preflight_only: bool = False,
+    revision_id: str | None = None,
+    output_root_ref: str | Path | None = None,
+) -> dict[str, Any]:
+    """Serialize full/root assembly before reconciling its staging namespace."""
+
+    if not isinstance(context, RunContext):
+        raise TypeError("assemble_dashboard requires one RunContext")
+    revision_root = _revision_output_root(context, revision_id, output_root_ref)
+    if revision_root is not None:
+        expected_root, expected_ref = revision_root
+        if output_dir is None or str(output_dir) == "repro_dashboard_v4":
+            output_dir = expected_ref
+        else:
+            requested_root, _requested_ref = _product_ref(context, output_dir)
+            if requested_root != expected_root:
+                raise AssemblyError("product revision output_dir disagrees with output_root_ref")
+    output_root, _output_run_ref = _product_ref(context, output_dir)
+    if output_root == context.run_root / "products":
+        raise AssemblyError("output_dir must be a dedicated reproducibility namespace")
+    lock_path = output_root.parent / f".{output_root.name}.assembly.lock"
+    with _assembly_lock(lock_path):
+        return _assemble_dashboard_locked(
+            context,
+            output_dir=output_dir,
+            revision_id=revision_id,
+            item_ids=item_ids,
+            plan_ref=plan_ref,
+            fixture_ref=fixture_ref,
+            chart_map_ref=chart_map_ref,
+            chart_registry_ref=chart_registry_ref,
+            blueprint_ref=blueprint_ref,
+            site_ref=site_ref,
+            receipt_ref=receipt_ref,
+            presentation_plan_ref=presentation_plan_ref,
+            _preflight_only=_preflight_only,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -5868,13 +9158,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--output-dir", required=False, help="products-relative reproducibility output directory")
     parser.add_argument("--presentation-plan-ref", required=False, help="run-relative business presentation plan")
+    parser.add_argument("--revision-id", required=False, help="bound Product revision identifier")
+    parser.add_argument("--output-root-ref", required=False, help="run-relative immutable Product revision output root")
     parser.add_argument("--write-presentation-plan", action="store_true", help="write an explicit manager presentation plan")
     parser.add_argument("--presentation-inventory-fixture-ref", required=False, help="export a read-only candidate inventory")
     parser.add_argument("--presentation-visual-inventory", action="store_true", help="export the read-only V2 visual inventory")
     parser.add_argument("--presentation-fixture-ref", required=False, help="run-relative candidate fixture for plan selection")
     parser.add_argument("--reviewer-ref", required=False, help="reviewer reference for an explicit presentation plan")
     parser.add_argument("--manager-entry-json", action="append", default=[], help="JSON file containing one pointer-bound manager entry (repeatable)")
-    parser.add_argument("--revise-presentation-plan-v2", action="store_true", help="CAS-replace the expected V1 plan with a canonical V2 successor")
+    parser.add_argument("--revise-presentation-plan-v2", action="store_true", help="CAS-replace the current V2 plan with a canonical V2 successor")
     parser.add_argument("--record-presentation-plan-v2", action="store_true", help="create the active generation's absent canonical V2 plan")
     parser.add_argument("--successor-plan-json", required=False, help="JSON path for the V2 successor plan")
     parser.add_argument("--expected-current-plan-sha256", required=False)
@@ -5912,11 +9204,25 @@ def main(argv: list[str] | None = None) -> int:
                 raise BusinessPresentationPlanError(
                     "direct V2 recording requires fixture/map/previous refs, reviewer, and all expected source/successor hashes"
                 )
+            if not args.manager_entry_json:
+                raise BusinessPresentationPlanError(
+                    "direct V2 recording requires the complete ordered manager selection via --manager-entry-json"
+                )
+            manager_entries = []
+            for entry_ref in args.manager_entry_json:
+                entry_path = Path(entry_ref)
+                if entry_path.is_symlink() or not entry_path.is_file():
+                    raise BusinessPresentationPlanError(f"manager entry JSON is missing or symlinked: {entry_ref}")
+                raw_entry = json.loads(entry_path.read_text(encoding="utf-8"))
+                if not isinstance(raw_entry, Mapping):
+                    raise BusinessPresentationPlanError(f"manager entry JSON must be an object: {entry_ref}")
+                manager_entries.append(dict(raw_entry))
             result = record_business_presentation_plan_v2(
                 context,
                 fixture_ref=args.presentation_fixture_ref,
                 chart_map_ref=args.presentation_chart_map_ref,
                 previous_plan_ref=args.presentation_previous_plan_ref,
+                manager_entries=manager_entries,
                 reviewer_ref=args.reviewer_ref,
                 expected_fixture_sha256=args.expected_fixture_sha256,
                 expected_chart_map_sha256=args.expected_chart_map_sha256,
@@ -5956,9 +9262,15 @@ def main(argv: list[str] | None = None) -> int:
                 presentation_plan_ref=args.presentation_plan_ref,
             )
         else:
-            if not args.output_dir:
+            if not args.output_dir and not args.output_root_ref:
                 raise AssemblyError("--output-dir is required for dashboard assembly")
-            result = assemble_dashboard(context, output_dir=args.output_dir, presentation_plan_ref=args.presentation_plan_ref)
+            result = assemble_dashboard(
+                context,
+                output_dir=args.output_dir or "repro_dashboard_v4",
+                presentation_plan_ref=args.presentation_plan_ref,
+                revision_id=args.revision_id,
+                output_root_ref=args.output_root_ref,
+            )
     except (OSError, ValueError, AssemblyError, BusinessPresentationPlanError, AllowedRootError) as exc:
         print(f"dashboard assembler: {exc}", file=sys.stderr)
         return 2

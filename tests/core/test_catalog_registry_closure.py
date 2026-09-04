@@ -12,7 +12,7 @@ import pytest
 
 from auto_foundry_core.contracts import DataAssetRef
 from auto_foundry_core.telemetry import TelemetryRecorder
-from auto_foundry_core.workbench import CatalogCounts, DataRoom
+from auto_foundry_core.workbench import CATALOG_SCHEMA_VERSION, CatalogCounts, DataRoom
 from auto_foundry_core.workspace import RunContext
 
 
@@ -79,7 +79,7 @@ def test_canonical_catalog_is_parameter_free_and_single_winner(tmp_path: Path) -
         rooms[0].build_catalog(sample_rows=1)  # type: ignore[call-arg]
 
     payload = json.loads(catalog_path.read_text(encoding="utf-8"))
-    assert payload["catalog_schema_version"] == "1"
+    assert payload["catalog_schema_version"] == CATALOG_SCHEMA_VERSION
     assert payload["core_version"] == context.core_version
     assert payload["source_hash"] == rooms[0].archive_ref.content_hash
     assert all(not entry.get("sample_values") and not entry.get("sample_rows") for entry in payload["entries"])

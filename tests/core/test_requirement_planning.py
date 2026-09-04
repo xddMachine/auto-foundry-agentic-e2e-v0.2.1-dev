@@ -214,6 +214,36 @@ def _append_identity_proposal(
     )
 
 
+def _publish_no_mapping_identity(
+    resolution: EntityResolutionWorkspace,
+    domain_id: str,
+    *,
+    owner_ref: str = "resolution-owner",
+    reviewer_ref: str = "independent-reviewer",
+) -> None:
+    """Publish a real empty identity outcome for planner wakeup fixtures."""
+
+    resolution.claim_resolution_owner(domain_id, owner_ref)
+    result = EntityResolutionResult(
+        coverage={"source_count": 1, "mapped_count": 0},
+        population={"source_count": 1},
+        unresolved=(
+            {"reason": "no deterministic identity match", "row_count": 1},
+        ),
+        evidence_refs=("work/plan.json",),
+        source_hash="a" * 64,
+        metadata={"resolution_outcome": "no_mapping_found"},
+    )
+    resolution.submit_result(
+        domain_id,
+        owner_ref,
+        result,
+        expected_scope_hash=resolution.current_scope(domain_id).scope_hash,
+    )
+    resolution.record_review(domain_id, "accept", reviewer_ref)
+    resolution.commit(domain_id)
+
+
 def test_plan_preserves_exact_records_and_cognitive_reorder() -> None:
     records = (_record("R1"), _record("R2"), _record("R3"))
     plan = _plan(records)
@@ -296,12 +326,7 @@ def test_shared_identity_wait_keeps_known_dependent_out_of_planner_offer(tmp_pat
     # to its accepted boundary.  The same Planner tick can now offer R2.
     _accept_only(ItemWorkspace.load(context, "R1", mode="requirement"))
     resolution = EntityResolutionWorkspace.load(context)
-    with resolution._locked():  # test-only durable fixture transition
-        resolution._refresh()
-        entry = dict(resolution._state["domains"]["shared-customer"])
-        entry["state"] = "ready"
-        resolution._state["domains"]["shared-customer"] = entry
-        resolution._persist()
+    _publish_no_mapping_identity(resolution, "shared-customer")
     resumed = planner.next_actions()
     assert any(action.action == "analyze_requirement" and action.subject_id == "R2" for action in resumed)
 
@@ -339,7 +364,78 @@ def test_planner_reconciles_shared_identity_requests_and_keeps_next_analytical_o
     assert first_state != second_state
 
 
-def test_material_request_expansion_resumes_one_existing_identity_domain(tmp_path: Path) -> None:
+def test_test13_identity_conflict_recovers_paused_run_via_public_successor(tmp_path: Path) -> None:
+    context = RunContext("RUN-TEST13-RECOVERY", tmp_path / "run", (tmp_path,))
+    records = tuple(_record(item_id) for item_id in ("R1", "R2"))
+    RunLifecycle.create(context, ("R1", "R2"), mode="requirement")
+    for item_id in ("R1", "R2"):
+        ItemWorkspace.create(context, item_id, mode="requirement", original_text=item_id)
+    _append_identity_proposal(context, "R1", "shared-product", object_type="product")
+    _append_identity_proposal(
+        context,
+        "R2",
+        "shared-product",
+        object_type="product_material_sku",
+    )
+
+    planner = RequirementSupervisorWorkspace(context)
+    planner.plan_requirements(records)
+    initial = planner.next_actions()
+    assert len(initial) == 1
+    repair = initial[0]
+    assert repair.action == "repair_identity_request"
+    assert repair.metadata["identity_recovery"]["same_domain_policy"] == (
+        "inherit_canonical_object_type_and_expand_scope"
+    )
+    candidate = repair.metadata["identity_recovery"]["candidates"][0]
+    assert candidate["requirement_id"] == "R2"
+    assert candidate["canonical_object_type"] == "product"
+    assert candidate["proposal_object_type"] == "product_material_sku"
+
+    # Recovery is explicitly allowed while scheduling is paused and must use
+    # the public successor API instead of mutating the run JSON directly.
+    lifecycle = RunLifecycle.load(context)
+    lifecycle.pause("supervisor identity proposal repair")
+    evidence = planner.recover_identity_domain_proposal(
+        "R2",
+        "shared-product",
+        expected_predecessor_hash=candidate["expected_predecessor_hash"],
+        rationale="Same business entity; retain the concrete R2 source scope.",
+        source_hints=("material-catalog.csv",),
+        representation_item_ids=("material-catalog",),
+    )
+    assert evidence["recovered"] is True
+    assert evidence["already_applied"] is False
+    assert evidence["canonical_object_type"] == "product"
+    assert evidence["lifecycle_status"] == "paused"
+
+    item_history = ItemWorkspace.load(context, "R2", mode="requirement").read_identity_domain_proposal_history()
+    assert len(item_history) == 2
+    assert item_history[0]["object_type"] == "product_material_sku"
+    assert item_history[1]["object_type"] == "product"
+    assert item_history[1]["superseded_object_type"] == "product_material_sku"
+    assert "material-catalog.csv" in item_history[1]["source_hints"]
+
+    lifecycle = RunLifecycle.load(context)
+    # The initial planner tick advanced the run before the explicit pause;
+    # resume restores that exact pre-pause running state.
+    assert lifecycle.resume().state == "running"
+    resumed = planner.next_actions()
+    assert not any(action.action == "repair_identity_request" for action in resumed)
+    assert [(action.action, action.subject_id) for action in resumed] == [
+        ("resolve_identity", "shared-product"),
+    ]
+    domain = EntityResolutionWorkspace.load(context).get_domain("shared-product")
+    assert domain.object_type == "product"
+    assert domain.requested_by == ("R1", "R2")
+    assert set(domain.source_hints) == {"shared-product.csv", "material-catalog.csv"}
+    assert set(domain.representation_item_ids) == {
+        "shared-product-source",
+        "material-catalog",
+    }
+
+
+def test_material_request_expansion_reopens_one_committed_identity_domain(tmp_path: Path) -> None:
     context = RunContext("RUN-SHARED-IDENTITY-EXPANSION", tmp_path / "run", (tmp_path,))
     records = tuple(_record(item_id) for item_id in ("R1", "R2"))
     RunLifecycle.create(context, ("R1", "R2"), mode="requirement")
@@ -368,6 +464,8 @@ def test_material_request_expansion_resumes_one_existing_identity_domain(tmp_pat
         ),
         expected_scope_hash=resolution.current_scope("shared-customer").scope_hash,
     )
+    resolution.record_review("shared-customer", "accept", "independent-reviewer")
+    first_commit = resolution.commit("shared-customer")
     second_item = ItemWorkspace.load(context, "R2", mode="requirement")
     second_item.bind_analysis_owner("ao-R2")
     second_item.append_identity_domain_proposal(
@@ -388,8 +486,12 @@ def test_material_request_expansion_resumes_one_existing_identity_domain(tmp_pat
         for action in resumed
         if action.role == "entity_resolution_owner"
     ]
-    assert identity_actions == [("resume_identity_resolution", "shared-customer")]
-    assert EntityResolutionWorkspace.load(context).get_domain("shared-customer").result_hash is None
+    assert identity_actions == [("resolve_identity", "shared-customer")]
+    expanded = EntityResolutionWorkspace.load(context).get_domain("shared-customer")
+    assert expanded.result_hash is None
+    assert expanded.revision == 2
+    assert expanded.published_revision == 1
+    assert expanded.commit_manifest_hash == first_commit.manifest_hash
 
 
 def test_planner_recovers_mixed_historical_owner_provenance_without_rewriting_proposals(
@@ -787,7 +889,46 @@ def test_scheduling_tick_starts_next_requirement_while_prior_item_waits(tmp_path
     ]
 
 
-def test_active_business_repair_does_not_offer_stale_review_and_reoffers_after_attempt(
+def test_historical_analytical_owner_lease_cannot_block_next_requirement(tmp_path: Path) -> None:
+    context = RunContext("RUN-HISTORICAL-AO-LEASE", tmp_path / "run", (tmp_path,))
+    records = (_record("REQ-01"), _record("REQ-02"))
+    RunLifecycle.create(context, ("REQ-01", "REQ-02"), mode="requirement")
+    first = ItemWorkspace.create(context, "REQ-01", mode="requirement", original_text="first")
+    ItemWorkspace.create(context, "REQ-02", mode="requirement", original_text="second")
+    completed = first.begin_attempt("ao-first", "Analytical Owner")
+    first.finish_attempt(completed.attempt_id, status="completed")
+
+    # This is the residue produced by the old resume path.  It remains valid
+    # durable input, but it is not an Analytical Owner capacity authority.
+    resolution = EntityResolutionWorkspace.create(context)
+    resolution.claim_worker("analytical_owner", "historical-ao", "REQ-01")
+    assert any(lease.worker_type == "analytical_owner" for lease in resolution.active_leases)
+
+    _save_plan(context, records)
+    planner = RequirementSupervisorWorkspace(context)
+    snapshot = planner.runtime_snapshot()
+    assert snapshot.active_analytical_owner_count == 0
+    assert snapshot.runnable_requirement_ids == ("REQ-02",)
+    assert snapshot.next_requirement_id == "REQ-02"
+
+
+def test_active_analytical_owner_attempt_still_blocks_next_requirement(tmp_path: Path) -> None:
+    context = RunContext("RUN-ACTIVE-AO-ATTEMPT", tmp_path / "run", (tmp_path,))
+    records = (_record("REQ-01"), _record("REQ-02"))
+    RunLifecycle.create(context, ("REQ-01", "REQ-02"), mode="requirement")
+    first = ItemWorkspace.create(context, "REQ-01", mode="requirement", original_text="first")
+    ItemWorkspace.create(context, "REQ-02", mode="requirement", original_text="second")
+    first.begin_attempt("ao-first", "Analytical Owner")
+    _save_plan(context, records)
+
+    snapshot = RequirementSupervisorWorkspace(context).runtime_snapshot()
+    assert snapshot.active_analytical_owner_count == 1
+    assert snapshot.runnable_requirement_ids == ("REQ-02",)
+    assert snapshot.next_requirement_id is None
+    assert snapshot.scheduler_status == "at_capacity"
+
+
+def test_interrupted_active_business_repair_resume_carries_authorization_and_reoffers_after_attempt(
     tmp_path: Path,
 ) -> None:
     context = RunContext("RUN-REPAIR-ADMISSION", tmp_path / "run", (tmp_path,))
@@ -809,6 +950,9 @@ def test_active_business_repair_does_not_offer_stale_review_and_reoffers_after_a
         ),
     )
     item.use_business_repair(owner_ref="ao-repair")
+    # Simulate a process crash while the same-owner repair attempt is still
+    # active.  The next Planner action must retain the durable authorization.
+    repair_attempt = item.begin_attempt("ao-repair", "Analytical Owner")
 
     planner = RequirementSupervisorWorkspace(context)
     planner.save(
@@ -825,9 +969,13 @@ def test_active_business_repair_does_not_offer_stale_review_and_reoffers_after_a
     assert [(action.action, action.role, action.subject_id) for action in during_repair] == [
         ("resume_requirement_analysis", "analytical_owner", "REQ-01")
     ]
-    assert during_repair[0].metadata == {"repair_active": True, "repair_count": 1}
+    assert during_repair[0].metadata == {
+        "attempt_id": repair_attempt.attempt_id,
+        "no_progress_count": 0,
+        "repair_active": True,
+        "repair_count": 1,
+    }
 
-    repair_attempt = item.begin_attempt("ao-repair", "Analytical Owner")
     item.finish_attempt(repair_attempt.attempt_id, status="completed")
     after_repair = planner.next_actions()
     assert [(action.action, action.role, action.subject_id) for action in after_repair] == [
@@ -908,9 +1056,15 @@ def test_historical_failed_identity_domain_does_not_preempt_appended_requirement
     entity_state_path = context.run_root / "entity_resolution" / "state.json"
     entity_state_before = entity_state_path.read_bytes()
     actions = RequirementSupervisorWorkspace(context).next_actions()
+    # The new requirement remains the first runnable action; an incremental
+    # product refresh may coexist as a lower-priority advisory action for the
+    # already-integrated historical item.
     assert [(action.action, action.role, action.subject_id) for action in actions] == [
         ("analyze_requirement", "analytical_owner", "REQ-23"),
+        ("refresh_product_preview", "product_agent", context.run_id),
     ]
+    assert actions[0].priority < actions[1].priority
+    assert actions[1].metadata["item_ids"] == [first_record.requirement_id]
     assert entity_state_path.read_bytes() == entity_state_before
     assert EntityResolutionWorkspace.load(context).get_domain("inventory-product").state == "failed"
 
@@ -968,9 +1122,20 @@ def test_shared_failed_identity_domain_escalates_once_for_active_requester_and_w
     with resolution._locked():  # test-only durable fixture transition
         resolution._refresh()
         entry = dict(resolution._state["domains"]["shared-customer"])
-        entry["state"] = "ready"
+        # Re-open the failed v1 as a normal resolver attempt, then publish a
+        # real immutable artifact instead of fabricating a ready state without
+        # its required commit directory.
+        entry["state"] = "reserved"
+        entry["resolution_owner"] = None
+        entry["result_hash"] = None
+        entry["result_scope_hash"] = None
+        entry["reviewer_ref"] = None
+        entry["review_verdict"] = None
+        entry["review"] = None
+        entry["accepted_pending_commit"] = False
         resolution._state["domains"]["shared-customer"] = entry
         resolution._persist()
+    _publish_no_mapping_identity(resolution, "shared-customer", owner_ref="resolution-owner-v2", reviewer_ref="review-v1-rerun")
     resumed = planner.next_actions()
     assert not any(action.action == "escalate_identity_failure" for action in resumed)
     assert any(action.action == "analyze_requirement" and action.subject_id == "R2" for action in resumed)

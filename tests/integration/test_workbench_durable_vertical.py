@@ -349,8 +349,8 @@ def test_complete_offline_workbench_and_durable_vertical_path(
 
 def test_run_context_defaults_to_current_versions(tmp_path: Path) -> None:
     context = RunContext("RUN-DEFAULT-VERSION", tmp_path / "run")
-    assert context.core_version == "0.8.0"
-    assert context.skill_version == "0.7.1"
+    assert context.core_version == "0.8.1"
+    assert context.skill_version == "0.7.2"
 
 
 def test_item_state_template_loads_through_durable_core(tmp_path: Path) -> None:

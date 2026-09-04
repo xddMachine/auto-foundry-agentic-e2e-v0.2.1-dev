@@ -1,0 +1,129 @@
+{
+  "action": "repaired_and_refreshed",
+  "diagnostics": [],
+  "observation": {
+    "coordinator": {
+      "active_dispatch_count": 0,
+      "diagnostic_count": 4,
+      "generation_id": "G-0001",
+      "has_last_event": true,
+      "last_event_seq": 46,
+      "lease_expires_at": null,
+      "next_action_count": 0,
+      "next_action_present": true,
+      "no_progress_count": 2,
+      "owner": null,
+      "phase": "waiting",
+      "publication_enabled": false,
+      "publication_ready": false,
+      "run_id": "RUN-2192ca59eb4a4718",
+      "status": "waiting"
+    },
+    "event_count": 32,
+    "inspection_error_count": 0,
+    "needs_attention": true,
+    "observed_at": "2026-08-31T18:14:49.399488+00:00",
+    "phase_present": true,
+    "repository_diff_present": true,
+    "repository_root": "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev",
+    "repository_status_count": 276,
+    "run_error_present": false,
+    "state_key_count": 29,
+    "state_present": true
+  },
+  "repair": {
+    "accepted": true,
+    "durable_progress": true,
+    "execution": {
+      "exit_code": 0,
+      "timed_out": false
+    },
+    "message": "supervisor repair accepted",
+    "repaired": true,
+    "tests_passed": true
+  },
+  "repaired": true,
+  "status": {
+    "active_dispatch_count": 0,
+    "diagnostic_count": 4,
+    "generation_id": "G-0001",
+    "has_last_event": true,
+    "last_event_seq": 46,
+    "lease_expires_at": null,
+    "next_action_count": 0,
+    "next_action_present": true,
+    "no_progress_count": 2,
+    "owner": null,
+    "phase": "waiting",
+    "publication_enabled": false,
+    "publication_ready": false,
+    "run_id": "RUN-2192ca59eb4a4718",
+    "status": "waiting"
+  }
+}
+{
+  "action": "repair_declined",
+  "diagnostics": [
+    "supervisor diagnostic available"
+  ],
+  "observation": {
+    "coordinator": {
+      "active_dispatch_count": 0,
+      "diagnostic_count": 6,
+      "generation_id": "G-0002",
+      "has_last_event": true,
+      "last_event_seq": 75,
+      "lease_expires_at": null,
+      "next_action_count": 0,
+      "next_action_present": true,
+      "no_progress_count": 2,
+      "owner": null,
+      "phase": "waiting",
+      "publication_enabled": false,
+      "publication_ready": false,
+      "run_id": "RUN-2192ca59eb4a4718",
+      "status": "waiting"
+    },
+    "event_count": 32,
+    "inspection_error_count": 0,
+    "needs_attention": true,
+    "observed_at": "2026-08-31T21:58:55.758859+00:00",
+    "phase_present": true,
+    "repository_diff_present": true,
+    "repository_root": "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev",
+    "repository_status_count": 343,
+    "run_error_present": false,
+    "state_key_count": 29,
+    "state_present": true
+  },
+  "repair": {
+    "accepted": false,
+    "durable_progress": false,
+    "execution": {
+      "error": "transport_failed",
+      "exit_code": 1,
+      "timed_out": false
+    },
+    "message": "supervisor repair declined",
+    "repaired": false,
+    "tests_passed": false
+  },
+  "repaired": false,
+  "status": {
+    "active_dispatch_count": 0,
+    "diagnostic_count": 6,
+    "generation_id": "G-0002",
+    "has_last_event": true,
+    "last_event_seq": 75,
+    "lease_expires_at": null,
+    "next_action_count": 0,
+    "next_action_present": true,
+    "no_progress_count": 2,
+    "owner": null,
+    "phase": "waiting",
+    "publication_enabled": false,
+    "publication_ready": false,
+    "run_id": "RUN-2192ca59eb4a4718",
+    "status": "waiting"
+  }
+}

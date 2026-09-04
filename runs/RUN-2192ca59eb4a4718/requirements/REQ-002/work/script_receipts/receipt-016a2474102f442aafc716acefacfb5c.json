@@ -1,0 +1,29 @@
+{
+  "context_hash": "3391c4429409f5be4c1445b9bb9d9efe771fde728c35a2cb0ad145c6373fb865",
+  "context_path": "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-002/work/analysis_context.json",
+  "error_category": null,
+  "error_type": null,
+  "exit_code": 0,
+  "finished_at": "2026-08-31T20:27:08.949379+00:00",
+  "output_hashes": {
+    "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-002/work/business_profile_artifact.json": "c53abc790faea8b646a251cafff8476b579aa564d090e30424110e59b4732ac3",
+    "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-002/work/profile_projection.json": "37adff270ffcc34a2942bd77db8e8c609a5d84fc6717eedc0164d6345a56f268",
+    "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-002/work/reconciliation.json": "0e98eb4a1a7645014f5d665fd546c33a0f8c43dc69a57edcc7121dd4b9e8b4db",
+    "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-002/work/supporting_profile_artifact.json": "8ab996d9db0bb3ada5d2f825fb0964fd80f5d54902174f5a1c448f51c933f550"
+  },
+  "output_limited": false,
+  "phase": "smoke",
+  "receipt_id": "receipt-016a2474102f442aafc716acefacfb5c",
+  "receipt_path": "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-002/work/script_receipts/receipt-016a2474102f442aafc716acefacfb5c.json",
+  "script_hash": "ae891e0ba12b21e06012a6da53e73033b39fdf75c52acc2683d056209ab505d9",
+  "script_path": "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-002/work/analyze_requirement.py",
+  "source_hash": "86e1f0e5c443ac4fa9049f538aa671d9fbca183368bfa355be80a17fe880c3d4",
+  "started_at": "2026-08-31T20:27:06.033593+00:00",
+  "stderr": "/Users/runner/work/crossbow/crossbow/arrow/cpp/src/arrow/util/cpu_info.cc:239: IOError: sysctlbyname failed for 'hw.l1dcachesize'. Detail: [errno 1] Operation not permitted\n/Users/runner/work/crossbow/crossbow/arrow/cpp/src/arrow/util/cpu_info.cc:239: IOError: sysctlbyname failed for 'hw.l2cachesize'. Detail: [errno 1] Operation not permitted\n/Users/runner/work/crossbow/crossbow/arrow/cpp/src/arrow/util/cpu_info.cc:239: IOError: sysctlbyname failed for 'hw.l3cachesize'. Detail: [errno 1] Operation not permitted\n/Users/runner/work/crossbow/crossbow/arrow/cpp/src/arrow/util/cpu_info.cc:239: IOError: sysctlbyname failed for 'hw.optional.neon'. Detail: [errno 1] Operation not permitted\n",
+  "stderr_truncated": false,
+  "stdout": "",
+  "stdout_truncated": false,
+  "timed_out": false,
+  "traceback": null,
+  "wall_seconds": 2.915774416993372
+}

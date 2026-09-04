@@ -1,8 +1,12 @@
 # Progressive Living Enterprise Model and reuse
 
-The program owns one run-local data room, one source catalog, and compact
-accepted semantic/prepared indexes. Every Requirement Mode item binds directly
-to the same `RunContext` and shared Data Room; it does not inherit a previous
+The program owns one logical run-local data room, immutable per-generation data
+revisions/catalogs, and compact accepted semantic/prepared indexes. Every
+Requirement Mode item binds directly to the same `RunContext`, while its
+physical inputs are program-bound to the active generation's immutable D
+revision. A context is immutable within an attempt; later uploads publish D
+successors at a safe generation boundary and never rebind active calculations.
+Old exact D/G bindings remain replayable. Items do not inherit a previous
 item's context or implementation identity. Only committed integration
 semantics and prepared assets selected through `AnalystWorkspace` are reused.
 One run-level event-driven **Planner** is a control plane and cognitive
@@ -17,18 +21,23 @@ create child lifecycles, or become a separate navigation role or gate.
 
 ## Data room and source catalog
 
-The data room builds one physical, searchable source catalog from ZIP/archive
-and member metadata before item analysis. Catalog entries are bounded and may
+Each immutable data revision builds one physical, searchable source catalog from
+its ZIP/archive and member metadata before item analysis. Catalog entries are bounded and may
 include source/member IDs, archive/member locations, formats, byte counts,
-hashes, bounded columns/types, bounded samples or values, and workbook sheet
-metadata. The raw archive remains read-only; the catalog is not a transaction
-copy. Source/member reads are observed in passive telemetry.
+hashes, bounded columns/types, bounded samples or values, workbook sheet or
+SQLite table metadata. Parquet metadata and batches are read natively; SQLite
+databases are opened read-only and contribute one entry per user table. Unknown,
+extensionless, notebook, and auxiliary files remain safe opaque members with no
+semantic parser; they can be copied only through explicit materialization. The
+raw archive remains read-only; the catalog is not a transaction copy. Source/member
+reads are observed in passive telemetry.
 
-Physical binding is run-level: the initial full archive/member inventory is
-counted once, bound child contexts reuse it, and selected-member verification
-is counted separately. An explicit final `verify_source_full()` detects a late
-mutation. Opaque members have no semantic parser; copy them only through the
-safe explicit materialization operation.
+Physical binding is generation-level: the active revision's archive/member
+inventory and catalog are reused by contexts in that generation, while
+selected-member verification is counted separately. A pending successor is
+not active until its generation boundary is admitted. An explicit final
+`verify_source_full()` detects a late mutation. Opaque members have no semantic
+parser; copy them only through the safe explicit materialization operation.
 
 ## Entity-resolution domains
 
@@ -37,10 +46,12 @@ during scouting, reserve that exact owner-bound proposal as `resolving` and
 launch one Entity Resolution Owner. The Planner does not invent or pre-reserve
 domains. A current item may wait for the commit; an accepted/integrated item may
 also leave a proposal for later reuse. Domain scope is not a hardcoded Supplier/Factory/Order list;
-strongly coupled classes may share a domain. The default run capacity is four
-entity-resolution workers, one Analytical Owner, up to three owner specialists,
-and eight active workers total; the Planner is not counted. Hosts may configure
-lower or higher limits but must never oversubscribe actual host capacity.
+strongly coupled classes may share a domain. Capacity is adaptive to the actual
+host: the scheduler leases the smallest useful set for genuinely independent
+work without oversubscription. Every requirement has exactly one Analytical
+Owner, reviewers remain fresh and independent, and the Planner is not counted
+or leased. Hosts may configure available capacity, but the scheduler must never
+oversubscribe it.
 
 The owner scans every row of domain-relevant tables and relevant documents from
 reservation hints, expanding only for concrete matching/conflict evidence and
@@ -176,8 +187,10 @@ not guess or broaden the selection.
 In Requirement Mode, the Planner receives exact `RequirementRecord` values,
 compact physical catalog metadata, and current outcomes. Its initial order and
 grouping are advisory; it does not predeclare runtime semantic dependencies.
-It may suggest zero to three owner specialists, revise the current
-recommendation, and preserve the exact input records. It reads no rows or
+It recommends only the smallest useful set of owner specialists for genuinely
+independent uncertainty, bounded by actual host capacity; zero is valid and it
+never creates one specialist per method or checklist item. It revises the
+current recommendation and preserves the exact input records. It reads no rows or
 internal artifacts and does not calculate or write answers. A technical failure
 does not create Planner dependency blocks; independent groups remain eligible
 and runtime resolution state controls waiting and resume. Each requirement creates an item-local `RequirementAnalysisPlan` with 1..N

@@ -890,6 +890,72 @@ def test_review_hash_rejects_direct_draft_mutation_and_writer_mutation_resets_re
         workspace.accept()
 
 
+@pytest.mark.parametrize("mutation", ("replace", "add", "remove"))
+def test_accept_rejects_post_review_artifact_progress_drift(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    workspace = _workspace(tmp_path)
+    workspace.write_plan({"version": 1})
+    workspace.write_draft({"answer": "reviewed"})
+    workspace.record_review("accept", reviewer_ref="review-1")
+    packet_before = workspace.business_review_path.read_bytes()
+    state_before = (workspace.item_root / "item_state.json").read_bytes()
+    plan_path = workspace.work_root / "plan.json"
+
+    # Simulate a process-independent writer changing the work tree after the
+    # Business Review has completed but before acceptance snapshots refs.
+    if mutation == "replace":
+        plan_path.write_bytes(b'{"version":2}\n')
+    elif mutation == "add":
+        (workspace.work_root / "late-output.json").write_bytes(b'{"late":true}\n')
+    else:
+        plan_path.unlink()
+
+    with pytest.raises(ValueError, match="exact currently reviewed artifact progress"):
+        workspace.accept(accepted_refs=("work/plan.json",))
+
+    assert not workspace.accepted_root.exists()
+    assert workspace.business_review_path.read_bytes() == packet_before
+    assert (workspace.item_root / "item_state.json").read_bytes() == state_before
+
+
+def test_accept_reuses_unchanged_reviewed_artifacts_and_repeated_review_is_idempotent(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    workspace.write_plan({"version": 1})
+    workspace.write_draft({"answer": "reviewed"})
+    workspace.record_review("accept", reviewer_ref="review-1")
+    packet_before = workspace.business_review_path.read_bytes()
+
+    # Re-recording the same final review does not alter its artifact baseline.
+    workspace.record_review("accept", reviewer_ref="review-1")
+    assert workspace.business_review_path.read_bytes() == packet_before
+    accepted = workspace.accept(accepted_refs=("work/plan.json",))
+    packet = json.loads(packet_before.decode("utf-8"))
+    manifest = json.loads((workspace.accepted_root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["hashes"] == packet["after_artifact_hashes"]
+    assert accepted.outcome == "accepted"
+
+
+def test_accept_succeeds_after_artifact_mutation_is_re_reviewed(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    workspace.write_plan({"version": 1})
+    workspace.write_draft({"answer": "reviewed"})
+    workspace.record_review("accept", reviewer_ref="review-1")
+    plan_path = workspace.work_root / "plan.json"
+    plan_path.write_bytes(b'{"version":2}\n')
+
+    with pytest.raises(ValueError, match="exact currently reviewed artifact progress"):
+        workspace.accept(accepted_refs=("work/plan.json",))
+
+    workspace.record_review("accept", reviewer_ref="review-2")
+    accepted = workspace.accept(accepted_refs=("work/plan.json",))
+    assert accepted.outcome == "accepted"
+    packet = json.loads(workspace.business_review_path.read_text(encoding="utf-8"))
+    manifest = json.loads((workspace.accepted_root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["hashes"] == packet["after_artifact_hashes"]
+
+
 def test_review_and_accept_require_no_active_attempt(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     workspace.write_draft({"answer": "bounded"})

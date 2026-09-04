@@ -41,29 +41,89 @@ bridge = _load_script(
 
 from auto_foundry_core import (  # noqa: E402
     ItemWorkspace,
+    IntegrationSession,
+    PreparedAssetRegistry,
     RequirementExecutionGroup,
     RequirementExecutionPlan,
     RequirementSupervisorWorkspace,
     RunContext,
     RunLifecycle,
 )
+from auto_foundry_core.analytical_artifacts import DataProfileArtifact  # noqa: E402
+
+
+def _complete_item_with_artifact(context: RunContext, item: ItemWorkspace, invocation: str) -> None:
+    """Create one accepted item whose committed records include a typed artifact."""
+
+    item.write_plan({"item_id": item.item_id, "offline": True})
+    item.write_draft(
+        {
+            "item_id": item.item_id,
+            "answer": "bounded",
+            "limitations": ["synthetic only"],
+        }
+    )
+    artifact_ref = "work/analytical_artifact.json"
+    artifact = DataProfileArtifact(
+        artifact_id=f"artifact-{item.item_id.lower()}",
+        requirement_id=item.item_id,
+        dataset_fingerprint="d" * 64,
+        source_refs=("synthetic:dataset",),
+        method="synthetic-fixture",
+        profile={"columns": [{"name": "customer_id", "nulls": 0}]},
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    # Simulate the Analytical Owner's canonical work-area output and include
+    # its exact ref in business acceptance before integration.
+    artifact_path = item.item_root / artifact_ref
+    artifact_path.write_bytes(artifact.to_json().encode("utf-8"))
+    item.record_review("accept", reviewer_ref="synthetic-reviewer")
+    item.accept(accepted_refs=("work/plan.json", artifact_ref))
+    session = IntegrationSession.create(
+        context,
+        item,
+        PreparedAssetRegistry(context),
+        "synthetic-integration",
+        invocation_id=invocation,
+    )
+    session.add_metric(
+        metric_id=f"metric-{item.item_id.lower()}",
+        scope=item.item_id,
+        evidence_refs=("answer_content.json",),
+        label=f"Reviewed {item.item_id}",
+        units="records",
+        value=7,
+        population=10,
+    )
+    session.add_accepted_analytical_artifact(
+        artifact_ref,
+        scope=item.item_id,
+        evidence_refs=("answer_content.json",),
+    )
+    session.record_fidelity_review(
+        "accept",
+        checked_record_ids=tuple(record.record_id for record in session.records),
+    )
+    assert session.validate().valid
+    session.commit()
 
 
 def _seed_receipt_bound_parent(
     tmp_path: Path,
     *,
     pretty_root: bool = False,
+    with_artifact: bool = False,
 ) -> tuple[RunContext, tuple, dict, bytes]:
     context = RunContext("RUN-LEGACY-BRIDGE", tmp_path / "run")
     item_ids = ("REQ-A",)
     records = tuple(delta_helpers._record(item_id) for item_id in item_ids)
     lifecycle = RunLifecycle.create(context, item_ids, mode="requirement")
     for item_id, record in zip(item_ids, records):
-        delta_helpers._complete_item(
-            context,
-            ItemWorkspace.create(context, item_id, mode="requirement", original_text=record.original_text),
-            f"parent-{item_id}",
-        )
+        item = ItemWorkspace.create(context, item_id, mode="requirement", original_text=record.original_text)
+        if with_artifact:
+            _complete_item_with_artifact(context, item, f"parent-{item_id}")
+        else:
+            delta_helpers._complete_item(context, item, f"parent-{item_id}")
     plan = RequirementExecutionPlan(
         input_records=records,
         groups=(RequirementExecutionGroup(item_ids, "Synthetic section 1"),),
@@ -145,6 +205,32 @@ def test_bridge_exact_retry_and_legacy_root_immutability(tmp_path: Path) -> None
     assert context.resolve_product_path("product_manifest.json").read_bytes() == root_bytes
 
 
+def test_bridge_propagates_and_strictly_validates_rendering_identity(tmp_path: Path) -> None:
+    context, _records, receipt, _root_bytes = _seed_receipt_bound_parent(tmp_path)
+    receipt_ref = receipt["outputs"]["receipt_ref"]
+    bridge.bootstrap_legacy_parent_manifest(context, receipt_ref=receipt_ref)
+    bridge_path = context.resolve_product_path("generations/G-0001/product_manifest.json")
+    bridge_value = json.loads(bridge_path.read_text(encoding="utf-8"))
+    assert bridge_value["dashboard"]["rendering_identity"] == receipt["rendering_identity"]
+    assert bridge.validate_legacy_parent_bridge(context, bridge_path, receipt_path=receipt_ref)[2] == receipt_ref
+
+    receipt_path = context.resolve_run_path(receipt_ref)
+    original_bytes = receipt_path.read_bytes()
+    original = json.loads(original_bytes)
+    invalid_identities = (
+        {**original["rendering_identity"], "skill_tree_sha256": "0" * 63},
+        {**original["rendering_identity"], "skill_file_count": True},
+        {key: value for key, value in original["rendering_identity"].items() if key != "core_implementation_tree"},
+    )
+    for invalid_identity in invalid_identities:
+        tampered = dict(original)
+        tampered["rendering_identity"] = invalid_identity
+        delta_helpers._canonical_write(receipt_path, tampered)
+        with pytest.raises(bridge.LegacyParentBridgeError, match="schema fields|rendering identity"):
+            bridge.bootstrap_legacy_parent_manifest(context, receipt_ref=receipt_ref)
+        receipt_path.write_bytes(original_bytes)
+
+
 def test_pretty_legacy_root_is_bound_by_raw_bytes_without_rewrite(tmp_path: Path) -> None:
     context, _records, receipt, root_bytes = _seed_receipt_bound_parent(tmp_path, pretty_root=True)
     root_path = context.resolve_product_path("product_manifest.json")
@@ -222,3 +308,21 @@ def test_delta_succeeds_from_bridge_without_rewriting_legacy_root(tmp_path: Path
     assert context.resolve_product_path("product_manifest.json").read_bytes() == root_bytes
     parent = json.loads(context.resolve_product_path("generations/G-0001/product_manifest.json").read_text(encoding="utf-8"))
     assert parent["bridge_type"] == bridge.BRIDGE_SCHEMA
+
+
+def test_bridge_binds_nonempty_analytical_artifacts_and_rejects_tamper(tmp_path: Path) -> None:
+    context, _records, receipt, _root_bytes = _seed_receipt_bound_parent(tmp_path, with_artifact=True)
+    assert receipt["analytical_artifacts"]
+    assert receipt["freeze_inputs"]["analytical_artifacts"] == receipt["analytical_artifacts"]
+    fixture_path = context.resolve_run_path(receipt["outputs"]["fixture_ref"])
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    assert fixture["analytical_artifacts"] == receipt["analytical_artifacts"]
+
+    receipt_ref = receipt["outputs"]["receipt_ref"]
+    bridge.bootstrap_legacy_parent_manifest(context, receipt_ref=receipt_ref)
+    receipt_path = context.resolve_run_path(receipt_ref)
+    tampered = json.loads(receipt_path.read_text(encoding="utf-8"))
+    tampered["analytical_artifacts"][0]["artifact_ref"] = "integration/committed/artifacts/tampered.json"
+    delta_helpers._canonical_write(receipt_path, tampered)
+    with pytest.raises(bridge.LegacyParentBridgeError, match="analytical artifact|freeze inputs"):
+        bridge.bootstrap_legacy_parent_manifest(context, receipt_ref=receipt_ref)

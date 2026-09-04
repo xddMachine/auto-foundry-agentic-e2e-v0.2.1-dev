@@ -96,13 +96,18 @@ def _register(spec: OperationSpec, output_dir: str | None, context: RunContext |
 def _preview(spec: OperationSpec, output_dir: str | None, context: RunContext | None = None) -> Any:
     from .sources import preview
     parameters = dict(spec.parameters)
-    return preview(
-        _source(spec),
-        limit=int(parameters.get("limit", 20)),
-        max_json_bytes=int(parameters.get("max_json_bytes", 16 * 1024 * 1024)),
-        parquet_batch_size=int(parameters.get("parquet_batch_size", 1024)),
-        allowed_roots=_required_roots(spec, context="sources.preview"),
-    )
+    options: dict[str, Any] = {
+        "limit": int(parameters.get("limit", 20)),
+        "parquet_batch_size": int(parameters.get("parquet_batch_size", 1024)),
+        "allowed_roots": _required_roots(spec, context="sources.preview"),
+    }
+    # Omitted means normal unbounded JSON operation.  Preserve an explicit
+    # caller cap (including ``None`` to deliberately disable one) and let the
+    # source reader enforce its validation/error contract.
+    if "max_json_bytes" in parameters:
+        value = parameters["max_json_bytes"]
+        options["max_json_bytes"] = None if value is None else int(value)
+    return preview(_source(spec), **options)
 
 
 def _profile(spec: OperationSpec, output_dir: str | None, context: RunContext | None = None) -> Any:

@@ -10,19 +10,252 @@ import shutil
 import threading
 import time
 from typing import Any, Mapping
+import zipfile
 
 import pytest
 
 from auto_foundry_core import (
     CoordinatorConflictError,
     CoordinatorIntegrityError,
+    CoordinatorProductionBindingMismatch,
     CoordinatorRunSpec,
+    DataRevisionStore,
+    EntityResolutionWorkspace,
+    ItemWorkspace,
     PlannerAction,
+    RequirementExecutionGroup,
+    RequirementExecutionPlan,
+    RequirementRecord,
+    RequirementRunExtension,
+    RequirementSupervisorWorkspace,
+    ResolutionCapacity,
     RoleExecution,
     RunContext,
+    RunLifecycle,
     RunCoordinator,
 )
 import auto_foundry_core.coordinator as coordinator_module
+import auto_foundry_core.run_extension as run_extension_module
+from auto_foundry_core.product_review import ProductCandidate, ProductReviewStore, canonical_hash
+from tests.core.test_data_refresh_generation import _fixture as _base_refresh_fixture
+
+
+def _refresh_fixture(*args: Any, **kwargs: Any) -> tuple[RunContext, RequirementExecutionPlan, object]:
+    """Build the refresh fixture with the valid G1 product parent required by D admission."""
+
+    context, plan, revision = _base_refresh_fixture(*args, **kwargs)
+    root = context.run_root
+    dashboard_root = root / "products" / "dashboard"
+    dashboard_root.mkdir(parents=True, exist_ok=True)
+    fixture_path = dashboard_root / "dashboard_fixture.json"
+    chart_map_path = dashboard_root / "chart_map.json"
+    chart_registry_path = dashboard_root / "chart_registry.json"
+    blueprint_path = dashboard_root / "dashboard_blueprint_v2.json"
+    for path in (fixture_path, chart_map_path, chart_registry_path):
+        path.write_bytes(b"{}\n")
+    blueprint_path.write_bytes(
+        json.dumps(
+            {"schema_version": "dashboard.business_presentation_plan.v2", "kind": "dashboard_blueprint"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        + b"\n"
+    )
+    site_path = dashboard_root / "site"
+    site_path.mkdir(exist_ok=True)
+    site_manifest_path = site_path / "site_manifest.json"
+    site_manifest_path.write_bytes(b"{}\n")
+    plan_path = root / "requirement_supervisor_plan.json"
+    plan_hash = hashlib.sha256(plan_path.read_bytes()).hexdigest()
+    receipt_ref = "products/dashboard/build_receipt.json"
+    receipt_path = root / receipt_ref
+    receipt = {
+        "schema_version": "1",
+        "status": "complete",
+        "run_id": context.run_id,
+        "generation_id": "G-0001",
+        "new_analytics": False,
+        "parent": {
+            "root_generation": True,
+            "parent_generation_id": None,
+            "parent_manifest_ref": None,
+            "parent_manifest_hash": None,
+        },
+        "plan_binding": {
+            "ref": "requirement_supervisor_plan.json",
+            "sha256": plan_hash,
+            "admission_sha256": plan_hash,
+            "generation_id": "G-0001",
+        },
+        "outputs": {
+            "fixture_ref": str(fixture_path.relative_to(root)),
+            "chart_map_ref": str(chart_map_path.relative_to(root)),
+            "chart_registry_ref": str(chart_registry_path.relative_to(root)),
+            "blueprint_ref": str(blueprint_path.relative_to(root)),
+            "site_ref": str(site_path.relative_to(root)),
+            "receipt_ref": receipt_ref,
+        },
+        "output_hashes": {
+            "fixture_sha256": hashlib.sha256(fixture_path.read_bytes()).hexdigest(),
+            "chart_map_sha256": hashlib.sha256(chart_map_path.read_bytes()).hexdigest(),
+            "chart_registry_sha256": hashlib.sha256(chart_registry_path.read_bytes()).hexdigest(),
+            "blueprint_sha256": hashlib.sha256(blueprint_path.read_bytes()).hexdigest(),
+            "site_manifest_sha256": hashlib.sha256(site_manifest_path.read_bytes()).hexdigest(),
+        },
+        "blueprint_binding": {
+            "ref": str(blueprint_path.relative_to(root)),
+            "sha256": hashlib.sha256(blueprint_path.read_bytes()).hexdigest(),
+            "schema_version": "dashboard.business_presentation_plan.v2",
+            "status": "Preview",
+        },
+    }
+    receipt_path.write_bytes(json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+    manifest = {
+        "schema_version": "1",
+        "product_type": "reviewed_run_product_bundle",
+        "run_id": context.run_id,
+        "status": "complete",
+        "terminal": True,
+        "source_status": "reviewed_outputs_only",
+        "new_analytics": False,
+        "freeze_markers": {
+            "answers_frozen": True,
+            "living_enterprise_model_frozen": True,
+            "prepared_data_registry_frozen": True,
+            "dashboard_frozen": True,
+            "telemetry_frozen": True,
+        },
+        "lifecycle": {"generation_id": "G-0001"},
+        "dashboard": {
+            "receipt_ref": receipt_ref,
+            "receipt_sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+        },
+        "lineage": {"root_generation": True},
+    }
+    (root / "products" / "product_manifest.json").write_bytes(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    )
+    return context, plan, revision
+
+
+def _write_valid_extension_product(context: RunContext, generation_id: str) -> None:
+    """Fixture one published generation product for the successor-parent gate."""
+
+    lifecycle = RunLifecycle.load(context)
+    metadata = lifecycle.generation_metadata
+    assert metadata is not None and metadata.generation_id == generation_id
+    root = context.run_root
+    product_root = root / "products" / "generations" / generation_id / "dashboard"
+    product_root.mkdir(parents=True, exist_ok=True)
+    fixture_path = product_root / "dashboard_fixture.json"
+    chart_map_path = product_root / "chart_map.json"
+    chart_registry_path = product_root / "chart_registry.json"
+    blueprint_path = product_root / "dashboard_blueprint_v2.json"
+    for path in (fixture_path, chart_map_path, chart_registry_path):
+        path.write_bytes(b"{}\n")
+    blueprint_path.write_bytes(
+        json.dumps(
+            {"schema_version": "dashboard.business_presentation_plan.v2", "kind": "dashboard_blueprint"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        + b"\n"
+    )
+    site_path = product_root / "site"
+    site_path.mkdir(exist_ok=True)
+    site_manifest_path = site_path / "site_manifest.json"
+    site_manifest_path.write_bytes(b"{}\n")
+    presentation_ref = f"extensions/{generation_id}/business_presentation_plan.json"
+    presentation_path = root / presentation_ref
+    presentation_path.parent.mkdir(parents=True, exist_ok=True)
+    presentation_path.write_bytes(b"{}\n")
+    plan_ref = Path(metadata.plan_path).relative_to(root).as_posix()
+    plan_hash = hashlib.sha256(Path(metadata.plan_path).read_bytes()).hexdigest()
+    parent_generation_id = metadata.parent_generation_id
+    parent_ref = (
+        "products/product_manifest.json"
+        if parent_generation_id == "G-0001"
+        else f"products/generations/{parent_generation_id}/product_manifest.json"
+    )
+    parent_path = root / parent_ref
+    parent_hash = hashlib.sha256(parent_path.read_bytes()).hexdigest()
+    receipt_ref = f"products/generations/{generation_id}/dashboard/build_receipt.json"
+    receipt_path = root / receipt_ref
+    receipt = {
+        "schema_version": "1",
+        "status": "complete",
+        "run_id": context.run_id,
+        "generation_id": generation_id,
+        "parent_generation_id": parent_generation_id,
+        "new_analytics": False,
+        "parent": {
+            "product_manifest_ref": parent_ref,
+            "product_manifest_sha256": parent_hash,
+        },
+        "plan_binding": {
+            "ref": plan_ref,
+            "sha256": plan_hash,
+            "admission_sha256": plan_hash,
+            "generation_id": generation_id,
+        },
+        "presentation_plan_ref": presentation_ref,
+        "presentation_plan_sha256": hashlib.sha256(presentation_path.read_bytes()).hexdigest(),
+        "outputs": {
+            "fixture_ref": str(fixture_path.relative_to(root)),
+            "chart_map_ref": str(chart_map_path.relative_to(root)),
+            "chart_registry_ref": str(chart_registry_path.relative_to(root)),
+            "blueprint_ref": str(blueprint_path.relative_to(root)),
+            "site_ref": str(site_path.relative_to(root)),
+            "receipt_ref": receipt_ref,
+        },
+        "output_hashes": {
+            "fixture_sha256": hashlib.sha256(fixture_path.read_bytes()).hexdigest(),
+            "chart_map_sha256": hashlib.sha256(chart_map_path.read_bytes()).hexdigest(),
+            "chart_registry_sha256": hashlib.sha256(chart_registry_path.read_bytes()).hexdigest(),
+            "blueprint_sha256": hashlib.sha256(blueprint_path.read_bytes()).hexdigest(),
+            "site_manifest_sha256": hashlib.sha256(site_manifest_path.read_bytes()).hexdigest(),
+        },
+        "blueprint_binding": {
+            "ref": str(blueprint_path.relative_to(root)),
+            "sha256": hashlib.sha256(blueprint_path.read_bytes()).hexdigest(),
+            "schema_version": "dashboard.business_presentation_plan.v2",
+            "status": "Preview",
+        },
+    }
+    receipt_path.write_bytes(json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+    manifest = {
+        "schema_version": "1",
+        "product_type": "reviewed_run_product_bundle",
+        "run_id": context.run_id,
+        "status": "complete",
+        "terminal": True,
+        "source_status": "reviewed_outputs_only",
+        "new_analytics": False,
+        "freeze_markers": {
+            "answers_frozen": True,
+            "living_enterprise_model_frozen": True,
+            "prepared_data_registry_frozen": True,
+            "dashboard_frozen": True,
+            "telemetry_frozen": True,
+        },
+        "lifecycle": {"generation_id": generation_id},
+        "dashboard": {
+            "receipt_ref": receipt_ref,
+            "receipt_sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+        },
+        "lineage": {
+            "parent_generation_id": parent_generation_id,
+            "parent_product_manifest_ref": parent_ref,
+            "parent_product_manifest_sha256": parent_hash,
+            "generation_manifest_hash": metadata.manifest_hash,
+            "active_plan_hash": metadata.plan_hash,
+            "delta_receipt_ref": receipt_ref,
+        },
+        "presentation_plan_ref": presentation_ref,
+        "presentation_plan_sha256": hashlib.sha256(presentation_path.read_bytes()).hexdigest(),
+    }
+    manifest_path = root / "products" / "generations" / generation_id / "product_manifest.json"
+    manifest_path.write_bytes(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode() + b"\n")
 
 
 class _InputSink:
@@ -56,6 +289,60 @@ def _spec(run_id: str = "RUN-COORD") -> CoordinatorRunSpec:
         "planner://test",
         hashlib.sha256(b"planner").hexdigest(),
     )
+
+
+def _seed_product_repair_candidate(context: RunContext) -> tuple[ProductCandidate, object]:
+    """Persist a valid repair_once candidate/review for coordinator admission tests."""
+
+    plan_path = context.run_root / "requirement_supervisor_plan.json"
+    plan_path.parent.mkdir(parents=True, exist_ok=True)
+    plan_path.write_text('{"schema_version":1}\n', encoding="utf-8")
+    product_root = context.run_root / "products" / "generations" / "G-0001"
+    product_root.mkdir(parents=True, exist_ok=True)
+    outputs: dict[str, Path] = {}
+    for name, filename in {
+        "manifest": "product_manifest.json",
+        "fixture": "dashboard_fixture.json",
+        "chart_map": "chart_map.json",
+        "chart_registry": "chart_registry.json",
+        "blueprint": "dashboard_blueprint_v2.json",
+        "receipt": "build_receipt.json",
+    }.items():
+        path = product_root / filename
+        path.write_text(json.dumps({"name": name}) + "\n", encoding="utf-8")
+        outputs[name] = path
+    site = product_root / "site"
+    site.mkdir(exist_ok=True)
+    (site / "index.html").write_text("<html>offline</html>\n", encoding="utf-8")
+    outputs["site"] = site
+    candidate = ProductCandidate(
+        run_id=context.run_id,
+        generation_id="G-0001",
+        product_owner="product-owner",
+        parent_lineage={
+            "root_generation": True,
+            "parent_generation_id": None,
+            "parent_manifest_ref": None,
+            "parent_manifest_hash": None,
+        },
+        plan_binding={
+            "plan_ref": "requirement_supervisor_plan.json",
+            "plan_hash": hashlib.sha256(plan_path.read_bytes()).hexdigest(),
+        },
+        publication_policy_hash=canonical_hash({"enabled": False}),
+        artifact_bindings={
+            name: {"ref": str(path.relative_to(context.run_root))}
+            for name, path in outputs.items()
+        },
+    )
+    store = ProductReviewStore(context, "G-0001")
+    persisted = store.record_candidate(candidate)
+    review = store.record_review(
+        reviewer_ref="independent-product-reviewer",
+        verdict="repair_once",
+        reviewed_at="2026-01-01T00:00:00Z",
+    )
+    return persisted, review
 
 
 def _rebound_spec(run_id: str, generation_id: str, planner_ref: str) -> CoordinatorRunSpec:
@@ -131,7 +418,13 @@ class QueuePlanner:
         return self.offers.pop(0) if self.offers else ()
 
 
-def _seed_active_dispatch(coordinator: RunCoordinator, action: PlannerAction, *, runner_pid: int | None = None) -> str:
+def _seed_active_dispatch(
+    coordinator: RunCoordinator,
+    action: PlannerAction,
+    *,
+    runner_pid: int | None = None,
+    runner_process_start: str | None = None,
+) -> str:
     with coordinator._locked(create=False):
         state, _ = coordinator._read_replay()
         assert state is not None
@@ -143,6 +436,8 @@ def _seed_active_dispatch(coordinator: RunCoordinator, action: PlannerAction, *,
         }
         if runner_pid is not None:
             entry.update({"runner_id": "dead-owner", "runner_pid": runner_pid})
+        if runner_process_start is not None:
+            entry["runner_process_start"] = runner_process_start
         state["active_dispatches"] = [entry]
         state["status"] = "dispatching"
         state["phase"] = action.action
@@ -185,6 +480,42 @@ def _claim_process_worker(
     barrier.wait(5)
     coordinator.step()
     coordinator.close(wait_for_roles=True)
+
+
+def _role_session_registry_race_worker(
+    run_root: str,
+    run_id: str,
+    token: str,
+    barrier: Any,
+    release: Any,
+    result_queue: Any,
+) -> None:
+    """Race two real processes through one durable role-session reservation."""
+
+    context = RunContext(run_id, Path(run_root))
+    registry = coordinator_module.RoleSessionRegistry(context)
+    action = PlannerAction("analyze_requirement", "analytical_owner", "REQ-RACE", "race")
+    barrier.wait(5)
+    reservation: Mapping[str, Any] | None = None
+    try:
+        reservation = registry.prepare(
+            action,
+            generation_id="G-0001",
+            idempotency_key=token,
+            reservation_owner_id=f"race-owner-{os.getpid()}",
+            reservation_pid=os.getpid(),
+            reservation_process_start=coordinator_module._process_start_token(os.getpid()),
+        )
+        result_queue.put({"pid": os.getpid(), "mode": reservation.get("mode"), "status": reservation.get("status")})
+        release.wait(5)
+    except Exception as exc:
+        result_queue.put({"pid": os.getpid(), "error": str(exc)})
+    finally:
+        if isinstance(reservation, Mapping):
+            owner = reservation.get("logical_owner")
+            token_value = reservation.get("reservation_token")
+            if isinstance(owner, str) and isinstance(token_value, str):
+                registry.release_reservation(owner, token_value)
 
 
 def _rebind_process_worker(
@@ -251,7 +582,30 @@ def _reconciliation_race_worker(
 
 
 def _action(name: str = "analyze_requirement", subject: str = "REQ-1") -> PlannerAction:
-    return PlannerAction(name, "analytical_owner", subject, "test action")
+    roles = {
+        "resolve_identity": "entity_resolution_owner",
+        "resume_identity_resolution": "entity_resolution_owner",
+        "repair_identity_result": "entity_resolution_owner",
+        "review_identity_result": "identity_reviewer",
+        "commit_identity_result": "identity_reviewer",
+        "review_requirement": "business_reviewer",
+        "finalize_requirement_review": "business_reviewer",
+        "integrate_requirement": "integration_agent",
+        "repair_integration_fidelity": "integration_agent",
+        "commit_integration_requirement": "integration_agent",
+        "review_integration_fidelity": "integration_fidelity_reviewer",
+        "build_product_candidate": "product_agent",
+        "build_final_product": "product_agent",
+        "publish_final_product": "product_agent",
+        "review_final_product": "product_reviewer",
+        "recover_final_report": "reporting_agent",
+        "preflight_final_report": "reporting_agent",
+        "finalize_final_report": "reporting_agent",
+        "repair_run_lifecycle": "planner",
+        "repair_identity_request": "planner",
+        "escalate_identity_failure": "planner",
+    }
+    return PlannerAction(name, roles.get(name, "analytical_owner"), subject, "test action")
 
 
 def test_role_guidance_finalization_precedes_business_reviewer() -> None:
@@ -269,17 +623,173 @@ def test_role_guidance_build_product_candidate_uses_public_refs_sequence() -> No
     guidance = coordinator_module._role_guidance(action)
 
     expected_order = [
-        "write_business_presentation_plan_v2",
-        "record_business_presentation_plan_v2",
-        "presentation_plan_ref",
-        "discard_stale_product_candidate",
-        "ProductCandidate",
+        "read PRODUCT_AGENT_ASSEMBLER_CONTRACT.md once",
+        "metadata['presentation_inventory_ref']",
+        "metadata['presentation_plan_ref']",
+        "business_presentation_preflight(context, item_ids=..., generation_id=...) once",
+        "business_presentation_inventory and business_presentation_visual_inventory once per attempt",
+        "assemble_generation_product(context, ...)",
+        "Only after canonical assembly",
+        "validate_generation_product",
+        "create ProductCandidate",
         "ProductReviewStore.record_candidate",
     ]
     positions = [guidance.index(value) for value in expected_order]
     assert positions == sorted(positions)
     assert "when the business presentation plan is absent" in guidance
-    assert "Only after canonical assembly" in guidance
+    assert "discard_stale_product_candidate" in guidance
+    assert "if the target exists and is a v2 plan" in guidance.lower()
+    assert "revise_business_presentation_plan_v2" in guidance
+    assert "expected_current_plan_sha256" in guidance
+    assert "If the target is absent" in guidance
+    assert "Never call both routes or all three plan APIs serially" in guidance
+
+
+def test_role_guidance_build_product_candidate_is_direct_and_history_bounded() -> None:
+    action = PlannerAction("build_product_candidate", "product_agent", "PRODUCT", "build")
+
+    guidance = coordinator_module._role_guidance(action)
+    guidance_lower = guidance.lower()
+
+    assert "Use public metadata and the contract/API definitions only" in guidance
+    for direct_path in (
+        "artifact-assembly execution, not code-discovery or repository-exploration",
+        "start immediately from supplied action metadata",
+        "public accepted-artifact/assembler apis",
+        "do not call index_repository or search code",
+        "inspect git status or env",
+        "inventory/list the run root",
+        "inspect control center or launch manifests",
+    ):
+        assert direct_path in guidance_lower
+    for forbidden_search in (
+        "control_plane/coordinator_events.jsonl",
+        "role_sessions.json",
+        "~/.codex/sessions/history",
+        "recursive run-root searches",
+    ):
+        assert forbidden_search in guidance
+    assert "call exactly one canonical dashboard generation entry point" in guidance
+    assert "create ProductCandidate and call ProductReviewStore.record_candidate" in guidance
+    assert "idempotent re-entry after a process interruption" in guidance
+    assert "reuse or refresh public preflight/inventory results as appropriate" in guidance
+    assert "public receipt is reused idempotently rather than rebuilt" in guidance
+
+
+def test_role_guidance_product_uses_generation_aware_assembler_entry_point() -> None:
+    for action_name in ("build_product_candidate", "build_final_product", "publish_final_product"):
+        action = PlannerAction(action_name, "product_agent", "PRODUCT", "build")
+
+        guidance = coordinator_module._role_guidance(action)
+
+        for phrase in (
+            "business_presentation_preflight",
+            "presentation_inventory_ref",
+            "presentation_plan_ref",
+            "explicit recipe_id, layout, and renderer_type",
+            "exactly one",
+        ):
+            assert phrase in guidance, (action_name, phrase, guidance)
+        assert "assemble_generation_product(context, ...)" in guidance
+        assert "full assembler for G-0001" in guidance
+        assert "successor-generation path" in guidance or "generation-aware successor path" in guidance
+        assert "parent_receipt_ref and explicit route" in guidance
+        assert "Do not call assemble_dashboard or assemble_dashboard_delta directly" in guidance
+        assert "never infer a route from requirement prose" in guidance
+        assert "validate_generation_product" in guidance
+        assert "artifact_bindings" in guidance
+        assert "never manually recompute" in guidance
+
+
+def test_role_guidance_product_composes_views_from_all_admissible_facts() -> None:
+    """Product roles must use the reviewed inventory, not a KPI-only default."""
+
+    for action_name in ("build_product_candidate", "build_final_product", "publish_final_product"):
+        action = PlannerAction(action_name, "product_agent", "PRODUCT", "build")
+        guidance = coordinator_module._role_guidance(action).lower()
+
+        for phrase in (
+            "business_presentation_inventory",
+            "business_presentation_visual_inventory",
+            "every accepted answer visual and committed candidate visual fact",
+            "integration success is not a presentation prerequisite",
+            "decision surface or explicit limitation",
+            "execution traces, files/inventory, pipeline/source-process diagnostics",
+            "funnel",
+            "table",
+            "callout",
+            "explicit reviewed empty state",
+            "do not invent metrics",
+            "run new analytics",
+            "do not edit fixture, chart, or manifest bytes directly",
+            "write_business_presentation_plan_v2",
+            "record_business_presentation_plan_v2",
+        ):
+            assert phrase in guidance, (action_name, phrase, guidance)
+
+
+def test_role_guidance_preview_uses_preflight_inventory_and_single_assembly() -> None:
+    action = PlannerAction("refresh_product_preview", "product_agent", "PRODUCT", "preview")
+
+    guidance = coordinator_module._role_guidance(action).lower()
+
+    for phrase in (
+        "business_presentation_preflight",
+        "presentation_inventory_ref",
+        "presentation_plan_ref",
+        "recipe_id",
+        "renderer_type",
+        "assemble_generation_preview",
+        "output_dir='generations/<g>/preview'",
+        "call the public preview entry exactly once",
+    ):
+        assert phrase in guidance, (phrase, guidance)
+    assert "assemble_dashboard(" not in guidance
+    assert "validate_generation_product" in guidance
+    assert "complete site binding includes site_manifest.json" in guidance
+    assert "manifest's internal binding excludes" in guidance
+
+
+def test_role_guidance_product_reviewer_checks_accepted_coverage_and_limits() -> None:
+    guidance = coordinator_module._role_guidance(
+        PlannerAction("review_final_product", "product_reviewer", "PRODUCT", "review")
+    ).lower()
+
+    for phrase in (
+        "every accepted requirement has a meaningful decision surface or an explicit business limitation",
+        "including accepted visuals whose integration projection is terminally failed",
+        "integration success is not a presentation prerequisite",
+        "execution traces, files/inventory, pipeline/source-process diagnostics",
+        "no raw failure reasons or internal absolute paths",
+    ):
+        assert phrase in guidance
+
+
+def test_role_guidance_product_quality_is_business_first_and_rendered() -> None:
+    product_guidance = coordinator_module._role_guidance(
+        PlannerAction("build_product_candidate", "product_agent", "PRODUCT", "build")
+    ).lower()
+    reviewer_guidance = coordinator_module._role_guidance(
+        PlannerAction("review_final_product", "product_reviewer", "PRODUCT", "review")
+    ).lower()
+
+    for phrase in (
+        "one semantic representative per requirement/business metric/scope",
+        "prefer substantive accepted-evidence surfaces over unavailable or unbound placeholders",
+        "populate the executive overview from the explicit manager selection",
+        "product agent itself chooses only decision-useful business information",
+        "preserve the selected business meaning and exact rows/columns/values",
+        "no assembler or renderer code may reinterpret the plan",
+    ):
+        assert phrase in product_guidance
+    for phrase in (
+        "inspect the assembled candidate's receipt",
+        "verify each manager visual is decision-useful",
+        "explicit plan membership is honored without semantic re-evaluation",
+        "chart count/type/layout remain product agent design decisions",
+        "contains no raw failure reasons or internal absolute paths",
+    ):
+        assert phrase in reviewer_guidance
 
 
 def test_role_prompt_forbids_nested_agents_and_source_edits(tmp_path: Path) -> None:
@@ -332,10 +842,11 @@ def test_role_guidance_reporting_recovery_uses_persisted_preflight() -> None:
 
     guidance = coordinator_module._role_guidance(action)
 
+    recover = guidance.index("RunReportFinalizer.recover()")
     gather = guidance.index("RunReportInputGatherer.gather_from_run(context, persist=True)")
     load = guidance.index("load the persisted preflight")
     assert guidance.startswith("Reporting preflight/recovery sequence:")
-    assert gather < load
+    assert recover < gather < load
     assert "agent-authored values" in guidance
 
 
@@ -364,6 +875,159 @@ def test_codex_role_adapter_appends_reporting_contract_to_custom_prompt(tmp_path
     gather = prompt.index("RunReportInputGatherer.gather_from_run(context, persist=True)")
     load = prompt.index("load the persisted preflight")
     assert prompt.index(custom) < gather < load
+
+
+def test_complete_role_model_contract_routes_all_current_roles() -> None:
+    routes = coordinator_module.production_role_routing()
+    assert routes["intake_planner"] == {"model": "gpt-5.6-sol", "reasoning_effort": "high"}
+    assert routes["foundry_supervisor"] == {"model": "gpt-5.6-sol", "reasoning_effort": "high"}
+    assert routes["analytical_owner"] == {"model": "gpt-5.6-sol", "reasoning_effort": "high"}
+    assert routes["business_reviewer"] == {"model": "gpt-5.6-sol", "reasoning_effort": "high"}
+    assert routes["entity_resolution_owner"] == {"model": "gpt-5.6-luna", "reasoning_effort": "max"}
+    assert routes["specialist"] == {"model": "gpt-5.6-luna", "reasoning_effort": "max"}
+    selected = coordinator_module.CodexExecConfig(binary="fake-codex").for_role("reporting_agent")
+    assert selected.model == "gpt-5.6-luna"
+    assert selected.reasoning_effort == "max"
+
+
+def test_generic_custom_prompt_always_keeps_mandatory_guidance(tmp_path: Path) -> None:
+    action = PlannerAction("review_requirement", "business_reviewer", "REQ-001", "review")
+    prompt = coordinator_module.build_role_prompt(
+        action,
+        context=RunContext("RUN-CUSTOM-CONTRACT", tmp_path),
+        idempotency_key="key",
+        custom="Use the persisted item review packet as context.",
+    )
+    assert prompt.index("Use the persisted item review packet as context.") < prompt.index("Business reviewer sequence:")
+    assert prompt.count("Business reviewer sequence:") == 1
+
+
+def test_planner_control_offer_is_deterministic_and_never_dispatched(tmp_path: Path) -> None:
+    action = PlannerAction(
+        "repair_identity_request",
+        "planner",
+        "RUN-CONTROL",
+        "identity proposal conflict",
+        metadata={"requires_rethink": True},
+    )
+    calls: list[str] = []
+
+    def forbidden_transport(current: PlannerAction, **_: object) -> RoleExecution:
+        calls.append(current.action)
+        raise AssertionError("planner control must not reach a role transport")
+
+    context = RunContext("RUN-CONTROL", tmp_path)
+    coordinator = RunCoordinator(
+        context,
+        planner_provider=QueuePlanner((action,)),
+        adapters={"repair_identity_request": forbidden_transport},
+    )
+    coordinator.start(_spec(context.run_id))
+    status = coordinator.step()
+    assert calls == []
+    assert status.status == "blocked_rethink"
+    assert status.phase == "rethink"
+    assert status.next_action == action.to_dict()
+    assert any(item.get("kind") == "coordinator_control" for item in status.diagnostics)
+
+
+def test_rethink_metadata_does_not_turn_executable_action_into_control(tmp_path: Path) -> None:
+    action = PlannerAction(
+        "analyze_requirement",
+        "analytical_owner",
+        "REQ-EXECUTABLE",
+        "repair evidence",
+        metadata={"requires_rethink": True},
+    )
+    calls: list[str] = []
+
+    def transport(current: PlannerAction, **_: object) -> RoleExecution:
+        calls.append(current.action)
+        return RoleExecution()
+
+    context = RunContext("RUN-TYPED-CONTROL", tmp_path)
+    coordinator = RunCoordinator(
+        context,
+        planner_provider=QueuePlanner((action,)),
+        adapters={action.action: transport},
+    )
+    coordinator.start(_spec(context.run_id))
+    status = coordinator.step()
+    coordinator.close(wait_for_roles=True)
+    assert coordinator_module._is_control_action(action) is False
+    assert calls == ["analyze_requirement"]
+    assert status.status in {"dispatching", "waiting"}
+
+
+def test_persisted_resolution_capacity_gates_total_and_role_subcaps(tmp_path: Path) -> None:
+    context = RunContext("RUN-CAPACITY", tmp_path)
+    EntityResolutionWorkspace.create(
+        context,
+        capacity=ResolutionCapacity(total_active=2, entity_resolution=1, analytical_owner=1, specialist=1),
+    )
+    resolver = PlannerAction("resolve_identity", "entity_resolution_owner", "DOMAIN-1", "resolve")
+    owner = PlannerAction("analyze_requirement", "analytical_owner", "REQ-1", "analyze")
+    product = PlannerAction("build_product_candidate", "product_agent", "RUN-CAPACITY", "build")
+    entered: list[str] = []
+    release = threading.Event()
+    started = threading.Event()
+
+    def role(action: PlannerAction, **_: object) -> RoleExecution:
+        entered.append(action.action)
+        started.set()
+        release.wait(2)
+        return RoleExecution()
+
+    coordinator = RunCoordinator(
+        context,
+        planner_provider=QueuePlanner((resolver, owner, product)),
+        adapters={"resolve_identity": role, "analyze_requirement": role, "build_product_candidate": role},
+    )
+    coordinator.start(_spec(context.run_id))
+    thread = threading.Thread(target=coordinator.step)
+    thread.start()
+    assert started.wait(2)
+    deadline = time.time() + 2
+    while len(entered) < 2 and time.time() < deadline:
+        time.sleep(0.01)
+    assert sorted(entered[:2]) == ["analyze_requirement", "resolve_identity"]
+    assert "build_product_candidate" not in entered[:2]
+    release.set()
+    thread.join(timeout=3)
+    coordinator.close(wait_for_roles=True)
+
+
+def test_retry_budget_survives_coordinator_restart(tmp_path: Path) -> None:
+    action = _action()
+    context = RunContext("RUN-DURABLE-RETRY", tmp_path)
+    first = RunCoordinator(
+        context,
+        planner_provider=QueuePlanner((action,), (action,), (action,), (action,)),
+        adapters={"analyze_requirement": lambda action, **_: RoleExecution(output="unchanged")},
+    )
+    first.start(_spec(context.run_id))
+    first.run(max_steps=5)
+    first.close(wait_for_roles=True)
+    persisted = json.loads((tmp_path / "control_plane/coordinator_state.json").read_text())
+    assert persisted["retry_blocked"]
+
+    calls: list[str] = []
+
+    def should_not_run(current: PlannerAction, **_: object) -> RoleExecution:
+        calls.append(current.action)
+        return RoleExecution()
+
+    restarted = RunCoordinator(
+        context,
+        planner_provider=QueuePlanner((action,)),
+        adapters={"analyze_requirement": should_not_run},
+    )
+    status = restarted.step()
+    assert calls == []
+    assert status.status == "waiting"
+    assert status.next_action == action.to_dict()
+    assert any(item.get("kind") == "retry_budget_exhausted" for item in status.diagnostics)
+    restarted.close(wait_for_roles=True)
 
 
 def test_codex_role_adapter_binds_production_skill_and_rejects_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -402,6 +1066,764 @@ def test_codex_role_adapter_binds_production_skill_and_rejects_drift(tmp_path: P
     assert not calls
 
 
+def test_role_session_reservation_is_single_owner_and_session_id_is_cas_bound(tmp_path: Path) -> None:
+    context = RunContext("RUN-ROLE-RESERVATION", tmp_path)
+    registry = coordinator_module.RoleSessionRegistry(context)
+    action = PlannerAction("analyze_requirement", "analytical_owner", "REQ-001", "analyze")
+
+    first = registry.prepare(action, generation_id="G-0001", idempotency_key="dispatch-1")
+    second = registry.prepare(action, generation_id="G-0001", idempotency_key="dispatch-2")
+    assert first["mode"] == "new"
+    assert second["mode"] == "blocked"
+    assert second["reservation_status"] == "reserved"
+    assert registry.get("analytical_owner:REQ-001")["status"] == "reserved"
+
+    registry.bind_reservation(
+        action,
+        generation_id="G-0001",
+        idempotency_key="dispatch-1",
+        reservation_token="dispatch-1",
+        session_id="SID-ONE",
+    )
+    with pytest.raises(CoordinatorConflictError, match="compare-and-set"):
+        registry.bind_reservation(
+            action,
+            generation_id="G-0001",
+            idempotency_key="dispatch-1",
+            reservation_token="dispatch-1",
+            session_id="SID-TWO",
+        )
+    assert registry.get("analytical_owner:REQ-001")["session_id"] == "SID-ONE"
+    registry.complete_reservation(
+        action,
+        generation_id="G-0001",
+        idempotency_key="dispatch-1",
+        reservation_token="dispatch-1",
+        session_id="SID-ONE",
+    )
+    registry.release_reservation("analytical_owner:REQ-001", "dispatch-1")
+
+    resumed = registry.prepare(
+        PlannerAction("resume_requirement_analysis", "analytical_owner", "REQ-001", "resume"),
+        generation_id="G-0001",
+        idempotency_key="dispatch-3",
+    )
+    assert resumed["mode"] == "resume"
+    assert resumed["session_id"] == "SID-ONE"
+    registry.release_reservation("analytical_owner:REQ-001", "dispatch-3")
+
+
+def test_role_session_process_start_identity_uses_required_portable_provider_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """macOS-style hosts must use the required psutil provider and fail closed."""
+
+    class NoProcPath:
+        def __init__(self, _: str) -> None:
+            pass
+
+        def is_file(self) -> bool:
+            return False
+
+        def is_symlink(self) -> bool:
+            return False
+
+    class Process:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+
+        def create_time(self) -> float:
+            return 1234.5
+
+    class ProcessProvider:
+        pass
+
+    ProcessProvider.Process = Process
+
+    monkeypatch.setattr(coordinator_module, "Path", NoProcPath)
+    monkeypatch.setattr(coordinator_module, "_load_psutil", lambda: ProcessProvider)
+    assert coordinator_module._process_start_token(4242) == "psutil:1234.500000"
+
+    monkeypatch.setattr(coordinator_module, "_load_psutil", lambda: None)
+    assert coordinator_module._process_start_token(4242) is None
+    with pytest.raises(CoordinatorIntegrityError, match="exact process start identity"):
+        coordinator_module._required_process_start_token(4242)
+
+
+def test_role_session_adapter_fails_closed_without_exact_process_start_before_popen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = RunContext("RUN-ROLE-IDENTITY-UNKNOWN", tmp_path)
+    context.resolve_run_path("control_plane").mkdir(parents=True, exist_ok=True)
+    action = PlannerAction("analyze_requirement", "analytical_owner", "REQ-001", "analyze")
+    calls: list[object] = []
+
+    monkeypatch.setattr(coordinator_module, "_process_start_token", lambda _pid=None: None)
+    monkeypatch.setattr(
+        coordinator_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    adapter = coordinator_module.CodexRoleAdapter(
+        context,
+        coordinator_module.CodexExecConfig(binary="fake-codex"),
+    )
+
+    execution = adapter(action, idempotency_key="dispatch-identity", context=context)
+
+    assert execution.exit_code == 1
+    assert execution.session_status == "replacement_required"
+    assert "role session registry is unavailable" in execution.error
+    assert calls == []
+
+
+def test_role_session_legacy_missing_process_start_requires_explicit_replacement(
+    tmp_path: Path,
+) -> None:
+    context = RunContext("RUN-ROLE-LEGACY-IDENTITY", tmp_path)
+    registry = coordinator_module.RoleSessionRegistry(context)
+    action = PlannerAction("analyze_requirement", "analytical_owner", "REQ-001", "analyze")
+    process_start = coordinator_module._required_process_start_token(os.getpid())
+
+    registry.prepare(
+        action,
+        generation_id="G-0001",
+        idempotency_key="dispatch-old",
+        reservation_owner_id="owner-old",
+        reservation_pid=os.getpid(),
+        reservation_process_start=process_start,
+    )
+    registry.bind_reservation(
+        action,
+        generation_id="G-0001",
+        idempotency_key="dispatch-old",
+        reservation_token="dispatch-old",
+        session_id="SID-LEGACY",
+    )
+    registry.release_reservation("analytical_owner:REQ-001", "dispatch-old")
+
+    document = registry.read()
+    document["sessions"]["analytical_owner:REQ-001"]["reservation_process_start"] = None
+    coordinator_module._atomic_json(registry.path, document)
+
+    resumed = registry.prepare(
+        PlannerAction("resume_requirement_analysis", "analytical_owner", "REQ-001", "resume"),
+        generation_id="G-0001",
+        idempotency_key="dispatch-unknown",
+        reservation_owner_id="owner-current",
+        reservation_pid=os.getpid(),
+        reservation_process_start=process_start,
+    )
+    assert resumed["mode"] == "blocked"
+    assert resumed["status"] == "replacement_required"
+    assert resumed["session_id"] == "SID-LEGACY"
+    stale = registry.get("analytical_owner:REQ-001")
+    assert stale is not None
+    assert stale["stale_reason"] == "reservation_owner_unknown"
+    assert stale["reservation_process_start"] is None
+
+    replacement = registry.prepare(
+        action,
+        generation_id="G-0001",
+        idempotency_key="dispatch-replacement",
+        allow_replacement=True,
+        reservation_owner_id="owner-current",
+        reservation_pid=os.getpid(),
+        reservation_process_start=process_start,
+    )
+    assert replacement["mode"] == "replace"
+    assert replacement["session_id"] is None
+    assert replacement["reservation_process_start"] == process_start
+    assert registry.get("analytical_owner:REQ-001")["replacement_of"] == "SID-LEGACY"
+    registry.release_reservation("analytical_owner:REQ-001", "dispatch-replacement")
+
+
+def test_role_session_same_pid_without_current_start_proof_cannot_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = RunContext("RUN-ROLE-CURRENT-IDENTITY-UNKNOWN", tmp_path)
+    registry = coordinator_module.RoleSessionRegistry(context)
+    action = PlannerAction("analyze_requirement", "analytical_owner", "REQ-001", "analyze")
+    persisted_start = "psutil:1234.500000"
+
+    registry.prepare(
+        action,
+        generation_id="G-0001",
+        idempotency_key="dispatch-old",
+        reservation_owner_id="owner-old",
+        reservation_pid=os.getpid(),
+        reservation_process_start=persisted_start,
+    )
+    registry.bind_reservation(
+        action,
+        generation_id="G-0001",
+        idempotency_key="dispatch-old",
+        reservation_token="dispatch-old",
+        session_id="SID-BOUND",
+    )
+    registry.release_reservation("analytical_owner:REQ-001", "dispatch-old")
+
+    # Supplying the persisted token explicitly models a caller that can read
+    # the legacy row but cannot prove the current process instance.  It must
+    # not turn a same-PID claim into an implicit continuation.
+    monkeypatch.setattr(coordinator_module, "_process_start_token", lambda _pid=None: None)
+    resumed = registry.prepare(
+        PlannerAction("resume_requirement_analysis", "analytical_owner", "REQ-001", "resume"),
+        generation_id="G-0001",
+        idempotency_key="dispatch-unknown-current",
+        reservation_owner_id="owner-current",
+        reservation_pid=os.getpid(),
+        reservation_process_start=persisted_start,
+    )
+    assert resumed["mode"] == "blocked"
+    assert resumed["status"] == "replacement_required"
+    assert resumed["session_id"] == "SID-BOUND"
+    assert registry.get("analytical_owner:REQ-001")["stale_reason"] == "reservation_owner_unknown"
+
+
+def test_role_session_current_exact_start_token_allows_abandoned_same_pid_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = RunContext("RUN-ROLE-CURRENT-IDENTITY-EXACT", tmp_path)
+    registry = coordinator_module.RoleSessionRegistry(context)
+    action = PlannerAction("analyze_requirement", "analytical_owner", "REQ-001", "analyze")
+    persisted_start = "psutil:1234.500000"
+
+    registry.prepare(
+        action,
+        generation_id="G-0001",
+        idempotency_key="dispatch-old",
+        reservation_owner_id="owner-old",
+        reservation_pid=os.getpid(),
+        reservation_process_start=persisted_start,
+    )
+    registry.bind_reservation(
+        action,
+        generation_id="G-0001",
+        idempotency_key="dispatch-old",
+        reservation_token="dispatch-old",
+        session_id="SID-BOUND",
+    )
+    registry.release_reservation("analytical_owner:REQ-001", "dispatch-old")
+
+    monkeypatch.setattr(coordinator_module, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(coordinator_module, "_process_start_token", lambda _pid=None: persisted_start)
+    resumed = registry.prepare(
+        PlannerAction("resume_requirement_analysis", "analytical_owner", "REQ-001", "resume"),
+        generation_id="G-0001",
+        idempotency_key="dispatch-next",
+        reservation_owner_id="owner-current",
+        reservation_pid=os.getpid(),
+        reservation_process_start=persisted_start,
+    )
+    assert resumed["mode"] == "resume"
+    assert resumed["session_id"] == "SID-BOUND"
+    registry.release_reservation("analytical_owner:REQ-001", "dispatch-next")
+
+
+def test_role_session_restart_claim_can_resume_bound_orphan_with_local_active_dispatch(
+    tmp_path: Path,
+) -> None:
+    context = RunContext("RUN-ROLE-RESTART", tmp_path)
+    registry = coordinator_module.RoleSessionRegistry(context)
+    action = PlannerAction("analyze_requirement", "analytical_owner", "REQ-001", "analyze")
+
+    initial = registry.prepare(action, generation_id="G-0001", idempotency_key="dispatch-1")
+    registry.bind_reservation(
+        action,
+        generation_id="G-0001",
+        idempotency_key="dispatch-1",
+        reservation_token="dispatch-1",
+        session_id="SID-BOUND",
+    )
+    registry.release_reservation("analytical_owner:REQ-001", "dispatch-1")
+
+    document = registry.read()
+    document["sessions"]["analytical_owner:REQ-001"]["reservation_pid"] = 99999999
+    coordinator_module._atomic_json(registry.path, document)
+    resumed = registry.prepare(
+        PlannerAction("resume_requirement_analysis", "analytical_owner", "REQ-001", "resume"),
+        generation_id="G-0001",
+        idempotency_key="dispatch-2",
+        active_dispatch_tokens={"dispatch-1"},
+        active_dispatch_owner_pid=os.getpid(),
+    )
+    assert resumed["mode"] == "resume"
+    assert resumed["session_id"] == "SID-BOUND"
+    registry.release_reservation("analytical_owner:REQ-001", "dispatch-2")
+
+
+def test_role_session_pid_reuse_requires_explicit_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = RunContext("RUN-ROLE-PID-REUSE", tmp_path)
+    registry = coordinator_module.RoleSessionRegistry(context)
+    action = PlannerAction("analyze_requirement", "analytical_owner", "REQ-001", "analyze")
+    monkeypatch.setattr(coordinator_module, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(coordinator_module, "_process_start_token", lambda _pid=None: "start-new")
+
+    first = registry.prepare(
+        action,
+        generation_id="G-0001",
+        idempotency_key="dispatch-old",
+        reservation_owner_id="owner-old",
+        reservation_pid=4242,
+        reservation_process_start="start-old",
+    )
+    registry.bind_reservation(
+        action,
+        generation_id="G-0001",
+        idempotency_key="dispatch-old",
+        reservation_token="dispatch-old",
+        session_id="SID-OLD",
+    )
+    registry.release_reservation("analytical_owner:REQ-001", "dispatch-old")
+
+    orphan = registry.prepare(
+        PlannerAction("resume_requirement_analysis", "analytical_owner", "REQ-001", "resume"),
+        generation_id="G-0001",
+        idempotency_key="dispatch-reused",
+        reservation_owner_id="owner-new",
+        reservation_pid=4242,
+        reservation_process_start="start-new",
+    )
+    assert orphan["mode"] == "blocked"
+    assert orphan["status"] == "replacement_required"
+    assert registry.get("analytical_owner:REQ-001")["session_id"] == "SID-OLD"
+
+    replacement = registry.prepare(
+        PlannerAction(
+            "analyze_requirement",
+            "analytical_owner",
+            "REQ-001",
+            "authorized replacement",
+        ),
+        generation_id="G-0001",
+        idempotency_key="dispatch-replacement",
+        allow_replacement=True,
+        reservation_owner_id="owner-new",
+        reservation_pid=4242,
+        reservation_process_start="start-new",
+    )
+    assert replacement["mode"] == "replace"
+    assert replacement["session_id"] is None
+    assert registry.get("analytical_owner:REQ-001")["replacement_of"] == "SID-OLD"
+    registry.release_reservation("analytical_owner:REQ-001", "dispatch-replacement")
+
+
+def test_role_session_abandoned_same_process_is_recoverable_without_active_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = RunContext("RUN-ROLE-ABANDONED", tmp_path)
+    registry = coordinator_module.RoleSessionRegistry(context)
+    action = PlannerAction("analyze_requirement", "analytical_owner", "REQ-001", "analyze")
+    current_pid = os.getpid()
+    monkeypatch.setattr(coordinator_module, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(coordinator_module, "_process_start_token", lambda _pid=None: "same-start")
+
+    registry.prepare(
+        action,
+        generation_id="G-0001",
+        idempotency_key="dispatch-old",
+        reservation_owner_id="owner-abandoned",
+        reservation_pid=current_pid,
+        reservation_process_start="same-start",
+    )
+    registry.bind_reservation(
+        action,
+        generation_id="G-0001",
+        idempotency_key="dispatch-old",
+        reservation_token="dispatch-old",
+        session_id="SID-ABANDONED",
+    )
+    registry.release_reservation("analytical_owner:REQ-001", "dispatch-old")
+
+    resumed = registry.prepare(
+        PlannerAction("resume_requirement_analysis", "analytical_owner", "REQ-001", "resume"),
+        generation_id="G-0001",
+        idempotency_key="dispatch-next",
+        reservation_owner_id="owner-restarted",
+        reservation_pid=current_pid,
+        reservation_process_start="same-start",
+    )
+    assert resumed["mode"] == "resume"
+    assert resumed["session_id"] == "SID-ABANDONED"
+    registry.release_reservation("analytical_owner:REQ-001", "dispatch-next")
+
+
+def test_role_session_registry_multiprocess_race_has_one_reservation_winner(tmp_path: Path) -> None:
+    context = RunContext("RUN-ROLE-MP-RACE", tmp_path)
+    context.resolve_run_path("control_plane").mkdir(parents=True, exist_ok=True)
+    mp_context = mp.get_context("fork")
+    barrier = mp_context.Barrier(2)
+    release = mp_context.Event()
+    result_queue = mp_context.Queue()
+    processes = [
+        mp_context.Process(
+            target=_role_session_registry_race_worker,
+            args=(str(tmp_path), context.run_id, f"dispatch-{index}", barrier, release, result_queue),
+        )
+        for index in range(2)
+    ]
+    for process in processes:
+        process.start()
+    results = [result_queue.get(timeout=5) for _ in processes]
+    release.set()
+    for process in processes:
+        process.join(timeout=5)
+        assert process.exitcode == 0
+    assert sorted(result.get("mode") for result in results) == ["blocked", "new"]
+    assert all("error" not in result for result in results)
+    document = coordinator_module.RoleSessionRegistry(context).read()
+    assert set(document["sessions"]) == {"analytical_owner:REQ-RACE"}
+    entry = document["sessions"]["analytical_owner:REQ-RACE"]
+    assert entry["status"] == "reserved"
+    assert entry["reservation_token"] in {"dispatch-0", "dispatch-1"}
+
+
+def test_codex_role_adapter_binds_thread_started_before_process_exit_and_resumes_exact_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    calls: list[list[str]] = []
+
+    class StreamingProcess:
+        def __init__(self, argv: list[str], **_: object) -> None:
+            calls.append(list(argv))
+            self.stdin = _InputSink({})
+            self.stdout = io.BytesIO(b'{"type":"thread.started","thread_id":"SID-STREAM"}\n')
+            self.stderr = io.BytesIO()
+            self.returncode = 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            entered.set()
+            assert release.wait(2)
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.returncode = -15
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    monkeypatch.setattr(coordinator_module.subprocess, "Popen", StreamingProcess)
+    context = RunContext("RUN-ROLE-STREAM", tmp_path)
+    (tmp_path / "control_plane").mkdir()
+    action = PlannerAction("analyze_requirement", "analytical_owner", "REQ-001", "analyze")
+    adapter = coordinator_module.CodexRoleAdapter(
+        context,
+        coordinator_module.CodexExecConfig(binary="fake-codex"),
+    )
+    result: list[RoleExecution] = []
+    thread = threading.Thread(target=lambda: result.append(adapter(action, idempotency_key="dispatch-1", context=context)))
+    thread.start()
+    assert entered.wait(2)
+    registry = coordinator_module.RoleSessionRegistry(context)
+    for _ in range(100):
+        bound = registry.get("analytical_owner:REQ-001")
+        if bound is not None and bound.get("session_id") == "SID-STREAM":
+            break
+        time.sleep(0.01)
+    else:
+        raise AssertionError("thread.started must bind the session before process exit")
+    assert "--ephemeral" not in calls[0]
+    release.set()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert result and result[0].ok
+
+    resume = adapter(
+        PlannerAction("resume_requirement_analysis", "analytical_owner", "REQ-001", "resume"),
+        idempotency_key="dispatch-2",
+        context=context,
+    )
+    assert resume.ok
+    assert calls[1][0:4] == ["fake-codex", "exec", "resume", "--skip-git-repo-check"]
+    assert "SID-STREAM" in calls[1]
+    assert "--ephemeral" not in calls[1]
+
+
+@pytest.mark.parametrize("replacement_succeeds", [True, False])
+def test_codex_role_adapter_replaces_unavailable_resume_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_succeeds: bool,
+) -> None:
+    """A dead exact resume is recovered by one fresh root, never by retrying its SID."""
+
+    calls: list[list[str]] = []
+
+    class SequencedProcess:
+        def __init__(self, argv: list[str], **_: object) -> None:
+            index = len(calls)
+            calls.append(list(argv))
+            self.stdin = _InputSink({})
+            if index == 0:
+                stdout = b'{"type":"thread.started","thread_id":"SID-OLD"}\n'
+                stderr = b""
+                self.returncode = 0
+            elif index == 1:
+                # The transport/app-server cannot open the state DB.  No root
+                # event proves that the expected SID was never resumed.
+                stdout = b""
+                stderr = b"readonly state db: unable to open database file"
+                self.returncode = 1
+            else:
+                stdout = (
+                    b'{"type":"thread.started","thread_id":"SID-NEW"}\n'
+                    if replacement_succeeds
+                    else b""
+                )
+                stderr = b"" if replacement_succeeds else b"replacement root failed"
+                self.returncode = 0 if replacement_succeeds else 1
+            self.stdout = io.BytesIO(stdout)
+            self.stderr = io.BytesIO(stderr)
+
+        def wait(self, timeout: float | None = None) -> int:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.returncode = -15
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    monkeypatch.setattr(coordinator_module.subprocess, "Popen", SequencedProcess)
+    context = RunContext("RUN-ROLE-RESUME-REPLACEMENT", tmp_path)
+    (tmp_path / "control_plane").mkdir()
+    adapter = coordinator_module.CodexRoleAdapter(
+        context,
+        coordinator_module.CodexExecConfig(binary="fake-codex", sandbox="workspace-write"),
+    )
+    initial = PlannerAction("analyze_requirement", "analytical_owner", "REQ-001", "analyze")
+    resumed = PlannerAction("resume_requirement_analysis", "analytical_owner", "REQ-001", "resume")
+
+    assert adapter(initial, idempotency_key="dispatch-1", context=context).ok
+    result = adapter(resumed, idempotency_key="dispatch-2", context=context)
+
+    assert len(calls) == 3
+    assert calls[1][0:4] == ["fake-codex", "exec", "resume", "--skip-git-repo-check"]
+    assert "SID-OLD" in calls[1]
+    assert "resume" not in calls[2]
+    sandbox_index = calls[2].index("--sandbox")
+    assert calls[2][sandbox_index : sandbox_index + 2] == ["--sandbox", "workspace-write"]
+    assert "SID-OLD" not in calls[2]
+    assert sum("resume" in argv for argv in calls) == 1
+
+    entry = coordinator_module.RoleSessionRegistry(context).get("analytical_owner:REQ-001")
+    assert entry is not None
+    assert entry["replacement_of"] == "SID-OLD"
+    assert entry["last_action"] == resumed.action
+    assert entry["last_idempotency_key"] == "dispatch-2"
+    assert any(
+        item["idempotency_key"] == "dispatch-2"
+        and item["action"] == resumed.action
+        for item in entry["action_lineage"]
+    )
+    assert entry["logical_owner"] == "analytical_owner:REQ-001"
+
+    if replacement_succeeds:
+        assert result.ok
+        assert result.session_id == "SID-NEW"
+        assert entry["session_id"] == "SID-NEW"
+        assert entry["status"] == "active"
+    else:
+        assert not result.ok
+        assert result.session_status == "replacement_required"
+        assert entry["session_id"] is None
+        assert entry["status"] == "replacement_required"
+
+
+def test_role_session_registry_failed_resume_replacement_is_atomic_and_preserves_owner(
+    tmp_path: Path,
+) -> None:
+    context = RunContext("RUN-ROLE-FAILED-RESUME-CAS", tmp_path)
+    registry = coordinator_module.RoleSessionRegistry(context)
+    action = PlannerAction("analyze_requirement", "analytical_owner", "REQ-001", "analyze")
+    process_start = coordinator_module._required_process_start_token()
+    reservation = registry.prepare(
+        action,
+        generation_id="G-0001",
+        idempotency_key="dispatch-1",
+        reservation_owner_id="owner-1",
+        reservation_process_start=process_start,
+    )
+    registry.bind_reservation(
+        action,
+        generation_id="G-0001",
+        idempotency_key="dispatch-1",
+        reservation_token="dispatch-1",
+        session_id="SID-OLD",
+    )
+    registry.complete_reservation(
+        action,
+        generation_id="G-0001",
+        idempotency_key="dispatch-1",
+        reservation_token="dispatch-1",
+        session_id="SID-OLD",
+    )
+    registry.release_reservation("analytical_owner:REQ-001", "dispatch-1")
+    resumed_action = PlannerAction("resume_requirement_analysis", "analytical_owner", "REQ-001", "resume")
+    reservation = registry.prepare(
+        resumed_action,
+        generation_id="G-0001",
+        idempotency_key="dispatch-2",
+        reservation_owner_id="owner-1",
+        reservation_process_start=process_start,
+    )
+
+    replacement = registry.replace_failed_resume(
+        resumed_action,
+        generation_id="G-0001",
+        idempotency_key="dispatch-2",
+        reservation_token=str(reservation["reservation_token"]),
+        expected_session_id="SID-OLD",
+    )
+
+    assert replacement["mode"] == "replace"
+    assert replacement["session_id"] is None
+    assert replacement["reservation_token"] == "dispatch-2"
+    entry = registry.get("analytical_owner:REQ-001")
+    assert entry is not None
+    assert entry["status"] == "reserved"
+    assert entry["replacement_of"] == "SID-OLD"
+    assert entry["reservation_owner_id"] == "owner-1"
+    assert entry["reservation_process_start"] == process_start
+    assert entry["reservation_action"] == "resume_requirement_analysis"
+    assert entry["action_lineage"][-1]["idempotency_key"] == "dispatch-2"
+    registry.release_reservation("analytical_owner:REQ-001", "dispatch-2")
+
+
+def test_coordinator_internal_resume_replacement_does_not_consume_retry_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    class SequencedProcess:
+        def __init__(self, argv: list[str], **_: object) -> None:
+            index = len(calls)
+            calls.append(list(argv))
+            self.stdin = _InputSink({})
+            payload = (
+                b'{"type":"thread.started","thread_id":"SID-OLD"}\n'
+                if index == 0
+                else b'{"type":"thread.started","thread_id":"SID-NEW"}\n'
+                if index == 2
+                else b""
+            )
+            self.stdout = io.BytesIO(payload)
+            self.stderr = io.BytesIO(b"readonly state db" if index == 1 else b"")
+            self.returncode = 0 if index != 1 else 1
+
+        def wait(self, timeout: float | None = None) -> int:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.returncode = -15
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    monkeypatch.setattr(coordinator_module.subprocess, "Popen", SequencedProcess)
+    initial = PlannerAction("analyze_requirement", "analytical_owner", "REQ-001", "analyze")
+    resumed = PlannerAction("resume_requirement_analysis", "analytical_owner", "REQ-001", "resume")
+    planner = QueuePlanner((initial,), (resumed,), ())
+    context = RunContext("RUN-COORD-RESUME-REPLACEMENT", tmp_path)
+    adapter = coordinator_module.CodexRoleAdapter(
+        context,
+        coordinator_module.CodexExecConfig(binary="fake-codex", sandbox="workspace-write"),
+    )
+    coordinator = RunCoordinator(context, planner_provider=planner, role_runner=adapter)
+    coordinator.start(_spec(context.run_id))
+
+    status = coordinator.run(max_steps=3)
+
+    assert len(calls) == 3
+    assert status.status == "waiting"
+    events = [json.loads(line) for line in (tmp_path / "control_plane/coordinator_events.jsonl").read_text().splitlines()]
+    waits = [event for event in events if event["event"] == "wait"]
+    assert waits
+    assert all(event["payload"].get("reason") != "retry_budget" for event in waits)
+    assert not any(
+        diagnostic.get("kind") == "role_transport_failure"
+        and diagnostic.get("transport", {}).get("session_status") == "replacement_required"
+        for diagnostic in coordinator.status().diagnostics
+    )
+    coordinator.close(wait_for_roles=True)
+
+
+def test_codex_role_adapter_orphan_without_thread_started_requires_explicit_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    class CrashedProcess:
+        def __init__(self, argv: list[str], **_: object) -> None:
+            calls.append(list(argv))
+            self.stdin = _InputSink({})
+            self.stdout = io.BytesIO()
+            self.stderr = io.BytesIO()
+            self.returncode = 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            raise RuntimeError("simulated transport crash")
+
+        def terminate(self) -> None:
+            self.returncode = -15
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    monkeypatch.setattr(coordinator_module.subprocess, "Popen", CrashedProcess)
+    context = RunContext("RUN-ROLE-ORPHAN", tmp_path)
+    (tmp_path / "control_plane").mkdir()
+    action = PlannerAction("analyze_requirement", "analytical_owner", "REQ-001", "analyze")
+    adapter = coordinator_module.CodexRoleAdapter(
+        context,
+        coordinator_module.CodexExecConfig(binary="fake-codex"),
+    )
+    failed = adapter(action, idempotency_key="dispatch-1", context=context)
+    assert failed.exit_code == 1
+    assert failed.session_status == "replacement_required"
+    entry = coordinator_module.RoleSessionRegistry(context).get("analytical_owner:REQ-001")
+    assert entry["status"] == "replacement_required"
+    assert entry["stale_reason"] == "thread_started_missing"
+    assert len(calls) == 1
+
+    class ReplacementProcess(CrashedProcess):
+        def __init__(self, argv: list[str], **kwargs: object) -> None:
+            super().__init__(argv, **kwargs)
+            self.stdout = io.BytesIO(b'{"type":"thread.started","thread_id":"SID-REPLACEMENT"}\n')
+
+        def wait(self, timeout: float | None = None) -> int:
+            return self.returncode
+
+    monkeypatch.setattr(coordinator_module.subprocess, "Popen", ReplacementProcess)
+    replacement = adapter(
+        PlannerAction(
+            "analyze_requirement",
+            "analytical_owner",
+            "REQ-001",
+            "replace orphan",
+            metadata={"allow_session_replacement": True},
+        ),
+        idempotency_key="dispatch-2",
+        context=context,
+    )
+    assert replacement.ok
+    assert replacement.session_id == "SID-REPLACEMENT"
+    assert len(calls) == 2
+
+
 def test_analytical_owner_guidance_requires_identity_fanout_and_wait() -> None:
     action = PlannerAction("analyze_requirement", "analytical_owner", "REQ-001", "analyze")
     guidance = coordinator_module._role_guidance(action)
@@ -425,6 +1847,58 @@ def test_analytical_owner_guidance_requires_identity_fanout_and_wait() -> None:
         assert marker in guidance
 
 
+def test_initial_business_repair_activates_before_readiness_or_selection() -> None:
+    action = PlannerAction("repair_requirement", "analytical_owner", "REQ-001", "repair")
+    guidance = coordinator_module._role_guidance(action)
+
+    begin = guidance.index("BusinessReviewAdapter.begin_repair")
+    use = guidance.index("ItemWorkspace.use_business_repair")
+    readiness = guidance.index("readiness check")
+    search = guidance.index("search_ontology")
+    assert begin < use < readiness < search
+    assert "do not call BusinessReviewAdapter.begin_repair" not in guidance
+
+
+def test_integration_guidance_auto_stages_accepted_artifacts_and_keeps_failures_open() -> None:
+    action = PlannerAction("integrate_requirement", "integration_agent", "REQ-001", "integrate")
+    guidance = coordinator_module._role_guidance(action)
+
+    assert "IntegrationSession.create/load" in guidance
+    assert "auto-stages all sealed business-accepted typed AnalyticalArtifact refs" in guidance
+    assert "sealed item-local state" in guidance
+    assert "mandatory handoff" in guidance
+    assert "Do not manually re-submit or re-declare accepted analytical artifacts" in guidance
+    assert "accepted_content_hash are immutable" in guidance
+    assert "derived pre-commit projection" in guidance
+    assert "correct_record for every authorized affected record" in guidance
+    assert "remove_record when removal is authorized" in guidance
+    assert "literal difference between normalized typed fields" in guidance
+    assert "targeted recheck" in guidance
+    assert "do not invent a new integration method" in guidance
+    assert "open/pending" in guidance
+    assert "record an incident" in guidance
+    assert "retry/repair" in guidance
+    assert "never terminalize accepted integration as a technical failure" in guidance
+    assert "mark_technical_failure" not in guidance
+    assert guidance.index("validate") < guidance.index("build_fidelity_packet")
+    assert "session.commit" in guidance
+
+
+def test_active_business_repair_reuses_authorization_without_reactivation() -> None:
+    action = PlannerAction(
+        "resume_requirement_analysis",
+        "analytical_owner",
+        "REQ-001",
+        "resume active repair",
+        metadata={"repair_active": True},
+    )
+    guidance = coordinator_module._role_guidance(action)
+
+    assert guidance.index("repair_active=true") < guidance.index("readiness check")
+    assert "Do not call BusinessReviewAdapter.begin_repair" in guidance
+    assert "or ItemWorkspace.use_business_repair" in guidance
+
+
 def test_analytical_owner_custom_prompt_cannot_replace_public_source_and_retry_contract(
     tmp_path: Path,
 ) -> None:
@@ -439,6 +1913,40 @@ def test_analytical_owner_custom_prompt_cannot_replace_public_source_and_retry_c
     assert prompt.index(custom) < prompt.index("Analytical Owner sequence:")
     assert prompt.index("selected_sources()") > prompt.index(custom)
     assert prompt.index("same Analytical Owner action and begin_attempt") > prompt.index(custom)
+
+
+def test_active_skill_release_rotation_has_a_typed_binding_mismatch_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active = _install_test_skill(tmp_path, monkeypatch)
+    binding = coordinator_module.resolve_production_skill_binding(repo_root=tmp_path, role_cwd=tmp_path)
+    stale = coordinator_module.CodexExecConfig.from_dict(
+        {**binding, "skill_sha256": "f" * 64},
+        validate_binding=False,
+    )
+
+    with pytest.raises(CoordinatorProductionBindingMismatch, match="active installed skill"):
+        stale.validate_skill_binding(
+            required=True,
+            verify_active=True,
+            repo_root=tmp_path,
+            role_cwd=tmp_path,
+        )
+
+    missing = coordinator_module.CodexExecConfig.from_dict(
+        {**binding, "skill_path": str(tmp_path / "missing-skill")},
+        validate_binding=False,
+    )
+    with pytest.raises(CoordinatorIntegrityError) as error:
+        missing.validate_skill_binding(
+            required=True,
+            verify_active=True,
+            repo_root=tmp_path,
+            role_cwd=tmp_path,
+        )
+    assert not isinstance(error.value, CoordinatorProductionBindingMismatch)
+    assert active.is_dir()
 
 
 def test_active_skill_binding_rejects_missing_stale_symlink_frontmatter_hash_and_duplicate(
@@ -700,6 +2208,626 @@ def test_upgrade_and_rebind_rejects_active_lineage_and_hash_conflicts_without_wr
     assert _control_plane_tree(hash_context.run_root / "control_plane") == hash_before
 
 
+def test_rebind_transport_preserves_lineage_progress_and_is_idempotent(tmp_path: Path) -> None:
+    run_id = "RUN-TRANSPORT-REBIND"
+    sentinel = "SECRET_TRANSPORT_ROLE_PROMPT_MODEL_COMMAND"
+    context = RunContext(run_id, tmp_path)
+    old = CoordinatorRunSpec(
+        run_id,
+        "G-0001",
+        "planner://test",
+        hashlib.sha256(b"planner").hexdigest(),
+        role_dispatch_command=(sentinel,),
+        codex_exec={"binary": "old-codex"},
+    )
+    target = CoordinatorRunSpec(
+        run_id,
+        old.generation_id,
+        old.planner_ref,
+        old.planner_hash,
+        role_dispatch_command=(sentinel,),
+        codex_exec={
+            "binary": sentinel,
+            "role_models": {"foundry_supervisor": sentinel},
+            "role_reasoning_efforts": {"foundry_supervisor": "high"},
+            "role_prompts": {"foundry_supervisor": sentinel},
+        },
+    )
+    coordinator = RunCoordinator(
+        context,
+        planner_provider=QueuePlanner(()),
+        role_runner=object(),
+    )
+    coordinator.start(old)
+    before_state = json.loads((tmp_path / "control_plane/coordinator_state.json").read_text())
+    rebound = coordinator.rebind_transport(target)
+    assert rebound.status == "ready"
+    assert rebound.generation_id == old.generation_id
+    assert coordinator.persisted_spec() == target
+    after_state = json.loads((tmp_path / "control_plane/coordinator_state.json").read_text())
+    for field in ("generation_id", "planner_ref", "planner_hash", "status", "phase", "attempt", "no_progress_count", "last_action"):
+        assert after_state[field] == before_state[field]
+    events_path = tmp_path / "control_plane/coordinator_events.jsonl"
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    assert sentinel.encode("utf-8") not in events_path.read_bytes()
+    assert [event["event"] for event in events][-2:] == [
+        "coordinator_transport_rebind_started",
+        "coordinator_transport_rebound",
+    ]
+    assert not coordinator.transport_rebind_intent_path.exists()
+    event_bytes = events_path.read_bytes()
+    state_bytes = (tmp_path / "control_plane/coordinator_state.json").read_bytes()
+    retried = coordinator.rebind_transport(target)
+    assert retried.last_event_seq == rebound.last_event_seq
+    assert events_path.read_bytes() == event_bytes
+    assert (tmp_path / "control_plane/coordinator_state.json").read_bytes() == state_bytes
+
+
+def test_rebind_transport_accepts_same_path_skill_release_upgrade_without_old_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A quiescent transport rotation must not revalidate removed old bytes."""
+
+    skill_path = _install_test_skill(tmp_path, monkeypatch)
+    run_id = "RUN-TRANSPORT-SKILL-ROTATION"
+    context = RunContext(run_id, tmp_path)
+    old_binding = coordinator_module.resolve_production_skill_binding(repo_root=tmp_path)
+    old = CoordinatorRunSpec(
+        run_id,
+        "G-0001",
+        "planner://test",
+        hashlib.sha256(b"planner").hexdigest(),
+        codex_exec={"binary": "fake-codex", **old_binding},
+    )
+    coordinator = RunCoordinator(context, planner_provider=QueuePlanner(()))
+    coordinator.start(old)
+
+    # Keep the canonical path but replace its bytes.  The previous release is
+    # no longer recoverable from the active install, which is the production
+    # skill-upgrade scenario that used to make rebind_transport fail while
+    # loading the persisted old spec.
+    (skill_path / "README.md").write_text("rotated release fixture\n", encoding="utf-8")
+    new_hash = hashlib.sha256(coordinator_module._skill_release_bytes(skill_path)).hexdigest()
+    monkeypatch.setattr(coordinator_module, "PRODUCTION_SKILL_SHA256", new_hash)
+    new_binding = coordinator_module.resolve_production_skill_binding(repo_root=tmp_path)
+    target = CoordinatorRunSpec(
+        run_id,
+        old.generation_id,
+        old.planner_ref,
+        old.planner_hash,
+        codex_exec={"binary": "fake-codex", **new_binding},
+    )
+
+    rebound = coordinator.rebind_transport(target)
+    assert rebound.status == "ready"
+    assert coordinator.persisted_spec() == target
+    assert not coordinator.transport_rebind_intent_path.exists()
+
+
+@pytest.mark.parametrize(
+    "failpoint",
+    (
+        "transport_rebind_after_intent",
+        "transport_rebind_after_started",
+        "transport_rebind_after_spec",
+        "transport_rebind_after_event",
+    ),
+)
+def test_transport_rebind_failpoint_recovery_keeps_secret_target_private(
+    tmp_path: Path,
+    failpoint: str,
+) -> None:
+    run_id = f"RUN-TRANSPORT-FAIL-{failpoint}"
+    sentinel = "SECRET_TRANSPORT_FAILPOINT_TARGET"
+    context = RunContext(run_id, tmp_path)
+    old = CoordinatorRunSpec(
+        run_id,
+        "G-0001",
+        "planner://test",
+        hashlib.sha256(b"planner").hexdigest(),
+        role_dispatch_command=(sentinel,),
+        codex_exec={"binary": "old-codex"},
+    )
+    target = CoordinatorRunSpec(
+        run_id,
+        old.generation_id,
+        old.planner_ref,
+        old.planner_hash,
+        role_dispatch_command=(sentinel,),
+        codex_exec={
+            "binary": sentinel,
+            "role_models": {"foundry_supervisor": sentinel},
+            "role_prompts": {"foundry_supervisor": sentinel},
+        },
+    )
+    first = RunCoordinator(context, planner_provider=QueuePlanner(()), role_runner=object())
+    first.start(old)
+
+    def inject(name: str) -> None:
+        if name == failpoint:
+            raise BaseException(name)
+
+    first._failpoint = inject
+    with pytest.raises(BaseException, match=failpoint):
+        first.rebind_transport(target)
+
+    restarted = RunCoordinator(context, planner_provider=QueuePlanner(()), role_runner=object())
+    restarted.rebind_transport(target)
+    assert restarted.persisted_spec() == target
+    assert not restarted.transport_rebind_intent_path.exists()
+    events_path = tmp_path / "control_plane" / "coordinator_events.jsonl"
+    assert sentinel.encode("utf-8") not in events_path.read_bytes()
+    events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+    assert [event["event"] for event in events][-2:] == [
+        "coordinator_transport_rebind_started",
+        "coordinator_transport_rebound",
+    ]
+
+
+def test_rebind_transport_rejects_active_dispatch_without_write(tmp_path: Path) -> None:
+    run_id = "RUN-TRANSPORT-ACTIVE"
+    context = RunContext(run_id, tmp_path)
+    old = CoordinatorRunSpec(
+        run_id,
+        "G-0001",
+        "planner://test",
+        hashlib.sha256(b"planner").hexdigest(),
+        codex_exec={"binary": "old-codex"},
+    )
+    target = CoordinatorRunSpec(
+        run_id,
+        old.generation_id,
+        old.planner_ref,
+        old.planner_hash,
+        codex_exec={"binary": "new-codex"},
+    )
+    coordinator = RunCoordinator(context, planner_provider=QueuePlanner(()), role_runner=object())
+    coordinator.start(old)
+    _seed_active_dispatch(
+        coordinator,
+        _action("analyze_requirement", "REQ-ACTIVE"),
+        runner_pid=os.getpid(),
+        runner_process_start=coordinator_module._required_process_start_token(os.getpid()),
+    )
+    before = _control_plane_tree(tmp_path / "control_plane")
+
+    with pytest.raises(CoordinatorConflictError, match="dispatches are active"):
+        coordinator.rebind_transport(target)
+    assert _control_plane_tree(tmp_path / "control_plane") == before
+
+
+def test_rebind_transport_clears_dead_orphan_and_records_durable_cleanup(
+    tmp_path: Path,
+) -> None:
+    run_id = "RUN-TRANSPORT-DEAD-ORPHAN"
+    context = RunContext(run_id, tmp_path)
+    old = CoordinatorRunSpec(
+        run_id,
+        "G-0001",
+        "planner://test",
+        hashlib.sha256(b"planner").hexdigest(),
+        codex_exec={"binary": "old-codex"},
+    )
+    target = CoordinatorRunSpec(
+        run_id,
+        old.generation_id,
+        old.planner_ref,
+        old.planner_hash,
+        codex_exec={"binary": "new-codex"},
+    )
+    coordinator = RunCoordinator(context, planner_provider=QueuePlanner(()), role_runner=object())
+    coordinator.start(old)
+    key = _seed_active_dispatch(
+        coordinator,
+        _action("analyze_requirement", "REQ-DEAD-ORPHAN"),
+        runner_pid=999_999,
+    )
+
+    rebound = coordinator.rebind_transport(target)
+
+    assert rebound.status == "waiting"
+    assert rebound.active_dispatches == ()
+    assert coordinator.persisted_spec() == target
+    state = json.loads((tmp_path / "control_plane/coordinator_state.json").read_text())
+    assert state["active_dispatches"] == []
+    diagnostics = state["diagnostics"]
+    cleanup_diagnostics = [
+        value
+        for value in diagnostics
+        if value.get("reason") == "transport_rebind_orphan_cleanup"
+    ]
+    assert cleanup_diagnostics
+    assert cleanup_diagnostics[-1]["removed_dispatches"][0]["idempotency_key"] == key
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "control_plane/coordinator_events.jsonl").read_text().splitlines()
+    ]
+    cleanup_events = [
+        event
+        for event in events
+        if event["event"] == "dispatch_claims_cleared"
+        and event["payload"].get("reason") == "transport_rebind_orphan_cleanup"
+    ]
+    assert cleanup_events
+    assert cleanup_events[-1]["payload"]["removed_dispatches"][0]["idempotency_key"] == key
+    assert any(
+        event["event"] == "dispatch_started"
+        and event["payload"]["idempotency_key"] == key
+        for event in events
+    )
+    assert [event["event"] for event in events][-2:] == [
+        "coordinator_transport_rebind_started",
+        "coordinator_transport_rebound",
+    ]
+
+
+@pytest.mark.parametrize("candidate_hash_mode", ("valid", "missing", "mismatch"))
+def test_transport_rebind_marks_matching_product_reservation_for_explicit_replacement(
+    tmp_path: Path,
+    candidate_hash_mode: str,
+) -> None:
+    """Dead dispatch cleanup preserves Product Agent lineage as stale."""
+
+    run_id = "RUN-TRANSPORT-PRODUCT-ORPHAN"
+    context = RunContext(run_id, tmp_path)
+    RunLifecycle.create(context, ("REQ-01",), mode="requirement")
+    candidate, _review = _seed_product_repair_candidate(context)
+    old = _spec(run_id)
+    target = CoordinatorRunSpec(
+        run_id,
+        old.generation_id,
+        old.planner_ref,
+        old.planner_hash,
+        codex_exec={"binary": "new-codex"},
+    )
+    coordinator = RunCoordinator(context, planner_provider=QueuePlanner(()), role_runner=object())
+    coordinator.start(old)
+    action = PlannerAction(
+        "build_product_candidate",
+        "product_agent",
+        run_id,
+        "reviewed product repair",
+        metadata={
+            "review_verdict": "repair_once",
+            **(
+                {"candidate_hash": candidate.computed_hash}
+                if candidate_hash_mode == "valid"
+                else ({"candidate_hash": "0" * 64} if candidate_hash_mode == "mismatch" else {})
+            ),
+        },
+    )
+    registry = coordinator_module.RoleSessionRegistry(context)
+    state, _ = coordinator._read_replay()  # noqa: SLF001
+    assert state is not None
+    key = coordinator._idempotency_key(state, action)
+    reservation = registry.prepare(
+        action,
+        generation_id="G-0001",
+        idempotency_key=key,
+        reservation_owner_id="dead-owner",
+        reservation_pid=999_999,
+        reservation_process_start="dead-start",
+    )
+    assert reservation["mode"] == "new"
+    with coordinator._locked(create=False):  # noqa: SLF001 - admission regression
+        state, _ = coordinator._read_replay()  # noqa: SLF001
+        assert state is not None
+        state["active_dispatches"] = [
+            {
+                "action": action.to_dict(),
+                "idempotency_key": key,
+                "slot_key": coordinator._slot_key(action),
+                "runner_id": "dead-owner",
+                "runner_pid": 999_999,
+                "runner_process_start": "dead-start",
+            }
+        ]
+        state["status"] = "dispatching"
+        state["phase"] = action.action
+        coordinator._append_event_locked(  # noqa: SLF001
+            state,
+            "dispatch_started",
+            {"action": action.to_dict(), "idempotency_key": key},
+        )
+
+    rebound = coordinator.rebind_transport(target)
+
+    assert rebound.status == "waiting"
+    stale = registry.get(f"product_agent:{run_id}:G-0001")
+    assert stale is not None
+    assert stale["status"] == "replacement_required"
+    assert stale["stale_reason"] == "orphaned_reservation"
+    assert stale["session_id"] is None
+    reopened = coordinator.reopen("authorize reviewed product repair")
+    assert reopened.status == "ready"
+    with coordinator._locked(create=False):  # noqa: SLF001 - one-shot auth admission
+        state, _ = coordinator._read_replay()  # noqa: SLF001
+        assert state is not None
+        authorized = coordinator._authorize_preview_replacement_for_final_locked(state, action)  # noqa: SLF001
+        assert authorized is (candidate_hash_mode == "valid")
+        if candidate_hash_mode == "valid":
+            consumed = coordinator._consume_replacement_authorization(state, action)  # noqa: SLF001
+            assert consumed is not None
+            authorized_action, _binding = consumed
+            assert authorized_action.metadata["allow_session_replacement"] is True
+            assert coordinator._consume_replacement_authorization(state, action) is None  # noqa: SLF001
+        else:
+            # The stale authorization remains available for a later exact
+            # action, but the admission guard must not consume it after this
+            # malformed/mismatched repair offer.
+            assert coordinator._replacement_authorization_for_action(state, action) is not None  # noqa: SLF001
+        coordinator._append_event_locked(  # noqa: SLF001 - persist one-shot consumption
+            state,
+            "test_product_replacement_authorized",
+            {"action": action.to_dict()},
+        )
+    # The row is not silently deleted: only the explicit replacement path may
+    # reserve a new Product Agent root.
+    blocked = registry.prepare(
+        action,
+        generation_id="G-0001",
+        idempotency_key="replacement-without-authorization",
+        reservation_owner_id="new-owner",
+        reservation_pid=os.getpid(),
+        reservation_process_start=coordinator_module._required_process_start_token(os.getpid()),
+    )
+    assert blocked["mode"] == "blocked"
+    assert blocked["status"] == "replacement_required"
+    replacement = registry.prepare(
+        action,
+        generation_id="G-0001",
+        idempotency_key="authorized-product-replacement",
+        allow_replacement=True,
+        reservation_owner_id="new-owner",
+        reservation_pid=os.getpid(),
+        reservation_process_start=coordinator_module._required_process_start_token(os.getpid()),
+    )
+    assert replacement["mode"] == "replace"
+    assert replacement["session_id"] is None
+    registry.release_reservation(f"product_agent:{run_id}:G-0001", "authorized-product-replacement")
+
+
+def test_transport_rebind_keeps_live_product_reservation_blocked(
+    tmp_path: Path,
+) -> None:
+    """A live Product Agent owner cannot be adopted by rebind cleanup."""
+
+    run_id = "RUN-TRANSPORT-PRODUCT-LIVE"
+    context = RunContext(run_id, tmp_path)
+    old = _spec(run_id)
+    target = CoordinatorRunSpec(
+        run_id,
+        old.generation_id,
+        old.planner_ref,
+        old.planner_hash,
+        codex_exec={"binary": "new-codex"},
+    )
+    coordinator = RunCoordinator(context, planner_provider=QueuePlanner(()), role_runner=object())
+    coordinator.start(old)
+    action = PlannerAction("build_product_candidate", "product_agent", run_id, "live reservation")
+    registry = coordinator_module.RoleSessionRegistry(context)
+    process_start = coordinator_module._required_process_start_token(os.getpid())
+    state, _ = coordinator._read_replay()  # noqa: SLF001
+    assert state is not None
+    key = coordinator._idempotency_key(state, action)
+    reservation = registry.prepare(
+        action,
+        generation_id="G-0001",
+        idempotency_key=key,
+        reservation_owner_id="live-owner",
+        reservation_pid=os.getpid(),
+        reservation_process_start=process_start,
+    )
+    assert reservation["mode"] == "new"
+    with coordinator._locked(create=False):  # noqa: SLF001 - admission regression
+        state, _ = coordinator._read_replay()  # noqa: SLF001
+        assert state is not None
+        state["active_dispatches"] = [
+            {
+                "action": action.to_dict(),
+                "idempotency_key": key,
+                "slot_key": coordinator._slot_key(action),
+                "runner_id": "live-owner",
+                "runner_pid": os.getpid(),
+                "runner_process_start": process_start,
+            }
+        ]
+        state["status"] = "dispatching"
+        state["phase"] = action.action
+        coordinator._append_event_locked(  # noqa: SLF001
+            state,
+            "dispatch_started",
+            {"action": action.to_dict(), "idempotency_key": key},
+        )
+
+    with pytest.raises(CoordinatorConflictError, match="dispatches are active"):
+        coordinator.rebind_transport(target)
+    live = registry.get(f"product_agent:{run_id}:G-0001")
+    assert live is not None
+    assert live["status"] == "reserved"
+    assert live["reservation_status"] == "reserved"
+    registry.release_reservation(f"product_agent:{run_id}:G-0001", key)
+
+
+def test_reopen_admits_one_stale_final_product_replacement_after_retry_exhaustion(
+    tmp_path: Path,
+) -> None:
+    """A public reopen grants exactly one stale-final Product Agent attempt."""
+
+    run_id = "RUN-REOPEN-STALE-FINAL-PRODUCT"
+    input_fingerprint = "a" * 64
+    old_candidate_hash = "b" * 64
+    action = PlannerAction(
+        "build_product_candidate",
+        "product_agent",
+        run_id,
+        "rebuild stale final candidate after product implementation repair",
+        metadata={
+            "generation_id": "G-0001",
+            "input_fingerprint": input_fingerprint,
+            # The old candidate identity is deliberately retained in the
+            # offer; its artifact bindings are what the Product Agent must
+            # rebuild.  No review_verdict is available while that candidate
+            # is invalid, matching the live recovery boundary.
+            "candidate_hash": old_candidate_hash,
+        },
+    )
+    context = RunContext(run_id, tmp_path)
+    calls: list[PlannerAction] = []
+
+    def transport(current: PlannerAction, **_: object) -> RoleExecution:
+        calls.append(current)
+        return RoleExecution()
+
+    planner = QueuePlanner((action,), (action,), (action,))
+    coordinator = RunCoordinator(context, planner_provider=planner, adapters={action.action: transport})
+    coordinator._phase_snapshot = lambda: {  # type: ignore[method-assign]
+        "lifecycle_validation": {"valid": True},
+        "product": {"preview_input_fingerprint": input_fingerprint},
+        "items": {},
+    }
+    coordinator.start(_spec(run_id))
+
+    registry = coordinator_module.RoleSessionRegistry(context)
+    reservation = registry.prepare(
+        action,
+        generation_id="G-0001",
+        idempotency_key="stale-product-dispatch",
+        reservation_owner_id="dead-product-owner",
+        reservation_pid=999_999,
+        reservation_process_start="dead-start",
+    )
+    assert reservation["mode"] == "new"
+    registry.mark_stale(
+        action,
+        generation_id="G-0001",
+        idempotency_key="stale-product-dispatch",
+        reservation_token="stale-product-dispatch",
+        reason="orphaned_reservation",
+    )
+    registry.release_reservation(
+        f"product_agent:{run_id}:G-0001",
+        "stale-product-dispatch",
+    )
+
+    with coordinator._locked(create=False):  # noqa: SLF001 - retry/reopen boundary
+        state, _ = coordinator._read_replay()  # noqa: SLF001
+        assert state is not None
+        retry_fingerprint = coordinator_module.logical_action_fingerprint(
+            action,
+            run_id=run_id,
+            generation_id="G-0001",
+        )
+        state_fingerprint = coordinator._authoritative_state_fingerprint(state, action)  # noqa: SLF001
+        state["retry_counts"] = {
+            retry_fingerprint: coordinator_module.MAX_RUN_RETRIES_PER_ACTION,
+        }
+        state["retry_blocked"] = {
+            retry_fingerprint: {
+                "action": action.to_dict(),
+                "count": coordinator_module.MAX_RUN_RETRIES_PER_ACTION,
+                "recoverable": True,
+            }
+        }
+        state["retry_state_fingerprints"] = {retry_fingerprint: state_fingerprint}
+        state["status"] = "waiting"
+        state["phase"] = "waiting"
+        coordinator._append_event_locked(  # noqa: SLF001
+            state,
+            "seed_stale_final_retry",
+            {"action": action.to_dict(), "retry_fingerprint": retry_fingerprint},
+        )
+
+    reopened = coordinator.reopen("explicitly authorize stale final product replacement")
+    assert reopened.status == "ready"
+    first = coordinator._refresh_and_launch(set())  # noqa: SLF001
+    assert first.status == "dispatching"
+    completed = coordinator._consume_one()  # noqa: SLF001
+    assert completed is not None
+    slot = coordinator._slot_key(action)  # noqa: SLF001
+    coordinator._refresh_and_launch({slot}, completed=completed)  # noqa: SLF001
+    assert len(calls) == 1
+
+    state = json.loads((tmp_path / "control_plane/coordinator_state.json").read_text())
+    assert state["replacement_authorizations"] == {}
+
+    # The same exhausted offer is still blocked after the one-shot
+    # authorization is consumed.  A second attempt requires another public
+    # reopen; the retry budget is not globally reset.
+    third = coordinator._refresh_and_launch(set())  # noqa: SLF001
+    assert third.status == "waiting"
+    assert third.active_dispatches == ()
+    assert len(calls) == 1
+    assert any(
+        diagnostic.get("kind") == "retry_budget_exhausted"
+        for diagnostic in third.diagnostics
+    )
+    coordinator.close(wait_for_roles=True)
+
+
+def test_rebind_transport_keeps_ambiguous_live_dispatch_without_write(tmp_path: Path) -> None:
+    run_id = "RUN-TRANSPORT-AMBIGUOUS-LIVE"
+    context = RunContext(run_id, tmp_path)
+    old = CoordinatorRunSpec(
+        run_id,
+        "G-0001",
+        "planner://test",
+        hashlib.sha256(b"planner").hexdigest(),
+        codex_exec={"binary": "old-codex"},
+    )
+    target = CoordinatorRunSpec(
+        run_id,
+        old.generation_id,
+        old.planner_ref,
+        old.planner_hash,
+        codex_exec={"binary": "new-codex"},
+    )
+    coordinator = RunCoordinator(context, planner_provider=QueuePlanner(()), role_runner=object())
+    coordinator.start(old)
+    _seed_active_dispatch(
+        coordinator,
+        _action("analyze_requirement", "REQ-AMBIGUOUS-LIVE"),
+        runner_pid=os.getpid(),
+    )
+    before = _control_plane_tree(tmp_path / "control_plane")
+
+    with pytest.raises(CoordinatorConflictError, match="dispatches are active"):
+        coordinator.rebind_transport(target)
+
+    assert _control_plane_tree(tmp_path / "control_plane") == before
+
+
+def test_rebind_transport_rejects_stale_spec_hash_without_write(tmp_path: Path) -> None:
+    run_id = "RUN-TRANSPORT-HASH"
+    context = RunContext(run_id, tmp_path)
+    old = CoordinatorRunSpec(
+        run_id,
+        "G-0001",
+        "planner://test",
+        hashlib.sha256(b"planner").hexdigest(),
+        codex_exec={"binary": "old-codex"},
+    )
+    target = CoordinatorRunSpec(
+        run_id,
+        old.generation_id,
+        old.planner_ref,
+        old.planner_hash,
+        codex_exec={"binary": "new-codex"},
+    )
+    coordinator = RunCoordinator(context, planner_provider=QueuePlanner(()), role_runner=object())
+    coordinator.start(old)
+    state_path = tmp_path / "control_plane/coordinator_state.json"
+    state = json.loads(state_path.read_text())
+    state["spec_hash"] = "f" * 64
+    state_path.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n")
+    before = _control_plane_tree(tmp_path / "control_plane")
+
+    with pytest.raises((CoordinatorConflictError, CoordinatorIntegrityError)):
+        coordinator.rebind_transport(target)
+    assert _control_plane_tree(tmp_path / "control_plane") == before
+
+
 @pytest.mark.parametrize(
     "failpoint",
     (
@@ -855,7 +2983,7 @@ def test_action_change_is_authoritative_and_output_is_diagnostic(tmp_path: Path)
     assert not any(event["event"] == "role_completed" for event in events)
 
 
-def test_same_action_is_waiting_and_reopen_resets_retry(tmp_path: Path) -> None:
+def test_same_action_is_waiting_and_reopen_preserves_retry_history(tmp_path: Path) -> None:
     action = _action()
     planner = QueuePlanner((action,), (action,), (action,), (action,), (action,), (action,))
     context = RunContext("RUN-COORD", tmp_path)
@@ -869,10 +2997,303 @@ def test_same_action_is_waiting_and_reopen_resets_retry(tmp_path: Path) -> None:
     assert status.status == "waiting"
     assert status.no_progress_count == 2
     assert any(item.get("kind") == "no_progress" for item in status.diagnostics)
+    before = json.loads((tmp_path / "control_plane/coordinator_state.json").read_text())
+    assert before["retry_counts"]
+    assert before["retry_state_fingerprints"]
     reopened = coordinator.reopen("retry after external repair")
     assert reopened.status == "ready"
     assert reopened.no_progress_count == 0
     assert reopened.last_event_seq > status.last_event_seq
+    after = json.loads((tmp_path / "control_plane/coordinator_state.json").read_text())
+    assert after["retry_counts"] == before["retry_counts"]
+    assert after["retry_blocked"] == before["retry_blocked"]
+
+
+def test_reopen_authorizes_only_matching_replacement_owner_once(tmp_path: Path) -> None:
+    """Planner metadata cannot self-authorize; reopen grants one exact owner once."""
+
+    context = RunContext("RUN-COORD-REOPEN-AUTH", tmp_path)
+    stale = _action("resume_requirement_analysis", "REQ-1")
+    unrelated = _action("resume_requirement_analysis", "REQ-2")
+    registry = coordinator_module.RoleSessionRegistry(context)
+    registry.mark_stale(
+        stale,
+        generation_id="G-0001",
+        idempotency_key="stale-session",
+        reason="thread_started_missing",
+    )
+    seen: list[PlannerAction] = []
+
+    def transport(action: PlannerAction, **_: object) -> RoleExecution:
+        seen.append(action)
+        return RoleExecution()
+
+    # The Planner's authority-looking metadata is stripped at intake.
+    planner_action = PlannerAction(
+        stale.action,
+        stale.role,
+        stale.subject_id,
+        stale.reason,
+        metadata={"allow_session_replacement": True},
+    )
+    planner = QueuePlanner((), (planner_action,), (unrelated,))
+    coordinator = RunCoordinator(
+        context,
+        planner_provider=planner,
+        adapters={stale.action: transport},
+    )
+    coordinator.start(_spec(context.run_id))
+    assert coordinator.step().status == "waiting"
+    assert "allow_session_replacement" not in coordinator._strip_untrusted_replacement_authorization(
+        planner_action
+    ).metadata
+    reopened = coordinator.reopen("replace stale analytical owner")
+    assert reopened.status == "ready"
+    state = json.loads((tmp_path / "control_plane/coordinator_state.json").read_text())
+    assert "analytical_owner:REQ-1" in state["replacement_authorizations"]
+    assert RunCoordinator._replacement_authorization_for_action(state, unrelated) is None
+
+    # The matching offer receives the coordinator-only flag and consumes it.
+    coordinator.step()
+    coordinator.run(max_steps=2)
+    assert seen
+    assert seen[0].metadata.get("allow_session_replacement") is True
+    state = json.loads((tmp_path / "control_plane/coordinator_state.json").read_text())
+    assert state["replacement_authorizations"] == {}
+    coordinator.close(wait_for_roles=True)
+
+
+def test_changed_durable_state_reopens_bounded_retry_for_same_action(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action = _action()
+    context = RunContext("RUN-STATE-AWARE-RETRY", tmp_path)
+    calls: list[str] = []
+
+    def transport(current: PlannerAction, **_: object) -> RoleExecution:
+        calls.append(current.action)
+        return RoleExecution()
+
+    coordinator = RunCoordinator(
+        context,
+        planner_provider=QueuePlanner((action,)),
+        adapters={action.action: transport},
+    )
+    coordinator.start(_spec(context.run_id))
+    retry_fingerprint = coordinator_module.logical_action_fingerprint(
+        action,
+        run_id=context.run_id,
+        generation_id="G-0001",
+    )
+    with coordinator._locked(create=False):
+        state, _ = coordinator._read_replay()
+        assert state is not None
+        state["retry_counts"] = {retry_fingerprint: 2}
+        state["retry_blocked"] = {
+            retry_fingerprint: {"action": action.to_dict(), "count": 2, "recoverable": True}
+        }
+        state["retry_state_fingerprints"] = {retry_fingerprint: "a" * 64}
+        coordinator._append_event_locked(state, "seed_retry", {"action": action.to_dict()})
+    monkeypatch.setattr(coordinator, "_phase_snapshot", lambda: {"marker": "advanced"})
+    status = coordinator._refresh_and_launch(set())
+    assert calls == ["analyze_requirement"]
+    assert status.status == "dispatching"
+    coordinator.close(wait_for_roles=True)
+
+
+def test_transport_rebind_invalidates_only_offered_retry_for_changed_spec(
+    tmp_path: Path,
+) -> None:
+    """A changed transport identity reopens the offered action only."""
+
+    action_a = _action("analyze_requirement", "REQ-A")
+    action_b = _action("analyze_requirement", "REQ-B")
+    context = RunContext("RUN-TRANSPORT-RETRY-ROTATION", tmp_path)
+    old = CoordinatorRunSpec(
+        context.run_id,
+        "G-0001",
+        "planner://test",
+        hashlib.sha256(b"planner").hexdigest(),
+        codex_exec={"binary": "old-codex"},
+    )
+    target = CoordinatorRunSpec(
+        context.run_id,
+        old.generation_id,
+        old.planner_ref,
+        old.planner_hash,
+        codex_exec={"binary": "new-codex"},
+    )
+    calls: list[str] = []
+    coordinator = RunCoordinator(
+        context,
+        planner_provider=QueuePlanner((action_a,)),
+        adapters={
+            "analyze_requirement": lambda action, **_: calls.append(action.subject_id)
+            or RoleExecution(),
+        },
+    )
+    # Keep a validated item-scoped phase projection so the regression covers
+    # the live requirement path (where the old implementation omitted spec
+    # identity from the fingerprint).
+    coordinator._phase_snapshot = lambda: {  # type: ignore[method-assign]
+        "lifecycle_validation": {"valid": True},
+        "items": {
+            "REQ-A": {"lifecycle_state": "work"},
+            "REQ-B": {"lifecycle_state": "work"},
+        },
+    }
+    coordinator.start(old)
+    retry_fingerprints: dict[str, str] = {}
+    with coordinator._locked(create=False):  # noqa: SLF001 - retry fixture boundary
+        state, _ = coordinator._read_replay()  # noqa: SLF001
+        assert state is not None
+        retry_counts: dict[str, int] = {}
+        retry_blocked: dict[str, dict[str, object]] = {}
+        retry_states: dict[str, str] = {}
+        for action in (action_a, action_b):
+            fingerprint = coordinator_module.logical_action_fingerprint(
+                action,
+                run_id=context.run_id,
+                generation_id=old.generation_id,
+            )
+            retry_fingerprints[action.subject_id] = fingerprint
+            retry_counts[fingerprint] = coordinator_module.MAX_RUN_RETRIES_PER_ACTION
+            retry_blocked[fingerprint] = {
+                "action": action.to_dict(),
+                "count": coordinator_module.MAX_RUN_RETRIES_PER_ACTION,
+                "recoverable": True,
+            }
+            retry_states[fingerprint] = coordinator._authoritative_state_fingerprint(  # noqa: SLF001
+                state,
+                action,
+            )
+        state["retry_counts"] = retry_counts
+        state["retry_blocked"] = retry_blocked
+        state["retry_state_fingerprints"] = retry_states
+        coordinator._append_event_locked(  # noqa: SLF001
+            state,
+            "retry_seed",
+            {"actions": [action_a.to_dict(), action_b.to_dict()]},
+        )
+        old_spec_hash = str(state["spec_hash"])
+
+    coordinator.rebind_transport(target)
+    with coordinator._locked(create=False):  # noqa: SLF001 - retry fixture boundary
+        rebound_state, _ = coordinator._read_replay()  # noqa: SLF001
+        assert rebound_state is not None
+        assert rebound_state["spec_hash"] != old_spec_hash
+        assert coordinator._authoritative_state_fingerprint(  # noqa: SLF001
+            rebound_state,
+            action_a,
+        ) != retry_states[retry_fingerprints["REQ-A"]]
+
+    status = coordinator._refresh_and_launch(set())  # noqa: SLF001
+    try:
+        assert status.status == "dispatching"
+        with coordinator._locked(create=False):  # noqa: SLF001 - retry fixture boundary
+            after, _ = coordinator._read_replay()  # noqa: SLF001
+            assert after is not None
+            # The offered action is reopened and admitted; the unrelated
+            # action's retry evidence remains durable and is not globally
+            # wiped by the transport rotation.
+            assert retry_fingerprints["REQ-A"] not in after["retry_counts"]
+            assert retry_fingerprints["REQ-A"] not in after["retry_blocked"]
+            assert retry_fingerprints["REQ-A"] not in after["retry_state_fingerprints"]
+            assert after["retry_counts"].get(retry_fingerprints["REQ-B"]) == coordinator_module.MAX_RUN_RETRIES_PER_ACTION
+            assert retry_fingerprints["REQ-B"] in after["retry_blocked"]
+            assert retry_fingerprints["REQ-B"] in after["retry_state_fingerprints"]
+            assert any(
+                entry.get("action", {}).get("subject_id") == "REQ-A"
+                for entry in after["active_dispatches"]
+            )
+    finally:
+        coordinator.close(wait_for_roles=True)
+
+
+def test_idempotent_transport_rebind_preserves_exhausted_retry(
+    tmp_path: Path,
+) -> None:
+    """Rebinding to the persisted transport identity does not reset retries."""
+
+    action = _action("analyze_requirement", "REQ-SAME")
+    context = RunContext("RUN-TRANSPORT-RETRY-IDEMPOTENT", tmp_path)
+    spec = CoordinatorRunSpec(
+        context.run_id,
+        "G-0001",
+        "planner://test",
+        hashlib.sha256(b"planner").hexdigest(),
+        codex_exec={"binary": "same-codex"},
+    )
+    calls: list[str] = []
+    coordinator = RunCoordinator(
+        context,
+        planner_provider=QueuePlanner((action,)),
+        adapters={
+            "analyze_requirement": lambda current, **_: calls.append(current.subject_id)
+            or RoleExecution(),
+        },
+    )
+    coordinator._phase_snapshot = lambda: {  # type: ignore[method-assign]
+        "lifecycle_validation": {"valid": True},
+        "items": {"REQ-SAME": {"lifecycle_state": "work"}},
+    }
+    coordinator.start(spec)
+    with coordinator._locked(create=False):  # noqa: SLF001 - retry fixture boundary
+        state, _ = coordinator._read_replay()  # noqa: SLF001
+        assert state is not None
+        fingerprint = coordinator_module.logical_action_fingerprint(
+            action,
+            run_id=context.run_id,
+            generation_id=spec.generation_id,
+        )
+        state_fingerprint = coordinator._authoritative_state_fingerprint(  # noqa: SLF001
+            state,
+            action,
+        )
+        state["retry_counts"] = {fingerprint: coordinator_module.MAX_RUN_RETRIES_PER_ACTION}
+        state["retry_blocked"] = {
+            fingerprint: {
+                "action": action.to_dict(),
+                "count": coordinator_module.MAX_RUN_RETRIES_PER_ACTION,
+                "recoverable": True,
+            }
+        }
+        state["retry_state_fingerprints"] = {fingerprint: state_fingerprint}
+        coordinator._append_event_locked(  # noqa: SLF001
+            state,
+            "retry_seed",
+            {"action": action.to_dict()},
+        )
+
+    # This is an idempotent no-op at the persisted spec boundary.
+    rebound = coordinator.rebind_transport(spec)
+    assert rebound.status == "ready"
+    status = coordinator._refresh_and_launch(set())  # noqa: SLF001
+    try:
+        assert status.status == "waiting"
+        assert calls == []
+        with coordinator._locked(create=False):  # noqa: SLF001 - retry fixture boundary
+            after, _ = coordinator._read_replay()  # noqa: SLF001
+            assert after is not None
+            assert after["retry_counts"].get(fingerprint) == coordinator_module.MAX_RUN_RETRIES_PER_ACTION
+            assert fingerprint in after["retry_blocked"]
+            assert after["active_dispatches"] == []
+    finally:
+        coordinator.close(wait_for_roles=True)
+
+
+def test_retry_budget_wait_projects_blocked_action(tmp_path: Path) -> None:
+    action = _action()
+    context = RunContext("RUN-COORD", tmp_path)
+    coordinator = RunCoordinator(context, planner_provider=QueuePlanner((action,)))
+    coordinator.start(_spec())
+
+    status = coordinator._refresh_and_launch({coordinator._slot_key(action)})
+
+    assert status.status == "waiting"
+    assert status.next_action == action.to_dict()
+    assert status.active_dispatches == ()
 
 
 def test_nonzero_role_transport_waits_and_is_retryable(tmp_path: Path) -> None:
@@ -1593,6 +4014,169 @@ def test_publish_and_rebind_is_quiescent_and_recoverable(tmp_path: Path) -> None
     assert seen == ["G-0002"]
 
 
+def _rotated_pending_plan_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    failpoint: str = "plan_rebind_after_started",
+) -> tuple[RunCoordinator, CoordinatorRunSpec, CoordinatorRunSpec, Path]:
+    """Create a pending plan rebind whose source skill is rotated in place."""
+
+    skill_path = _install_test_skill(tmp_path, monkeypatch)
+    run_id = "RUN-PENDING-ROTATED"
+    context = RunContext(run_id, tmp_path)
+    old_binding = coordinator_module.resolve_production_skill_binding(repo_root=tmp_path)
+    source = CoordinatorRunSpec(
+        run_id,
+        "G-0001",
+        "planner://g1",
+        hashlib.sha256(b"planner://g1").hexdigest(),
+        codex_exec={"binary": "fake-codex", **old_binding},
+    )
+    old_target = CoordinatorRunSpec(
+        run_id,
+        "G-0002",
+        "planner://g2",
+        hashlib.sha256(b"planner://g2").hexdigest(),
+        codex_exec={"binary": "fake-codex", **old_binding},
+    )
+    coordinator = RunCoordinator(context, planner_provider=QueuePlanner(()))
+    coordinator.start(source)
+
+    def fail_started(name: str) -> None:
+        if name == failpoint:
+            raise RuntimeError(name)
+
+    coordinator._failpoint = fail_started
+    with pytest.raises(RuntimeError, match=failpoint):
+        coordinator.publish_and_rebind(old_target, lambda _spec: None)
+    coordinator._failpoint = None
+
+    # Keep the canonical path but rotate its release bytes.  The old binding
+    # remains in the raw coordinator spec and is no longer loadable through a
+    # production Codex adapter.
+    (skill_path / "README.md").write_text("rotated release fixture\n", encoding="utf-8")
+    new_hash = hashlib.sha256(coordinator_module._skill_release_bytes(skill_path)).hexdigest()
+    monkeypatch.setattr(coordinator_module, "PRODUCTION_SKILL_SHA256", new_hash)
+    new_binding = coordinator_module.resolve_production_skill_binding(repo_root=tmp_path)
+    target = CoordinatorRunSpec(
+        run_id,
+        old_target.generation_id,
+        old_target.planner_ref,
+        old_target.planner_hash,
+        codex_exec={"binary": "fake-codex", **new_binding},
+    )
+    return coordinator, old_target, target, tmp_path / "control_plane"
+
+
+def test_pending_plan_rebind_retargets_rotated_skill_and_finishes_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, old_target, target, control_plane = _rotated_pending_plan_fixture(tmp_path, monkeypatch)
+    published: list[str] = []
+
+    recovered = coordinator.publish_and_rebind(target, lambda spec: published.append(spec.generation_id))
+
+    assert recovered.status == "ready"
+    assert published == [target.generation_id]
+    assert coordinator.persisted_spec() == target
+    assert not coordinator.transport_rebind_intent_path.exists()
+    events = [json.loads(line) for line in (control_plane / "coordinator_events.jsonl").read_text().splitlines()]
+    assert [event["event"] for event in events][-2:] == [
+        "plan_rebind_transport_retargeted",
+        "plan_rebound",
+    ]
+    retargeted = next(event for event in events if event["event"] == "plan_rebind_transport_retargeted")
+    assert retargeted["payload"]["old_new_spec_hash"] == coordinator._spec_hash(old_target)
+    assert retargeted["payload"]["new_spec_hash"] == coordinator._spec_hash(target)
+    assert events[-1]["event"] == "plan_rebound"
+
+
+def test_pending_plan_rebind_recovers_after_spec_crash_and_skill_rotation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restart accepts the durable window after spec write but before state."""
+
+    coordinator, old_target, target, control_plane = _rotated_pending_plan_fixture(
+        tmp_path,
+        monkeypatch,
+        failpoint="plan_rebind_after_spec",
+    )
+    raw_spec = json.loads((control_plane / "coordinator_spec.json").read_text())
+    state = json.loads((control_plane / "coordinator_state.json").read_text())
+    pending = state["pending_plan_rebind"]
+    assert raw_spec["generation_id"] == old_target.generation_id
+    assert state["generation_id"] != raw_spec["generation_id"]
+    assert pending["old_spec_hash"] == state["spec_hash"]
+    assert pending["new_spec_hash"] == coordinator._spec_hash(old_target)
+
+    coordinator.close()
+    restarted = RunCoordinator(coordinator.context, planner_provider=QueuePlanner(()))
+    published: list[str] = []
+    recovered = restarted.publish_and_rebind(target, lambda spec: published.append(spec.generation_id))
+
+    assert recovered.status == "ready"
+    assert published == [target.generation_id]
+    assert restarted.persisted_spec() == target
+    events = [json.loads(line) for line in (control_plane / "coordinator_events.jsonl").read_text().splitlines()]
+    assert [event["event"] for event in events][-2:] == [
+        "plan_rebind_transport_retargeted",
+        "plan_rebound",
+    ]
+
+
+def test_pending_plan_rebind_rejects_mismatched_rotated_target_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, _old_target, target, control_plane = _rotated_pending_plan_fixture(tmp_path, monkeypatch)
+    wrong_target = CoordinatorRunSpec(
+        target.run_id,
+        "G-0003",
+        "planner://g3",
+        hashlib.sha256(b"planner://g3").hexdigest(),
+        codex_exec=target.codex_exec,
+    )
+    before = _control_plane_tree(control_plane)
+
+    with pytest.raises(CoordinatorConflictError, match="different plan rebind"):
+        coordinator.publish_and_rebind(wrong_target, lambda _spec: pytest.fail("publisher must not run"))
+
+    assert _control_plane_tree(control_plane) == before
+
+
+def test_pending_plan_rebind_publisher_failure_after_retarget_converges_on_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, _old_target, target, control_plane = _rotated_pending_plan_fixture(tmp_path, monkeypatch)
+    calls = 0
+
+    def publish(_spec: CoordinatorRunSpec) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("publisher unavailable")
+
+    deferred = coordinator.publish_and_rebind(target, publish)
+    assert deferred.status == "waiting"
+    assert deferred.phase == "plan_rebind_pending"
+    pending = json.loads((control_plane / "coordinator_state.json").read_text())["pending_plan_rebind"]
+    assert pending["new_spec_hash"] == coordinator._spec_hash(target)
+    events_before = [json.loads(line) for line in (control_plane / "coordinator_events.jsonl").read_text().splitlines()]
+    assert [event["event"] for event in events_before].count("plan_rebind_transport_retargeted") == 1
+
+    recovered = coordinator.publish_and_rebind(target, publish)
+    assert recovered.status == "ready"
+    assert calls == 2
+    assert coordinator.persisted_spec() == target
+    events_after = [json.loads(line) for line in (control_plane / "coordinator_events.jsonl").read_text().splitlines()]
+    assert [event["event"] for event in events_after].count("plan_rebind_transport_retargeted") == 1
+    assert [event["event"] for event in events_after].count("plan_rebound") == 1
+
+
 @pytest.mark.parametrize(
     "failpoint",
     (
@@ -1708,6 +4292,31 @@ def test_live_pid_claim_allows_exactly_one_multiprocess_submit(tmp_path: Path) -
     assert submissions[0].split(":", 1)[1] == key
 
 
+def test_unknown_live_active_claim_is_not_silently_adopted(tmp_path: Path) -> None:
+    context = RunContext("RUN-UNKNOWN-LIVE-CLAIM", tmp_path)
+    action = _action("analyze_requirement", "REQ-UNKNOWN-LIVE")
+    seen: list[str] = []
+    seed = RunCoordinator(context, planner_provider=QueuePlanner(()))
+    seed.start(_spec(context.run_id))
+    _seed_active_dispatch(seed, action, runner_pid=os.getpid())
+    seed.close(wait_for_roles=True)
+
+    restarted = RunCoordinator(
+        context,
+        planner_provider=QueuePlanner((action,)),
+        adapters={
+            "analyze_requirement": lambda current, **kwargs: seen.append(kwargs["idempotency_key"])
+            or RoleExecution()
+        },
+    )
+
+    status = restarted.step()
+
+    assert status.status == "dispatching"
+    assert status.active_dispatches
+    assert seen == []
+
+
 def test_dead_pid_adopts_active_slot_with_same_idempotency_key(tmp_path: Path) -> None:
     context = RunContext("RUN-DEAD-CLAIM", tmp_path)
     action = _action("analyze_requirement", "REQ-DEAD")
@@ -1795,3 +4404,442 @@ def test_reopen_clears_only_dead_claims(tmp_path: Path) -> None:
     assert reopened.active_dispatches[0].get("runner_id") is None
     events = [json.loads(line) for line in (tmp_path / "control_plane/coordinator_events.jsonl").read_text().splitlines()]
     assert events[-1]["event"] == "dispatch_claims_cleared"
+
+
+def _admit_refresh(context: RunContext, parent: Any, revision: Any, coordinator: RunCoordinator) -> Any:
+    lifecycle = RunLifecycle.load(context)
+    return DataRevisionStore(context).admit_pending_data_refresh(
+        data_revision=revision,
+        plan=parent.to_dict(),
+        reopened_item_ids=("REQ-01",),
+        expected_parent_generation_id="G-0001",
+        expected_parent_state_hash=lifecycle.snapshot.manifest_hash,
+        expected_parent_plan_hash=hashlib.sha256(lifecycle.plan_path.read_bytes()).hexdigest(),
+        launch_draft_id="DRAFT-REFRESH",
+        launch_fingerprint="a" * 64,
+        created_at="2026-08-26T00:00:00Z",
+        data_revision_ref="data_room/revisions/D-0002/revision_manifest.json",
+    )
+
+
+def _expanded_refresh_plan(parent: RequirementExecutionPlan) -> RequirementExecutionPlan:
+    added = RequirementRecord(
+        requirement_id="REQ-02",
+        original_text="Investigate REQ-02.",
+        business_objective="Support REQ-02",
+        expected_analytical_outputs=("output-REQ-02",),
+    )
+    return RequirementExecutionPlan(
+        input_records=(*parent.input_records, added),
+        groups=(RequirementExecutionGroup(("REQ-01", "REQ-02"), "Original route."),),
+        planner_ref=parent.planner_ref,
+        portfolio_strategy=parent.portfolio_strategy,
+        revision=parent.revision + 1,
+    )
+
+
+def test_data_refresh_active_attempt_defers_without_plan_rebind_trap(tmp_path: Path) -> None:
+    context, parent, revision = _refresh_fixture(tmp_path)
+    item = ItemWorkspace.load(context, "REQ-01", mode="requirement")
+    attempt = item.begin_attempt("owner", "analysis")
+    coordinator = RunCoordinator(context, planner_provider=QueuePlanner(()))
+    coordinator.start(_spec(context.run_id))
+    store = DataRevisionStore(context)
+    pending = _admit_refresh(context, parent, revision, coordinator)
+
+    status = coordinator.consume_pending_data_refresh()
+
+    assert status.phase == "data_refresh_pending"
+    assert status.generation_id == "G-0001"
+    assert store.pending_data_refresh().intent_hash == pending.intent_hash
+    state = json.loads((tmp_path / "run/control_plane/coordinator_state.json").read_text())
+    assert state["pending_plan_rebind"] is None
+    assert all("error" not in diagnostic for diagnostic in status.diagnostics)
+
+    item.finish_attempt(attempt.attempt_id, status="interrupted", error="host_interruption")
+    recovered = coordinator.consume_pending_data_refresh()
+    assert recovered.generation_id == "G-0002"
+    assert store.pending_data_refresh() is None
+
+
+def test_root_g1_without_product_remains_pending_before_data_refresh(tmp_path: Path) -> None:
+    context, parent, revision = _base_refresh_fixture(tmp_path)
+    coordinator = RunCoordinator(context, planner_provider=QueuePlanner(()))
+    coordinator.start(_spec(context.run_id))
+    store = DataRevisionStore(context)
+    pending = _admit_refresh(context, parent, revision, coordinator)
+
+    status = coordinator.consume_pending_data_refresh()
+
+    assert status.phase == "waiting_product"
+    assert status.generation_id == "G-0001"
+    assert store.pending_data_refresh().intent_hash == pending.intent_hash
+    assert RunLifecycle.load(context).generation_metadata is None
+
+
+def test_root_g1_valid_product_allows_first_data_refresh(tmp_path: Path) -> None:
+    context, parent, revision = _refresh_fixture(tmp_path)
+    coordinator = RunCoordinator(context, planner_provider=QueuePlanner(()))
+    coordinator.start(_spec(context.run_id))
+    store = DataRevisionStore(context)
+    _admit_refresh(context, parent, revision, coordinator)
+
+    status = coordinator.consume_pending_data_refresh()
+
+    assert status.generation_id == "G-0002"
+    assert RunLifecycle.load(context).generation_metadata.data_revision_hash == revision.manifest_hash
+    assert store.pending_data_refresh() is None
+
+
+def test_append_successor_transaction_leaves_stale_pending_in_recovery_until_exact_admit(tmp_path: Path) -> None:
+    context, parent, revision = _refresh_fixture(tmp_path)
+    coordinator = RunCoordinator(context, planner_provider=QueuePlanner(()))
+    coordinator.start(_spec(context.run_id))
+    store = DataRevisionStore(context)
+    _admit_refresh(context, parent, revision, coordinator)
+
+    third_archive = tmp_path / "inputs" / "three-transaction.zip"
+    with zipfile.ZipFile(third_archive, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("orders.csv", "id,value\n1,three\n")
+    d3 = store.append(
+        third_archive,
+        expected_current_revision_id=revision.revision_id,
+        expected_current_manifest_hash=revision.manifest_hash,
+        transaction={
+            "launch_draft_id": "DRAFT-SUCCESSOR-TX",
+            "launch_fingerprint": "b" * 64,
+            "created_at": "2026-08-26T00:00:01Z",
+        },
+    )
+
+    # The old D2 admission is immutable audit, but no longer current after the
+    # crash-window D3 pointer swap. Coordinator projects recovery rather than
+    # raising a technical CAS error or starting a second generation.
+    status = coordinator.step()
+    assert status.status == "waiting"
+    assert status.phase == "data_revision_recovery"
+    assert status.diagnostics[-1]["kind"] == "data_revision_recovery"
+    assert status.diagnostics[-1]["pending_revision_id"] == revision.revision_id
+    assert store.pending_data_refresh(allow_stale=True).data_revision_id == revision.revision_id
+    assert RunLifecycle.load(context).generation_id == "G-0001"
+
+    lifecycle = RunLifecycle.load(context)
+    recovered_pending = store.admit_pending_data_refresh(
+        data_revision=d3,
+        plan=parent.to_dict(),
+        reopened_item_ids=("REQ-01",),
+        expected_parent_generation_id="G-0001",
+        expected_parent_state_hash=lifecycle.snapshot.manifest_hash,
+        expected_parent_plan_hash=hashlib.sha256(lifecycle.plan_path.read_bytes()).hexdigest(),
+        launch_draft_id="DRAFT-SUCCESSOR-TX",
+        launch_fingerprint="b" * 64,
+        created_at="2026-08-26T00:00:01Z",
+        data_revision_ref="data_room/revisions/D-0003/revision_manifest.json",
+    )
+    assert recovered_pending.data_revision_id == "D-0003"
+    assert store.revision_transaction() is None
+    recovered = coordinator.consume_pending_data_refresh()
+    assert recovered.generation_id == "G-0002"
+    assert RunLifecycle.load(context).generation_metadata.data_revision_hash == d3.manifest_hash
+    assert store.pending_data_refresh() is None
+
+
+def test_revision_recovery_keeps_current_generation_planner_work_running(tmp_path: Path) -> None:
+    context, parent, revision = _refresh_fixture(tmp_path)
+    seen: list[str] = []
+    action = _action("analyze_requirement", "REQ-01")
+    planner = QueuePlanner((action,), ())
+    coordinator = RunCoordinator(
+        context,
+        planner_provider=planner,
+        adapters={
+            "analyze_requirement": lambda _context, **kwargs: seen.append(kwargs["idempotency_key"]) or RoleExecution(),
+        },
+    )
+    coordinator.start(_spec(context.run_id))
+    store = DataRevisionStore(context)
+    _admit_refresh(context, parent, revision, coordinator)
+    third_archive = tmp_path / "inputs" / "three-planner-recovery.zip"
+    with zipfile.ZipFile(third_archive, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("orders.csv", "id,value\n1,three\n")
+    store.append(
+        third_archive,
+        expected_current_revision_id=revision.revision_id,
+        expected_current_manifest_hash=revision.manifest_hash,
+        transaction={
+            "launch_draft_id": "DRAFT-PLANNER-RECOVERY",
+            "launch_fingerprint": "d" * 64,
+            "created_at": "2026-08-26T00:00:02Z",
+        },
+    )
+
+    status = coordinator.step()
+    assert seen
+    assert status.phase == "data_revision_recovery"
+    assert status.status == "waiting"
+    assert RunLifecycle.load(context).generation_id == "G-0001"
+
+
+def test_data_refresh_superseded_pointer_clears_temporary_rebind_and_retries_latest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context, parent, revision = _refresh_fixture(tmp_path)
+    coordinator = RunCoordinator(context, planner_provider=QueuePlanner(()))
+    coordinator.start(_spec(context.run_id))
+    store = DataRevisionStore(context)
+    lifecycle = RunLifecycle.load(context)
+    parent_state_hash = lifecycle.snapshot.manifest_hash
+    parent_plan_hash = hashlib.sha256(lifecycle.plan_path.read_bytes()).hexdigest()
+    _admit_refresh(context, parent, revision, coordinator)
+
+    inputs = tmp_path / "inputs"
+    third_archive = inputs / "three.zip"
+    with zipfile.ZipFile(third_archive, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("orders.csv", "id,value\n1,three\n")
+    started = threading.Event()
+    release = threading.Event()
+    original = RequirementRunExtension.refresh_data
+
+    def pause_before_refresh(context_arg: RunContext, *args: Any, **kwargs: Any) -> Any:
+        started.set()
+        assert release.wait(5)
+        return original(context_arg, *args, **kwargs)
+
+    monkeypatch.setattr(
+        RequirementRunExtension,
+        "refresh_data",
+        staticmethod(pause_before_refresh),
+    )
+    outcomes: list[Any] = []
+    errors: list[BaseException] = []
+
+    def consume() -> None:
+        try:
+            outcomes.append(coordinator.consume_pending_data_refresh())
+        except BaseException as exc:  # noqa: BLE001 - thread evidence is asserted below
+            errors.append(exc)
+
+    worker = threading.Thread(target=consume)
+    worker.start()
+    assert started.wait(5)
+
+    d3 = store.append(
+        third_archive,
+        expected_current_revision_id=revision.revision_id,
+        expected_current_manifest_hash=revision.manifest_hash,
+    )
+    store.admit_pending_data_refresh(
+        data_revision=d3,
+        plan=_expanded_refresh_plan(parent).to_dict(),
+        reopened_item_ids=("REQ-01",),
+        expected_parent_generation_id="G-0001",
+        expected_parent_state_hash=parent_state_hash,
+        expected_parent_plan_hash=parent_plan_hash,
+        launch_draft_id="DRAFT-REFRESH",
+        launch_fingerprint="a" * 64,
+        created_at="2026-08-26T00:00:00Z",
+        data_revision_ref="data_room/revisions/D-0003/revision_manifest.json",
+    )
+    release.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert errors == []
+    assert outcomes and outcomes[0].phase == "data_refresh_pending"
+    assert outcomes[0].generation_id == "G-0001"
+    assert store.pending_data_refresh().data_revision_id == "D-0003"
+    state = json.loads((tmp_path / "run/control_plane/coordinator_state.json").read_text())
+    assert state["pending_plan_rebind"] is None
+    assert not (tmp_path / "run/extensions/G-0002").exists()
+
+    monkeypatch.setattr(RequirementRunExtension, "refresh_data", original)
+    recovered = coordinator.consume_pending_data_refresh()
+    assert recovered.generation_id == "G-0002"
+    assert RunLifecycle.load(context).generation_id == "G-0002"
+    assert RunLifecycle.load(context).generation_metadata.data_revision_hash == d3.manifest_hash
+    assert store.pending_data_refresh() is None
+
+
+def test_data_refresh_successor_after_pointer_before_mark_waits_for_product_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context, parent, revision = _refresh_fixture(tmp_path)
+    coordinator = RunCoordinator(context, planner_provider=QueuePlanner(()))
+    coordinator.start(_spec(context.run_id))
+    store = DataRevisionStore(context)
+    lifecycle = RunLifecycle.load(context)
+    parent_state_hash = lifecycle.snapshot.manifest_hash
+    parent_plan_hash = hashlib.sha256(lifecycle.plan_path.read_bytes()).hexdigest()
+    first_pending = _admit_refresh(context, parent, revision, coordinator)
+
+    third_archive = tmp_path / "inputs" / "three-after-mark.zip"
+    with zipfile.ZipFile(third_archive, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("orders.csv", "id,value\n1,three\n")
+    original_mark = DataRevisionStore.mark_pending_data_refresh_applied
+    injected = {"value": False}
+
+    def append_successor(self: DataRevisionStore, intent_hash: str, *, generation_id: str) -> Any:
+        if not injected["value"]:
+            injected["value"] = True
+            successor = self.append(
+                third_archive,
+                expected_current_revision_id=revision.revision_id,
+                expected_current_manifest_hash=revision.manifest_hash,
+            )
+            self.admit_pending_data_refresh(
+                data_revision=successor,
+                plan=_expanded_refresh_plan(parent).to_dict(),
+                reopened_item_ids=("REQ-01",),
+                expected_parent_generation_id="G-0001",
+                expected_parent_state_hash=parent_state_hash,
+                expected_parent_plan_hash=parent_plan_hash,
+                launch_draft_id="DRAFT-REFRESH",
+                launch_fingerprint="a" * 64,
+                created_at="2026-08-26T00:00:00Z",
+                data_revision_ref="data_room/revisions/D-0003/revision_manifest.json",
+            )
+        return original_mark(self, intent_hash, generation_id=generation_id)
+
+    monkeypatch.setattr(DataRevisionStore, "mark_pending_data_refresh_applied", append_successor)
+    first_applied = coordinator.consume_pending_data_refresh()
+
+    assert first_applied.generation_id == "G-0002"
+    assert RunLifecycle.load(context).generation_id == "G-0002"
+    successor_pending = store.pending_data_refresh()
+    assert successor_pending is not None
+    assert successor_pending.data_revision_id == "D-0003"
+    assert successor_pending.expected_parent_generation_id == "G-0002"
+    # A second D cannot supersede G2 in the same safe-boundary call: G2 must
+    # first publish its own generation product for G3's parent lineage.
+    _write_valid_extension_product(context, "G-0002")
+    recovered = coordinator.consume_pending_data_refresh()
+    assert recovered.generation_id == "G-0003"
+    assert RunLifecycle.load(context).generation_id == "G-0003"
+    assert store.pending_data_refresh() is None
+    assert RunLifecycle.load(context).generation_metadata.data_revision_ref.endswith("D-0003/revision_manifest.json")
+    assert first_pending.intent_hash != ""
+
+
+def test_data_refresh_rebases_after_real_plan_generation_and_preserves_admission_provenance(
+    tmp_path: Path,
+) -> None:
+    context, parent, revision = _refresh_fixture(tmp_path)
+    coordinator = RunCoordinator(context, planner_provider=QueuePlanner(()))
+    coordinator.start(_spec(context.run_id))
+    store = DataRevisionStore(context)
+    admitted = _admit_refresh(context, parent, revision, coordinator)
+
+    # Existing contracts publish a real current-plan generation before the
+    # pending data admission reaches its safe boundary.
+    revised = RequirementRunExtension.revise(context, plan=_expanded_refresh_plan(parent))
+    assert revised.generation_id == "G-0002"
+    _write_valid_extension_product(context, "G-0002")
+
+    status = coordinator.consume_pending_data_refresh()
+    assert status.generation_id == "G-0003"
+    assert store.pending_data_refresh() is None
+    current_plan = RequirementSupervisorWorkspace(context).load()
+    assert tuple(record.requirement_id for record in current_plan.input_records) == ("REQ-01", "REQ-02")
+
+    # The applied receipt retains the original G1 parent CAS even though the
+    # canonical pending bytes were rebased to G2 before publication.
+    receipts = list(store.pending_data_refresh_archive_root.glob("*.json"))
+    assert receipts
+    receipt = json.loads(receipts[-1].read_text(encoding="utf-8"))
+    assert receipt["original_parent_generation_id"] == admitted.expected_parent_generation_id
+    assert receipt["original_parent_state_hash"] == admitted.expected_parent_state_hash
+    assert receipt["original_parent_plan_hash"] == admitted.expected_parent_plan_hash
+
+
+@pytest.mark.parametrize(
+    "crash_point",
+    ("after_g_before_spec", "after_spec_before_state", "after_state_before_applied"),
+)
+def test_data_refresh_restart_recovery_converges_across_rebind_windows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    crash_point: str,
+) -> None:
+    context, parent, revision = _refresh_fixture(tmp_path)
+    coordinator = RunCoordinator(context, planner_provider=QueuePlanner(()))
+    coordinator.start(_spec(context.run_id))
+    store = DataRevisionStore(context)
+    _admit_refresh(context, parent, revision, coordinator)
+
+    if crash_point == "after_g_before_spec":
+        original = RequirementRunExtension.refresh_data
+
+        def crash_after_generation(context_arg: RunContext, *args: Any, **kwargs: Any) -> Any:
+            result = original(context_arg, *args, **kwargs)
+            raise BaseException("after generation publication")
+
+        monkeypatch.setattr(
+            RequirementRunExtension,
+            "refresh_data",
+            staticmethod(crash_after_generation),
+        )
+    else:
+        failpoint_name = {
+            "after_spec_before_state": "data_refresh_after_spec",
+            "after_state_before_applied": "data_refresh_before_applied",
+        }[crash_point]
+
+        def failpoint(name: str) -> None:
+            if name == failpoint_name:
+                raise BaseException(name)
+
+        coordinator._failpoint = failpoint
+
+    with pytest.raises(BaseException):
+        coordinator.consume_pending_data_refresh()
+    if crash_point == "after_g_before_spec":
+        monkeypatch.setattr(RequirementRunExtension, "refresh_data", original)
+
+    restarted = RunCoordinator.from_persisted_spec(
+        context,
+        planner_provider=QueuePlanner(()),
+    )
+    recovered = restarted.consume_pending_data_refresh()
+
+    assert recovered.generation_id == "G-0002"
+    assert RunLifecycle.load(context).generation_id == "G-0002"
+    assert store.pending_data_refresh() is None
+    state = json.loads((tmp_path / "run/control_plane/coordinator_state.json").read_text())
+    assert state["pending_plan_rebind"] is None
+
+
+def test_data_refresh_runtime_failpoint_retains_rebind_for_exact_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context, parent, revision = _refresh_fixture(tmp_path)
+    coordinator = RunCoordinator(context, planner_provider=QueuePlanner(()))
+    coordinator.start(_spec(context.run_id))
+    store = DataRevisionStore(context)
+    _admit_refresh(context, parent, revision, coordinator)
+    original = run_extension_module.RequirementRunExtension._refresh_failpoint
+
+    def failpoint(name: str) -> None:
+        if name == "after_intent":
+            raise RuntimeError("refresh failpoint")
+
+    monkeypatch.setattr(
+        run_extension_module.RequirementRunExtension,
+        "_refresh_failpoint",
+        staticmethod(failpoint),
+    )
+    pending_status = coordinator.consume_pending_data_refresh()
+    assert pending_status.phase == "plan_rebind_pending"
+    assert store.pending_data_refresh() is not None
+    state = json.loads((tmp_path / "run/control_plane/coordinator_state.json").read_text())
+    assert state["pending_plan_rebind"] is not None
+
+    monkeypatch.setattr(
+        run_extension_module.RequirementRunExtension,
+        "_refresh_failpoint",
+        original,
+    )
+    recovered = coordinator.consume_pending_data_refresh()
+    assert recovered.generation_id == "G-0002"
+    assert store.pending_data_refresh() is None

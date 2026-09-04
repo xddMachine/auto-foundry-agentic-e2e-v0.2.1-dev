@@ -1,0 +1,31 @@
+{
+  "context_hash": "4710e8f7b623f2121ae92cb453dcf331dbd8331db104fda00b817dc9c283f849",
+  "context_path": "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-001/work/analysis_context.json",
+  "error_category": null,
+  "error_type": null,
+  "exit_code": 0,
+  "finished_at": "2026-08-31T16:01:36.770407+00:00",
+  "output_hashes": {
+    "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-001/work/.analysis-run/deterministic-da8300ec3a7841cfbcc71a5c015f3d5b-second/profile_communications.json": "82eb76d07cbb5b845c64e8cd7065a70cbc29fbadf45c8f4d96fc1c8d5bdf0a38",
+    "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-001/work/.analysis-run/deterministic-da8300ec3a7841cfbcc71a5c015f3d5b-second/profile_erp.json": "e6acb786c6b5d912d1bbf984c5150207a329b01707045646ff21c9b471186ca9",
+    "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-001/work/.analysis-run/deterministic-da8300ec3a7841cfbcc71a5c015f3d5b-second/profile_supporting.json": "c561bde19a9ecd95658c536c04fd32ba3d139d3140f41c020ab689a91c44033d",
+    "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-001/work/.analysis-run/deterministic-da8300ec3a7841cfbcc71a5c015f3d5b-second/profiles_projection.json": "7f1abf0f893394c138e4a743c19f91842c3f0c4079de8624c5f2a65a36816de2",
+    "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-001/work/.analysis-run/deterministic-da8300ec3a7841cfbcc71a5c015f3d5b-second/watchlist_analysis.json": "0c3667430af0cb92519a310d4b216788470e115d0b4db31d15a6f573a13901df",
+    "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-001/work/.analysis-run/deterministic-da8300ec3a7841cfbcc71a5c015f3d5b-second/watchlist_projection.json": "6b9cd0eec36fe0ac65613c8a94f8ff8bd4e7b227538736df8f1051bbe38a9489"
+  },
+  "output_limited": false,
+  "phase": "full",
+  "receipt_id": "receipt-85099e5146504ff9a61f102f6078b23f",
+  "receipt_path": "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-001/work/script_receipts/receipt-85099e5146504ff9a61f102f6078b23f.json",
+  "script_hash": "a32a28d69a031adc2730c74b2a8239128d506ed6d981096d7ca65d92410d51d7",
+  "script_path": "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-001/work/analysis_req001.py",
+  "source_hash": "86e1f0e5c443ac4fa9049f538aa671d9fbca183368bfa355be80a17fe880c3d4",
+  "started_at": "2026-08-31T15:49:35.998480+00:00",
+  "stderr": "/Users/runner/work/crossbow/crossbow/arrow/cpp/src/arrow/util/cpu_info.cc:239: IOError: sysctlbyname failed for 'hw.l1dcachesize'. Detail: [errno 1] Operation not permitted\n/Users/runner/work/crossbow/crossbow/arrow/cpp/src/arrow/util/cpu_info.cc:239: IOError: sysctlbyname failed for 'hw.l2cachesize'. Detail: [errno 1] Operation not permitted\n/Users/runner/work/crossbow/crossbow/arrow/cpp/src/arrow/util/cpu_info.cc:239: IOError: sysctlbyname failed for 'hw.l3cachesize'. Detail: [errno 1] Operation not permitted\n/Users/runner/work/crossbow/crossbow/arrow/cpp/src/arrow/util/cpu_info.cc:239: IOError: sysctlbyname failed for 'hw.optional.neon'. Detail: [errno 1] Operation not permitted\n",
+  "stderr_truncated": false,
+  "stdout": "{\"communication_to_erp_customer_coverage\": 1.0, \"high_priority_count\": 40, \"main_watchlist_count\": 183, \"sensitivity_intersection_count\": 38}\n",
+  "stdout_truncated": false,
+  "timed_out": false,
+  "traceback": null,
+  "wall_seconds": 720.7702601659985
+}

@@ -22,7 +22,13 @@ from auto_foundry_core import (
     observation_as_of,
 )
 from auto_foundry_core.analyst_workspace import _canonical_hash as _semantic_selection_journal_hash
-from auto_foundry_core.contracts import CanonicalMapping, IdentityDecision, OntologyItem, PreparedAssetDescriptor
+from auto_foundry_core.contracts import (
+    CanonicalMapping,
+    IdentityDecision,
+    KnowledgeDelta,
+    OntologyItem,
+    PreparedAssetDescriptor,
+)
 from auto_foundry_core.durable import ItemWorkspace, _json_bytes, _manifest_hash
 from auto_foundry_core.enterprise_model import LivingEnterpriseModel
 from auto_foundry_core.integration import (
@@ -31,6 +37,8 @@ from auto_foundry_core.integration import (
     IntegrationSession,
     _sha256_value,
 )
+from auto_foundry_core.analytical_artifacts import DataProfileArtifact
+from auto_foundry_core.lem_projection import LivingEnterpriseModelProjector
 from auto_foundry_core.lifecycle import RunLifecycle
 from auto_foundry_core.prepared import PreparedAssetRegistry
 from auto_foundry_core.semantic_store import SemanticSnapshotStore
@@ -240,6 +248,98 @@ def _commit(session: IntegrationSession):
     return session.commit()
 
 
+def test_duplicate_artifact_retry_with_new_record_id_is_idempotent_before_lem_apply(tmp_path: Path) -> None:
+    """An exact artifact retry cannot poison a mixed LEM/artifact commit."""
+
+    context = RunContext("RUN-ARTIFACT-RETRY", tmp_path / "run")
+    workspace, _lem, registry, session = _session(context)
+    session.add_ontology_item(
+        {"item_id": "customer", "item_type": "entity", "label": "Customer"},
+        scope="question",
+        evidence_refs=("work/plan.json",),
+    )
+    artifact = DataProfileArtifact(
+        artifact_id="artifact-profile-retry",
+        profile={"columns": [{"name": "customer_id", "nulls": 0}]},
+        requirement_id=workspace.item_id,
+        dataset_fingerprint="d" * 64,
+        source_refs=("synthetic:dataset",),
+        method="reviewed_fixture",
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    # Internal serializer coverage only; public integrations must use the
+    # accepted-ref handoff API exercised by the vertical tests.
+    first_id = session._add_analytical_artifact(  # noqa: SLF001
+        artifact,
+        scope="question",
+        evidence_refs=("work/plan.json",),
+        artifact_record_id="caller-artifact-a",
+    )
+    before_records = tuple(session.records)
+    second_id = session._add_analytical_artifact(  # noqa: SLF001
+        artifact.to_dict(),
+        scope="question",
+        evidence_refs=("work/plan.json",),
+        artifact_record_id="caller-artifact-b",
+    )
+    assert second_id == first_id
+    assert tuple(session.records) == before_records
+    assert session.validate().valid
+
+    manifest = _commit(session)
+    assert manifest["status"] == "committed"
+    reloaded = IntegrationSession.load(
+        context,
+        workspace,
+        registry,
+        "integration-owner",
+        invocation_id="inv-Q-001",
+    )
+    assert [record.record_id for record in reloaded.records].count(first_id) == 1
+    assert "customer" in reloaded.lem.ontology
+    assert sum(record.kind == "analytical_artifact" for record in reloaded.records) == 1
+
+
+def test_duplicate_accepted_artifact_ids_reject_before_terminal_intent_even_when_bytes_match(tmp_path: Path) -> None:
+    """Accepted artifact identity is unique before the item can terminalize."""
+
+    context = RunContext("RUN-ARTIFACT-DUPLICATE-ACCEPT", tmp_path / "run")
+    RunLifecycle.create(context, ("Q-DUP",))
+    workspace = ItemWorkspace.create(context, "Q-DUP", original_text="duplicate artifact identity")
+    workspace.write_plan({"item_id": "Q-DUP", "offline": True})
+    artifact = DataProfileArtifact(
+        artifact_id="artifact-duplicate-id",
+        profile={"columns": [{"name": "customer_id", "nulls": 0}]},
+        requirement_id="Q-DUP",
+        dataset_fingerprint="d" * 64,
+        source_refs=("synthetic:dataset",),
+        method="reviewed_fixture",
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+    artifact_bytes = artifact.to_json().encode("utf-8")
+    first = workspace.work_root / "artifact-first.json"
+    second = workspace.work_root / "artifact-second.json"
+    first.write_bytes(artifact_bytes)
+    # Distinct refs intentionally point at byte-identical descriptors.  The
+    # artifact_id collision must be rejected by the business acceptance
+    # boundary, before terminal intent or accepted/ is published.
+    second.write_bytes(artifact_bytes)
+    workspace.write_draft(
+        {
+            "answer": "reviewed",
+            "evidence_refs": ["work/artifact-first.json", "work/artifact-second.json"],
+        }
+    )
+    workspace.record_review("accept", reviewer_ref="reviewer-duplicate")
+    with pytest.raises(ValueError, match="artifact_id values must be unique"):
+        workspace.accept(
+            accepted_refs=("work/artifact-first.json", "work/artifact-second.json"),
+        )
+    assert workspace.state["lifecycle_state"] == "review"
+    assert workspace.state.get("terminal_intent") is None
+    assert not workspace.accepted_root.exists()
+
+
 def _analytical_relationship(
     relationship_id: str,
     source_id: str,
@@ -447,7 +547,7 @@ def test_public_analyst_relationship_output_binds_integration(tmp_path: Path) ->
     )
     analyst.submit_answer("The tested join is publishable.")
     workspace.record_review("accept", reviewer_ref="reviewer-Q-001")
-    analyst.accept(accepted_refs=("work/plan.json", "work/analytical_relationships.jsonl"))
+    workspace.accept(accepted_refs=("work/plan.json", "work/analytical_relationships.jsonl"))
 
     # Read the canonical post-cleanup AO artifact rather than reconstructing
     # relationship fields from the answer prose or from a compatibility alias.
@@ -469,10 +569,15 @@ def test_public_analyst_relationship_output_binds_integration(tmp_path: Path) ->
         OntologyItem(item_id=artifact["target_id"], item_type="entity", label="Customers", scope="question"),
         evidence_refs=("work/plan.json",),
     )
-    session.add_relationship(
+    relationship_record_id = session.add_relationship(
         _staged_relationship(artifact),
         scope="question",
-        evidence_refs=("work/analytical_relationships.jsonl",),
+        evidence_refs=("answer_content.json",),
+    )
+    relationship_record = next(record for record in session.records if record.record_id == relationship_record_id)
+    assert relationship_record.evidence_refs == (
+        "answer_content.json",
+        "work/analytical_relationships.jsonl",
     )
 
     validation = session.validate()
@@ -485,6 +590,30 @@ def test_public_analyst_relationship_output_binds_integration(tmp_path: Path) ->
     )
     session.commit()
     assert workspace.integration_state == "integrated"
+
+
+def test_public_relationship_auto_binding_rejects_missing_artifact_without_staging(tmp_path: Path) -> None:
+    context = RunContext("RUN-AUTO-BIND-MISSING-ARTIFACT", tmp_path / "run")
+    artifact = _analytical_relationship("orders-customers-missing-artifact", "orders", "customers")
+    workspace, _lem, _registry, session = _session(context, analytical_relationships=(artifact,))
+    artifact_path = workspace.work_root / "analytical_relationships.jsonl"
+    artifact_path.unlink()
+    paths = (
+        session.staging_root / "snapshot.json",
+        session.staging_root / "session.json",
+        session.staging_root / "records.jsonl",
+    )
+    before = {path: path.read_bytes() for path in paths}
+
+    with pytest.raises(FileNotFoundError):
+        session.add_relationship(
+            _staged_relationship(artifact),
+            scope="question",
+            evidence_refs=("answer_content.json",),
+        )
+
+    assert session.records == ()
+    assert {path: path.read_bytes() for path in paths} == before
 
 
 def test_relationship_item_id_mismatch_is_rejected_before_staging(tmp_path: Path) -> None:
@@ -612,6 +741,51 @@ def test_pre_fidelity_relationship_envelopes_are_attributed_and_corrected_sequen
     packet = session.build_fidelity_packet()
     assert packet.records_hash == session.state["records_hash"]
     assert len(packet.records) == 21
+
+
+def test_pre_fidelity_record_blocks_technical_failure_without_durable_mutation(tmp_path: Path) -> None:
+    context = RunContext("RUN-PRE-FIDELITY-TECHNICAL-FAILURE-GUARD", tmp_path / "run")
+    artifact = _analytical_relationship("REQ16.relationship-technical-failure", "orders", "customers")
+    workspace, _lem, _registry, session = _session(context, analytical_relationships=(artifact,))
+    for item_id in ("orders", "customers"):
+        session.add_ontology_item(
+            OntologyItem(item_id=item_id, item_type="entity", label=item_id.title(), scope="question"),
+            evidence_refs=("work/plan.json",),
+        )
+    record_id = session._stage(
+        "relationship",
+        _staged_relationship(artifact),
+        scope="question",
+        evidence_refs=("work/plan.json",),
+    )
+    staging_paths = (
+        session.staging_root / "snapshot.json",
+        session.staging_root / "session.json",
+        session.staging_root / "records.jsonl",
+    )
+    failure_path = session.staging_root.parent / "technical_failure" / "manifest.json"
+    item_state_path = workspace.item_root / "item_state.json"
+    before_staging = {path: path.read_bytes() for path in staging_paths}
+    before_item_state = item_state_path.read_bytes()
+
+    result = session.mark_technical_failure("mechanically invalid relationship staging")
+    assert result["status"] == "pending"
+    assert result["recoverable"] is True
+    assert result["continuation"] == "same_session"
+
+    assert session.status == "open"
+    assert workspace.integration_state == "pending"
+    assert not failure_path.exists()
+    assert {path: path.read_bytes() for path in staging_paths} == before_staging
+    assert item_state_path.read_bytes() == before_item_state
+
+    payload = next(record.payload for record in session.records if record.record_id == record_id)
+    session.correct_record(
+        record_id,
+        payload,
+        evidence_refs=("work/analytical_relationships.jsonl",),
+    )
+    assert session.validate().valid
 
 
 def test_pre_fidelity_relationship_correction_rejects_wrong_target_and_preserves_bytes(tmp_path: Path) -> None:
@@ -1657,7 +1831,7 @@ def test_relationship_audit_can_coexist_without_publication(tmp_path: Path) -> N
     assert session.validate().valid
 
 
-def test_preflight_collision_has_no_intent_or_partial_lem_mutation(tmp_path: Path) -> None:
+def test_same_id_ontology_description_reuses_canonical_item(tmp_path: Path) -> None:
     context = RunContext("RUN", tmp_path / "run")
     workspace1, _lem, registry, session1 = _session(context)
     session1.add_metric_definition({"item_id": "m", "label": "existing"}, scope="question", evidence_refs=("work/plan.json",))
@@ -1665,11 +1839,490 @@ def test_preflight_collision_has_no_intent_or_partial_lem_mutation(tmp_path: Pat
     workspace = _accepted(context, "Q-002")
     session = IntegrationSession.create(context, workspace, registry, "integration-owner", invocation_id="inv-Q-002")
     session.add_metric_definition({"item_id": "m", "label": "different"}, scope="question", evidence_refs=("work/plan.json",))
-    with pytest.raises(ValueError, match="collision"):
-        _commit(session)
-    assert not (session.staging_root / "commit_intent.json").exists()
+    _commit(session)
+    assert (session.staging_root / "commit_intent.json").exists()
     assert len(session.lem.ontology) == 1
-    assert workspace.integration_state == "pending"
+    assert session.lem.ontology["m"].label == "existing"
+    assert workspace.integration_state == "integrated"
+
+
+def test_public_ontology_add_reuses_and_merges_same_id() -> None:
+    model = LivingEnterpriseModel(run_id="RUN-PUBLIC-ONTOLOGY-ENSURE")
+    model.add_ontology_item(
+        {
+            "item_id": "shared-source",
+            "item_type": "entity",
+            "label": "Canonical source",
+            "properties": {"columns": ["id"], "date_field": None, "nested": {"first": True}},
+            "effective_period": "2020",
+            "source_refs": ["source.csv"],
+        }
+    )
+    repeated = model.add_ontology_item(
+        {
+            "item_id": "shared-source",
+            "item_type": "different-type",
+            "label": "Requirement wording",
+            "properties": {
+                "columns": ["id", "created_at"],
+                "date_field": "created_at",
+                "nested": {"second": True},
+            },
+            "effective_period": None,
+            "source_refs": ["source.csv", "schema.json"],
+            "limitations": ["Reviewed limitation"],
+        }
+    )
+    assert repeated is model.ontology["shared-source"]
+    item = model.ontology["shared-source"]
+    assert len(model.ontology) == 1
+    assert item.item_type == "entity"
+    assert item.label == "Canonical source"
+    assert item.properties["columns"] == ["id", "created_at"]
+    assert item.properties["date_field"] == "created_at"
+    assert item.properties["nested"] == {"first": True, "second": True}
+    assert item.effective_period == "2020"
+    assert item.source_refs == ("source.csv", "schema.json")
+    assert item.limitations == ("Reviewed limitation",)
+
+
+def test_same_id_identical_ontology_across_requirements_is_idempotent(tmp_path: Path) -> None:
+    context = RunContext("RUN-ONTOLOGY-IDEMPOTENT", tmp_path / "run")
+    RunLifecycle.create(context, ("Q-001", "Q-002"))
+    payload = {
+        "item_id": "shared-source",
+        "item_type": "entity",
+        "label": "Shared source",
+        "properties": {"grain": "row"},
+        "source_refs": ["source.csv"],
+        "evidence_level": "reviewed",
+        "limitations": ["Synthetic fixture"],
+    }
+
+    first_workspace, _lem, registry, first = _session(context, item_id="Q-001")
+    first.add_ontology_item(payload, scope="question", evidence_refs=("work/plan.json",))
+    _commit(first)
+
+    second_workspace = _accepted(context, "Q-002")
+    second = IntegrationSession.create(
+        context,
+        second_workspace,
+        registry,
+        "integration-owner",
+        invocation_id="inv-Q-002",
+    )
+    second.add_ontology_item(dict(payload), scope="question", evidence_refs=("work/plan.json",))
+    _commit(second)
+
+    assert tuple(second.lem.ontology) == ("shared-source",)
+    assert second.lem.ontology["shared-source"].to_dict() == first.lem.ontology["shared-source"].to_dict()
+    reloaded = IntegrationSession.load(
+        context,
+        second_workspace,
+        registry,
+        "integration-owner",
+        "inv-Q-002",
+    )
+    assert reloaded.lem.ontology["shared-source"].to_dict() == second.lem.ontology["shared-source"].to_dict()
+    projected = LivingEnterpriseModelProjector.project(context).model
+    assert projected.export() == second.lem.export()
+    assert first_workspace.integration_state == "integrated"
+    assert second_workspace.integration_state == "integrated"
+
+
+def test_same_id_additive_ontology_keeps_scalars_and_unions_reviewed_facts(tmp_path: Path) -> None:
+    context = RunContext("RUN-ONTOLOGY-ADDITIVE", tmp_path / "run")
+    RunLifecycle.create(context, ("Q-001", "Q-002"))
+    first_payload = {
+        "item_id": "erp_transactions.parquet",
+        "item_type": "entity",
+        "label": "ERP sales transactions",
+        "properties": {
+            "analytical_role": "distinct-sales-document customer activity",
+            "grain": "ERP line item",
+            "order_key_field": "SALESDOCUMENT",
+        },
+        "source_refs": ["erp_transactions.parquet"],
+        "evidence_level": "reviewed",
+        "limitations": ["Line-item rows are reduced to distinct sales documents."],
+        "scope": "question",
+        "effective_period": "2019-07-06/2020-06-29",
+    }
+    second_payload = {
+        "item_id": "erp_transactions.parquet",
+        "item_type": "entity",
+        "label": "ERP transaction rows",
+        "properties": {
+            "analytical_role": "ERP line-level reference target and date/customer cross-check",
+            "columns": ["SALESDOCUMENT", "SALESDOCUMENTITEM", "CREATIONDATE"],
+            "date_field": "CREATIONDATE",
+            "grain": "ERP transaction line item",
+            "key_fields": ["SALESDOCUMENT", "SALESDOCUMENTITEM"],
+            "row_count": 1916685,
+            "row_count_exact": True,
+        },
+        "source_refs": ["erp_transactions.parquet", "erp_transactions.schema.json"],
+        "evidence_level": "reviewed",
+        "limitations": [
+            "Matched rows are line-level fan-out, not distinct order counts.",
+            "The selected ERP schema has no comparable amount field for NETAMOUNT reconciliation.",
+        ],
+        "scope": "question",
+        "effective_period": None,
+    }
+
+    _workspace, _lem, registry, first = _session(context, item_id="Q-001")
+    first.add_ontology_item(first_payload, scope="question", evidence_refs=("work/plan.json",))
+    _commit(first)
+    second_workspace = _accepted(context, "Q-002")
+    second = IntegrationSession.create(
+        context,
+        second_workspace,
+        registry,
+        "integration-owner",
+        invocation_id="inv-Q-002",
+    )
+    second.add_ontology_item(second_payload, scope="question", evidence_refs=("work/plan.json",))
+    _commit(second)
+
+    item = second.lem.ontology["erp_transactions.parquet"]
+    assert item.label == "ERP sales transactions"
+    assert item.effective_period == "2019-07-06/2020-06-29"
+    assert item.properties["analytical_role"] == "distinct-sales-document customer activity"
+    assert item.properties["columns"] == ["SALESDOCUMENT", "SALESDOCUMENTITEM", "CREATIONDATE"]
+    assert item.properties["key_fields"] == ["SALESDOCUMENT", "SALESDOCUMENTITEM"]
+    assert item.properties["row_count"] == 1916685
+    assert item.properties["row_count_exact"] is True
+    assert item.source_refs == ("erp_transactions.parquet", "erp_transactions.schema.json")
+    assert item.limitations == (
+        "Line-item rows are reduced to distinct sales documents.",
+        "Matched rows are line-level fan-out, not distinct order counts.",
+        "The selected ERP schema has no comparable amount field for NETAMOUNT reconciliation.",
+    )
+    projected = LivingEnterpriseModelProjector.project(context).model
+    assert projected.export() == second.lem.export()
+
+
+def test_same_session_repeated_ontology_records_merge_deterministically(tmp_path: Path) -> None:
+    context = RunContext("RUN-ONTOLOGY-SAME-SESSION", tmp_path / "run")
+    _workspace, _lem, _registry, session = _session(context)
+    first_id = session.add_ontology_item(
+        {
+            "item_id": "same-session",
+            "item_type": "entity",
+            "label": "Canonical label",
+            "properties": {"nested": {"first": True}, "columns": ["a"]},
+            "limitations": ["first limitation"],
+        },
+        scope="question",
+        evidence_refs=("work/plan.json",),
+        ontology_record_id="same-session-first",
+    )
+    second_id = session.add_ontology_item(
+        {
+            "item_id": "same-session",
+            "item_type": "entity",
+            "label": "Requirement wording",
+            "properties": {"nested": {"second": True}, "columns": ["a", "b"]},
+            "limitations": ["second limitation"],
+        },
+        scope="question",
+        evidence_refs=("work/plan.json",),
+        ontology_record_id="same-session-second",
+    )
+    assert first_id != second_id
+    _commit(session)
+
+    item = session.lem.ontology["same-session"]
+    assert len(session.lem.ontology) == 1
+    assert item.label == "Canonical label"
+    assert item.properties["nested"] == {"first": True, "second": True}
+    assert item.properties["columns"] == ["a", "b"]
+    assert item.limitations == ("first limitation", "second limitation")
+    staged_payloads = {record.record_id: record.payload for record in session.records}
+    assert staged_payloads[first_id]["label"] == "Canonical label"
+    assert staged_payloads[second_id]["label"] == "Requirement wording"
+
+
+def test_repeated_relationship_id_is_noop_and_new_relationship_is_added_once() -> None:
+    model = LivingEnterpriseModel(run_id="RUN-RELATIONSHIP-IDEMPOTENT")
+    model.add_ontology_item(OntologyItem(item_id="source", item_type="entity", label="Source"))
+    model.add_ontology_item(OntologyItem(item_id="target", item_type="entity", label="Target"))
+    first = model.add_relationship(
+        {
+            "relationship_id": "source-target",
+            "source_id": "source",
+            "target_id": "target",
+            "relationship_type": "association",
+        }
+    )
+    repeated = model.add_relationship(
+        {
+            "relationship_id": "source-target",
+            # Existing IDs are checked before endpoint/shape validation.  A
+            # later requirement may submit an incomplete or contradictory
+            # payload, but it must still reuse the canonical edge.
+            "source_id": "missing-source",
+            "target_id": None,
+            "analysis_relationship_id": "malformed-analysis",
+            "join_keys": "not-a-list",
+        }
+    )
+    del model.ontology["source-target"]
+    repaired = model.add_relationship(
+        {
+            "relationship_id": "source-target",
+            "source_id": "still-missing",
+        }
+    )
+    model.add_relationship(
+        {
+            "relationship_id": "source-target-2",
+            "source_id": "source",
+            "target_id": "target",
+            "relationship_type": "association",
+        }
+    )
+    assert repeated == first
+    assert repaired == first
+    assert set(model.relationships) == {"source-target", "source-target-2"}
+    assert set(model.ontology) == {"source", "target", "source-target", "source-target-2"}
+
+
+def test_existing_integration_relationship_reuses_id_before_payload_validation(tmp_path: Path) -> None:
+    """A normal duplicate relation keeps its raw audit payload but reuses the edge."""
+
+    context = RunContext("RUN-RELATIONSHIP-ID-FIRST", tmp_path / "run")
+    analytical = _analytical_relationship("shared-analysis", "source", "target")
+    first_workspace, _lem, registry, first = _session(
+        context,
+        item_id="Q-001",
+        analytical_relationships=(analytical,),
+    )
+    for item_id in ("source", "target"):
+        first.add_ontology_item(
+            OntologyItem(item_id=item_id, item_type="entity", label=item_id.title()),
+            scope="question",
+            evidence_refs=("work/plan.json",),
+        )
+    first.add_relationship(
+        _staged_relationship(analytical, relationship_id="REL-SHARED"),
+        scope="question",
+        evidence_refs=("work/analytical_relationships.jsonl",),
+    )
+    _commit(first)
+
+    second_workspace = _accepted(context, "Q-002", analytical_relationships=(analytical,))
+    second = IntegrationSession.create(
+        context,
+        second_workspace,
+        registry,
+        "integration-owner",
+        invocation_id="inv-Q-002",
+    )
+    malformed = {
+        "relationship_id": "REL-SHARED",
+        "source_id": "unknown-source",
+        "target_id": None,
+        "analysis_relationship_id": "malformed-analysis",
+        "join_keys": "not-a-list",
+    }
+    record_id = second.add_relationship(
+        malformed,
+        scope="question",
+        evidence_refs=("work/plan.json",),
+    )
+    staged = next(record for record in second.records if record.record_id == record_id)
+    assert staged.payload == malformed | {"scope": "question"}
+    _commit(second)
+
+    assert set(second.lem.relationships) == {"REL-SHARED"}
+    assert second.lem.relationships["REL-SHARED"]["source_id"] == "source"
+    assert second.lem.relationships["REL-SHARED"]["target_id"] == "target"
+
+
+def test_knowledge_delta_relationship_reuses_committed_id_before_payload_validation(tmp_path: Path) -> None:
+    """A KD relationship repeat keeps its raw payload and canonical edge."""
+
+    context = RunContext("RUN-KD-RELATIONSHIP-ID-FIRST", tmp_path / "run")
+    _workspace, _lem, registry, first = _session(context, item_id="Q-001")
+    for item_id in ("source", "target"):
+        first.add_ontology_item(
+            OntologyItem(item_id=item_id, item_type="entity", label=item_id.title()),
+            scope="question",
+            evidence_refs=("work/plan.json",),
+        )
+    source = _analytical_relationship("analysis-kd", "source", "target")
+    canonical_payload = _staged_relationship(source, relationship_id="REL-KD")
+    first.add_knowledge_delta(
+        KnowledgeDelta(
+            "kd-rel-v1",
+            "add_relationship",
+            canonical_payload,
+            accepted=True,
+        ),
+        scope="question",
+        evidence_refs=("work/plan.json",),
+    )
+    _commit(first)
+
+    second_workspace = _accepted(context, "Q-002")
+    second = IntegrationSession.create(
+        context,
+        second_workspace,
+        registry,
+        "integration-owner",
+        invocation_id="inv-Q-002",
+    )
+    malformed = {
+        "relationship_id": "REL-KD",
+        "source_id": "unknown-source",
+        "target_id": None,
+        "analysis_relationship_id": "malformed-analysis",
+        "join_keys": "not-a-list",
+    }
+    record_id = second.add_knowledge_delta(
+        KnowledgeDelta("kd-rel-v2", "add_relationship", malformed, accepted=True),
+        scope="question",
+        evidence_refs=("work/plan.json",),
+    )
+    staged = next(record for record in second.records if record.record_id == record_id)
+    assert staged.payload["payload"] == malformed
+    assert second.validate().valid
+    _commit(second)
+
+    assert set(second.lem.relationships) == {"REL-KD"}
+    assert second.lem.relationships["REL-KD"]["source_id"] == "source"
+    assert second.lem.relationships["REL-KD"]["target_id"] == "target"
+
+
+def test_knowledge_delta_relationship_same_session_orderings_and_new_validation(tmp_path: Path) -> None:
+    """Typed/KD duplicates are order-independent while new KD rows stay strict."""
+
+    analysis_typed = _analytical_relationship("analysis-typed-first", "source", "target")
+    context = RunContext("RUN-KD-RELATIONSHIP-TYPED-FIRST", tmp_path / "typed-first")
+    _workspace, _lem, registry, typed_first = _session(
+        context,
+        item_id="Q-001",
+        analytical_relationships=(analysis_typed,),
+    )
+    for item_id in ("source", "target"):
+        typed_first.add_ontology_item(
+            OntologyItem(item_id=item_id, item_type="entity", label=item_id.title()),
+            scope="question",
+            evidence_refs=("work/plan.json",),
+        )
+    typed_first.add_relationship(
+        _staged_relationship(analysis_typed, relationship_id="REL-TYPED-FIRST"),
+        scope="question",
+        evidence_refs=("work/analytical_relationships.jsonl",),
+    )
+    typed_first.add_knowledge_delta(
+        KnowledgeDelta(
+            "kd-after-typed",
+            "add_relationship",
+            {
+                "relationship_id": "REL-TYPED-FIRST",
+                "source_id": "unknown-source",
+                "target_id": None,
+                "analysis_relationship_id": "malformed-analysis",
+                "join_keys": "not-a-list",
+            },
+            accepted=True,
+        ),
+        scope="question",
+        evidence_refs=("work/plan.json",),
+    )
+    assert typed_first.validate().valid
+    _commit(typed_first)
+    assert set(typed_first.lem.relationships) == {"REL-TYPED-FIRST"}
+
+    analysis_kd = _analytical_relationship("analysis-kd-first", "source", "target")
+    context = RunContext("RUN-KD-RELATIONSHIP-KD-FIRST", tmp_path / "kd-first")
+    _workspace, _lem, registry, kd_first = _session(context, item_id="Q-001")
+    for item_id in ("source", "target"):
+        kd_first.add_ontology_item(
+            OntologyItem(item_id=item_id, item_type="entity", label=item_id.title()),
+            scope="question",
+            evidence_refs=("work/plan.json",),
+        )
+    kd_payload = _staged_relationship(analysis_kd, relationship_id="REL-KD-FIRST")
+    kd_first.add_knowledge_delta(
+        KnowledgeDelta("kd-before-typed", "add_relationship", kd_payload, accepted=True),
+        scope="question",
+        evidence_refs=("work/plan.json",),
+    )
+    kd_first.add_relationship(
+        {
+            "relationship_id": "REL-KD-FIRST",
+            "source_id": "unknown-source",
+            "target_id": None,
+            "analysis_relationship_id": "malformed-analysis",
+            "join_keys": "not-a-list",
+        },
+        scope="question",
+        evidence_refs=("work/plan.json",),
+    )
+    with pytest.raises(ValueError, match="unknown"):
+        kd_first.add_knowledge_delta(
+            KnowledgeDelta(
+                "kd-new-malformed",
+                "add_relationship",
+                {**kd_payload, "relationship_id": "REL-NEW-MALFORMED", "source_id": "unknown-source"},
+                accepted=True,
+            ),
+            scope="question",
+            evidence_refs=("work/plan.json",),
+        )
+    with pytest.raises(ValueError, match="cannot use reuse_existing_relationship_id"):
+        kd_first.add_knowledge_delta(
+            KnowledgeDelta(
+                "kd-reuse-marker",
+                "add_relationship",
+                {**kd_payload, "relationship_id": "REL-MARKER", "reuse_existing_relationship_id": "REL-KD-FIRST"},
+                accepted=True,
+            ),
+            scope="question",
+            evidence_refs=("work/plan.json",),
+        )
+    assert kd_first.validate().valid
+    _commit(kd_first)
+    assert set(kd_first.lem.relationships) == {"REL-KD-FIRST"}
+    assert kd_first.lem.relationships["REL-KD-FIRST"]["source_id"] == "source"
+    assert kd_first.lem.relationships["REL-KD-FIRST"]["target_id"] == "target"
+
+
+def test_knowledge_delta_extension_uses_canonical_ontology_merge() -> None:
+    model = LivingEnterpriseModel(run_id="RUN-DELTA-ONTOLOGY-MERGE")
+    model.add_ontology_item(
+        OntologyItem(
+            item_id="delta-item",
+            item_type="entity",
+            label="Canonical label",
+            properties={"columns": ["a"], "nested": {"first": True}},
+            limitations=("first limitation",),
+            effective_period="2020",
+        )
+    )
+    model.apply_delta(
+        KnowledgeDelta(
+            delta_id="delta-extension",
+            operation="extend_ontology_item",
+            payload={
+                "item_id": "delta-item",
+                "label": "Requirement wording",
+                "properties": {"columns": ["a", "b"], "nested": {"second": True}},
+                "limitations": ["second limitation"],
+                "effective_period": None,
+            },
+            accepted=True,
+        )
+    )
+    item = model.ontology["delta-item"]
+    assert item.label == "Canonical label"
+    assert item.properties == {"columns": ["a", "b"], "nested": {"first": True, "second": True}}
+    assert item.limitations == ("first limitation", "second limitation")
+    assert item.effective_period == "2020"
 
 
 def test_staging_snapshot_reconciles_projection_crashes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1804,48 +2457,45 @@ def test_integrated_then_staging_persistence_crash_converges(tmp_path: Path, mon
     assert manifest["status"] == "committed"
 
 
-def test_technical_failure_manifest_and_item_state_crashes_converge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_technical_failure_after_acceptance_is_always_recoverable(tmp_path: Path) -> None:
     context = RunContext("RUN", tmp_path / "run")
-    workspace, lem, registry, session = _session(context)
+    workspace, _lem, _registry, session = _session(context)
     failure_path = session.staging_root.parent / "technical_failure" / "manifest.json"
-    original_mark = workspace.mark_integration_failed
-    raised = {"value": False}
+    staging_paths = (
+        session.staging_root / "snapshot.json",
+        session.staging_root / "session.json",
+        session.staging_root / "records.jsonl",
+    )
 
-    def flaky_mark(*args, **kwargs):
-        if not raised["value"]:
-            raised["value"] = True
-            raise RuntimeError("failure item-state crash")
-        return original_mark(*args, **kwargs)
-
-    monkeypatch.setattr(workspace, "mark_integration_failed", flaky_mark)
-    with pytest.raises(RuntimeError):
-        session.mark_technical_failure("unrecoverable integration")
-    assert failure_path.is_file()
+    before = {path: path.read_bytes() for path in staging_paths}
+    result = session.mark_technical_failure("internal handoff staging failed")
+    assert result["status"] == "pending"
+    assert result["recoverable"] is True
+    assert result["continuation"] == "same_session"
+    assert session.status == "open"
     assert workspace.integration_state == "pending"
-    monkeypatch.setattr(workspace, "mark_integration_failed", original_mark)
-    first = session.mark_technical_failure("unrecoverable integration")
-    assert first["status"] == "technical_failure"
-    assert workspace.integration_state == "technical_failure"
+    assert not failure_path.exists()
+    assert {path: path.read_bytes() for path in staging_paths} == before
 
-    # A second crash after the item state is durable must reuse the exact
-    # manifest rather than minting a competing timestamp/hash.
-    workspace2, lem2, registry2, session2 = _session(context, "Q-002")
-    original_persist = session2._persist_state
-    raised2 = {"value": False}
-
-    def flaky_persist(state):
-        if state.get("status") == "technical_failure" and not raised2["value"]:
-            raised2["value"] = True
-            raise RuntimeError("failure session-state crash")
-        return original_persist(state)
-
-    monkeypatch.setattr(session2, "_persist_state", flaky_persist)
-    with pytest.raises(RuntimeError):
-        session2.mark_technical_failure("unrecoverable integration")
-    assert workspace2.integration_state == "technical_failure"
-    monkeypatch.setattr(session2, "_persist_state", original_persist)
-    second = session2.mark_technical_failure("unrecoverable integration")
-    assert second["manifest_hash"] == json.loads((session2.staging_root.parent / "technical_failure" / "manifest.json").read_text())["manifest_hash"]
+    # An empty/technical-failure handoff is not a fidelity input.  Continue
+    # the same Integration Agent session by staging an explicit typed
+    # limitation record before requesting review.
+    session.add_limitation(
+        {"limitation": "integration handoff unavailable; no semantic change"},
+        scope="question",
+        evidence_refs=("work/plan.json",),
+    )
+    session.build_fidelity_packet()
+    session.record_fidelity_review("fail", checked_record_ids=())
+    before = {path: path.read_bytes() for path in staging_paths}
+    result = session.mark_technical_failure("fidelity handoff failed")
+    assert result["status"] == "pending"
+    assert result["recoverable"] is True
+    assert result["continuation"] == "same_session"
+    assert session.status == "open"
+    assert workspace.integration_state == "pending"
+    assert not failure_path.exists()
+    assert {path: path.read_bytes() for path in staging_paths} == before
 
 
 def test_prepared_assets_all_scopes_register_and_reusable_loads_next_item(tmp_path: Path) -> None:

@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Auto Foundry · Mission Board concept</title>
+    <link rel="stylesheet" href="styles.css">
+    <script defer src="app.js"></script>
+  </head>
+  <body>
+    <aside class="app-rail">
+      <div class="brand">
+        <span class="brand-glyph"><i></i><i></i><i></i></span>
+        <strong>AUTO<small>FOUNDRY</small></strong>
+      </div>
+
+      <nav class="main-nav" aria-label="Concept navigation">
+        <span>CONTROL CENTER</span>
+        <a class="active" href="#"><b>◇</b><em>Mission</em><small id="nav-requirement-count">13</small></a>
+        <a href="#"><b>≡</b><em>Runs</em></a>
+        <a href="#"><b>↯</b><em>Evidence</em></a>
+      </nav>
+
+      <div class="rail-callout">
+        <span>DESIGN DIRECTION</span>
+        <strong>Truth before graph</strong>
+        <p>Workers, coordination and durable state are three different layers.</p>
+      </div>
+
+      <footer><i id="rail-status-dot"></i><span id="rail-status-label">STATIC CONCEPT</span><small id="rail-status-detail">NO LIVE CONNECTION</small></footer>
+    </aside>
+
+    <main class="workspace">
+      <header class="page-header">
+        <div>
+          <span class="eyebrow">CONTROL CENTER / MISSION</span>
+          <div class="mission-title">
+            <span class="af-badge">AF</span>
+            <div>
+              <h1 id="run-title">Test new architecture 2</h1>
+              <p id="run-meta">Frozen design snapshot · 13 requirements · D-0001</p>
+            </div>
+          </div>
+        </div>
+        <div class="concept-state">
+          <span id="concept-label">DESIGN CONCEPT B</span>
+          <strong id="connection-state"><i></i> STATIC SNAPSHOT</strong>
+          <small id="connection-freshness">Layout review only</small>
+        </div>
+      </header>
+
+      <section class="truth-layer" aria-label="Runtime truth layers">
+        <article class="truth-card runtime-card">
+          <header><span>TRUE RUNTIME</span><b>COUNTED IN CAPACITY</b></header>
+          <div class="runtime-body">
+            <div class="capacity-number"><strong id="capacity-active">1</strong><span id="capacity-total">/ 8</span><small id="capacity-caption">worker now</small></div>
+            <div class="live-worker" id="live-worker-slot">
+              <span class="avatar violet">BR</span>
+              <div><b>Business Reviewer</b><small>REQ-006 · Review requirement</small></div>
+              <em><i></i> LIVE</em>
+            </div>
+          </div>
+        </article>
+
+        <article class="truth-card coordinator-card">
+          <header><span>CONTROL PLANE</span><b>NOT A WORKER</b></header>
+          <div class="coordinator-body">
+            <span class="planner-mark">PL</span>
+            <div><strong>Planner</strong><p id="planner-status">Coordinating the mission</p><small id="planner-capacity-note">Excluded from 1 / 8 capacity</small></div>
+            <i class="coord-pulse" id="planner-pulse"></i>
+          </div>
+        </article>
+
+        <article class="truth-card state-card">
+          <header><span>SYSTEM STATES</span><b>NOT WORKERS</b></header>
+          <div id="system-state-rows">
+            <div class="state-row"><span class="state-symbol">ID</span><div><strong>Customer Party Identities</strong><small>Current domain state</small></div><em>CURRENT</em></div>
+            <div class="state-row"><span class="state-symbol">↯</span><div><strong>Durable projection</strong><small>371 recorded events</small></div><em>CURRENT</em></div>
+          </div>
+        </article>
+
+        <article class="truth-card progress-card">
+          <header><span>MISSION OUTCOME</span><b id="mission-total">13 TOTAL</b></header>
+          <div class="progress-split">
+            <div><strong id="accepted-count">5</strong><small>accepted</small></div>
+            <div><strong id="progress-count">2</strong><small>in progress</small></div>
+            <div><strong id="queued-count">6</strong><small>queued</small></div>
+          </div>
+          <div class="progress-bar"><i id="accepted-bar" style="width:38%"></i><i id="progress-bar" style="width:16%"></i><i id="queued-bar" style="width:46%"></i></div>
+        </article>
+      </section>
+
+      <section class="mission-layout">
+        <article class="board panel">
+          <header class="board-header">
+            <div>
+              <span class="eyebrow">MISSION EXECUTION</span>
+              <h2>Requirement board</h2>
+              <p>Every requirement stays visible. Each row reads left → right.</p>
+            </div>
+            <div class="board-summary">
+              <span><b id="board-requirement-count">13</b> requirements</span>
+              <span><b id="board-record-count">59</b> visible records</span>
+              <span><b id="board-relationship-count">69</b> relationships</span>
+            </div>
+          </header>
+
+          <div class="board-legend">
+            <span><i class="legend-live"></i>Runtime worker</span>
+            <span><i class="legend-state"></i>Current system state</span>
+            <span><i class="legend-done">✓</i>Completed step</span>
+            <span><i class="legend-next"></i>Queued step</span>
+            <em>Graph connections appear only after selecting a row</em>
+          </div>
+
+          <div class="board-scroll" id="requirement-board">
+            <div class="phase-grid phase-header">
+              <div>REQUIREMENT</div><div>01 · ANALYZE</div><div>02 · IDENTITIES</div><div>03 · REVIEW</div><div>04 · INTEGRATE</div><div>05 · RESULT</div>
+            </div>
+
+            <div class="requirement-row complete-row phase-grid">
+              <div class="requirement-name"><b>REQ-001</b><strong>Supplier reliability</strong><small>Closed · 8 records</small></div>
+              <div class="phase done"><span>AO</span><b>Analysis</b><small>Complete</small></div>
+              <div class="phase done"><span>ID</span><b>Identity</b><small>Committed</small></div>
+              <div class="phase done"><span>BR</span><b>Review</b><small>Accepted</small></div>
+              <div class="phase done"><span>IN</span><b>Integration</b><small>Verified</small></div>
+              <div class="outcome accepted"><i>✓</i><b>Accepted</b><small>Ready</small></div>
+            </div>
+
+            <div class="requirement-row complete-row phase-grid">
+              <div class="requirement-name"><b>REQ-002</b><strong>Customer margin</strong><small>Closed · 15 records</small></div>
+              <div class="phase done"><span>AO</span><b>Analysis</b><small>Complete</small></div>
+              <div class="phase done state-used"><span>ID</span><b>Party state</b><small>Reused</small></div>
+              <div class="phase done"><span>BR</span><b>Review</b><small>Accepted</small></div>
+              <div class="phase done"><span>IN</span><b>Integration</b><small>Verified</small></div>
+              <div class="outcome accepted"><i>✓</i><b>Accepted</b><small>Ready</small></div>
+            </div>
+
+            <div class="requirement-row complete-row phase-grid">
+              <div class="requirement-name"><b>REQ-003</b><strong>Inventory availability</strong><small>Closed · 9 records</small></div>
+              <div class="phase done"><span>AO</span><b>Analysis</b><small>Complete</small></div>
+              <div class="phase neutral"><span>—</span><b>Not needed</b><small>No identity work</small></div>
+              <div class="phase done"><span>BR</span><b>Review</b><small>Accepted</small></div>
+              <div class="phase done"><span>IN</span><b>Integration</b><small>Verified</small></div>
+              <div class="outcome accepted"><i>✓</i><b>Accepted</b><small>Ready</small></div>
+            </div>
+
+            <div class="requirement-row complete-row phase-grid">
+              <div class="requirement-name"><b>REQ-004</b><strong>Receivables risk</strong><small>Closed · 7 records</small></div>
+              <div class="phase done"><span>AO</span><b>Analysis</b><small>Complete</small></div>
+              <div class="phase neutral"><span>—</span><b>Not needed</b><small>No identity work</small></div>
+              <div class="phase done"><span>BR</span><b>Review</b><small>Accepted</small></div>
+              <div class="phase done"><span>IN</span><b>Integration</b><small>Verified</small></div>
+              <div class="outcome accepted"><i>✓</i><b>Accepted</b><small>Ready</small></div>
+            </div>
+
+            <div class="requirement-row complete-row phase-grid">
+              <div class="requirement-name"><b>REQ-005</b><strong>Cross-domain operations</strong><small>Closed · 7 records</small></div>
+              <div class="phase done"><span>AO</span><b>Analysis</b><small>Complete</small></div>
+              <div class="phase done state-used"><span>ID</span><b>Party state</b><small>Reused</small></div>
+              <div class="phase done"><span>BR</span><b>Review</b><small>Accepted</small></div>
+              <div class="phase done"><span>IN</span><b>Integration</b><small>Verified</small></div>
+              <div class="outcome accepted"><i>✓</i><b>Accepted</b><small>Ready</small></div>
+            </div>
+
+            <div class="requirement-row selected-row phase-grid">
+              <div class="requirement-name"><b>REQ-006</b><strong>Fulfillment risk</strong><small>Selected · 4 records</small></div>
+              <div class="phase done"><span>AO</span><b>Analysis</b><small>Complete 04:03</small></div>
+              <div class="phase state-reference"><span>ID</span><b>Party state</b><small>Current · not worker</small></div>
+              <div class="phase live"><span>BR</span><b>Review</b><small><i></i>Running now</small></div>
+              <div class="phase queued"><span>04</span><b>Integration</b><small>Next</small></div>
+              <div class="outcome waiting"><i>···</i><b>Waiting</b><small>For review</small></div>
+            </div>
+
+            <div class="requirement-row queued-row phase-grid">
+              <div class="requirement-name"><b>REQ-007</b><strong>Supplier concentration</strong><small>Queued · 0 records</small></div>
+              <div class="phase queued"><span>01</span><b>Analysis</b><small>Queued</small></div><div class="phase empty"></div><div class="phase empty"></div><div class="phase empty"></div><div class="outcome not-started"><b>Not started</b></div>
+            </div>
+            <div class="requirement-row queued-row phase-grid">
+              <div class="requirement-name"><b>REQ-008</b><strong>Lead-time variability</strong><small>Queued · 0 records</small></div>
+              <div class="phase queued"><span>01</span><b>Analysis</b><small>Queued</small></div><div class="phase empty"></div><div class="phase empty"></div><div class="phase empty"></div><div class="outcome not-started"><b>Not started</b></div>
+            </div>
+            <div class="requirement-row queued-row phase-grid">
+              <div class="requirement-name"><b>REQ-009</b><strong>Stockout exposure</strong><small>Queued · 0 records</small></div>
+              <div class="phase queued"><span>01</span><b>Analysis</b><small>Queued</small></div><div class="phase empty"></div><div class="phase empty"></div><div class="phase empty"></div><div class="outcome not-started"><b>Not started</b></div>
+            </div>
+            <div class="requirement-row queued-row phase-grid">
+              <div class="requirement-name"><b>REQ-010</b><strong>Slow-moving inventory</strong><small>Queued · 0 records</small></div>
+              <div class="phase queued"><span>01</span><b>Analysis</b><small>Queued</small></div><div class="phase empty"></div><div class="phase empty"></div><div class="phase empty"></div><div class="outcome not-started"><b>Not started</b></div>
+            </div>
+
+            <div class="requirement-row progress-row phase-grid">
+              <div class="requirement-name"><b>REQ-011</b><strong>Margin risk</strong><small>In progress · 3 records</small></div>
+              <div class="phase done"><span>AO</span><b>Analysis</b><small>Complete</small></div>
+              <div class="phase neutral"><span>—</span><b>Not needed</b><small>No identity work</small></div>
+              <div class="phase queued"><span>03</span><b>Review</b><small>Queued</small></div>
+              <div class="phase empty"></div><div class="outcome waiting"><i>···</i><b>Waiting</b><small>For review</small></div>
+            </div>
+
+            <div class="requirement-row queued-row phase-grid">
+              <div class="requirement-name"><b>REQ-012</b><strong>Collection priorities</strong><small>Queued · 0 records</small></div>
+              <div class="phase queued"><span>01</span><b>Analysis</b><small>Queued</small></div><div class="phase empty"></div><div class="phase empty"></div><div class="phase empty"></div><div class="outcome not-started"><b>Not started</b></div>
+            </div>
+            <div class="requirement-row queued-row phase-grid">
+              <div class="requirement-name"><b>REQ-013</b><strong>Operational dependencies</strong><small>Queued · 0 records</small></div>
+              <div class="phase queued"><span>01</span><b>Analysis</b><small>Queued</small></div><div class="phase empty"></div><div class="phase empty"></div><div class="phase empty"></div><div class="outcome not-started"><b>Not started</b></div>
+            </div>
+          </div>
+        </article>
+
+        <aside class="focus-panel panel" id="focus-panel">
+          <header>
+            <div><span class="eyebrow">SELECTED REQUIREMENT</span><h2>REQ-006</h2><p>Fulfillment risk</p></div>
+            <span class="review-pill"><i></i> REVIEWING</span>
+          </header>
+
+          <section class="focus-progress">
+            <div><span>MISSION PROGRESS</span><strong>2 / 5 stages</strong></div>
+            <div class="focus-bar"><i class="done"></i><i class="done"></i><i class="active"></i><i></i><i></i></div>
+          </section>
+
+          <section class="execution-chain">
+            <span class="section-label">EXECUTION CHAIN</span>
+            <article class="chain-step finished"><i>✓</i><div><b>Analysis completed</b><small>Analytical Owner · 04:03:14</small></div><em>DONE</em></article>
+            <article class="chain-step state-step"><i>ID</i><div><b>Identity state reused</b><small>Customer Party · not a worker</small></div><em>STATE</em></article>
+            <article class="chain-step running"><i>BR</i><div><b>Business review</b><small>Business Reviewer · running now</small></div><em>LIVE</em></article>
+            <article class="chain-step future"><i>04</i><div><b>Integration</b><small>Will dispatch after review</small></div><em>NEXT</em></article>
+            <article class="chain-step future"><i>05</i><div><b>Business result</b><small>Waiting for integration</small></div><em>WAIT</em></article>
+          </section>
+
+          <section class="truth-explainer">
+            <div class="actual-worker"><span>BR</span><p><b>1 real worker</b><small>This card is the entire `1 / 8` count.</small></p></div>
+            <div class="not-worker"><span>ID</span><p><b>1 referenced state</b><small>Visible in the flow, never counted as a worker.</small></p></div>
+          </section>
+
+          <section class="recent-events">
+            <span class="section-label">RECENT DURABLE ACTIVITY</span>
+            <article><time>04:03:37</time><i class="event-live"></i><p><b>Review dispatched</b><small>Business Reviewer · REQ-006</small></p></article>
+            <article><time>04:03:14</time><i class="event-done"></i><p><b>Analysis completed</b><small>Analytical Owner · REQ-006</small></p></article>
+            <article><time>04:02:39</time><i class="event-data"></i><p><b>Evidence read completed</b><small>Durable data-room activity</small></p></article>
+          </section>
+        </aside>
+      </section>
+    </main>
+  </body>
+</html>

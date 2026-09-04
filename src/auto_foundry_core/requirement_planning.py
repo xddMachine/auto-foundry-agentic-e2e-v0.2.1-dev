@@ -27,6 +27,56 @@ from .workspace import RunContext
 
 SUPERVISOR_PLAN_FILENAME = "requirement_supervisor_plan.json"
 PLANNER_INCIDENT_FILENAME = "run_incidents.jsonl"
+PREVIEW_MANIFEST_SCHEMA_VERSION = "dashboard.preview.v1"
+PREVIEW_MANIFEST_FILENAME = "preview_manifest.json"
+
+# The preview manifest is deliberately a small presentation handoff.  It is
+# not a product candidate/review/authorization record and therefore has no
+# lifecycle or publication authority.  Keep the allowlist exact so a role
+# cannot accidentally smuggle raw/work references or volatile transport
+# fields into the durable preview boundary.
+_PREVIEW_MANIFEST_REQUIRED_FIELDS = frozenset(
+    {
+        "schema_version",
+        "run_id",
+        "generation_id",
+        "finalizable",
+        "input_fingerprint",
+        "item_ids",
+        "item_bindings",
+        "assembly_receipt_ref",
+        "assembly_receipt_sha256",
+        "blueprint_ref",
+        "blueprint_sha256",
+        "site_manifest_ref",
+        "site_manifest_sha256",
+        "site_ref",
+        "site_tree_sha256",
+    }
+)
+_PREVIEW_MANIFEST_OPTIONAL_FIELDS = frozenset({"failed_items", "limitations"})
+_PREVIEW_ITEM_REQUIRED_BINDING_FIELDS = frozenset(
+    {
+        "accepted_manifest_ref",
+        "accepted_manifest_hash",
+        "accepted_content_ref",
+        "accepted_content_hash",
+    }
+)
+_PREVIEW_ITEM_OPTIONAL_BINDING_FIELDS = frozenset(
+    {
+        "committed_manifest_ref",
+        "committed_manifest_hash",
+        "records_ref",
+        "records_hash",
+    }
+)
+_PREVIEW_ITEM_BINDING_FIELDS = _PREVIEW_ITEM_REQUIRED_BINDING_FIELDS | _PREVIEW_ITEM_OPTIONAL_BINDING_FIELDS
+
+# Business acceptance is the presentation boundary.  Integration remains a
+# separate ontology/machine-reuse boundary and therefore cannot make a
+# terminal accepted answer disappear from Product Agent inputs.
+_ACCEPTED_BUSINESS_STATUSES = frozenset({"accepted", "accepted_with_limits"})
 
 
 def _text(value: Any, field_name: str) -> str:
@@ -75,6 +125,43 @@ def _sha256_value(value: Any) -> str:
     return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
 
 
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+
+
+def _staging_incomplete_handoff(
+    item_id: str,
+    *,
+    session: Mapping[str, Any] | None = None,
+    reason: str,
+) -> dict[str, Any]:
+    """Build the typed positive continuation contract for incomplete staging.
+
+    The Integration Agent owns the existing session.  Returning its identity
+    in the handoff lets a host re-offer the same owner/invocation instead of
+    treating an empty/partial projection as a new review or as a terminal
+    no-op.  This helper is intentionally pure and emits no scheduler state.
+    """
+
+    session_value = session if isinstance(session, Mapping) else {}
+    session_id = session_value.get("session_id")
+    owner_id = session_value.get("owner_id")
+    invocation_id = session_value.get("invocation_id")
+    handoff = {
+        "kind": "staging_incomplete",
+        "item_id": item_id,
+        "session_id": session_id,
+        "owner_id": owner_id,
+        "invocation_id": invocation_id,
+        "action": "integrate_requirement",
+        "role": "integration_agent",
+        "subject_id": item_id,
+        "continuation": "same_session",
+        "reason": reason,
+    }
+    return handoff
+
+
 def inspect_integration_fidelity(
     context_or_item_root: RunContext | Path | str,
     item_id: str | None = None,
@@ -104,13 +191,20 @@ def inspect_integration_fidelity(
             if item_id is None:
                 raise ValueError("item_id is required with a RunContext")
             expected_item_id = str(item_id)
-            lexical_item_root = context_or_item_root.run_root / "requirements" / expected_item_id
+            requirement_lexical = context_or_item_root.run_root / "requirements" / expected_item_id
+            question_lexical = context_or_item_root.run_root / "questions" / expected_item_id
+            if requirement_lexical.exists() or requirement_lexical.is_symlink():
+                lexical_item_root = requirement_lexical
+                namespace = "requirements"
+            else:
+                lexical_item_root = question_lexical
+                namespace = "questions"
             lexical_parent = context_or_item_root.run_root
-            for component in ("requirements", expected_item_id):
+            for component in (namespace, expected_item_id):
                 lexical_parent = lexical_parent / component
                 if lexical_parent.is_symlink():
                     raise ValueError("item workspace path is symlinked")
-            item_root = context_or_item_root.resolve_run_path(f"requirements/{item_id}")
+            item_root = context_or_item_root.resolve_run_path(f"{namespace}/{item_id}")
             if item_root != lexical_item_root:
                 raise ValueError("item workspace path is aliased")
         else:
@@ -125,7 +219,39 @@ def inspect_integration_fidelity(
             return {"valid": True, "stage": "not_started", "verdict": None, "diagnostics": []}
         diagnostics: list[str] = []
         if session_path.is_symlink() or snapshot_path.is_symlink() or not session_path.is_file() or not snapshot_path.is_file():
-            raise ValueError("integration staging session/snapshot projection is incomplete")
+            reason = "integration staging session/snapshot projection is incomplete"
+            # A crash between the authoritative snapshot and its projections
+            # is a recoverable handoff, not a fidelity-review input.  Preserve
+            # any session identity available so the same Integration
+            # Agent/session can continue positively.
+            partial_session: Mapping[str, Any] | None = None
+            if session_path.is_file() and not session_path.is_symlink():
+                try:
+                    loaded_session = json.loads(session_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    loaded_session = None
+                if isinstance(loaded_session, Mapping):
+                    partial_session = loaded_session
+            if partial_session is None and snapshot_path.is_file() and not snapshot_path.is_symlink():
+                try:
+                    loaded_snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    loaded_snapshot = None
+                if isinstance(loaded_snapshot, Mapping) and isinstance(loaded_snapshot.get("state"), Mapping):
+                    partial_session = loaded_snapshot["state"]
+            handoff = _staging_incomplete_handoff(
+                expected_item_id,
+                session=partial_session,
+                reason=reason,
+            )
+            return {
+                "valid": False,
+                "stage": "staging_incomplete",
+                "verdict": None,
+                "diagnostics": [reason],
+                "session_id": handoff.get("session_id"),
+                "handoff": handoff,
+            }
         session = json.loads(session_path.read_text(encoding="utf-8"))
         snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
         if not isinstance(session, Mapping) or not isinstance(snapshot, Mapping):
@@ -190,6 +316,21 @@ def inspect_integration_fidelity(
         records_projection = staging / "records.jsonl"
         if records_projection.is_symlink() or not records_projection.is_file() or records_projection.read_bytes() != records_bytes:
             raise ValueError("integration staging records projection is stale")
+        if not records:
+            reason = (
+                "staging_incomplete: integration session has no records; "
+                "stage an explicit no_change or limitation record before fidelity review"
+            )
+            handoff = _staging_incomplete_handoff(expected_item_id, session=session, reason=reason)
+            return {
+                "valid": False,
+                "stage": "staging_incomplete",
+                "verdict": None,
+                "diagnostics": [reason],
+                "session_id": session.get("session_id"),
+                "records_hash": records_hash,
+                "handoff": handoff,
+            }
         packet_path = review_root / "packet.json"
         result_path = review_root / "result.json"
         if not packet_path.exists() and not result_path.exists():
@@ -401,8 +542,17 @@ def inspect_committed_integration(
         if isinstance(context_or_item_root, RunContext):
             if item_id is None:
                 raise ValueError("item_id is required with a RunContext")
-            item_root = context_or_item_root.resolve_run_path(f"requirements/{item_id}")
             expected_item_id = str(item_id)
+            # Requirement Mode is the common Planner path, but the same
+            # immutable integration boundary is also valid for Question Mode
+            # workspaces.  Resolve the namespace from the materialized item
+            # without allowing a caller to select an arbitrary path.
+            requirement_root = context_or_item_root.resolve_run_path(f"requirements/{expected_item_id}")
+            question_root = context_or_item_root.resolve_run_path(f"questions/{expected_item_id}")
+            if requirement_root.exists() or requirement_root.is_symlink():
+                item_root = requirement_root
+            else:
+                item_root = question_root
             raw_state_path = item_root / "item_state.json"
             if raw_state_path.is_symlink() or not raw_state_path.is_file():
                 raise ValueError("item state is missing for committed integration")
@@ -416,20 +566,22 @@ def inspect_committed_integration(
                 original_text=str(raw_state.get("original_text", "")),
                 state=raw_state,
             )
-            # ``blocked_by_evidence`` is a valid terminal outcome but does
-            # not publish an answer bundle.  Do not classify its empty
-            # integration boundary as malformed merely because the normal
-            # accepted-bundle loader quite correctly rejects that outcome.
-            bundle = (
-                None
-                if _status(raw_state.get("terminal_outcome")) == "blocked_by_evidence"
-                else AcceptedAnalysisBundle.load(workspace)
-            )
-            if bundle is None:
-                snapshot, manifest = workspace._read_valid_terminal_snapshot()
-                if snapshot.outcome != "blocked_by_evidence":
-                    raise ValueError("blocked terminal snapshot outcome is invalid")
-                workspace._validate_preterminal_binding(snapshot.outcome, manifest)
+            # ``blocked_by_evidence`` and pre-acceptance technical failure
+            # are valid terminal snapshots but do not publish an accepted
+            # answer bundle.  Do not classify their empty integration
+            # boundary as malformed merely because the normal accepted-bundle
+            # loader quite correctly rejects those outcomes.
+            preaccept_terminal = raw_state.get("lifecycle_state") == "technical_failure"
+            terminal_outcome = _status(raw_state.get("terminal_outcome"))
+            if preaccept_terminal or terminal_outcome == "blocked_by_evidence":
+                bundle = None
+                snapshot, terminal_manifest = workspace._read_valid_terminal_snapshot()
+                expected_outcome = "technical_failure" if preaccept_terminal else "blocked_by_evidence"
+                if snapshot.outcome != expected_outcome:
+                    raise ValueError("terminal snapshot outcome is invalid")
+                workspace._validate_preterminal_binding(snapshot.outcome, terminal_manifest)
+            else:
+                bundle = AcceptedAnalysisBundle.load(workspace)
         else:
             item_root = Path(context_or_item_root).expanduser().resolve(strict=False)
             expected_item_id = str(item_id or item_root.name)
@@ -458,6 +610,58 @@ def inspect_committed_integration(
         failure_path = failure_root / "manifest.json"
         failure_present = failure_root.exists() or failure_root.is_symlink()
         state_value = raw_state if isinstance(context_or_item_root, RunContext) else None
+        if state_value is not None and preaccept_terminal:
+            # A pre-acceptance terminal failure has no integration manifest or
+            # staging session.  Any such residue would be a forged/ambiguous
+            # boundary and must remain fail-closed rather than settling the
+            # requirement for product routing.
+            if state_value.get("integration_state") != "pending":
+                raise ValueError("pre-acceptance technical failure has an integration state")
+            if state_value.get("integration_manifest_hash") is not None or state_value.get("integration_manifest_ref") is not None:
+                raise ValueError("pre-acceptance technical failure has an integration pointer")
+            integration_root = item_root / "integration"
+            if integration_root.is_symlink() or (integration_root.exists() and not integration_root.is_dir()):
+                raise ValueError("pre-acceptance technical failure has an invalid integration root")
+            for leaf in ("committed", "technical_failure", "staging"):
+                residue = integration_root / leaf
+                if residue.exists() or residue.is_symlink():
+                    raise ValueError("pre-acceptance technical failure has integration residue")
+            if not isinstance(terminal_manifest, Mapping) or terminal_manifest.get("recovery_exhausted") is not True:
+                raise ValueError("pre-acceptance technical failure is not an exhausted boundary")
+            terminal = state_value.get("terminal_outcome")
+            accepted_manifest_path = item_root / "accepted" / "manifest.json"
+            terminal_ref = terminal.get("manifest_path") if isinstance(terminal, Mapping) else None
+            terminal_path_matches = (
+                isinstance(terminal_ref, str)
+                and (
+                    terminal_ref == "accepted/manifest.json"
+                    or (
+                        Path(terminal_ref).is_absolute()
+                        and Path(terminal_ref).resolve(strict=False)
+                        == accepted_manifest_path.resolve(strict=False)
+                    )
+                )
+            )
+            if (
+                not isinstance(terminal, Mapping)
+                or terminal.get("status") != "technical_failure"
+                or terminal.get("outcome") != "technical_failure"
+                or terminal.get("item_id") != expected_item_id
+                or terminal.get("content_hash") != terminal_manifest.get("content_hash")
+                or not terminal_path_matches
+            ):
+                raise ValueError("pre-acceptance technical failure terminal binding is stale")
+            return {
+                "valid": True,
+                "stage": "technical_failure",
+                "verdict": "technical_failure",
+                "diagnostics": [],
+                "records_count": 0,
+                "accepted_content_hash": terminal_manifest.get("content_hash"),
+                "manifest_hash": terminal_manifest.get("manifest_hash"),
+                "recovery_exhausted": True,
+                "pre_acceptance": True,
+            }
         if failure_present:
             if failure_root.is_symlink() or not failure_root.is_dir() or failure_path.is_symlink() or not failure_path.is_file():
                 raise ValueError("technical failure manifest is missing or symlinked")
@@ -471,7 +675,8 @@ def inspect_committed_integration(
                 "schema_version", "session_id", "item_id", "owner_id", "status",
                 "accepted_content_hash", "reason", "created_at", "manifest_hash",
             }
-            if set(failure_manifest) != expected_failure_fields:
+            optional_failure_fields = {"recovery_exhausted"}
+            if not expected_failure_fields.issubset(set(failure_manifest)) or set(failure_manifest) - expected_failure_fields - optional_failure_fields:
                 raise ValueError("technical failure manifest fields are invalid")
             if failure_manifest.get("schema_version") != "1" or failure_manifest.get("status") != "technical_failure":
                 raise ValueError("technical failure manifest fields are invalid")
@@ -482,6 +687,8 @@ def inspect_committed_integration(
                 for key in ("session_id", "owner_id", "reason", "created_at")
             ):
                 raise ValueError("technical failure manifest identity is invalid")
+            if "recovery_exhausted" in failure_manifest and not isinstance(failure_manifest.get("recovery_exhausted"), bool):
+                raise ValueError("technical failure manifest recovery marker is invalid")
             accepted_content_hash = failure_manifest.get("accepted_content_hash")
             if not isinstance(accepted_content_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", accepted_content_hash):
                 raise ValueError("technical failure manifest accepted hash is invalid")
@@ -509,6 +716,7 @@ def inspect_committed_integration(
                 "records_count": 0,
                 "accepted_content_hash": accepted_content_hash,
                 "manifest_hash": failure_manifest.get("manifest_hash"),
+                "recovery_exhausted": failure_manifest.get("recovery_exhausted") is True,
             }
         if state_value is not None and state_value.get("integration_state") == "technical_failure":
             raise ValueError("technical failure item state has no validated manifest")
@@ -558,6 +766,25 @@ def inspect_committed_integration(
             records.append(record)
         if manifest.get("records_count") != len(records) or len({record.record_id for record in records}) != len(records):
             raise ValueError("committed integration record count or IDs are invalid")
+        if not records:
+            raise ValueError(
+                "committed integration has no records; explicit no_change or limitation record is required"
+            )
+        # Reuse the same committed artifact/publication validator as the
+        # IntegrationSession reload path.  This keeps Planner and lifecycle
+        # reconciliation on one manifest boundary instead of trusting only
+        # item labels or the record count/hash envelope.
+        from .integration import IntegrationSession
+
+        IntegrationSession._validate_committed_artifacts(committed, records)
+        counts = manifest.get("counts")
+        if not isinstance(counts, Mapping):
+            raise ValueError("committed integration counts are invalid")
+        expected_counts: dict[str, int] = {str(key): 0 for key in counts}
+        for record in records:
+            expected_counts[record.kind] = expected_counts.get(record.kind, 0) + 1
+        if {str(key): int(value) for key, value in counts.items()} != expected_counts:
+            raise ValueError("committed integration counts do not match records")
         if isinstance(context_or_item_root, RunContext):
             state = raw_state
             if state.get("integration_state") != "integrated" or state.get("integration_manifest_hash") != manifest.get("manifest_hash"):
@@ -771,15 +998,38 @@ def inspect_product_manifest(
         output_hashes = receipt.get("output_hashes")
         if not isinstance(outputs, Mapping) or not isinstance(output_hashes, Mapping):
             raise ValueError("product manifest dashboard output bindings are missing")
-        expected_output_hashes = {"fixture_sha256", "chart_map_sha256", "chart_registry_sha256", "site_manifest_sha256"}
+        expected_output_hashes = {
+            "fixture_sha256",
+            "chart_map_sha256",
+            "chart_registry_sha256",
+            "blueprint_sha256",
+            "site_manifest_sha256",
+        }
         if set(output_hashes) != expected_output_hashes:
             raise ValueError("product manifest dashboard output hashes are not exact")
         if outputs.get("receipt_ref") != receipt_ref:
             raise ValueError("product manifest dashboard receipt reference is stale")
+        blueprint_binding = receipt.get("blueprint_binding")
+        blueprint_ref = outputs.get("blueprint_ref")
+        blueprint_hash = output_hashes.get("blueprint_sha256")
+        if (
+            not isinstance(blueprint_binding, Mapping)
+            or set(blueprint_binding) != {"ref", "sha256", "schema_version", "status"}
+            or blueprint_binding.get("ref") != blueprint_ref
+            or blueprint_binding.get("sha256") != blueprint_hash
+            or blueprint_binding.get("schema_version") != "dashboard.business_presentation_plan.v2"
+            or blueprint_binding.get("status") != "Preview"
+            or not isinstance(blueprint_ref, str)
+            or not blueprint_ref.strip()
+            or not isinstance(blueprint_hash, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", blueprint_hash)
+        ):
+            raise ValueError("product manifest dashboard blueprint binding is missing or stale")
         hash_key_by_ref = {
             "fixture_ref": "fixture_sha256",
             "chart_map_ref": "chart_map_sha256",
             "chart_registry_ref": "chart_registry_sha256",
+            "blueprint_ref": "blueprint_sha256",
             "site_ref": "site_manifest_sha256",
             "receipt_ref": None,
         }
@@ -1156,6 +1406,106 @@ class RequirementRunSnapshot:
 
 
 @dataclass(frozen=True)
+class ActionRoleContract:
+    """Typed authorization binding between one planner action and role."""
+
+    action: str
+    role: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "action", _text(self.action, "action"))
+        object.__setattr__(self, "role", _text(self.role, "role"))
+
+    def to_dict(self) -> dict[str, str]:
+        return {"action": self.action, "role": self.role}
+
+
+# Keep this contract as typed values rather than a free-form action/role map.
+# The coordinator can consume ``validate_action_role`` before dispatch, while
+# PlannerAction construction enforces the same binding for every local path.
+AUTHORIZED_ACTION_ROLE_CONTRACTS: tuple[ActionRoleContract, ...] = (
+    # Intake/supervisor controls are typed planner actions but are not model
+    # dispatches.  The coordinator consumes these records as deterministic
+    # control-plane transitions and deliberately has no transport route for
+    # their roles.
+    ActionRoleContract("plan_intake", "intake_planner"),
+    ActionRoleContract("materialize_intake", "intake_planner"),
+    ActionRoleContract("classify_intake", "intake_planner"),
+    ActionRoleContract("supervise", "foundry_supervisor"),
+    ActionRoleContract("repair_run", "foundry_supervisor"),
+    ActionRoleContract("technical_recovery", "foundry_supervisor"),
+    ActionRoleContract("requires_rethink", "planner"),
+    ActionRoleContract("rethink", "planner"),
+    ActionRoleContract("wait", "planner"),
+    ActionRoleContract("pause", "planner"),
+    ActionRoleContract("await_publication_authorization", "planner"),
+    ActionRoleContract("repair_run_lifecycle", "planner"),
+    ActionRoleContract("repair_identity_request", "planner"),
+    ActionRoleContract("escalate_identity_failure", "planner"),
+    ActionRoleContract("resolve_identity", "entity_resolution_owner"),
+    ActionRoleContract("repair_identity_result", "entity_resolution_owner"),
+    ActionRoleContract("resume_identity_resolution", "entity_resolution_owner"),
+    ActionRoleContract("commit_identity_result", "identity_reviewer"),
+    ActionRoleContract("review_identity_result", "identity_reviewer"),
+    ActionRoleContract("specialist", "specialist"),
+    ActionRoleContract("integrate_requirement", "integration_agent"),
+    ActionRoleContract("repair_integration_fidelity", "integration_agent"),
+    ActionRoleContract("commit_integration_requirement", "integration_agent"),
+    ActionRoleContract("review_integration_fidelity", "integration_fidelity_reviewer"),
+    ActionRoleContract("resume_requirement_analysis", "analytical_owner"),
+    ActionRoleContract("analyze_requirement", "analytical_owner"),
+    ActionRoleContract("repair_requirement", "analytical_owner"),
+    ActionRoleContract("review_requirement", "business_reviewer"),
+    ActionRoleContract("finalize_requirement_review", "business_reviewer"),
+    ActionRoleContract("build_product_candidate", "product_agent"),
+    ActionRoleContract("refresh_product_preview", "product_agent"),
+    ActionRoleContract("build_final_product", "product_agent"),
+    ActionRoleContract("publish_final_product", "product_agent"),
+    ActionRoleContract("review_final_product", "product_reviewer"),
+    ActionRoleContract("recover_final_report", "reporting_agent"),
+    ActionRoleContract("preflight_final_report", "reporting_agent"),
+    ActionRoleContract("finalize_final_report", "reporting_agent"),
+)
+
+
+def action_role_contract(action: Any) -> ActionRoleContract:
+    """Return the canonical typed contract for one Planner action kind."""
+
+    action_value = _text(action, "action")
+    for contract in AUTHORIZED_ACTION_ROLE_CONTRACTS:
+        if contract.action == action_value:
+            return contract
+    raise ValueError(f"unsupported planner action kind: {action_value!r}")
+
+
+def action_role_contracts_by_action() -> Mapping[str, ActionRoleContract]:
+    """Return a detached action-keyed projection of the typed contract.
+
+    This projection is intentionally derived from ``AUTHORIZED_ACTION_ROLE_CONTRACTS``
+    on every call so consumers cannot maintain a second, drifting allowlist.
+    """
+
+    return {contract.action: contract for contract in AUTHORIZED_ACTION_ROLE_CONTRACTS}
+
+
+def validate_action_role(action: Any, role: Any) -> ActionRoleContract:
+    """Validate the sole authorized role for a Planner action kind."""
+
+    action_value = _text(action, "action")
+    role_value = _text(role, "role")
+    contract = action_role_contract(action_value)
+    if contract.role != role_value:
+        raise ValueError(
+            f"planner action {action_value!r} may target role {contract.role!r}, not {role_value!r}"
+        )
+    return contract
+
+
+# Explicit alias for hosts that phrase the boundary as a role validator.
+validate_planner_action_role = validate_action_role
+
+
+@dataclass(frozen=True)
 class PlannerAction:
     """One host-dispatchable action selected from current durable state.
 
@@ -1172,8 +1522,11 @@ class PlannerAction:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "action", _text(self.action, "action"))
-        object.__setattr__(self, "role", _text(self.role, "role"))
+        action = _text(self.action, "action")
+        role = _text(self.role, "role")
+        validate_action_role(action, role)
+        object.__setattr__(self, "action", action)
+        object.__setattr__(self, "role", role)
         object.__setattr__(self, "subject_id", _text(self.subject_id, "subject_id"))
         object.__setattr__(self, "reason", _text(self.reason, "reason"))
         if isinstance(self.priority, bool) or not isinstance(self.priority, int) or self.priority < 0:
@@ -1418,11 +1771,31 @@ def _validated_terminal_integration_boundary(phase: Mapping[str, Any]) -> bool:
             and validation.get("stage") == "committed"
         )
     if integration_state == "technical_failure":
+        # Only an explicit exhausted-recovery manifest settles the boundary.
+        # Historical/recoverable failure evidence remains actionable.
         return (
             phase.get("integration_stage") == "technical_failure"
             and isinstance(validation, Mapping)
             and validation.get("valid") is True
             and validation.get("stage") == "technical_failure"
+            and validation.get("recovery_exhausted") is True
+        )
+    # A requirement can exhaust its analytical/role recovery before business
+    # acceptance.  Its immutable ItemWorkspace terminal snapshot is then a
+    # settled no-integration boundary even though ``integration_state`` stays
+    # pending (there is deliberately no fabricated integration manifest).
+    # ``phase_snapshot`` validates the accepted/manifest binding and marks
+    # this projection explicitly so malformed/forged snapshots remain
+    # fail-closed.
+    if phase.get("lifecycle_state") == "technical_failure":
+        return (
+            integration_state == "pending"
+            and phase.get("integration_stage") == "technical_failure"
+            and isinstance(validation, Mapping)
+            and validation.get("valid") is True
+            and validation.get("stage") == "technical_failure"
+            and validation.get("pre_acceptance") is True
+            and validation.get("recovery_exhausted") is True
         )
     if _status(phase.get("terminal_outcome")) == "blocked_by_evidence":
         blocked_validation = phase.get("blocked_integration_validation")
@@ -1433,6 +1806,601 @@ def _validated_terminal_integration_boundary(phase: Mapping[str, Any]) -> bool:
             and blocked_validation.get("stage") == "blocked_by_evidence"
         )
     return False
+
+
+def _inspect_accepted_business_boundary(
+    context: RunContext,
+    item_id: str,
+    state_value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the immutable business-accepted answer boundary.
+
+    Product presentation is sourced from the exact accepted answer, not from
+    the downstream integration projection.  This helper intentionally reads
+    the same sealed ``AcceptedAnalysisBundle`` used by integration and keeps
+    any malformed boundary fail-closed without exposing exception text or
+    absolute paths to the Planner/Product Agent.
+    """
+
+    terminal = state_value.get("terminal_outcome") if isinstance(state_value, Mapping) else None
+    status = _status(terminal)
+    if status not in _ACCEPTED_BUSINESS_STATUSES:
+        return {
+            "valid": False,
+            "stage": "not_applicable",
+            "diagnostics": [],
+        }
+    mode = state_value.get("mode", "requirement")
+    if mode not in {"requirement", "question"}:
+        return {
+            "valid": False,
+            "stage": "invalid",
+            "diagnostics": ["accepted business boundary is unavailable or invalid"],
+        }
+    try:
+        from .durable import ItemWorkspace
+        from .integration import AcceptedAnalysisBundle
+
+        workspace = ItemWorkspace(
+            context,
+            item_id,
+            mode=mode,
+            original_text=str(state_value.get("original_text", "")),
+            state=state_value,
+        )
+        bundle = AcceptedAnalysisBundle.load(workspace)
+        if bundle.item_id != item_id or bundle.outcome != status:
+            raise ValueError("accepted business outcome does not match terminal state")
+        terminal_content_hash = terminal.get("content_hash") if isinstance(terminal, Mapping) else None
+        if terminal_content_hash != bundle.content_hash:
+            raise ValueError("accepted business content hash does not match terminal state")
+        namespace = "questions" if mode == "question" else "requirements"
+        accepted_prefix = f"{namespace}/{item_id}/accepted"
+        return {
+            "valid": True,
+            "stage": "accepted",
+            "manifest_ref": f"{accepted_prefix}/manifest.json",
+            # ``manifest_hash`` in this projection is the hash of the
+            # published manifest bytes, matching the preview binding
+            # contract.  The accepted manifest's own semantic hash remains
+            # validated by ``AcceptedAnalysisBundle.load`` and is retained
+            # separately for consumers that need that declaration.
+            "manifest_hash": hashlib.sha256(
+                context.resolve_run_path(f"{accepted_prefix}/manifest.json").read_bytes()
+            ).hexdigest(),
+            "declared_manifest_hash": bundle.manifest_hash,
+            "content_ref": f"{accepted_prefix}/answer_content.json",
+            "content_hash": bundle.content_hash,
+        }
+    except Exception:
+        # Do not copy underlying paths/reasons into a product-facing
+        # diagnostic.  The immutable accepted loader remains the detailed
+        # integrity authority; Planner only needs a safe admission result.
+        return {
+            "valid": False,
+            "stage": "invalid",
+            "diagnostics": ["accepted business boundary is unavailable or invalid"],
+        }
+
+
+def _safe_generation_component(generation_id: Any) -> str:
+    """Validate the generation path component used by preview helpers."""
+
+    value = _text(generation_id, "generation_id")
+    path = Path(value)
+    if value in {".", ".."} or len(path.parts) != 1 or path.name != value:
+        raise ValueError("generation_id must be one path component")
+    return value
+
+
+def _preview_item_views(
+    item_views: Mapping[str, Mapping[str, Any]],
+) -> tuple[tuple[str, Mapping[str, Any]], ...]:
+    """Return validated business-accepted item projections in deterministic order."""
+
+    if not isinstance(item_views, Mapping):
+        raise TypeError("item_views must be a mapping")
+    values: list[tuple[str, Mapping[str, Any]]] = []
+    for raw_item_id, phase in item_views.items():
+        item_id = _text(raw_item_id, "preview item_id")
+        if not isinstance(phase, Mapping):
+            continue
+        accepted = phase.get("accepted_business_validation")
+        if (
+            _status(phase.get("terminal_outcome")) in _ACCEPTED_BUSINESS_STATUSES
+            and isinstance(accepted, Mapping)
+            and accepted.get("valid") is True
+            and accepted.get("stage") == "accepted"
+        ):
+            values.append((item_id, phase))
+    return tuple(sorted(values, key=lambda value: value[0]))
+
+
+def preview_input_fingerprint(item_views: Mapping[str, Mapping[str, Any]]) -> str:
+    """Hash accepted business facts and optional committed enrichments.
+
+    The fingerprint intentionally contains only stable public boundary facts:
+    requirement IDs, accepted answer/manifest hashes, and optional committed
+    integration/records hashes.  It excludes timestamps, transport/session
+    IDs, raw/work paths, and presentation output bytes so a newly accepted
+    answer (or changed committed records) deterministically re-enables a
+    refresh without changing run lifecycle state.
+    """
+
+    entries: list[dict[str, Any]] = []
+    for item_id, phase in _preview_item_views(item_views):
+        terminal = phase.get("terminal_outcome")
+        terminal_value = terminal if isinstance(terminal, Mapping) else {}
+        accepted = phase.get("accepted_business_validation")
+        accepted_value = accepted if isinstance(accepted, Mapping) else {}
+        committed = phase.get("committed_integration_validation")
+        committed_value = committed if isinstance(committed, Mapping) else {}
+        entries.append(
+            {
+                "item_id": item_id,
+                "terminal_status": _status(terminal_value),
+                "accepted_content_hash": accepted_value.get("content_hash", terminal_value.get("content_hash")),
+                "accepted_manifest_hash": accepted_value.get("manifest_hash"),
+                "integration_state": phase.get("integration_state"),
+                "integration_stage": phase.get("integration_stage"),
+                "committed_manifest_hash": committed_value.get("manifest_hash"),
+                "records_hash": committed_value.get("records_hash"),
+            }
+        )
+    return _sha256_value({"schema_version": PREVIEW_MANIFEST_SCHEMA_VERSION, "items": entries})
+
+
+def _preview_output_refs(generation_id: Any) -> dict[str, str]:
+    generation = _safe_generation_component(generation_id)
+    prefix = f"products/generations/{generation}/preview"
+    preflight_prefix = f"extensions/{generation}/dashboard_preflight"
+    return {
+        "presentation_inventory_ref": f"{preflight_prefix}/dashboard_fixture_v4.json",
+        "presentation_plan_ref": f"extensions/{generation}/business_presentation_plan.json",
+        "assembly_receipt_ref": f"{prefix}/build_receipt.json",
+        "blueprint_ref": f"{prefix}/dashboard_blueprint_v2.json",
+        "site_manifest_ref": f"{prefix}/site/site_manifest.json",
+        "site_ref": f"{prefix}/site",
+        "manifest_ref": f"{prefix}/{PREVIEW_MANIFEST_FILENAME}",
+    }
+
+
+def _preview_site_tree_files(context: RunContext, site_ref: str) -> dict[str, str]:
+    """Return the assembler-shaped relative-file hash map for a preview site."""
+
+    site_root = context.resolve_run_path(site_ref)
+    if site_root.is_symlink() or not site_root.is_dir():
+        raise ValueError("preview site_ref is missing or symlinked")
+    files: dict[str, str] = {}
+    for path in sorted(site_root.rglob("*")):
+        relative = path.relative_to(site_root).as_posix()
+        if path.is_symlink():
+            raise ValueError(f"preview site contains symlink: {relative}")
+        if path.is_file():
+            files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    if not files:
+        raise ValueError("preview site contains no files")
+    return files
+
+
+def _preview_site_tree_sha256(context: RunContext, site_ref: str) -> str:
+    """Hash every file in a preview site tree, including site_manifest."""
+
+    # Match the assembler's ``_site_tree_binding`` contract exactly: the
+    # canonical hash is over the direct sorted ``{relative_path: sha256}``
+    # map, without an additional wrapper object.
+    return _sha256_value(_preview_site_tree_files(context, site_ref))
+
+
+def _preview_item_bindings(
+    context: RunContext,
+    item_views: Mapping[str, Mapping[str, Any]],
+    item_ids: Sequence[str],
+) -> dict[str, dict[str, str]]:
+    """Build public accepted refs and optional committed enrichments."""
+
+    bindings: dict[str, dict[str, str]] = {}
+    for raw_item_id in item_ids:
+        item_id = _text(raw_item_id, "preview item_id")
+        phase = item_views.get(item_id)
+        if not isinstance(phase, Mapping):
+            raise ValueError(f"preview item is not a validated accepted boundary: {item_id}")
+        accepted_validation = phase.get("accepted_business_validation")
+        if (
+            not isinstance(accepted_validation, Mapping)
+            or accepted_validation.get("valid") is not True
+            or accepted_validation.get("stage") != "accepted"
+        ):
+            raise ValueError(f"preview item is not a validated accepted boundary: {item_id}")
+        terminal = phase.get("terminal_outcome")
+        terminal_value = terminal if isinstance(terminal, Mapping) else {}
+        accepted_content_hash = accepted_validation.get("content_hash", terminal_value.get("content_hash"))
+        accepted_manifest_hash = accepted_validation.get("manifest_hash")
+        if not _is_sha256(accepted_content_hash):
+            raise ValueError(f"preview accepted content hash is invalid: {item_id}")
+        if not _is_sha256(accepted_manifest_hash):
+            raise ValueError(f"preview accepted manifest hash is invalid: {item_id}")
+        accepted_manifest_ref = accepted_validation.get("manifest_ref")
+        accepted_content_ref = accepted_validation.get("content_ref")
+        if not isinstance(accepted_manifest_ref, str) or not isinstance(accepted_content_ref, str):
+            raise ValueError(f"preview accepted references are invalid: {item_id}")
+        accepted_path = context.resolve_run_path(accepted_manifest_ref)
+        accepted_content_path = context.resolve_run_path(accepted_content_ref)
+        for path, label in (
+            (accepted_path, "accepted manifest"),
+            (accepted_content_path, "accepted content"),
+        ):
+            if path.is_symlink() or not path.is_file():
+                raise ValueError(f"preview {label} is missing or symlinked: {item_id}")
+        accepted_value = json.loads(accepted_path.read_text(encoding="utf-8"))
+        if not isinstance(accepted_value, Mapping):
+            raise ValueError(f"preview accepted manifest is invalid: {item_id}")
+        if hashlib.sha256(accepted_path.read_bytes()).hexdigest() != accepted_manifest_hash:
+            raise ValueError(f"preview accepted manifest binding is stale: {item_id}")
+        if hashlib.sha256(accepted_content_path.read_bytes()).hexdigest() != accepted_content_hash:
+            raise ValueError(f"preview accepted content binding is stale: {item_id}")
+        declared_manifest_hash = accepted_validation.get("declared_manifest_hash")
+        if accepted_value.get("manifest_hash") != declared_manifest_hash:
+            raise ValueError(f"preview accepted manifest declaration is stale: {item_id}")
+        if accepted_value.get("content_hash") != accepted_content_hash:
+            raise ValueError(f"preview accepted content binding is stale: {item_id}")
+        binding = {
+            "accepted_manifest_ref": accepted_manifest_ref,
+            "accepted_manifest_hash": str(accepted_manifest_hash),
+            "accepted_content_ref": accepted_content_ref,
+            "accepted_content_hash": str(accepted_content_hash),
+        }
+        committed_validation = phase.get("committed_integration_validation")
+        if (
+            isinstance(committed_validation, Mapping)
+            and committed_validation.get("valid") is True
+            and committed_validation.get("stage") == "committed"
+        ):
+            committed_manifest_ref = f"requirements/{item_id}/integration/committed/manifest.json"
+            records_ref = f"requirements/{item_id}/integration/committed/records.jsonl"
+            committed_path = context.resolve_run_path(committed_manifest_ref)
+            records_path = context.resolve_run_path(records_ref)
+            for path, label in ((committed_path, "committed manifest"), (records_path, "committed records")):
+                if path.is_symlink() or not path.is_file():
+                    raise ValueError(f"preview {label} is missing or symlinked: {item_id}")
+            committed_manifest_hash = hashlib.sha256(committed_path.read_bytes()).hexdigest()
+            records_hash = hashlib.sha256(records_path.read_bytes()).hexdigest()
+            if committed_validation.get("records_hash") not in {None, records_hash}:
+                raise ValueError(f"preview committed records binding is stale: {item_id}")
+            binding.update(
+                {
+                    "committed_manifest_ref": committed_manifest_ref,
+                    "committed_manifest_hash": committed_manifest_hash,
+                    "records_ref": records_ref,
+                    "records_hash": records_hash,
+                }
+            )
+        bindings[item_id] = binding
+    return {item_id: bindings[item_id] for item_id in sorted(bindings)}
+
+
+def _accepted_preview_bindings_complete(
+    item_views: Mapping[str, Mapping[str, Any]],
+    item_ids: Sequence[str],
+    bindings: Mapping[str, Mapping[str, Any]] | None,
+) -> bool:
+    """Require an exact accepted-answer binding for every terminal item."""
+
+    if not isinstance(item_views, Mapping) or not isinstance(bindings, Mapping):
+        return False
+    if any(not isinstance(item_id, str) or not item_id.strip() for item_id in item_ids):
+        return False
+    accepted_ids = tuple(
+        sorted(
+            str(item_id)
+            for item_id, phase in item_views.items()
+            if isinstance(phase, Mapping)
+            and _status(phase.get("terminal_outcome")) in _ACCEPTED_BUSINESS_STATUSES
+        )
+    )
+    if len(item_ids) != len(set(item_ids)) or set(item_ids) != set(accepted_ids):
+        return False
+    if set(bindings) != set(accepted_ids):
+        return False
+    accepted_field_by_binding = {
+        "accepted_manifest_ref": "manifest_ref",
+        "accepted_manifest_hash": "manifest_hash",
+        "accepted_content_ref": "content_ref",
+        "accepted_content_hash": "content_hash",
+    }
+    for item_id in accepted_ids:
+        phase = item_views.get(item_id)
+        accepted = phase.get("accepted_business_validation") if isinstance(phase, Mapping) else None
+        binding = bindings.get(item_id)
+        if (
+            not isinstance(accepted, Mapping)
+            or accepted.get("valid") is not True
+            or accepted.get("stage") != "accepted"
+            or not isinstance(binding, Mapping)
+            or not _PREVIEW_ITEM_REQUIRED_BINDING_FIELDS.issubset(set(binding))
+            or set(binding) - _PREVIEW_ITEM_BINDING_FIELDS
+        ):
+            return False
+        if any(
+            not isinstance(accepted.get(field_name), str)
+            or not accepted.get(field_name).strip()
+            or (
+                field_name.endswith("_hash")
+                and not _is_sha256(accepted.get(field_name))
+            )
+            for field_name in accepted_field_by_binding.values()
+        ):
+            return False
+        if any(
+            binding.get(binding_field) != accepted.get(accepted_field)
+            for binding_field, accepted_field in accepted_field_by_binding.items()
+        ):
+            return False
+    return True
+
+
+def inspect_preview_manifest(
+    context: RunContext,
+    generation_id: str,
+    manifest_ref: str | None = None,
+    *,
+    expected_input_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """Purely validate one non-finalizable dashboard preview manifest.
+
+    A missing, malformed, stale, or output-drifted preview is represented as
+    ``valid=False`` so Planner can offer a low-priority refresh.  No lifecycle
+    or retry state is mutated by this inspector.
+    """
+
+    try:
+        generation = _safe_generation_component(generation_id)
+        refs = _preview_output_refs(generation)
+        if manifest_ref is not None and manifest_ref != refs["manifest_ref"]:
+            raise ValueError("preview manifest reference is stale or foreign")
+        path = context.resolve_run_path(manifest_ref or refs["manifest_ref"])
+        if path.is_symlink() or not path.is_file():
+            return {
+                "valid": False,
+                "stage": "missing",
+                "manifest": None,
+                "diagnostics": ["preview manifest is missing"],
+            }
+        raw_bytes = path.read_bytes()
+        value = json.loads(raw_bytes.decode("utf-8"))
+        if not isinstance(value, Mapping):
+            raise ValueError("preview manifest must be an object")
+        allowed = _PREVIEW_MANIFEST_REQUIRED_FIELDS | _PREVIEW_MANIFEST_OPTIONAL_FIELDS
+        if set(value) - allowed or not _PREVIEW_MANIFEST_REQUIRED_FIELDS.issubset(value):
+            raise ValueError("preview manifest fields are invalid")
+        if raw_bytes != _canonical_json_bytes(value):
+            raise ValueError("preview manifest is not canonical")
+        if value.get("schema_version") != PREVIEW_MANIFEST_SCHEMA_VERSION:
+            raise ValueError("preview manifest schema_version is invalid")
+        if value.get("run_id") != context.run_id or value.get("generation_id") != generation or value.get("finalizable") is not False:
+            raise ValueError("preview manifest run/generation/finalizable binding is invalid")
+        input_fingerprint = value.get("input_fingerprint")
+        if not _is_sha256(input_fingerprint):
+            raise ValueError("preview input_fingerprint is invalid")
+        if expected_input_fingerprint is not None and input_fingerprint != expected_input_fingerprint:
+            return {
+                "valid": False,
+                "stage": "stale",
+                "manifest": dict(value),
+                "input_fingerprint": input_fingerprint,
+                "diagnostics": ["preview input fingerprint differs from current terminal inputs"],
+            }
+        item_ids = value.get("item_ids")
+        if not isinstance(item_ids, list) or item_ids != sorted(item_ids) or len(item_ids) != len(set(item_ids)) or any(not isinstance(item_id, str) or not item_id.strip() for item_id in item_ids):
+            raise ValueError("preview item_ids must be a sorted unique string list")
+        bindings = value.get("item_bindings")
+        if not isinstance(bindings, Mapping) or set(bindings) != set(item_ids):
+            raise ValueError("preview item_bindings must match item_ids")
+        for item_id in item_ids:
+            binding = bindings.get(item_id)
+            if not isinstance(binding, Mapping):
+                raise ValueError("preview item binding fields are invalid")
+            binding_fields = set(binding)
+            if not _PREVIEW_ITEM_REQUIRED_BINDING_FIELDS.issubset(binding_fields):
+                raise ValueError("preview item binding accepted fields are missing")
+            optional_fields = binding_fields - _PREVIEW_ITEM_REQUIRED_BINDING_FIELDS
+            if optional_fields and optional_fields != _PREVIEW_ITEM_OPTIONAL_BINDING_FIELDS:
+                raise ValueError("preview item binding committed fields are incomplete")
+            if binding_fields - _PREVIEW_ITEM_BINDING_FIELDS:
+                raise ValueError("preview item binding fields are invalid")
+            for field_name in binding_fields:
+                if field_name.endswith("_ref"):
+                    ref = binding.get(field_name)
+                    if not isinstance(ref, str) or not ref or Path(ref).is_absolute() or ".." in Path(ref).parts:
+                        raise ValueError("preview item binding reference is invalid")
+                    if any(part.lower() in {"raw", "work", "source", "sources", "calculations"} for part in Path(ref).parts):
+                        raise ValueError("preview item binding references raw/work data")
+                else:
+                    if not _is_sha256(binding.get(field_name)):
+                        raise ValueError("preview item binding hash is invalid")
+            expected_item_refs = {
+                "accepted_manifest_ref": f"requirements/{item_id}/accepted/manifest.json",
+                "accepted_content_ref": f"requirements/{item_id}/accepted/answer_content.json",
+                "committed_manifest_ref": f"requirements/{item_id}/integration/committed/manifest.json",
+                "records_ref": f"requirements/{item_id}/integration/committed/records.jsonl",
+            }
+            if any(
+                key in binding and binding.get(key) != expected
+                for key, expected in expected_item_refs.items()
+            ):
+                raise ValueError("preview item binding reference is stale or foreign")
+            for field_name in (
+                "accepted_manifest_ref",
+                "accepted_content_ref",
+                "committed_manifest_ref",
+                "records_ref",
+            ):
+                if field_name not in binding:
+                    continue
+                target = context.resolve_run_path(binding[field_name])
+                if target.is_symlink() or not target.is_file() or hashlib.sha256(target.read_bytes()).hexdigest() != binding[field_name.replace("_ref", "_hash")]:
+                    raise ValueError("preview item binding hash does not match its public artifact")
+        for field_name, expected_ref in (
+            ("assembly_receipt_ref", refs["assembly_receipt_ref"]),
+            ("blueprint_ref", refs["blueprint_ref"]),
+            ("site_manifest_ref", refs["site_manifest_ref"]),
+            ("site_ref", refs["site_ref"]),
+        ):
+            if value.get(field_name) != expected_ref:
+                raise ValueError(f"preview {field_name} is stale or foreign")
+        receipt_path = context.resolve_run_path(value["assembly_receipt_ref"])
+        blueprint_path = context.resolve_run_path(value["blueprint_ref"])
+        site_manifest_path = context.resolve_run_path(value["site_manifest_ref"])
+        for target, label in ((receipt_path, "assembly receipt"), (blueprint_path, "blueprint"), (site_manifest_path, "site manifest")):
+            if target.is_symlink() or not target.is_file():
+                raise ValueError(f"preview {label} is missing or symlinked")
+        for field_name, target in (
+            ("assembly_receipt_sha256", receipt_path),
+            ("blueprint_sha256", blueprint_path),
+            ("site_manifest_sha256", site_manifest_path),
+        ):
+            if not _is_sha256(value.get(field_name)) or hashlib.sha256(target.read_bytes()).hexdigest() != value[field_name]:
+                raise ValueError(f"preview {field_name} does not match its output")
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        if not isinstance(receipt, Mapping) or receipt.get("status") != "complete" or receipt.get("run_id") != context.run_id or receipt.get("generation_id") != generation or receipt.get("new_analytics") is not False:
+            raise ValueError("preview assembly receipt is invalid")
+        receipt_outputs = receipt.get("outputs")
+        if not isinstance(receipt_outputs, Mapping):
+            raise ValueError("preview assembly receipt outputs are missing")
+        if receipt_outputs.get("receipt_ref") != value["assembly_receipt_ref"] or receipt_outputs.get("blueprint_ref") != value["blueprint_ref"] or receipt_outputs.get("site_ref") != value["site_ref"]:
+            raise ValueError("preview assembly receipt output binding is stale")
+        blueprint_binding = receipt.get("blueprint_binding")
+        if not isinstance(blueprint_binding, Mapping) or blueprint_binding.get("ref") != value["blueprint_ref"] or blueprint_binding.get("sha256") != value["blueprint_sha256"]:
+            raise ValueError("preview blueprint binding is stale")
+        site_manifest = json.loads(site_manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(site_manifest, Mapping) or site_manifest.get("blueprint_ref") != value["blueprint_ref"] or site_manifest.get("blueprint_sha256") != value["blueprint_sha256"]:
+            raise ValueError("preview site manifest blueprint binding is stale")
+        site_files = _preview_site_tree_files(context, value["site_ref"])
+        tree_hash = _sha256_value(site_files)
+        if value.get("site_tree_sha256") != tree_hash:
+            raise ValueError("preview site_tree_sha256 does not match site")
+        receipt_site_binding = receipt.get("site_binding")
+        if (
+            not isinstance(receipt_site_binding, Mapping)
+            or receipt_site_binding.get("files") != site_files
+            or receipt_site_binding.get("tree_sha256") != tree_hash
+        ):
+            raise ValueError("preview assembly receipt site binding is stale")
+        for field_name in _PREVIEW_MANIFEST_OPTIONAL_FIELDS:
+            if field_name in value:
+                entries = value[field_name]
+                if not isinstance(entries, list) or entries != sorted(entries) or len(entries) != len(set(entries)) or any(not isinstance(entry, str) or not entry.strip() for entry in entries):
+                    raise ValueError(f"preview {field_name} must be a sorted unique string list")
+        return {
+            "valid": True,
+            "stage": "preview",
+            "manifest": dict(value),
+            "input_fingerprint": input_fingerprint,
+            "diagnostics": [],
+        }
+    except Exception as exc:
+        return {"valid": False, "stage": "invalid", "manifest": None, "diagnostics": [str(exc)]}
+
+
+def persist_preview_manifest(
+    context: RunContext,
+    generation_id: str,
+    *,
+    input_fingerprint: str,
+    item_ids: Sequence[str],
+    item_bindings: Mapping[str, Mapping[str, Any]],
+    failed_items: Iterable[str] = (),
+    limitations: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Atomically publish the canonical non-finalizable preview manifest.
+
+    The assembler owns all fixture/blueprint/site bytes.  This helper only
+    binds those already-produced public outputs and the accepted/committed
+    item refs; it never creates a candidate, review, authorization, freeze,
+    or publication record.
+    """
+
+    if not isinstance(context, RunContext):
+        raise TypeError("persist_preview_manifest requires a RunContext")
+    generation = _safe_generation_component(generation_id)
+    refs = _preview_output_refs(generation)
+    if not _is_sha256(input_fingerprint):
+        raise ValueError("input_fingerprint must be a lowercase SHA-256 digest")
+    normalized_ids = tuple(sorted(_text(item_id, "preview item_id") for item_id in item_ids))
+    if len(normalized_ids) != len(set(normalized_ids)):
+        raise ValueError("item_ids must not contain duplicates")
+    if not isinstance(item_bindings, Mapping) or set(item_bindings) != set(normalized_ids):
+        raise ValueError("item_bindings must match item_ids")
+    normalized_bindings = {
+        item_id: dict(_jsonable(item_bindings[item_id]))
+        for item_id in normalized_ids
+    }
+    failed = sorted({_text(value, "failed_items entry") for value in failed_items})
+    limits = sorted({_text(value, "limitations entry") for value in limitations})
+    receipt_path = context.resolve_run_path(refs["assembly_receipt_ref"])
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise ValueError("preview assembly receipt is missing or symlinked")
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if not isinstance(receipt, Mapping):
+        raise ValueError("preview assembly receipt is invalid")
+    outputs = receipt.get("outputs")
+    if not isinstance(outputs, Mapping):
+        raise ValueError("preview assembly receipt outputs are missing")
+    # Use the canonical namespace regardless of any advisory output refs in a
+    # role payload.  The inspector below performs the exact equality checks.
+    blueprint_ref = refs["blueprint_ref"]
+    site_ref = refs["site_ref"]
+    blueprint_path = context.resolve_run_path(blueprint_ref)
+    site_manifest_path = context.resolve_run_path(refs["site_manifest_ref"])
+    if blueprint_path.is_symlink() or not blueprint_path.is_file() or site_manifest_path.is_symlink() or not site_manifest_path.is_file():
+        raise ValueError("preview blueprint/site manifest is missing or symlinked")
+    manifest: dict[str, Any] = {
+        "schema_version": PREVIEW_MANIFEST_SCHEMA_VERSION,
+        "run_id": context.run_id,
+        "generation_id": generation,
+        "finalizable": False,
+        "input_fingerprint": input_fingerprint,
+        "item_ids": list(normalized_ids),
+        "item_bindings": normalized_bindings,
+        "assembly_receipt_ref": refs["assembly_receipt_ref"],
+        "assembly_receipt_sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+        "blueprint_ref": blueprint_ref,
+        "blueprint_sha256": hashlib.sha256(blueprint_path.read_bytes()).hexdigest(),
+        "site_manifest_ref": refs["site_manifest_ref"],
+        "site_manifest_sha256": hashlib.sha256(site_manifest_path.read_bytes()).hexdigest(),
+        "site_ref": site_ref,
+        "site_tree_sha256": _preview_site_tree_sha256(context, site_ref),
+    }
+    if failed:
+        manifest["failed_items"] = failed
+    if limits:
+        manifest["limitations"] = limits
+    destination = context.resolve_run_path(refs["manifest_ref"])
+    payload = _canonical_json_bytes(manifest)
+    if destination.is_file() and not destination.is_symlink() and destination.read_bytes() == payload:
+        return dict(manifest)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile("wb", dir=destination.parent, prefix=f".{destination.name}.", delete=False) as stream:
+            temporary_name = stream.name
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_name, destination)
+        temporary_name = None
+    finally:
+        if temporary_name is not None:
+            Path(temporary_name).unlink(missing_ok=True)
+    inspected = inspect_preview_manifest(
+        context,
+        generation,
+        refs["manifest_ref"],
+        expected_input_fingerprint=input_fingerprint,
+    )
+    if inspected.get("valid") is not True:
+        raise ValueError("persisted preview manifest failed validation: " + "; ".join(inspected.get("diagnostics", ())))
+    return dict(manifest)
 
 
 class RequirementSupervisorWorkspace:
@@ -1731,10 +2699,12 @@ class RequirementSupervisorWorkspace:
     def runtime_snapshot(self) -> RequirementRunSnapshot:
         """Return one typed, current scheduling snapshot for this run.
 
-        The method joins the three program-owned authorities that a host used
-        to have to assemble manually: item state, entity-resolution waits, and
-        top-level lifecycle state.  It never launches work; it only reports the
-        next requirement when the single Analytical Owner slot is available.
+        The method joins the program-owned item state, entity-resolution waits,
+        and top-level lifecycle state.  Analytical Owner schedulability comes
+        only from durable item attempts; historical entity-resolution lease
+        records are intentionally not a capacity input.  The method never
+        launches work; it only reports the next requirement when the single
+        Analytical Owner slot is available.
         """
 
         from .durable import ItemWorkspace
@@ -1754,14 +2724,9 @@ class RequirementSupervisorWorkspace:
             resolution = None
             runtime_statuses: Mapping[str, Mapping[str, Any]] = {}
             active_resolver_count = 0
-            active_owner_leases = 0
         else:
             runtime_statuses = resolution.requirement_runtime_statuses()
             active_resolver_count = resolution.active_resolution_count
-            active_owner_leases = sum(
-                lease.worker_type == "analytical_owner"
-                for lease in resolution.active_leases
-            )
 
         item_outcomes: dict[str, str] = {}
         active_owner_items = 0
@@ -1789,7 +2754,7 @@ class RequirementSupervisorWorkspace:
 
         plan = self.load()
         runnable = self._runnable_requirement_ids(plan, item_outcomes, runtime_statuses)
-        owner_busy = active_owner_items > 0 or active_owner_leases > 0
+        owner_busy = active_owner_items > 0
         next_requirement_id = None if lifecycle.paused or owner_busy or not runnable else runnable[0]
         if lifecycle.paused:
             scheduler_status = "paused"
@@ -1812,7 +2777,7 @@ class RequirementSupervisorWorkspace:
                 requirement_id: _runtime_status(status)
                 for requirement_id, status in runtime_statuses.items()
             },
-            active_analytical_owner_count=max(active_owner_items, active_owner_leases),
+            active_analytical_owner_count=active_owner_items,
             active_resolver_count=active_resolver_count,
         )
 
@@ -1913,6 +2878,11 @@ class RequirementSupervisorWorkspace:
                 fidelity_view,
                 committed_view,
             )
+            accepted_business_view = _inspect_accepted_business_boundary(
+                self.context,
+                item_id,
+                state_value,
+            )
             if blocked_integration_view.get("valid") is True:
                 integration_stage = "blocked_by_evidence"
             elif _status(terminal) == "blocked_by_evidence":
@@ -1920,6 +2890,11 @@ class RequirementSupervisorWorkspace:
                 # integration artifact, or other residue is not a valid
                 # no-op terminal. Keep it in repair, never product routing.
                 integration_stage = "invalid"
+            elif fidelity_view.get("stage") == "staging_incomplete":
+                # Empty/partial staging is a positive continuation handoff
+                # for the same Integration Agent/session, not a generic
+                # malformed boundary and never a fidelity-review input.
+                integration_stage = "staging_incomplete"
             elif committed_view.get("stage") == "technical_failure" and committed_view.get("valid"):
                 integration_stage = "technical_failure"
             elif not fidelity_view.get("valid") or not committed_view.get("valid"):
@@ -1944,6 +2919,7 @@ class RequirementSupervisorWorkspace:
                 "integration_validation": fidelity_view,
                 "committed_integration_validation": committed_view,
                 "blocked_integration_validation": blocked_integration_view,
+                "accepted_business_validation": accepted_business_view,
                 "business_review_status": review.get("status"),
                 "business_review_verdict": review.get("verdict"),
                 "paths": {
@@ -1972,10 +2948,27 @@ class RequirementSupervisorWorkspace:
         product_review = self._read_json_object(review_path)
         authorization = self._read_json_object(authorization_path)
         product_validation: dict[str, Any] = product_view
+        # A completed Product revision is authoritative after the explicit
+        # regeneration transaction.  Read the pointer without adopting or
+        # mutating legacy root evidence so Planner/status probes remain pure.
+        try:
+            from .product_review import ProductReviewStore
+
+            product_store = ProductReviewStore(self.context, generation_id)
+            active_pointer = product_store.read_active_revision()
+        except Exception as exc:
+            active_pointer = None
+            if (product_root / "product_revision.json").exists():
+                product_validation = {"valid": False, "diagnostics": [str(exc)]}
+        if active_pointer is not None:
+            candidate_path = self.context.resolve_run_path(active_pointer.candidate_ref)
+            review_path = self.context.resolve_run_path(active_pointer.review_ref)
+            authorization_path = product_store._revision_authorization_path(active_pointer.revision_id)  # noqa: SLF001
+            candidate = self._read_json_object(candidate_path)
+            product_review = self._read_json_object(review_path)
+            authorization = self._read_json_object(authorization_path)
         if candidate is not None or product_review is not None or authorization is not None:
             try:
-                from .product_review import ProductReviewStore
-
                 product_store = ProductReviewStore(self.context, generation_id)
                 candidate = product_store.load_candidate().to_dict() if candidate is not None else None
                 product_review = product_store.load_review().to_dict() if product_review is not None else None
@@ -1989,6 +2982,52 @@ class RequirementSupervisorWorkspace:
         report_view = inspect_report_artifacts(self.context, run_id=self.context.run_id)
         report_preflight = report_view.get("preflight")
         report = report_view.get("report")
+        preview_generation = _safe_generation_component(generation_id)
+        preview_refs = _preview_output_refs(preview_generation)
+        preview_fingerprint = preview_input_fingerprint(items)
+        preview_item_ids = tuple(item_id for item_id, _phase in _preview_item_views(items))
+        preview_bindings: dict[str, dict[str, str]] = {}
+        preview_binding_diagnostics: list[str] = []
+        if preview_item_ids:
+            try:
+                preview_bindings = _preview_item_bindings(self.context, items, preview_item_ids)
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                # A malformed accepted/committed public boundary is already
+                # represented by the item's pure phase validation.  Keep the
+                # preview projection diagnostic-only and do not turn it into a
+                # run-level lifecycle failure.
+                preview_binding_diagnostics.append(str(exc))
+        preview_view = inspect_preview_manifest(
+            self.context,
+            preview_generation,
+            preview_refs["manifest_ref"],
+            expected_input_fingerprint=preview_fingerprint,
+        )
+        if preview_binding_diagnostics:
+            preview_view = {
+                **preview_view,
+                "valid": False,
+                "stage": "invalid",
+                "diagnostics": [*preview_view.get("diagnostics", ()), *preview_binding_diagnostics],
+            }
+        accepted_terminal_ids = {
+            item_id
+            for item_id, phase in items.items()
+            if _status(phase.get("terminal_outcome")) in _ACCEPTED_BUSINESS_STATUSES
+        }
+        failed_preview_items = sorted(
+            item_id
+            for item_id in accepted_terminal_ids
+            if item_id not in preview_item_ids
+            or not _validated_terminal_integration_boundary(items[item_id])
+        )
+        preview_limitations = [
+            "Presentation inputs include every terminal business-accepted answer; committed integration facts are optional audit enrichment.",
+        ]
+        if any(item_id not in preview_item_ids for item_id in accepted_terminal_ids):
+            preview_limitations.append("Some accepted answer boundaries could not be validated and are withheld until repaired.")
+        if failed_preview_items:
+            preview_limitations.append("Accepted requirements with unfinished or failed integration remain visible with limitations.")
         return {
             "run_id": self.context.run_id,
             "generation_id": generation_id,
@@ -1996,20 +3035,7 @@ class RequirementSupervisorWorkspace:
             "lifecycle_validation": {"valid": True, "diagnostics": []},
             "items": items,
             "all_items_integrated": bool(items) and all(
-                (
-                    item.get("integration_state") == "technical_failure"
-                    and item.get("integration_stage") == "technical_failure"
-                    and item.get("committed_integration_validation", {}).get("valid") is True
-                )
-                or (
-                    item.get("integration_state") == "integrated"
-                    and item.get("committed_integration_validation", {}).get("valid") is True
-                )
-                or (
-                    item.get("terminal_status") == "blocked_by_evidence"
-                    and item.get("integration_stage") == "blocked_by_evidence"
-                    and item.get("blocked_integration_validation", {}).get("valid") is True
-                )
+                _validated_terminal_integration_boundary(item)
                 for item in items.values()
             ),
             "product": {
@@ -2022,6 +3048,15 @@ class RequirementSupervisorWorkspace:
                 "review": product_review,
                 "authorization_ref": str(authorization_path.relative_to(self.context.run_root)),
                 "authorization": authorization,
+                "preview_ref": preview_refs["manifest_ref"],
+                "presentation_inventory_ref": preview_refs["presentation_inventory_ref"],
+                "presentation_plan_ref": preview_refs["presentation_plan_ref"],
+                "preview": preview_view,
+                "preview_input_fingerprint": preview_fingerprint,
+                "preview_item_ids": list(preview_item_ids),
+                "preview_item_bindings": preview_bindings,
+                "preview_failed_items": failed_preview_items,
+                "preview_limitations": preview_limitations,
                 "validation": product_validation,
             },
             "report": {
@@ -2108,6 +3143,7 @@ class RequirementSupervisorWorkspace:
         for item_id, owner_ref, proposals in proposal_batches:
             unresolved: list[str] = []
             states: dict[str, str] = {}
+            required_revisions: dict[str, int] = {}
             for proposal in proposals:
                 reservation = resolution.reserve_identity_domain(
                     proposal.domain_id,
@@ -2119,10 +3155,26 @@ class RequirementSupervisorWorkspace:
                     request_owner_ref=owner_ref,
                 )
                 states[proposal.domain_id] = reservation.state
-                # A failed domain is not a satisfied request.  Keep every
-                # exact requester waiting so the Planner can expose one
-                # repair/escalation while unrelated requirements continue.
-                if reservation.state != "ready":
+                authoritative_request = resolution.authoritative_request_for_requirement(
+                    item_id,
+                    proposal.domain_id,
+                    entry=reservation.to_dict(),
+                )
+                request_revision = (
+                    1
+                    if authoritative_request is None or authoritative_request.required_revision is None
+                    else authoritative_request.required_revision
+                )
+                if isinstance(request_revision, bool) or not isinstance(request_revision, int) or request_revision < 1:
+                    raise ValueError("identity domain request required_revision is invalid")
+                required_revisions[proposal.domain_id] = request_revision
+                # Satisfaction is revision-bound, not state-bound.  A v1
+                # requester remains released after v1 publication even when
+                # another requester has opened a pending/failed v2.
+                published_revision = reservation.published_revision or (
+                    1 if reservation.state == "ready" else 0
+                )
+                if published_revision < request_revision:
                     unresolved.append(proposal.domain_id)
             if unresolved:
                 waiting = resolution.mark_waiting_on_resolution(
@@ -2133,6 +3185,10 @@ class RequirementSupervisorWorkspace:
                         for domain_id in unresolved
                     ),
                     owner_ref=owner_ref,
+                    required_revisions={
+                        domain_id: required_revisions[domain_id]
+                        for domain_id in unresolved
+                    },
                 )
             else:
                 waiting = None
@@ -2147,7 +3203,453 @@ class RequirementSupervisorWorkspace:
             )
         return tuple(reconciled)
 
-    def next_actions(self) -> tuple[PlannerAction, ...]:
+    def recover_identity_domain_proposal(
+        self,
+        requirement_id: str,
+        domain_id: str,
+        *,
+        expected_predecessor_hash: str,
+        rationale: str | None = None,
+        source_hints: Iterable[str] | None = None,
+        representation_item_ids: Iterable[str] | None = None,
+    ) -> Mapping[str, Any]:
+        """Public, audited recovery for one malformed same-domain proposal.
+
+        The run-level reservation supplies the canonical ``object_type``;
+        callers cannot redefine it through this operation.  The item workspace
+        performs the append-only successor CAS and keeps the lifecycle paused
+        until the caller explicitly invokes :meth:`RunLifecycle.resume`.
+        """
+
+        item_id = _text(requirement_id, "requirement_id")
+        domain_key = _text(domain_id, "domain_id")
+        if not _is_sha256(expected_predecessor_hash):
+            raise ValueError("expected_predecessor_hash must be a SHA-256 digest")
+
+        from .analyst_workspace import IdentityDomainProposal
+        from .durable import ItemWorkspace
+        from .entity_resolution import EntityResolutionWorkspace
+        from .lifecycle import RunLifecycle
+
+        lifecycle = RunLifecycle.load(self.context)
+        if item_id not in lifecycle.item_ids:
+            raise ValueError("requirement_id is not in the active lifecycle")
+        item = ItemWorkspace.load(self.context, item_id, mode="requirement")
+        owner_ref = item.analysis_owner_ref()
+        try:
+            resolution = EntityResolutionWorkspace.load(self.context)
+            reservation = resolution.get_domain(domain_key)
+        except FileNotFoundError as exc:
+            raise ValueError("identity domain reservation is missing") from exc
+        canonical_object_type = _text(reservation.object_type, "canonical object_type")
+
+        effective_rows = item.read_identity_domain_proposals()
+        effective = [
+            row
+            for row in effective_rows
+            if row.get("domain_id") == domain_key
+        ]
+        if len(effective) != 1:
+            raise ValueError("item-local effective identity proposal is missing or ambiguous")
+        history = item.read_identity_domain_proposal_history()
+        predecessor = next(
+            (
+                row
+                for row in history
+                if row.get("domain_id") == domain_key
+                and row.get("proposal_hash") == expected_predecessor_hash
+            ),
+            None,
+        )
+        if predecessor is None:
+            raise ValueError("identity domain proposal predecessor is unknown")
+        predecessor_proposal = IdentityDomainProposal.from_dict(predecessor)
+
+        additions_sources = _text_tuple(source_hints, "source_hints")
+        additions_representations = _text_tuple(
+            representation_item_ids,
+            "representation_item_ids",
+        )
+        successor_rationale = predecessor_proposal.rationale
+        if rationale is not None:
+            extension = _text(rationale, "rationale")
+            successor_rationale = f"{successor_rationale}\n{extension}"
+        successor_sources = tuple(
+            dict.fromkeys((*predecessor_proposal.source_hints, *additions_sources))
+        )
+        successor_representations = tuple(
+            dict.fromkeys(
+                (*predecessor_proposal.representation_item_ids, *additions_representations)
+            )
+        )
+
+        # If a prior invocation already appended the exact successor, return
+        # its durable evidence without requiring the caller to guess the new
+        # head digest.  A divergent branch on the same predecessor is never
+        # accepted as an idempotent retry.
+        existing_successors = [
+            row
+            for row in history
+            if row.get("domain_id") == domain_key
+            and row.get("supersedes_hash") == expected_predecessor_hash
+        ]
+        expected_successor = IdentityDomainProposal(
+            domain_id=domain_key,
+            object_type=canonical_object_type,
+            rationale=successor_rationale,
+            source_hints=successor_sources,
+            representation_item_ids=successor_representations,
+            revision=predecessor_proposal.revision + 1,
+            supersedes_hash=expected_predecessor_hash,
+            superseded_object_type=predecessor_proposal.object_type,
+        )
+        expected_successor_with_hash = IdentityDomainProposal(
+            domain_id=expected_successor.domain_id,
+            object_type=expected_successor.object_type,
+            rationale=expected_successor.rationale,
+            source_hints=expected_successor.source_hints,
+            representation_item_ids=expected_successor.representation_item_ids,
+            revision=expected_successor.revision,
+            supersedes_hash=expected_successor.supersedes_hash,
+            proposal_hash=expected_successor.digest,
+            superseded_object_type=expected_successor.superseded_object_type,
+        )
+        for existing in existing_successors:
+            existing_proposal = IdentityDomainProposal.from_dict(existing)
+            if existing_proposal.to_dict() != expected_successor_with_hash.to_dict():
+                raise ValueError("identity domain proposal successor conflicts with predecessor")
+            return {
+                "recovered": True,
+                "already_applied": True,
+                "requirement_id": item_id,
+                "domain_id": domain_key,
+                "owner_ref": owner_ref,
+                "canonical_object_type": canonical_object_type,
+                "predecessor": dict(predecessor),
+                "successor": dict(existing),
+                "history_preserved": True,
+                "lifecycle_status": lifecycle.snapshot.state,
+            }
+
+        if effective[0].get("proposal_hash") != expected_predecessor_hash:
+            raise ValueError("identity domain proposal predecessor is stale")
+        successor = item.supersede_identity_domain_proposal(
+            {
+                # Revision, predecessor digest, and predecessor type audit
+                # are assigned by the durable CAS boundary.  Pass only the
+                # semantic successor fields so callers cannot smuggle an
+                # alternate branch or revision through the public recovery
+                # operation.
+                "record_kind": "identity_domain_proposal",
+                "domain_id": expected_successor.domain_id,
+                "object_type": expected_successor.object_type,
+                "rationale": expected_successor.rationale,
+                "source_hints": list(expected_successor.source_hints),
+                "representation_item_ids": list(expected_successor.representation_item_ids),
+                "item_id": item_id,
+                "owner_ref": owner_ref,
+            },
+            expected_predecessor_hash=expected_predecessor_hash,
+            owner_ref=owner_ref,
+        )
+        return {
+            "recovered": True,
+            "already_applied": False,
+            "requirement_id": item_id,
+            "domain_id": domain_key,
+            "owner_ref": owner_ref,
+            "canonical_object_type": canonical_object_type,
+            "predecessor": dict(predecessor),
+            "successor": dict(successor),
+            "history_preserved": True,
+            "lifecycle_status": lifecycle.snapshot.state,
+        }
+
+    def _identity_repair_metadata(self) -> dict[str, Any]:
+        """Describe supported public recovery candidates without mutating state."""
+
+        from .analyst_workspace import IdentityDomainProposal
+        from .durable import ItemWorkspace
+        from .entity_resolution import EntityResolutionWorkspace
+        from .lifecycle import RunLifecycle
+
+        metadata: dict[str, Any] = {
+            "recovery_operation": "recover_identity_domain_proposal",
+            "same_domain_policy": "inherit_canonical_object_type_and_expand_scope",
+            "distinct_domain_policy": "use_a_new_domain_id_without_merging",
+            "candidates": [],
+        }
+        try:
+            lifecycle = RunLifecycle.load(self.context)
+            resolution = EntityResolutionWorkspace.load(self.context)
+        except (FileNotFoundError, ValueError, TypeError):
+            return metadata
+        candidates: list[dict[str, Any]] = []
+        for item_id in lifecycle.item_ids:
+            try:
+                item = ItemWorkspace.load(self.context, item_id, mode="requirement")
+                owner_ref = item.analysis_owner_ref()
+                rows = item.read_identity_domain_proposals()
+            except (FileNotFoundError, ValueError, TypeError):
+                continue
+            for row in rows:
+                try:
+                    proposal = IdentityDomainProposal.from_dict(row)
+                    reservation = resolution.get_domain(proposal.domain_id)
+                except (KeyError, ValueError, TypeError):
+                    continue
+                if proposal.object_type == reservation.object_type:
+                    continue
+                candidates.append(
+                    {
+                        "requirement_id": item_id,
+                        "domain_id": proposal.domain_id,
+                        "owner_ref": owner_ref,
+                        "canonical_object_type": reservation.object_type,
+                        "proposal_object_type": proposal.object_type,
+                        "expected_predecessor_hash": proposal.digest,
+                    }
+                )
+        metadata["candidates"] = candidates
+        return metadata
+
+    def _active_mission_context_metadata(self) -> dict[str, Any]:
+        """Return immutable active MissionContext refs/hashes, when present.
+
+        The Control Center publishes one hash-checked pointer after launch
+        admission.  Planner actions carry only these immutable references;
+        they never inline or reinterpret mission prose.  A missing pointer is
+        valid for older requirement-only runs, while a present malformed
+        pointer is surfaced as a validation diagnostic rather than silently
+        falling back to a historical launch directory.
+        """
+
+        pointer_path = self.context.resolve_run_path("control_center/mission_context_active.json")
+        if not pointer_path.exists() and not pointer_path.is_symlink():
+            return {}
+        if pointer_path.is_symlink() or not pointer_path.is_file():
+            return {
+                "mission_context_validation": {
+                    "valid": False,
+                    "diagnostics": ["active mission-context pointer is unavailable"],
+                }
+            }
+        try:
+            raw_pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+            if not isinstance(raw_pointer, Mapping):
+                raise ValueError("active mission-context pointer must be an object")
+            if raw_pointer.get("schemaVersion") != 1 or raw_pointer.get("kind") != "active_mission_context_pointer":
+                raise ValueError("active mission-context pointer schema is invalid")
+            if raw_pointer.get("runId") != self.context.run_id or raw_pointer.get("runRoot") != str(self.context.run_root):
+                raise ValueError("active mission-context pointer run lineage is stale")
+
+            def load_ref(name: str, expected_hash_name: str, *, kind: str) -> tuple[str, str, Mapping[str, Any]]:
+                ref = raw_pointer.get(name)
+                digest = raw_pointer.get(expected_hash_name)
+                if not isinstance(ref, str) or not ref.strip() or Path(ref).is_absolute():
+                    raise ValueError(f"active {kind} reference is invalid")
+                if not _is_sha256(digest):
+                    raise ValueError(f"active {kind} hash is invalid")
+                target = self.context.resolve_run_path(ref)
+                if target.is_symlink() or not target.is_file():
+                    raise ValueError(f"active {kind} sidecar is missing")
+                value = json.loads(target.read_text(encoding="utf-8"))
+                if not isinstance(value, Mapping):
+                    raise ValueError(f"active {kind} sidecar must be an object")
+                return ref, digest.lower(), value
+
+            context_ref, context_hash, context_payload = load_ref(
+                "missionContextRef", "missionContextHash", kind="mission context"
+            )
+            plan_ref, plan_hash, plan_payload = load_ref(
+                "missionPlanRef", "missionPlanHash", kind="mission plan"
+            )
+            from .mission_context import MissionContext, MissionPlan
+
+            context_value = context_payload.get("context")
+            context = MissionContext.from_dict(context_value if isinstance(context_value, Mapping) else context_payload)
+            mission_plan_value = plan_payload.get("missionPlan")
+            mission_plan = MissionPlan.from_dict(
+                mission_plan_value if isinstance(mission_plan_value, Mapping) else plan_payload
+            )
+            if context_hash != context.context_hash:
+                raise ValueError("active mission-context hash does not match sidecar")
+            if plan_hash != mission_plan.plan_hash or mission_plan.context_hash != context.context_hash:
+                raise ValueError("active mission-plan hash does not match sidecar")
+            if context_payload.get("contextHash") not in (None, context.context_hash):
+                raise ValueError("active mission-context sidecar hash is inconsistent")
+            if plan_payload.get("planHash") not in (None, mission_plan.plan_hash):
+                raise ValueError("active mission-plan sidecar hash is inconsistent")
+            return {
+                "mission_context_ref": context_ref,
+                "mission_context_hash": context.context_hash,
+                "mission_plan_ref": plan_ref,
+                "mission_plan_hash": mission_plan.plan_hash,
+                "mission_context_validation": {"valid": True, "diagnostics": []},
+            }
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            return {
+                "mission_context_validation": {
+                    "valid": False,
+                    "diagnostics": [str(exc)],
+                }
+            }
+
+    def _group_context_metadata(
+        self,
+        plan: RequirementExecutionPlan,
+        requirement_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Project advisory shared-group context into action metadata."""
+
+        groups = (
+            (plan.group_for(requirement_id),)
+            if requirement_id is not None
+            else tuple(plan.groups)
+        )
+        entries = [
+            {
+                "requirement_ids": list(group.requirement_ids),
+                "shared_analysis_intent": group.shared_analysis_intent,
+                "suggested_specialists": list(group.suggested_specialists),
+            }
+            for group in groups
+        ]
+        if requirement_id is not None:
+            group = groups[0]
+            if (
+                len(group.requirement_ids) == 1
+                and group.shared_analysis_intent is None
+                and not group.suggested_specialists
+            ):
+                return {}
+            return {
+                "group_requirement_ids": list(group.requirement_ids),
+                "shared_analysis_intent": group.shared_analysis_intent,
+                "suggested_specialists": list(group.suggested_specialists),
+            }
+        meaningful = [
+            entry
+            for entry, group in zip(entries, groups)
+            if (
+                len(group.requirement_ids) > 1
+                or group.shared_analysis_intent is not None
+                or group.suggested_specialists
+            )
+        ]
+        return {"shared_analysis_context": meaningful} if meaningful else {}
+
+    def _publication_policy_metadata(
+        self,
+        coordinator_state: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Read the current hash-bound publication policy for product routing.
+
+        The coordinator persists the canonical policy alongside its event
+        chain.  Planner product offers carry only a detached policy hash and
+        enabled bit; deterministic authorization later re-reads the policy
+        from the coordinator spec/state.  Missing or malformed policy data is
+        fail-closed as disabled and therefore cannot produce an impossible
+        publication action.
+        """
+
+        raw_policy: Any = None
+        source = "coordinator_state"
+        if isinstance(coordinator_state, Mapping) and "publication_policy" in coordinator_state:
+            raw_policy = coordinator_state.get("publication_policy")
+        else:
+            path = self.context.resolve_run_path("control_plane/coordinator_state.json")
+            if path.exists() or path.is_symlink():
+                if path.is_symlink() or not path.is_file():
+                    return {
+                        "publication_policy_enabled": False,
+                        "publication_policy_hash": None,
+                        "publication_policy_validation": {
+                            "valid": False,
+                            "diagnostics": ["coordinator publication policy is not a regular file"],
+                        },
+                    }
+                try:
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    return {
+                        "publication_policy_enabled": False,
+                        "publication_policy_hash": None,
+                        "publication_policy_validation": {
+                            "valid": False,
+                            "diagnostics": [f"coordinator publication policy is unreadable: {exc}"],
+                        },
+                    }
+                if isinstance(value, Mapping):
+                    raw_policy = value.get("publication_policy")
+                else:
+                    raw_policy = None
+        if not isinstance(raw_policy, Mapping):
+            return {
+                "publication_policy_enabled": False,
+                "publication_policy_hash": None,
+                "publication_policy_validation": {
+                    "valid": False,
+                    "diagnostics": [f"{source} publication_policy is missing or invalid"],
+                },
+            }
+        # ProductCandidate/PublishAuthorization use the product-review
+        # canonical hash (including its canonical JSON line ending).  Reuse
+        # that public helper rather than the Planner's unrelated action hash
+        # so the publication gate binds the same bytes end to end.
+        from .product_review import canonical_hash
+
+        policy = dict(_jsonable(raw_policy))
+        enabled = policy.get("enabled")
+        if not isinstance(enabled, bool):
+            return {
+                "publication_policy_enabled": False,
+                "publication_policy_hash": canonical_hash(policy),
+                "publication_policy_validation": {
+                    "valid": False,
+                    "diagnostics": ["publication_policy.enabled must be boolean"],
+                },
+            }
+        return {
+            "publication_policy_enabled": enabled,
+            "publication_policy_hash": canonical_hash(policy),
+            "publication_policy_validation": {"valid": True, "diagnostics": []},
+        }
+
+    @staticmethod
+    def _preview_retry_exhausted(
+        coordinator_state: Mapping[str, Any] | None,
+        input_fingerprint: str,
+    ) -> bool:
+        """Return whether this exact preview input has exhausted retries.
+
+        Preview retry exhaustion is intentionally item/product-local.  The
+        Planner suppresses only the same input fingerprint; a later committed
+        requirement produces a different fingerprint and re-enables refresh.
+        No ``requires_rethink`` control is emitted for this isolated boundary.
+        """
+
+        if not isinstance(coordinator_state, Mapping):
+            return False
+        blocked = coordinator_state.get("retry_blocked")
+        if not isinstance(blocked, Mapping):
+            return False
+        for value in blocked.values():
+            if not isinstance(value, Mapping):
+                continue
+            raw_action = value.get("action")
+            if not isinstance(raw_action, Mapping) or raw_action.get("action") != "refresh_product_preview":
+                continue
+            metadata = raw_action.get("metadata")
+            if isinstance(metadata, Mapping) and metadata.get("input_fingerprint") == input_fingerprint:
+                return True
+        return False
+
+    def next_actions(
+        self,
+        *,
+        coordinator_state: Mapping[str, Any] | None = None,
+    ) -> tuple[PlannerAction, ...]:
         """Derive role dispatches from durable run state without doing work.
 
         Entity resolution, reviews, integration, and product construction are
@@ -2157,6 +3659,7 @@ class RequirementSupervisorWorkspace:
         not perform their calculations or reviews itself.
         """
 
+        from .analyst_workspace import AnalystWorkspace
         from .durable import ItemWorkspace
         from .entity_resolution import EntityResolutionWorkspace
         from .lifecycle import RunLifecycle
@@ -2199,21 +3702,24 @@ class RequirementSupervisorWorkspace:
         )
         if invalid_blocked_repairs:
             return invalid_blocked_repairs
+        identity_repair_action: PlannerAction | None = None
         try:
             self.reconcile_identity_requests()
         except (KeyError, TypeError, ValueError) as exc:
             # Proposal ingestion is a Planner admission boundary.  A malformed
-            # or conflicting semantic request must be repairable and must not
-            # be mistaken for a runnable requirement.
-            return (
-                PlannerAction(
-                    "repair_identity_request",
-                    "planner",
-                    self.context.run_id,
-                    "item-local identity-domain proposal could not be reconciled",
-                    priority=4,
-                    metadata={"error": str(exc), "requires_rethink": True},
-                ),
+            # or conflicting semantic request remains an explicit control
+            # action, but must not suppress unrelated runnable requirements.
+            identity_repair_action = PlannerAction(
+                "repair_identity_request",
+                "planner",
+                self.context.run_id,
+                "item-local identity-domain proposal could not be reconciled",
+                priority=4,
+                metadata={
+                    "error": str(exc),
+                    "requires_rethink": True,
+                    "identity_recovery": self._identity_repair_metadata(),
+                },
             )
         snapshot = self.runtime_snapshot()
         if snapshot.scheduler_status == "paused":
@@ -2230,6 +3736,11 @@ class RequirementSupervisorWorkspace:
         # decisions; no adapter reconciliation occurs during this step.
         phase_items = phase_view["items"]
         actions: list[PlannerAction] = []
+        if identity_repair_action is not None:
+            actions.append(identity_repair_action)
+        plan = self.load()
+        mission_context_metadata = self._active_mission_context_metadata()
+        publication_policy_metadata = self._publication_policy_metadata(coordinator_state)
 
         try:
             resolution = EntityResolutionWorkspace.load(self.context)
@@ -2245,7 +3756,6 @@ class RequirementSupervisorWorkspace:
                 for lease in active_leases
                 if lease.worker_type == "entity_resolution"
             }
-            plan = self.load()
             plan_positions = {
                 requirement_id: index
                 for index, requirement_id in enumerate(plan.execution_order)
@@ -2260,6 +3770,12 @@ class RequirementSupervisorWorkspace:
                 request_metadata = {
                     "discovered_by_item_id": domain.discovered_by_item_id,
                 }
+                if domain.state != "failed":
+                    request_metadata.update({
+                        "revision": domain.revision,
+                        "published_revision": domain.published_revision,
+                        "scope_hash": domain.scope_hash,
+                    })
                 if len(domain.requested_by) > 1:
                     request_metadata.update(
                         {
@@ -2275,7 +3791,11 @@ class RequirementSupervisorWorkspace:
                             "resolve_identity",
                             "entity_resolution_owner",
                             domain.domain_id,
-                            "identity domain is reserved and has no submitted result",
+                            (
+                                "identity domain is an additive immutable revision awaiting resolution"
+                                if domain.revision > domain.published_revision
+                                else "identity domain is reserved and has no submitted result"
+                            ),
                             priority=10,
                             metadata=request_metadata,
                         )
@@ -2327,7 +3847,11 @@ class RequirementSupervisorWorkspace:
                             "resume_identity_resolution",
                             "entity_resolution_owner",
                             domain.domain_id,
-                            "identity domain is resolving but no resolver lease is active",
+                            (
+                                "additive identity revision is resolving but no resolver lease is active"
+                                if domain.revision > domain.published_revision
+                                else "identity domain is resolving but no resolver lease is active"
+                            ),
                             priority=10,
                             metadata=request_metadata,
                         )
@@ -2403,6 +3927,60 @@ class RequirementSupervisorWorkspace:
             state = item.state
             phase = phase_items.get(item_id, {})
             terminal = state.get("terminal_outcome")
+            try:
+                specialist_tasks = AnalystWorkspace.read_specialist_tasks_for_item(item)
+                specialist_memos = AnalystWorkspace.read_specialist_memos_for_item(item)
+            except (TypeError, ValueError) as exc:
+                # A malformed specialist record is an item-local contract
+                # defect.  Keep it actionable as a Planner control diagnostic
+                # instead of treating the item as accepted or fabricating a
+                # replacement task from advisory group suggestions.
+                actions.append(
+                    PlannerAction(
+                        "repair_requirement",
+                        "analytical_owner",
+                        item_id,
+                        "persisted specialist task/memo records are invalid",
+                        priority=39,
+                        metadata={"specialist_validation": {"valid": False, "diagnostics": [str(exc)]}},
+                    )
+                )
+                continue
+            memo_task_ids = {memo.task_id for memo in specialist_memos}
+            unresolved_specialists = tuple(
+                task for task in specialist_tasks if task.task_id not in memo_task_ids
+            )
+            item_context_metadata = {
+                **self._group_context_metadata(plan, item_id),
+                **mission_context_metadata,
+            }
+            if unresolved_specialists:
+                try:
+                    owner_ref = item.analysis_owner_ref()
+                except (TypeError, ValueError):
+                    owner_ref = None
+                for task in unresolved_specialists:
+                    task_metadata = {
+                        "item_id": item_id,
+                        "task": task.to_dict(),
+                        "specialist_task_fingerprint": _sha256_value(
+                            {"item_id": item_id, "task": task.to_dict()}
+                        ),
+                        **self._group_context_metadata(plan, item_id),
+                        **mission_context_metadata,
+                    }
+                    if owner_ref is not None:
+                        task_metadata["owner_ref"] = owner_ref
+                    actions.append(
+                        PlannerAction(
+                            "specialist",
+                            "specialist",
+                            task.task_id,
+                            "assigned specialist task has no durable memo; coordinator-owned continuation is required",
+                            priority=35,
+                            metadata=task_metadata,
+                        )
+                    )
             if _status(terminal) == "blocked_by_evidence":
                 blocked_validation = phase.get("blocked_integration_validation") or {}
                 if phase.get("integration_stage") != "blocked_by_evidence" or blocked_validation.get("valid") is not True:
@@ -2424,20 +4002,44 @@ class RequirementSupervisorWorkspace:
                 # no-integration outcome. It never receives integrate,
                 # fidelity-review, or integration-commit actions.
                 continue
+            # A specialist memo is part of the AO evidence boundary.  Do not
+            # advance an accepted item into integration while its assigned
+            # task is still unresolved; the same typed task will be reused
+            # after the memo arrives.
+            if unresolved_specialists and isinstance(terminal, Mapping):
+                continue
+            # Any validated terminal boundary (including a pre-acceptance
+            # recovery-exhausted ItemWorkspace snapshot) is settled.  Do not
+            # re-offer fidelity/identity work for it; only malformed or
+            # recoverable evidence remains actionable below.
+            if isinstance(terminal, Mapping) and _validated_terminal_integration_boundary(phase):
+                continue
             if isinstance(terminal, Mapping) and phase.get("integration_state") == "technical_failure":
                 technical_validation = phase.get("committed_integration_validation") or {}
-                if phase.get("integration_stage") != "technical_failure" or technical_validation.get("valid") is not True:
+                if not (
+                    phase.get("integration_stage") == "technical_failure"
+                    and technical_validation.get("valid") is True
+                    and technical_validation.get("recovery_exhausted") is True
+                ):
+                    # Historical/recoverable failure evidence remains
+                    # actionable.  An explicit exhausted boundary is settled
+                    # and must not reopen an accepted integration session.
                     actions.append(
                         PlannerAction(
                             "repair_integration_fidelity",
                             "integration_agent",
                             item_id,
-                            "technical-failure integration manifest is missing, foreign, stale, or hash-invalid; no product routing is authorized",
+                            (
+                                "accepted integration technical failure requires a bounded positive continuation"
+                                if phase.get("integration_stage") == "technical_failure" and technical_validation.get("valid") is True
+                                else "technical-failure integration boundary is missing, foreign, stale, or hash-invalid"
+                            ),
                             priority=31,
                             metadata={
                                 "integration_stage": phase.get("integration_stage"),
                                 "validation": technical_validation,
-                                "requires_rethink": True,
+                                "technical_failure_recovery": True,
+                                "continuation": "same_session",
                             },
                         )
                     )
@@ -2454,6 +4056,23 @@ class RequirementSupervisorWorkspace:
                             "integration boundary is forged, stale, or hash-invalid; no commit or fresh staging is authorized",
                             priority=31,
                             metadata={"integration_stage": integration_stage, "requires_rethink": True},
+                        )
+                    )
+                elif integration_stage == "staging_incomplete":
+                    staging_validation = phase.get("integration_validation") or {}
+                    handoff = staging_validation.get("handoff") if isinstance(staging_validation, Mapping) else None
+                    actions.append(
+                        PlannerAction(
+                            "integrate_requirement",
+                            "integration_agent",
+                            item_id,
+                            "integration staging is incomplete; continue the existing session before fidelity review",
+                            priority=30,
+                            metadata={
+                                "integration_stage": integration_stage,
+                                "continuation": "same_session",
+                                **({"handoff": handoff} if isinstance(handoff, Mapping) else {}),
+                            },
                         )
                     )
                 elif integration_stage == "not_started":
@@ -2498,7 +4117,7 @@ class RequirementSupervisorWorkspace:
                             metadata={"fidelity_verdict": fidelity_verdict},
                         )
                     )
-                elif fidelity_verdict in {"accept", "accept_with_limits", "unavailable"}:
+                elif fidelity_verdict in {"accept", "accept_with_limits"}:
                     actions.append(
                         PlannerAction(
                             "commit_integration_requirement",
@@ -2507,6 +4126,26 @@ class RequirementSupervisorWorkspace:
                             "fidelity boundary is terminal and the integration commit is pending",
                             priority=32,
                             metadata={"fidelity_verdict": fidelity_verdict},
+                        )
+                    )
+                elif fidelity_verdict == "unavailable":
+                    # An unavailable independent reviewer is an operational
+                    # gap, not semantic acceptance. Re-open the one-shot
+                    # fidelity review without mutating staged records; the
+                    # coordinator's ordinary retry/no-progress gate prevents
+                    # a tight loop when the reviewer remains unavailable.
+                    actions.append(
+                        PlannerAction(
+                            "review_integration_fidelity",
+                            "integration_fidelity_reviewer",
+                            item_id,
+                            "fidelity review was unavailable; retryable independent re-review is required before commit",
+                            priority=31,
+                            metadata={
+                                "integration_stage": integration_stage,
+                                "fidelity_verdict": fidelity_verdict,
+                                "retryable": True,
+                            },
                         )
                     )
                 elif fidelity_verdict in {"fail", "blocked", "blocked_rethink"}:
@@ -2526,35 +4165,46 @@ class RequirementSupervisorWorkspace:
             runtime_status = _runtime_status(runtime_statuses.get(item_id))
             if runtime_status == _RUNTIME_WAITING_STATUS:
                 continue
+            if unresolved_specialists and state.get("active_attempt_id") is None:
+                # The coordinator owns specialist admission.  AO review or a
+                # new attempt is re-offered only after the exact task receives
+                # a typed memo.
+                continue
+            # Read the durable business-repair packet before deciding how to
+            # continue an interrupted attempt.  A process can die after the
+            # repair authorization is active but before the next action is
+            # emitted; that resume action must carry the authorization marker
+            # so the AO reuses it instead of opening a second repair.
+            repair_packet = self._read_json_object(item.item_root / "work" / "business_review.json")
+            repair_active = isinstance(repair_packet, Mapping) and repair_packet.get("repair_active") is True
+            repair_count = int(state.get("business_repair_count", 0) or 0)
             active_attempt = state.get("active_attempt_id")
-            has_active_owner = any(
-                lease.worker_type == "analytical_owner" and lease.subject_id == item_id
-                for lease in active_leases
-            )
-            if active_attempt is not None and not has_active_owner:
+            if active_attempt is not None:
+                metadata = {
+                    "attempt_id": active_attempt,
+                    "no_progress_count": int(state.get("consecutive_no_progress", 0)),
+                    **item_context_metadata,
+                }
+                if repair_active:
+                    metadata["repair_active"] = True
+                    metadata["repair_count"] = repair_count
                 actions.append(
                     PlannerAction(
                         "resume_requirement_analysis",
                         "analytical_owner",
                         item_id,
-                        "active analytical attempt has no active owner lease",
+                        "active analytical attempt owns the Analytical Owner slot and requires continuation",
                         priority=40,
-                        metadata={
-                            "attempt_id": active_attempt,
-                            "no_progress_count": int(state.get("consecutive_no_progress", 0)),
-                        },
+                        metadata=metadata,
                     )
                 )
                 continue
             review = state.get("review") if isinstance(state.get("review"), Mapping) else {}
-            repair_packet = self._read_json_object(item.item_root / "work" / "business_review.json")
-            repair_active = isinstance(repair_packet, Mapping) and repair_packet.get("repair_active") is True
             attempts = state.get("attempts") if isinstance(state.get("attempts"), list) else []
             completed_attempts = sum(
                 isinstance(record, Mapping) and record.get("status") == "completed"
                 for record in attempts
             )
-            repair_count = int(state.get("business_repair_count", 0) or 0)
             # ``use_business_repair`` keeps the authorization packet active
             # while the same AO action is between dispatch and its next
             # attempt.  The prior completed attempt is still present, so a
@@ -2579,6 +4229,7 @@ class RequirementSupervisorWorkspace:
                         metadata={
                             "repair_active": True,
                             "repair_count": repair_count,
+                            **item_context_metadata,
                         },
                     )
                 )
@@ -2591,6 +4242,7 @@ class RequirementSupervisorWorkspace:
                             item_id,
                             "completed analytical attempt has a draft awaiting independent review",
                             priority=50,
+                            metadata=item_context_metadata,
                         )
                     )
                 elif item_id == snapshot.next_requirement_id:
@@ -2601,6 +4253,7 @@ class RequirementSupervisorWorkspace:
                             item_id,
                             "requirement is the next runnable item in the cognitive plan",
                             priority=40,
+                            metadata=item_context_metadata,
                         )
                     )
             elif active_attempt is None and review.get("status") == "reviewed" and review.get("verdict") in {"repair_once", "repair"}:
@@ -2611,7 +4264,11 @@ class RequirementSupervisorWorkspace:
                         item_id,
                         "business review durably authorized a same-owner repair",
                         priority=45,
-                        metadata={"review_verdict": review.get("verdict"), "repair_count": state.get("business_repair_count", 0)},
+                        metadata={
+                            "review_verdict": review.get("verdict"),
+                            "repair_count": state.get("business_repair_count", 0),
+                            **item_context_metadata,
+                        },
                     )
                 )
             elif active_attempt is None and review.get("status") in {"reviewed", "unavailable"}:
@@ -2625,8 +4282,279 @@ class RequirementSupervisorWorkspace:
                     )
                 )
 
-        if phase_view["all_items_integrated"]:
+        # An operator-requested regeneration is a one-shot Product Agent
+        # boundary. It is intentionally evaluated before integration
+        # readiness so accepted answers remain the presentation input even
+        # while unrelated integration work is pending.
+        regeneration_request = (
+            coordinator_state.get("product_regeneration")
+            if isinstance(coordinator_state, Mapping)
+            and isinstance(coordinator_state.get("product_regeneration"), Mapping)
+            else None
+        )
+        regeneration_pending = (
+            isinstance(regeneration_request, Mapping)
+            and regeneration_request.get("status") in {"requested", "dispatched"}
+            and regeneration_request.get("authorization_origin") == "operator_product_regeneration"
+            and regeneration_request.get("run_id") == self.context.run_id
+            and regeneration_request.get("generation_id") == lifecycle.generation_id
+        )
+        if regeneration_pending:
             product = phase_view["product"]
+            regeneration_item_ids = tuple(product.get("preview_item_ids") or ())
+            regeneration_bindings = product.get("preview_item_bindings")
+            regeneration_input = product.get("preview_input_fingerprint")
+            if (
+                regeneration_item_ids
+                and _is_sha256(regeneration_input)
+                and regeneration_input == regeneration_request.get("input_fingerprint")
+                and _accepted_preview_bindings_complete(
+                    phase_view.get("items", {}),
+                    regeneration_item_ids,
+                    regeneration_bindings,
+                )
+            ):
+                revision_id = regeneration_request.get("revision_id")
+                revision = None
+                try:
+                    from .product_review import ProductReviewStore
+
+                    if isinstance(revision_id, str):
+                        revision = ProductReviewStore(self.context, lifecycle.generation_id).load_revision(revision_id)
+                except Exception:
+                    revision = None
+                revision_output_root_ref = (
+                    revision.output_root_ref
+                    if revision is not None and isinstance(revision.output_root_ref, str)
+                    else None
+                )
+                regeneration_metadata: dict[str, Any] = {
+                    "generation_id": lifecycle.generation_id,
+                    "product_manifest_ref": (
+                        f"{revision_output_root_ref}/product_manifest.json"
+                        if revision_output_root_ref
+                        else product.get("manifest_ref")
+                    ),
+                    "output_root_ref": revision_output_root_ref,
+                    "candidate_ref": (
+                        f"products/generations/{lifecycle.generation_id}/product_revisions/{revision_id}/product_candidate.json"
+                        if isinstance(revision_id, str) else product.get("candidate_ref")
+                    ),
+                    "review_ref": (
+                        f"products/generations/{lifecycle.generation_id}/product_revisions/{revision_id}/product_review.json"
+                        if isinstance(revision_id, str) else product.get("review_ref")
+                    ),
+                    "authorization_ref": (
+                        f"products/generations/{lifecycle.generation_id}/product_revisions/{revision_id}/publish_authorization.json"
+                        if isinstance(revision_id, str) else product.get("authorization_ref")
+                    ),
+                    "presentation_inventory_ref": product.get("presentation_inventory_ref"),
+                    "presentation_plan_ref": product.get("presentation_plan_ref"),
+                    "input_fingerprint": regeneration_input,
+                    "item_ids": list(regeneration_item_ids),
+                    "item_bindings": dict(regeneration_bindings),
+                    "failed_items": list(product.get("preview_failed_items") or ()),
+                    "limitations": list(product.get("preview_limitations") or ()),
+                    "authorization_origin": "operator_product_regeneration",
+                    "product_regeneration_request_id": regeneration_request.get("request_id"),
+                    "product_revision_id": revision_id,
+                    "prior_revision_id": regeneration_request.get("prior_revision_id"),
+                    # These are Coordinator-issued binding digests, not
+                    # reviewer-authored values.  Keeping them on both the
+                    # Product Agent and Reviewer offers lets the dispatch
+                    # boundary reject a mixed/stale Reviewer projection
+                    # before transport or one-shot admission.
+                    "implementation_identity": regeneration_request.get("implementation_identity"),
+                    "regeneration_action_fingerprint": regeneration_request.get("action_fingerprint"),
+                    "regeneration_state_fingerprint": regeneration_request.get("state_fingerprint"),
+                }
+                for field_name in (
+                    "predecessor_product_review_ref",
+                    "predecessor_product_review_hash",
+                ):
+                    if regeneration_request.get(field_name) is not None:
+                        regeneration_metadata[field_name] = regeneration_request.get(field_name)
+                if revision is not None and revision.status == "candidate":
+                    regeneration_metadata["candidate_ref"] = revision.candidate_ref
+                    regeneration_metadata["candidate_hash"] = revision.candidate_hash
+                    regeneration_metadata["review_ref"] = (
+                        revision.review_ref
+                        or f"products/generations/{lifecycle.generation_id}/product_revisions/{revision_id}/product_review.json"
+                    )
+                regeneration_reason = regeneration_request.get("reason")
+                if not isinstance(regeneration_reason, str) or not regeneration_reason.strip():
+                    regeneration_reason = "operator requested Product dashboard regeneration"
+                if revision is not None and revision.status in {"pending", "candidate"}:
+                    if revision.status == "candidate":
+                        actions.append(
+                            PlannerAction(
+                                "review_final_product",
+                                "product_reviewer",
+                                self.context.run_id,
+                                "regenerated Product candidate awaits an independent review",
+                                priority=61,
+                                metadata=regeneration_metadata,
+                            )
+                        )
+                    else:
+                        actions.append(
+                            PlannerAction(
+                                "build_product_candidate",
+                                "product_agent",
+                                self.context.run_id,
+                                f"operator requested Product regeneration: {regeneration_reason}",
+                                priority=59,
+                                metadata=regeneration_metadata,
+                            )
+                        )
+                elif revision is None and revision_id is None:
+                    # Minimal planner fixtures may exercise the historical
+                    # request projection without a durable revision yet. The
+                    # coordinator's admission boundary still requires the
+                    # revision binding before transport.
+                    actions.append(
+                        PlannerAction(
+                            "build_product_candidate",
+                            "product_agent",
+                            self.context.run_id,
+                            f"operator requested Product regeneration: {regeneration_reason}",
+                            priority=59,
+                            metadata=regeneration_metadata,
+                        )
+                    )
+
+            # Regeneration is an exclusive Product workflow. Requirements,
+            # integration, ontology, reporting, and unrelated controls from
+            # the same snapshot must not leak while this target revision is
+            # pending or under review.
+            return tuple(
+                sorted(
+                    [
+                        action
+                        for action in actions
+                        if action.role.strip().lower() in {"product_agent", "product_reviewer"}
+                        and action.action.strip().lower() in {"build_product_candidate", "review_final_product"}
+                    ],
+                    key=lambda value: value.priority,
+                )
+            )
+
+        # Incremental previews are advisory product work.  They are offered
+        # as soon as one requirement has a validated committed integration,
+        # while another requirement remains nonterminal.  A preview never
+        # gates the next Analytical Owner action or advances run lifecycle;
+        # Product Agent failures are isolated by the input fingerprint.
+        if not regeneration_pending and not phase_view["all_items_integrated"]:
+            product = phase_view["product"]
+            preview_input = product.get("preview_input_fingerprint")
+            preview_item_ids = tuple(product.get("preview_item_ids") or ())
+            preview_bindings = product.get("preview_item_bindings")
+            preview_validation = product.get("preview") if isinstance(product.get("preview"), Mapping) else {}
+            if (
+                isinstance(preview_input, str)
+                and _is_sha256(preview_input)
+                and preview_item_ids
+                and isinstance(preview_bindings, Mapping)
+                and set(preview_bindings) == set(preview_item_ids)
+                and not self._preview_retry_exhausted(coordinator_state, preview_input)
+                and not (
+                    preview_validation.get("valid") is True
+                    and preview_validation.get("input_fingerprint") == preview_input
+                )
+            ):
+                preview_metadata = {
+                    "generation_id": lifecycle.generation_id,
+                    "output_dir": f"generations/{lifecycle.generation_id}/preview",
+                    "preview_manifest_ref": product.get("preview_ref"),
+                    "presentation_inventory_ref": product.get("presentation_inventory_ref"),
+                    "presentation_plan_ref": product.get("presentation_plan_ref"),
+                    "input_fingerprint": preview_input,
+                    "item_ids": list(preview_item_ids),
+                    "item_bindings": dict(preview_bindings),
+                    "failed_items": list(product.get("preview_failed_items") or ()),
+                    "limitations": list(product.get("preview_limitations") or ()),
+                    **self._group_context_metadata(plan),
+                    **mission_context_metadata,
+                }
+                actions.append(
+                    PlannerAction(
+                        "refresh_product_preview",
+                        "product_agent",
+                        self.context.run_id,
+                        (
+                            "terminal integration facts changed and the durable dashboard preview is missing or stale"
+                        ),
+                        priority=80,
+                        metadata=preview_metadata,
+                    )
+                )
+
+            # A Product Reviewer may request one bounded candidate repair
+            # while unrelated integrations are still pending or have reached
+            # a terminal technical failure.  Business acceptance, rather
+            # than integration readiness, is the presentation input boundary;
+            # keep this repair offer reachable without changing integration
+            # lifecycle or retry semantics.
+            review = product.get("review") if isinstance(product.get("review"), Mapping) else {}
+            candidate = product.get("candidate")
+            repair_item_ids = tuple(product.get("preview_item_ids") or ())
+            repair_bindings = product.get("preview_item_bindings")
+            if (
+                isinstance(candidate, Mapping)
+                and product.get("authorization") is None
+                and review.get("verdict") in {"repair_once", "blocked_rethink"}
+                and _accepted_preview_bindings_complete(
+                    phase_view.get("items", {}),
+                    repair_item_ids,
+                    repair_bindings,
+                )
+            ):
+                repair_refs = _preview_output_refs(lifecycle.generation_id)
+                repair_metadata = {
+                    "generation_id": lifecycle.generation_id,
+                    "generation_ordinal": lifecycle.generation_ordinal,
+                    "product_manifest_ref": lifecycle.product_manifest_ref,
+                    "candidate_ref": product["candidate_ref"],
+                    "review_ref": product["review_ref"],
+                    "authorization_ref": product["authorization_ref"],
+                    "presentation_inventory_ref": repair_refs["presentation_inventory_ref"],
+                    "presentation_plan_ref": repair_refs["presentation_plan_ref"],
+                    "input_fingerprint": product.get("preview_input_fingerprint"),
+                    "item_ids": list(repair_item_ids),
+                    "item_bindings": dict(repair_bindings),
+                    "failed_items": list(product.get("preview_failed_items") or ()),
+                    "limitations": list(product.get("preview_limitations") or ()),
+                    "review_verdict": review.get("verdict"),
+                    "candidate_hash": candidate.get("candidate_hash"),
+                    **self._group_context_metadata(plan),
+                    **mission_context_metadata,
+                }
+                actions.append(
+                    PlannerAction(
+                        "build_product_candidate",
+                        "product_agent",
+                        self.context.run_id,
+                        "product review requires repair before publication",
+                        priority=60,
+                        metadata=repair_metadata,
+                    )
+                )
+
+        if not regeneration_pending and phase_view["all_items_integrated"]:
+            product = phase_view["product"]
+            # Final Product Agent actions use the same deterministic,
+            # generation-scoped presentation inputs as an incremental
+            # preview.  A run may reach its all-terminal boundary before any
+            # preview was dispatched, so these refs must be carried directly
+            # from the pure projection rather than inferred from a prior
+            # preview manifest.  The preflight/plan files are intentionally
+            # allowed to be absent here; the Product Agent creates them before
+            # the single canonical assembly.
+            final_presentation_refs = _preview_output_refs(lifecycle.generation_id)
+            final_item_ids = tuple(product.get("preview_item_ids") or ())
+            final_item_bindings = product.get("preview_item_bindings")
+            if not isinstance(final_item_bindings, Mapping):
+                final_item_bindings = {}
             product_metadata = {
                 "generation_id": lifecycle.generation_id,
                 "generation_ordinal": lifecycle.generation_ordinal,
@@ -2634,7 +4562,24 @@ class RequirementSupervisorWorkspace:
                 "candidate_ref": product["candidate_ref"],
                 "review_ref": product["review_ref"],
                 "authorization_ref": product["authorization_ref"],
+                "presentation_inventory_ref": final_presentation_refs["presentation_inventory_ref"],
+                "presentation_plan_ref": final_presentation_refs["presentation_plan_ref"],
+                "input_fingerprint": product.get("preview_input_fingerprint"),
+                "item_ids": list(final_item_ids),
+                "item_bindings": dict(final_item_bindings),
+                "failed_items": list(product.get("preview_failed_items") or ()),
+                "limitations": list(product.get("preview_limitations") or ()),
+                **self._group_context_metadata(plan),
+                **mission_context_metadata,
             }
+            # A reviewed candidate repair at the all-integrated boundary must
+            # carry the exact persisted candidate hash into coordinator
+            # admission.  The coordinator re-reads the candidate/review and
+            # rejects missing or mismatched hashes, so do not derive or
+            # replace this value in the Planner.  Legacy/bootstrap offers
+            # without a candidate intentionally omit the field.
+            if isinstance(product.get("candidate"), Mapping):
+                product_metadata["candidate_hash"] = product["candidate"].get("candidate_hash")
             if not (product.get("validation") or {}).get("valid", True):
                 # A terminal legacy generation with no product namespace has
                 # no candidate to repair yet; retain the explicit bootstrap
@@ -2700,21 +4645,39 @@ class RequirementSupervisorWorkspace:
             elif product.get("authorization") is None:
                 review = product.get("review") or {}
                 if review.get("verdict") in {"accept", "accept_with_limits"}:
-                    actions.append(
-                        PlannerAction(
-                            "publish_final_product",
-                            "product_agent",
-                            self.context.run_id,
-                            "accepted product review awaits explicit publication authorization",
-                            priority=62,
-                            metadata={
-                                **product_metadata,
-                                "candidate_hash": product["candidate"].get("candidate_hash"),
-                                "review_hash": review.get("review_hash"),
-                                "publication_policy_required": True,
-                            },
+                    publication_metadata = {
+                        **product_metadata,
+                        **publication_policy_metadata,
+                        "candidate_hash": product["candidate"].get("candidate_hash"),
+                        "review_hash": review.get("review_hash"),
+                        "publication_policy_required": True,
+                    }
+                    if publication_policy_metadata.get("publication_policy_enabled") is True:
+                        actions.append(
+                            PlannerAction(
+                                "publish_final_product",
+                                "product_agent",
+                                self.context.run_id,
+                                "accepted product review awaits hash-bound publication authorization",
+                                priority=62,
+                                metadata=publication_metadata,
+                            )
                         )
-                    )
+                    else:
+                        actions.append(
+                            PlannerAction(
+                                "await_publication_authorization",
+                                "planner",
+                                self.context.run_id,
+                                "reviewed product awaiting publication authorization",
+                                priority=62,
+                                metadata={
+                                    **publication_metadata,
+                                    "publication_status": "awaiting_authorization",
+                                    "operator_action_required": True,
+                                },
+                            )
+                        )
                 else:
                     actions.append(
                         PlannerAction(
@@ -2729,7 +4692,26 @@ class RequirementSupervisorWorkspace:
             else:
                 report = phase_view["report"]
                 report_validation = report.get("validation") or {}
-                if report_validation.get("stage") in {"transaction_pending", "recovery_required"}:
+                if report_validation.get("stage") == "transaction_pending":
+                    # Staging/backup residue without the finalizer's
+                    # hash-bound intent cannot be attributed to this run.
+                    # Keep the boundary deterministic and explicit for an
+                    # operator; never offer a model retry that might guess
+                    # which transaction to recover.
+                    actions.append(
+                        PlannerAction(
+                            "repair_run_lifecycle",
+                            "planner",
+                            self.context.run_id,
+                            "unbound report finalization transaction residue requires operator repair",
+                            priority=69,
+                            metadata={
+                                "report_recovery": "operator_repair",
+                                "validation": report_validation,
+                            },
+                        )
+                    )
+                elif report_validation.get("stage") == "recovery_required":
                     actions.append(
                         PlannerAction(
                             "recover_final_report",
@@ -2741,7 +4723,7 @@ class RequirementSupervisorWorkspace:
                                 "preflight_ref": report["preflight_ref"],
                                 "generation_id": lifecycle.generation_id,
                                 "validation": report_validation,
-                                "recovery_via": "RunReportFinalizer.finalize",
+                                "recovery_via": "RunReportFinalizer.recover",
                             },
                         )
                     )
@@ -2778,6 +4760,47 @@ class RequirementSupervisorWorkspace:
                             metadata={"preflight_ref": report["preflight_ref"], "generation_id": lifecycle.generation_id},
                         )
                     )
+
+        if identity_repair_action is not None:
+            # Keep malformed identity controls item-local: requirements
+            # bound to the conflicting domain wait for the public repair,
+            # while unrelated requirements remain eligible in this same
+            # Planner read.  The request collection is authoritative; no
+            # proposal text is used for suppression.
+            recovery = identity_repair_action.metadata.get("identity_recovery", {})
+            domain_ids = {
+                candidate.get("domain_id")
+                for candidate in recovery.get("candidates", ())
+                if isinstance(candidate, Mapping) and candidate.get("domain_id")
+            } if isinstance(recovery, Mapping) else set()
+            affected_items: set[str] = set()
+            if domain_ids:
+                try:
+                    for domain_id in domain_ids:
+                        domain = resolution.get_domain(str(domain_id)) if resolution is not None else None
+                        if domain is not None:
+                            affected_items.update(str(item_id) for item_id in domain.requested_by)
+                except (KeyError, TypeError, ValueError):
+                    affected_items = set()
+            # A conflicting proposal can fail before the second requester is
+            # appended to the durable domain row.  The recovery candidates
+            # themselves are therefore part of the affected set.
+            if isinstance(recovery, Mapping):
+                affected_items.update(
+                    str(candidate.get("requirement_id"))
+                    for candidate in recovery.get("candidates", ())
+                    if isinstance(candidate, Mapping) and candidate.get("requirement_id")
+                )
+            if affected_items:
+                actions = [
+                    value
+                    for value in actions
+                    if value is identity_repair_action
+                    or (
+                        value.subject_id not in affected_items
+                        and value.subject_id not in domain_ids
+                    )
+                ]
 
         # Preserve the Planner's insertion order for equal-priority actions:
         # identity domains are ordered by the earliest requesting requirement,
@@ -2871,6 +4894,13 @@ class RequirementSupervisorWorkspace:
 
 __all__ = [
     "SUPERVISOR_PLAN_FILENAME",
+    "PREVIEW_MANIFEST_SCHEMA_VERSION",
+    "PREVIEW_MANIFEST_FILENAME",
+    "ActionRoleContract",
+    "AUTHORIZED_ACTION_ROLE_CONTRACTS",
+    "action_role_contract",
+    "action_role_contracts_by_action",
+    "PlannerAction",
     "RequirementExecutionGroup",
     "RequirementExecutionPlan",
     "RequirementPhaseSnapshot",
@@ -2878,4 +4908,9 @@ __all__ = [
     "compact_catalog_payload",
     "inspect_committed_integration",
     "inspect_integration_fidelity",
+    "inspect_preview_manifest",
+    "persist_preview_manifest",
+    "preview_input_fingerprint",
+    "validate_action_role",
+    "validate_planner_action_role",
 ]

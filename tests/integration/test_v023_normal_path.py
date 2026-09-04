@@ -230,13 +230,22 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
         publishable=True,
     )
     relationship_payload = relationship.to_dict()
-    analyst.accept(accepted_refs=("work/plan.json", "work/analysis.json", "work/analytical_relationships.jsonl"))
+    # The relationship was written after the previous targeted Business
+    # Review.  Re-review the complete item so acceptance binds the newly
+    # appended artifact to the reviewer-visible hash set.
+    refreshed_review = item.record_review("accept", reviewer_ref="synthetic-reviewer-relationship-rereview")
+    assert refreshed_review["targeted_recheck"] is False
+    review_packet = json.loads(item.business_review_path.read_text(encoding="utf-8"))
+    assert review_packet["after_artifact_hashes"] == dict(item.artifact_progress().hashes)
+    item.accept(accepted_refs=("work/plan.json", "work/analysis.json", "work/analytical_relationships.jsonl"))
     accepted_bundle = AcceptedAnalysisBundle.load(item)
     answer_before = accepted_bundle.answer_content
     envelope_before = (item.accepted_root / "acceptance_envelope.json").read_bytes()
     assert (item.accepted_root / "answer_content.json").read_bytes() == answer_before
     item2 = _accepted_item(context, "Q-002", "second bounded item")
-    assert lifecycle.reconcile([item.state, item2.state]).state == "analytical_complete"
+    # ItemWorkspace inputs let reconciliation validate on-disk accepted and
+    # integration boundaries; bare state labels are not authoritative.
+    assert lifecycle.reconcile([item, item2]).state == "analytical_complete"
 
     # Exactly one owner stages all integration kinds through the program API.
     external_lem = LivingEnterpriseModel(run_id=context.run_id)
@@ -389,7 +398,7 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
     assert registry.load("generic-reusable").rows[0]["record_id"] == "R-1"
 
     # Lifecycle barriers are program-owned and explicit.
-    assert lifecycle.reconcile([item.state, item2.state]).state == "integration_complete"
+    assert lifecycle.reconcile([item, item2]).state == "integration_complete"
 
     fixture = {
         "title": "Generic reviewed product",
@@ -444,7 +453,7 @@ def test_v023_normal_path_is_offline_and_program_owned(tmp_path: Path) -> None:
     assert optimizer["optimizer_status"] == "complete"
     assert optimizer["input_hashes_unchanged"] is True
     assert lifecycle.reconcile(
-        [item.state, item2.state],
+        [item, item2],
         product_status={"status": "complete"},
         optimizer_status=optimizer,
     ).state == "complete"

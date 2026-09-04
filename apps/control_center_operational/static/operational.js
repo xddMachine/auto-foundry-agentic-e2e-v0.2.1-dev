@@ -17,11 +17,47 @@ let operationalPendingLaunchTimer = null;
 let operationalLaunchRequestPending = false;
 let operationalStatusPollGeneration = 0;
 let operationalStatusPollInFlight = false;
+let operationalEventsPollInFlight = false;
+let operationalLastSnapshotRefreshAt = 0;
 let operationalCacheRunId = null;
 let operationalGraphWidth = 1460;
 let operationalGraphHeight = 720;
 let operationalRunControlInFlight = false;
+let operationalProductRegenerationInFlight = false;
 let operationalRunControlState = null;
+let operationalPreparationKey = null;
+const OPERATIONAL_PREPARATION_STORAGE_KEY = "auto-foundry.operational.preparation-key";
+
+function operationalPreparationIdentity() {
+  if (operationalPreparationKey) return operationalPreparationKey;
+  try {
+    operationalPreparationKey = window.localStorage.getItem(OPERATIONAL_PREPARATION_STORAGE_KEY);
+  } catch (_error) {
+    operationalPreparationKey = null;
+  }
+  if (!operationalPreparationKey) {
+    const random = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    operationalPreparationKey = `prep-${random}`;
+    try {
+      window.localStorage.setItem(OPERATIONAL_PREPARATION_STORAGE_KEY, operationalPreparationKey);
+    } catch (_error) {
+      // Private browsing/storage-disabled contexts still get a per-tab key;
+      // the server remains the durable authority when storage is available.
+    }
+  }
+  return operationalPreparationKey;
+}
+
+function operationalForgetPreparationIdentity() {
+  operationalPreparationKey = null;
+  try {
+    window.localStorage.removeItem(OPERATIONAL_PREPARATION_STORAGE_KEY);
+  } catch (_error) {
+    // Storage is optional; the next request will create a fresh in-memory key.
+  }
+}
 
 const layerOneRoleLabel = roleLabel;
 roleLabel = function operationalRoleLabel(value) {
@@ -34,7 +70,25 @@ roleGlyph = function operationalRoleGlyph(value) {
 };
 
 const layerOneApi = api;
-api = function operationalApi(path, options = {}) {
+function operationalMutationPath(path, options = {}) {
+  const method = String(options.method || "GET").toUpperCase();
+  return !["GET", "HEAD"].includes(method)
+    && (path.startsWith("/api/launch/") || path.startsWith("/api/run/"));
+}
+
+api = async function operationalApi(path, options = {}) {
+  const mutation = operationalMutationPath(path, options);
+  if (mutation) {
+    // LaunchSettings issues a fresh process-local token on every server
+    // start.  Refresh it immediately before a command so an already-open
+    // tab cannot submit the token captured before a restart.
+    const config = await layerOneApi("/api/config");
+    const launchToken = config?.launchToken;
+    if (typeof launchToken !== "string" || !launchToken) {
+      throw new Error("Operational control token is unavailable");
+    }
+    state.config = config;
+  }
   const token = state.config?.launchToken;
   const headers = { ...(options.headers || {}) };
   if (token && (path.startsWith("/api/launch/") || path.startsWith("/api/run/"))) {
@@ -46,6 +100,7 @@ api = function operationalApi(path, options = {}) {
 function operationalRenderRunControl(value = operationalRunControlState) {
   const container = $("#runControl");
   const button = $("#runControlButton");
+  const regenerationButton = $("#regenerateProductButton");
   const message = $("#runControlMessage");
   if (!container || !button || !message) return;
   const selected = state.runs.find((run) => run.id === state.selectedRunId);
@@ -56,14 +111,42 @@ function operationalRenderRunControl(value = operationalRunControlState) {
     && !selected.placeholder
     && ["pause", "resume"].includes(action),
   );
-  container.hidden = !available;
-  if (!available) return;
-  button.dataset.action = action;
-  button.textContent = operationalRunControlInFlight
-    ? (action === "pause" ? "Pausing…" : "Resuming…")
-    : (action === "pause" ? "Pause run" : "Resume run");
-  button.disabled = operationalRunControlInFlight;
-  message.textContent = value.message || "Durable progress and graph history are preserved.";
+  const regenerationAvailable = Boolean(
+    regenerationButton
+    && state.config?.commandsEnabled
+    && selected
+    && !selected.placeholder
+    && (value?.canRegenerateProduct || value?.productRegenerationPending),
+  );
+  const regenerationPending = Boolean(value?.productRegenerationPending);
+  container.hidden = !(available || regenerationAvailable);
+  if (available) {
+    button.dataset.action = action;
+    button.hidden = false;
+    button.textContent = operationalRunControlInFlight
+      ? (action === "pause" ? "Pausing…" : "Resuming…")
+      : (action === "pause" ? "Pause run" : "Resume run");
+    button.disabled = operationalRunControlInFlight || operationalProductRegenerationInFlight;
+  } else {
+    button.hidden = true;
+    button.disabled = true;
+  }
+  if (regenerationButton) {
+    regenerationButton.hidden = !regenerationAvailable;
+    regenerationButton.disabled = regenerationPending || operationalProductRegenerationInFlight || operationalRunControlInFlight;
+    regenerationButton.textContent = regenerationPending
+      ? "Regeneration pending…"
+      : operationalProductRegenerationInFlight
+      ? "Requesting…"
+      : "Regenerate dashboard";
+  }
+  if (available) {
+    message.textContent = value.message || "Durable progress and graph history are preserved.";
+  } else if (regenerationAvailable) {
+    message.textContent = value.productRegenerationMessage || "Request one Product Agent dashboard regeneration from accepted business outputs.";
+  } else {
+    message.textContent = "Run control is unavailable for this lifecycle state.";
+  }
 }
 
 async function operationalRefreshRunControl(runId = state.selectedRunId, generation = state.selectionGeneration) {
@@ -115,8 +198,42 @@ async function operationalApplyRunControl() {
   }
 }
 
+async function operationalApplyProductRegeneration() {
+  const value = operationalRunControlState;
+  const runId = state.selectedRunId;
+  if (operationalProductRegenerationInFlight || operationalRunControlInFlight || !runId || !value?.canRegenerateProduct || value?.productRegenerationPending) return;
+  if (!window.confirm("Request one Product Agent dashboard regeneration from accepted business outputs? The existing candidate and review remain preserved.")) return;
+  // The server derives this key from the durable Coordinator projection and
+  // binds it to the current accepted Product revision/spec.  Never generate
+  // a browser-local timestamp/random key: a refresh or double-click must
+  // address the same one-shot request.
+  const idempotencyKey = value.productRegenerationIdempotencyKey;
+  operationalProductRegenerationInFlight = true;
+  operationalRenderRunControl();
+  try {
+    operationalRunControlState = await api("/api/run/regenerate-product", {
+      method: "POST",
+      body: JSON.stringify({
+        runId,
+        confirmed: true,
+        ...(typeof idempotencyKey === "string" && idempotencyKey ? { idempotencyKey } : {}),
+        reason: "operator requested Product dashboard regeneration",
+      }),
+    });
+    await operationalRefreshRuns();
+    await selectRun(runId);
+  } catch (error) {
+    const message = error?.message || String(error);
+    operationalRunControlState = { ...operationalRunControlState, message };
+  } finally {
+    operationalProductRegenerationInFlight = false;
+    operationalRenderRunControl();
+  }
+}
+
 function operationalFileKey(file) {
-  const relativePath = file.webkitRelativePath || file.name;
+  const name = String(file.name || "unnamed-file");
+  const relativePath = file.webkitRelativePath || name;
   return `${relativePath}:${file.size}:${file.lastModified}`;
 }
 
@@ -131,18 +248,22 @@ function operationalCapacityForTotal(value) {
 capacityForTotal = operationalCapacityForTotal;
 
 addFiles = function operationalAddFiles(fileList) {
-  const allowed = new Set(["csv", "tsv", "json", "jsonl", "ndjson", "xlsx", "parquet", "zip", "txt", "text", "md", "markdown", "rst", "pdf", "docx", "odt"]);
   Array.from(fileList || []).forEach((file) => {
-    const extension = file.name.split(".").pop().toLowerCase();
+    const name = String(file.name || "unnamed-file");
+    const extension = name.includes(".") ? name.split(".").pop().toLowerCase() : "";
     const key = operationalFileKey(file);
     operationalFiles.set(key, file);
     const descriptor = {
       key,
-      name: file.name,
-      relativePath: file.webkitRelativePath || file.name,
+      name,
+      relativePath: file.webkitRelativePath || name,
       size: file.size,
-      type: file.type || extension,
-      valid: allowed.has(extension),
+      type: file.type || extension || "application/octet-stream",
+      // Local admission is based on the regular-file/path safety checks in
+      // the launch boundary, not a browser extension allowlist.  Keep this
+      // flag for the base application contract, but every selected file is
+      // eligible for staging here (including extensionless/unknown files).
+      valid: true,
       uploadState: "selected",
     };
     if (!state.files.some((current) => current.key === key)) state.files.push(descriptor);
@@ -159,12 +280,11 @@ renderFileManifest = function operationalRenderFileManifest() {
     const row = element("div", `file-row upload-${file.uploadState || "selected"}`);
     row.dataset.sourceIndex = String(index);
     if (file.validationError) row.classList.add("has-error");
-    row.append(element("span", "file-type", file.name.split(".").pop()));
+    const suffix = file.name.includes(".") ? file.name.split(".").pop() : "file";
+    row.append(element("span", "file-type", suffix));
     const copy = element("span");
     const status = file.validationError
       ? file.validationError
-      : !file.valid
-      ? "unsupported format"
       : file.uploadState === "uploaded"
         ? "staged and hash-bound"
         : file.uploadState === "uploading"
@@ -203,13 +323,13 @@ launchPayload = function operationalLaunchPayload() {
     relativePath: file.relativePath || file.name,
     size: file.size,
     sha256: file.sha256 || null,
-    valid: file.valid,
   }));
   const sourcePath = $("#sourcePath").value.trim();
   if (sourcePath) sources.push({ kind: "local_path", path: sourcePath });
   const sourceUrl = $("#sourceUrl").value.trim();
   if (sourceUrl) sources.push({ kind: "remote_url", url: sourceUrl });
   return {
+    idempotencyKey: operationalPreparationIdentity(),
     mode,
     projectName: $("#projectName").value.trim(),
     runId: $("#existingRun").value,
@@ -221,6 +341,7 @@ launchPayload = function operationalLaunchPayload() {
 };
 
 function operationalResetPreparedDraft() {
+  operationalForgetPreparationIdentity();
   if (!operationalDraft) return;
   operationalDraft = null;
   const button = $("#validateDraft");
@@ -245,21 +366,16 @@ async function operationalUploadFile(descriptor) {
     filename: descriptor.name,
     relative_path: descriptor.relativePath || descriptor.name,
   });
-  const response = await fetch(`/api/launch/upload?${params}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/octet-stream",
-      "X-Control-Center-Token": state.config?.launchToken || "",
-    },
-    body: file,
-  });
-  const result = await response.json().catch(() => ({}));
-  if (!response.ok) {
+  let result;
+  try {
+    result = await api(`/api/launch/upload?${params}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: file,
+    });
+  } catch (error) {
     descriptor.uploadState = "failed";
     renderFileManifest();
-    const details = operationalValidationDetails(result.errors).join("; ");
-    const error = new Error(details || result.error || `Could not stage ${descriptor.name}`);
-    if (result.errors) error.errors = result.errors;
     throw error;
   }
   descriptor.uploadId = result.uploadId;
@@ -317,9 +433,16 @@ function operationalConfirmationCard(result) {
   const heading = element("div", "launch-confirmation-heading");
   heading.append(element("span", "confirmation-glyph", "✓"));
   const copy = element("div");
+  const continuation = $("input[name='mode']:checked")?.value === "continue";
   copy.append(
     element("strong", "", "Launch package is ready"),
-    element("small", "", "Review the immutable fingerprint, then start the local Planner session."),
+    element(
+      "small",
+      "",
+      continuation
+        ? "Sources create a new immutable data revision; the active attempt is never rewritten."
+        : "Review the immutable fingerprint, then start the Foundry Supervisor.",
+    ),
   );
   heading.append(copy);
   const facts = element("dl", "confirmation-facts");
@@ -329,14 +452,37 @@ function operationalConfirmationCard(result) {
     ["Sources", String(result.summary?.sources ?? 0)],
     ["Capacity", `${result.effectiveCapacity?.total ?? "—"} workers`],
   ];
+  if (continuation && result.dataRevision?.revisionId) {
+    entries.push(["Current data", `${result.dataRevision.revisionId} · immutable`]);
+  }
   entries.forEach(([label, value]) => {
     const row = element("div");
     row.append(element("dt", "", label), element("dd", "", value));
     facts.append(row);
   });
   const fingerprint = element("code", "launch-fingerprint", result.fingerprint || "fingerprint unavailable");
-  card.append(heading, facts, fingerprint);
+  const cancel = element("button", "text-button", "Cancel preparation");
+  cancel.type = "button";
+  cancel.addEventListener("click", () => operationalCancelPreparation().catch((error) => {
+    operationalRenderStatus({ status: "failed", message: error.message || String(error) });
+  }));
+  card.append(heading, facts, fingerprint, cancel);
   $("#validateDraft").before(card);
+}
+
+async function operationalCancelPreparation() {
+  if (!operationalDraft) return;
+  const result = await api("/api/launch/cancel", {
+    method: "POST",
+    body: JSON.stringify({
+      draftId: operationalDraft.draftId,
+      fingerprint: operationalDraft.fingerprint,
+      confirmed: true,
+    }),
+  });
+  operationalRenderStatus(result);
+  operationalResetPreparedDraft();
+  await operationalRefreshRuns();
 }
 
 async function operationalPrepare() {
@@ -371,9 +517,25 @@ async function operationalExecute() {
 function operationalRenderStatus(result) {
   const output = $("#validationResult");
   output.hidden = false;
-  const status = result.status || "starting";
+  // The operational API only promotes a launch to ``running`` after the
+  // current-checkout Supervisor writes its hash-bound readiness receipt.  Be
+  // defensive at the browser boundary as well: a legacy/partial payload must
+  // remain visibly starting rather than claiming a live run.
+  const requestedStatus = result.status || "starting";
+  const status = requestedStatus === "running" && result.ready !== true ? "starting" : requestedStatus;
   output.className = `validation-result launch-status status-${status}`;
-  output.textContent = result.message || (status === "starting" ? "Interpreting requirements before the Planner starts." : `Run ${status}.`);
+  const message = result.message || (
+    status === "starting"
+      ? result.startupTimedOut === true
+        ? "Foundry Supervisor is still starting; its live child was retained while readiness is pending."
+        : "Preparing the run before the Foundry Supervisor starts."
+      : `Run ${status}.`
+  );
+  const pending = result.pendingDataRefresh === true || status === "queued";
+  const revisionId = result.dataRevisionId || result.dataRevision?.revisionId;
+  output.textContent = pending && revisionId
+    ? `${message} Data revision ${revisionId} is pending the next safe scheduler boundary.`
+    : message;
 }
 
 function operationalPlaceholderIsOpen(run) {
@@ -422,7 +584,14 @@ async function operationalRefreshRuns() {
 }
 
 function operationalRefreshIsNeeded() {
-  return operationalLaunchRequestPending || state.runs.some(operationalPlaceholderIsOpen);
+  const selected = state.runs.find((run) => run.id === state.selectedRunId);
+  // Keep a stale tab attached to a selected placeholder until its durable
+  // successor replaces it, even when the placeholder has already failed.
+  // Otherwise terminal intake failures stop the refresh loop before the
+  // replacement run can become selectable/control-ready.
+  return operationalLaunchRequestPending
+    || Boolean(selected?.placeholder)
+    || state.runs.some(operationalPlaceholderIsOpen);
 }
 
 function operationalMaybeStopRunsRefresh() {
@@ -570,7 +739,21 @@ selectRun = async function operationalSelectRun(runId) {
   // Clear synchronously before the base selector awaits the new snapshot, so
   // no previous run's cached agents can be reintroduced on the next frame.
   operationalResetNodeCacheForRun(runId);
-  const result = await layerOneSelectRun(runId);
+  // Async selectors execute their state reset before the first await.  Start
+  // the existing refresh loop immediately after that reset so a slow snapshot
+  // cannot leave a selected terminal placeholder stale.
+  const selection = layerOneSelectRun(runId);
+  const selected = state.runs.find((run) => run.id === state.selectedRunId);
+  if (selected?.placeholder && !operationalRunsTimer) {
+    // A terminal placeholder may have stopped the initial refresh loop before
+    // the operator selected it.  Restart that same loop so its durable
+    // successor can replace it without requiring a page reload.
+    operationalStartRunsRefresh();
+  }
+  const result = await selection;
+  if (snapshotOwnershipIsCurrent(runId, state.selectionGeneration)) {
+    operationalLastSnapshotRefreshAt = Date.now();
+  }
   await operationalRefreshRunControl(runId, state.selectionGeneration);
   return result;
 };
@@ -652,11 +835,19 @@ fitGraph = function operationalFitGraph() {
 
 const layerOnePollEvents = pollEvents;
 pollEvents = async function operationalPollEvents() {
+  if (operationalEventsPollInFlight) return;
+  operationalEventsPollInFlight = true;
   const requestedRunId = state.selectedRunId;
   const requestedGeneration = state.selectionGeneration;
-  await layerOnePollEvents();
-  if (!snapshotOwnershipIsCurrent(requestedRunId, requestedGeneration) || !state.selectedRunId || state.feedPaused) return;
   try {
+    const priorCursor = String(state.eventCursor ?? "0");
+    const priorStream = String(state.eventStream || "");
+    await layerOnePollEvents();
+    if (!snapshotOwnershipIsCurrent(requestedRunId, requestedGeneration) || !state.selectedRunId || state.feedPaused) return;
+    const cursorChanged = String(state.eventCursor ?? "0") !== priorCursor;
+    const streamChanged = String(state.eventStream || "") !== priorStream;
+    const refreshDue = Date.now() - operationalLastSnapshotRefreshAt >= 10000;
+    if (!cursorChanged && !streamChanged && !refreshDue) return;
     const fresh = await api(`/api/snapshot?run_id=${encodeURIComponent(requestedRunId)}`);
     if (!snapshotOwnershipIsCurrent(requestedRunId, requestedGeneration)) return;
     const priorEvents = state.snapshot?.events || [];
@@ -664,10 +855,13 @@ pollEvents = async function operationalPollEvents() {
     (fresh.events || []).forEach((event) => eventMap.set(event.id, event));
     fresh.events = Array.from(eventMap.values()).slice(-600);
     if (!commitSnapshot(fresh, requestedRunId, requestedGeneration)) return;
+    operationalLastSnapshotRefreshAt = Date.now();
     renderMission();
     await operationalRefreshRunControl(requestedRunId, requestedGeneration);
   } catch (_error) {
     // The base poller already exposes connection state; retain the last safe snapshot.
+  } finally {
+    operationalEventsPollInFlight = false;
   }
 };
 
@@ -686,6 +880,43 @@ renderLimitations = function operationalRenderLimitations() {
   });
   layerOneRenderLimitations();
   state.snapshot.limitations = limitations;
+};
+
+const layerOneRenderRunContext = renderRunContext;
+renderRunContext = function operationalRenderRunContext() {
+  layerOneRenderRunContext();
+  const run = state.snapshot?.run || {};
+  const meta = $("#selectedRunMeta");
+  if (!meta) return;
+  const stage = run.placeholder && run.observedStage ? ` · ${humanStatus(run.observedStage)}` : "";
+  const source = run.source === "fixture" ? "Deterministic fixture" : "Filesystem projection";
+  const base = `${source} · ${run.requirementCount || 0} requirements${stage}`;
+  const revision = run.dataRevision;
+  const pending = run.pendingDataRefresh;
+  if (pending?.revisionId) {
+    meta.textContent = `${base} · ${pending.revisionId} pending next safe scheduler boundary`;
+  } else if (revision?.revisionId) {
+    meta.textContent = `${base} · ${revision.revisionId} active`;
+  } else {
+    meta.textContent = base;
+  }
+};
+
+const layerOneRenderRunsTable = renderRunsTable;
+renderRunsTable = function operationalRenderRunsTable() {
+  layerOneRenderRunsTable();
+  $$("#runsTableBody tr").forEach((row) => {
+    const runId = row.querySelector(".run-cell small")?.textContent;
+    const run = state.runs.find((candidate) => candidate.id === runId);
+    const mode = row.children[4];
+    if (!run || !mode) return;
+    const pending = run.pendingDataRefresh;
+    const revision = pending?.revisionId || run.dataRevision?.revisionId;
+    if (!revision) return;
+    mode.textContent = pending?.revisionId
+      ? `D ${revision} · pending next safe scheduler boundary`
+      : `D ${revision} · active`;
+  });
 };
 
 async function operationalConfigure() {
@@ -713,5 +944,6 @@ document.addEventListener("DOMContentLoaded", () => {
   }, true);
   form.addEventListener("change", operationalResetPreparedDraft, true);
   $("#runControlButton")?.addEventListener("click", operationalApplyRunControl);
+  $("#regenerateProductButton")?.addEventListener("click", operationalApplyProductRegeneration);
   operationalConfigure().catch((error) => operationalRenderStatus({ status: "unknown", message: error.message }));
 });

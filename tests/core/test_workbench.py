@@ -13,6 +13,7 @@ import pytest
 from auto_foundry_core.contracts import DataAssetRef
 from auto_foundry_core.analysis import BoundAnalysisContext
 from auto_foundry_core.durable import ItemWorkspace
+from auto_foundry_core.sources import read_rows as source_read_rows
 from auto_foundry_core.telemetry import TelemetryRecorder
 from auto_foundry_core.workbench import CatalogCounts, DataRoom, DataRoomCatalogEntry
 from auto_foundry_core.workspace import AllowedRootError, RunContext
@@ -98,6 +99,23 @@ def test_inventory_hash_search_and_read_formats(room_fixture: tuple[RunContext, 
         "data_room_member_read",
         "data_room_catalog_created",
     }
+
+
+def test_corrupt_inventory_telemetry_is_observational_and_recovers(
+    room_fixture: tuple[RunContext, Path, dict[str, bytes]],
+) -> None:
+    context, archive, _ = room_fixture
+    counter_path = context.resolve_run_path("telemetry/inventory_counters.json")
+    counter_path.parent.mkdir(parents=True)
+    counter_path.write_text("{not-json", encoding="utf-8")
+
+    with pytest.warns(RuntimeWarning, match="inventory instrumentation recovered"):
+        room = DataRoom.open(context, archive)
+
+    payload = json.loads(counter_path.read_text(encoding="utf-8"))
+    assert payload["run_id"] == context.run_id
+    assert payload["diagnostics"]
+    assert room.instrumentation_counters["archive_full_hash"]["count"] >= 1
 
 
 def test_macos_metadata_is_ignored_without_mutating_archive(tmp_path: Path) -> None:
@@ -224,8 +242,9 @@ def test_pdf_members_are_opaque_catalog_documents_without_excerpt_decoding(tmp_p
     assert pdf_entry.row_count_exact is False
     assert pdf_entry.metadata == {"extraction": "opaque", "requires_custom_code": True}
     assert room.search("policy.pdf", catalog=catalog) == (pdf_entry,)
-    with pytest.raises(ValueError, match="PDF document excerpts require custom code"):
-        room.document_excerpt(pdf_member)
+    # Valid PDFs use the shared normalizer.  Unsupported/opaque content may
+    # yield an empty excerpt, but it must not hard-stop the workbench.
+    assert isinstance(room.document_excerpt(pdf_member), str)
 
     assert archive.read_bytes() == original_bytes
     assert hashlib.sha256(archive.read_bytes()).hexdigest() == original_hash
@@ -349,6 +368,49 @@ def test_bounded_json_and_archive_immutability(room_fixture: tuple[RunContext, P
     assert archive.read_bytes() != original
     with pytest.raises(ValueError, match="archive changed"):
         room.members()
+
+
+def test_default_json_reader_accepts_payloads_larger_than_legacy_16_mib_cap(tmp_path: Path) -> None:
+    input_root = tmp_path / "inputs"
+    run_root = tmp_path / "run"
+    input_root.mkdir()
+    run_root.mkdir()
+    # Store the member (rather than deflating a repetitive fixture) so this
+    # test exercises the JSON admission limit, not the ZIP-bomb ratio guard.
+    text = "x" * (16 * 1024 * 1024 + 1024)
+    payload = json.dumps({"value": text}).encode("utf-8")
+    archive = input_root / "large-json.zip"
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as output:
+        output.writestr("large.json", payload)
+    context = RunContext("RUN-LARGE-JSON", run_root, (input_root,))
+    room = DataRoom.open(context, archive)
+
+    rows = room.read_rows("large.json", limit=1)
+    assert rows[0]["value"] == text
+
+
+def test_direct_json_reader_default_is_unbounded_but_explicit_cap_applies(tmp_path: Path) -> None:
+    source = tmp_path / "large.json"
+    value = "x" * (16 * 1024 * 1024 + 1024)
+    source.write_text(json.dumps({"value": value}), encoding="utf-8")
+
+    assert source_read_rows(source, limit=1) == [{"value": value}]
+    with pytest.raises(ValueError, match="max_json_bytes"):
+        source_read_rows(source, limit=1, max_json_bytes=1024)
+
+
+def test_prepared_candidate_defaults_accept_more_than_legacy_100k_rows(room_fixture: tuple[RunContext, Path, dict[str, bytes]]) -> None:
+    context, archive, _ = room_fixture
+    item = ItemWorkspace.create(context, "Q-PREPARED-LARGE", original_text="prepared")
+    bound = BoundAnalysisContext.create(context, archive, item)
+    descriptor = bound.save_prepared_candidate(
+        "many-rows",
+        ({"row": index} for index in range(100_001)),
+    )
+
+    assert descriptor.row_count == 100_001
+    assert descriptor.byte_count > 0
+    assert descriptor.limitations == ()
 
 
 def test_zip_bomb_and_member_bounds(tmp_path: Path) -> None:
@@ -496,6 +558,25 @@ def test_xlsx_entry_bound_counts_directories_and_exact_valid_bound(room_fixture:
     directory_context = RunContext("RUN-XLSX-DIRECTORIES", run_root, (input_root,))
     with pytest.raises(ValueError, match="max_xlsx_entries"):
         DataRoom.open(directory_context, directory_archive, max_xlsx_entries=2)
+
+
+def test_xlsx_legacy_byte_and_entry_defaults_are_not_admission_limits(
+    room_fixture: tuple[RunContext, Path, dict[str, bytes]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Changing retired defaults cannot reintroduce hidden XLSX rejection."""
+
+    context, archive, payloads = room_fixture
+    if "workbook.xlsx" not in payloads:
+        pytest.skip("openpyxl is not installed")
+    import auto_foundry_core.workbench as workbench_module
+
+    monkeypatch.setattr(workbench_module, "DEFAULT_XLSX_MEMBER_MAX_BYTES", 1)
+    monkeypatch.setattr(workbench_module, "DEFAULT_XLSX_TOTAL_MAX_BYTES", 1)
+    monkeypatch.setattr(workbench_module, "DEFAULT_XLSX_ENTRY_LIMIT", 1)
+
+    room = DataRoom.open(context, archive)
+    assert room.read_rows("workbook.xlsx", sheet="Orders", limit=1) == [{"order_id": "A-1", "amount": 10}]
 
 
 def test_prepared_encoded_byte_cap_and_provenance_integrity(room_fixture: tuple[RunContext, Path, dict[str, bytes]]) -> None:

@@ -1,4 +1,4 @@
-# Auto Foundry Agentic E2E Skill v0.7.1
+# Auto Foundry Agentic E2E Skill v0.7.2
 
 This skill produces two things: strong reviewed business analysis and a clear
 offline dashboard built from reviewed results. Deterministic core code exists
@@ -9,9 +9,9 @@ JSON operators.
 
 ```text
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.7.1
+skill_version: 0.7.2
 core_name: auto_foundry_core
-core_version: 0.8.0
+core_version: 0.8.1
 ```
 
 ## Architecture
@@ -21,7 +21,7 @@ user question
   -> one Analytical Owner
        -> bounded data room
        -> reproducible calculations
-       -> optional 0-3 specialist memos
+       -> smallest useful set of specialist memos for independent uncertainty
        -> complete business answer
        -> iterative material repairs, each with a targeted recheck
   -> one Independent Business Reviewer
@@ -131,6 +131,14 @@ The program, not the agent or caller, restores cumulative LEM context. It
 projects validated prior committed integration records in lifecycle order, so
 there is no separate mutable LEM checkpoint to reconstruct or reconcile.
 
+## Data Room admission
+
+The Data Room accepts every safe regular file. Native catalog/read paths cover
+CSV/TSV/JSON, Parquet, and SQLite (`.db`, `.sqlite`, `.sqlite3`) with one
+catalog entry per SQLite user table. Unknown, extensionless, notebook, and
+other auxiliary files are retained as opaque members for explicit
+materialization; they are not analytically parsed by the core.
+
 ## Modes
 
 Question Mode preserves supplied wording and order, activates one question at
@@ -156,10 +164,11 @@ outcomes change, but a technical failure does not create Planner dependency
 blocks; independent groups remain eligible and runtime resolution state
 controls waiting and resume. Every requirement binds
 directly to the same `RunContext` and shared `DataRoomWorkbench`.
-The default capacity is four entity-resolution workers, one Analytical Owner,
-up to three owner specialists, and eight active workers total; the Planner is
-not counted. Hosts may configure lower or higher limits, but may never be
-oversubscribed. Requested Run A and Run B executions remain sequential.
+Capacity is adaptive to the actual host capacity: the scheduler leases the smallest
+useful set for genuinely independent work without oversubscription. Every
+requirement has exactly one Analytical Owner, reviewers remain fresh and
+independent, and the Planner is not counted or leased. Requested Run A and Run
+B executions remain sequential.
 Within a group, one Analytical Owner remains responsible for each requirement;
 bounded shared investigation may be reused and independent groups may run when
 host capacity permits. Each item follows the ordinary loop: item-local
@@ -254,6 +263,7 @@ never performs client-business automation.
 - [Business and fidelity review protocol](references/REVIEW_PROTOCOL.md)
 - [Knowledge and prepared-data reuse](references/KNOWLEDGE_AND_REUSE.md)
 - [Artifact and efficiency policy](references/ARTIFACT_AND_EFFICIENCY_POLICY.md)
+- [Analytics toolkit](references/ANALYTICS_TOOLKIT.md)
 - [Final products and optimizer](references/FINAL_PRODUCT_AND_AUTOMATION.md)
 - [Offline contract prompts](TEST_PROMPTS.md)
 - [Program-populated item result view](assets/QUESTION_RESULT_TEMPLATE.md)

@@ -5,19 +5,25 @@ import json
 import hashlib
 import os
 import signal
+import sqlite3
 import stat
 import struct
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 from auto_foundry_core.workbench import DataRoom
 from auto_foundry_core.workspace import RunContext
+from auto_foundry_core.lifecycle import RunLifecycle
 import auto_foundry_core.coordinator as coordinator_module
+import apps.control_center_operational.launch as launch_module
 from apps.control_center_operational.launch import (
     _BoundedRedirectHandler,
     _PinnedHTTPSConnection,
@@ -27,15 +33,16 @@ from apps.control_center_operational.launch import (
     LaunchConflictError,
     LaunchSettings,
     LockedLaunchError,
-    MAX_ZIP_MEMBER_COUNT,
     ZIP64_EOCD_LOCATOR_BYTES,
     default_codex_binary,
     _planner_plan_hash,
     SubprocessRunner,
     validate_remote_url,
     _inspect_zip_source,
+    atomic_write_json,
 )
 from apps.control_center_operational.projection import OperationalRepository
+from apps.control_center_operational.run_control import RunControlManager
 
 
 class FakeRunner:
@@ -45,7 +52,12 @@ class FakeRunner:
 
     def start(self, **kwargs):
         self.calls.append(kwargs)
-        return {"monitorRunId": "fake-monitor"}
+        return {
+            "monitorRunId": "fake-monitor",
+            "pid": 5252,
+            "processGroupId": 5252,
+            "processGroupToken": "fake-runner-token",
+        }
 
     def plan_intake(self, *, intake_blocks, existing_plan, **_kwargs):
         if self.intake_responses:
@@ -90,6 +102,29 @@ class FakeRunner:
             "groups": groups,
             "unassignedContext": [],
         }
+
+
+class TimeoutRunner(FakeRunner):
+    """Return a complete identity while retaining a timed-out live child."""
+
+    def start(self, **kwargs):
+        result = super().start(**kwargs)
+        result.update({"ready": False, "startupTimedOut": True})
+        return result
+
+
+class RepairingPlanner:
+    """Return one malformed representation, then a valid plan."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def plan_intake(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        if len(self.calls) == 1:
+            return {"schemaVersion": 1, "requirements": [], "groups": []}
+        blocks = [str(item["text"]) for item in kwargs["intake_blocks"]]
+        return fake_intake_response(blocks)
 
 
 def fake_intake_response(blocks, *, candidates=None, groups=None, strategy="semantic test plan"):
@@ -536,6 +571,15 @@ class LaunchTests(unittest.TestCase):
             "capacity": {"total": 64, "entityResolution": 32, "analyticalOwner": 8, "specialist": 24},
         }
 
+    def test_publication_policy_is_exact_boolean_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = LaunchManager(self.settings(Path(directory), enabled=False))
+            self.assertEqual(manager._canonical_publication_policy({"enabled": False}), {"enabled": False})
+            self.assertEqual(manager._canonical_publication_policy({"enabled": True}), {"enabled": True})
+            for invalid in ({}, {"enabled": 1}, {"enabled": None}, {"enabled": False, "channel": "local"}):
+                with self.assertRaises(LaunchConflictError):
+                    manager._canonical_publication_policy(invalid)
+
     def test_default_codex_binary_prefers_executable_desktop_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bundled = Path(directory) / "ChatGPT.app" / "Contents" / "Resources" / "codex"
@@ -579,6 +623,8 @@ class LaunchTests(unittest.TestCase):
             self.assertFalse(kwargs["shell"])
             self.assertIn("The UI fields are input blocks, not requirement boundaries", kwargs["input"])
             self.assertIn("Requirement 1\\nRequirement 2", kwargs["input"])
+            self.assertNotIn("originalText", kwargs["input"])
+            self.assertNotIn("content_hash", kwargs["input"])
 
     def _initial_continue_context(self, root: Path):
         runner = FakeRunner()
@@ -627,6 +673,304 @@ class LaunchTests(unittest.TestCase):
             draft = json.loads((manager.drafts_root / f"{prepared['draftId']}.json").read_text())
             self.assertEqual(draft["intakeBlocks"][0]["text"], " padded requirement")
 
+    def test_prepare_is_idempotent_across_manager_reload_and_can_cancel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = self.settings(root, enabled=True)
+            payload = {
+                "mode": "new",
+                "projectName": "Durable preparation",
+                "intakeBlocks": ["same request"],
+                "sources": [],
+                "maxAgents": 1,
+                "capacity": {"total": 1, "entityResolution": 0, "analyticalOwner": 1, "specialist": 0},
+                "idempotencyKey": "browser-tab-preparation-1",
+            }
+            first = LaunchManager(settings).prepare(payload)
+            second_manager = LaunchManager(settings)
+            second = second_manager.prepare(dict(payload))
+            self.assertEqual(second["draftId"], first["draftId"])
+            self.assertEqual(second["fingerprint"], first["fingerprint"])
+            self.assertTrue(second["reused"])
+            self.assertTrue(second_manager.status(first["draftId"])["cancelable"])
+            cancelled = second_manager.cancel(
+                draft_id=first["draftId"],
+                fingerprint=first["fingerprint"],
+                confirmed=True,
+            )
+            self.assertEqual(cancelled["status"], "cancelled")
+            self.assertFalse(cancelled["cancelable"])
+
+    def test_production_role_bindings_require_every_canonical_dispatch_role(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = LaunchManager(self.settings(root))
+            api = manager._core_imports()
+            routes = api["production_role_routing"]()
+            routes.pop("analytical_owner")
+            api["production_role_routing"] = lambda: routes
+            with self.assertRaisesRegex(LaunchConflictError, "analytical_owner"):
+                manager._production_role_bindings(api)
+
+    def test_intake_representation_repair_is_one_validator_informed_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = self.settings(root, enabled=True)
+            planner = RepairingPlanner()
+            manager = LaunchManager(settings, runner=FakeRunner(), intake_planner=planner)
+            prepared = manager.prepare(
+                {
+                    "mode": "new",
+                    "projectName": "One repair",
+                    "intakeBlocks": ["One exact requirement"],
+                    "sources": [],
+                    "maxAgents": 1,
+                    "capacity": {"total": 1, "entityResolution": 0, "analyticalOwner": 1, "specialist": 0},
+                }
+            )
+            result = manager.execute(
+                draft_id=prepared["draftId"],
+                fingerprint=prepared["fingerprint"],
+                confirmed=True,
+            )
+            self.assertEqual(result["status"], "accepted")
+            self.assertEqual(len(planner.calls), 2)
+            self.assertEqual(planner.calls[1]["repair_context"]["kind"], "representation_repair")
+            self.assertEqual(planner.calls[1]["response_schema"]["$schema"], "https://json-schema.org/draft/2020-12/schema")
+
+    def test_planner_original_text_echo_is_ignored_and_host_derives_exact_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = self.settings(root, enabled=True)
+            calls: list[dict[str, object]] = []
+            source_text = "Revenue margin\nby region"
+
+            def planner(**kwargs):
+                calls.append(dict(kwargs))
+                return fake_intake_response(
+                    [source_text],
+                    candidates=[{"originalText": "Planner paraphrase of the requirement"}],
+                )
+
+            manager = LaunchManager(settings, runner=FakeRunner(), intake_planner=planner)
+            prepared = manager.prepare(
+                {
+                    "mode": "new",
+                    "projectName": "Canonical requirement text",
+                    "intakeBlocks": [source_text],
+                    "sources": [],
+                    "maxAgents": 1,
+                    "capacity": {"total": 1, "entityResolution": 0, "analyticalOwner": 1, "specialist": 0},
+                }
+            )
+            result = manager.execute(
+                draft_id=prepared["draftId"],
+                fingerprint=prepared["fingerprint"],
+                confirmed=True,
+            )
+            self.assertEqual(result["status"], "accepted")
+            self.assertEqual(len(calls), 1)
+            plan = json.loads((Path(result["runRoot"]) / "requirement_supervisor_plan.json").read_text())
+            self.assertEqual(plan["input_records"][0]["original_text"], source_text)
+
+    def test_intake_aliases_and_block_context_text_hash_are_host_canonicalized(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = self.settings(root, enabled=True)
+            calls: list[dict[str, object]] = []
+            source_text = "Revenue margin\nby region"
+
+            def planner(**kwargs):
+                calls.append(dict(kwargs))
+                return {
+                    "schema_version": 1,
+                    "portfolio_strategy": "canonicalize safe wire aliases",
+                    "requirements": {
+                        "candidate_id": "C-001",
+                        "source_spans": {"block_id": "INPUT-001", "start": 0, "end": len(source_text)},
+                        "source_bindings": {
+                            "ref": "INPUT-001",
+                            "span": {"block_id": "INPUT-001", "start": 0, "end": len(source_text)},
+                            "text": "wrong planner echo",
+                            "content_hash": "0" * 64,
+                        },
+                        "original_text": "another planner paraphrase",
+                        "business_objective": "Assess margin by region.",
+                    },
+                    "groups": {
+                        "members": "C-001",
+                        "rationale": "One independent decision.",
+                    },
+                    "product_brief": {
+                        "audience": {
+                            "value": "wrong context echo",
+                            "source_bindings": {
+                                "ref": "INPUT-001",
+                                "span": {"block_id": "INPUT-001", "start": 0, "end": len(source_text)},
+                                "text": "wrong context echo",
+                                "content_hash": "f" * 64,
+                            },
+                        }
+                    },
+                }
+
+            manager = LaunchManager(settings, runner=FakeRunner(), intake_planner=planner)
+            prepared = manager.prepare(
+                {
+                    "mode": "new",
+                    "projectName": "Alias normalization",
+                    "intakeBlocks": [source_text],
+                    "sources": [],
+                    "maxAgents": 1,
+                    "capacity": {"total": 1, "entityResolution": 0, "analyticalOwner": 1, "specialist": 0},
+                }
+            )
+            result = manager.execute(
+                draft_id=prepared["draftId"],
+                fingerprint=prepared["fingerprint"],
+                confirmed=True,
+            )
+            self.assertEqual(result["status"], "accepted")
+            self.assertEqual(len(calls), 1)
+            run_root = Path(result["runRoot"])
+            plan = json.loads((run_root / "requirement_supervisor_plan.json").read_text())
+            self.assertEqual(plan["input_records"][0]["original_text"], source_text)
+            binding = plan["input_records"][0]["metadata"]["source_bindings"][0]
+            self.assertEqual(binding["text"], source_text)
+            self.assertEqual(binding["content_hash"], hashlib.sha256(source_text.encode()).hexdigest())
+            context_artifact = run_root / "control_center" / "launches" / prepared["draftId"] / "mission_context.json"
+            context = json.loads(context_artifact.read_text())
+            audience = context["context"]["product_brief"]["audience"][0]
+            self.assertEqual(audience["text"], source_text)
+            self.assertEqual(audience["source_bindings"][0]["text"], source_text)
+            self.assertEqual(audience["source_bindings"][0]["content_hash"], hashlib.sha256(source_text.encode()).hexdigest())
+
+    def test_document_binding_aliases_ignore_planner_text_and_hash_echoes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = self.settings(root, enabled=True)
+            upload_bytes = b"Investigate margin and inventory as separate decisions.\n"
+            upload = LaunchManager(settings).upload(
+                io.BytesIO(upload_bytes),
+                filename="brief.md",
+                relative_path="brief.md",
+                content_length=len(upload_bytes),
+            )
+            calls: list[dict[str, object]] = []
+            canonical_text = "Investigate margin and inventory as separate decisions."
+
+            def planner(**kwargs):
+                calls.append(dict(kwargs))
+                return {
+                    "schema_version": 1,
+                    "portfolio_strategy": "document source aliases",
+                    "requirements": {
+                        "candidate_id": "C-001",
+                        "source_spans": [],
+                        "document_refs": "brief.md",
+                        "source_bindings": {
+                            "ref": "brief.md",
+                            "location": {"section": 1, "paragraph": 1},
+                            "contentHash": "0" * 64,
+                            "text": "Planner paraphrase",
+                        },
+                        "original_text": "Planner paraphrase",
+                        "business_objective": "Determine the required margin and inventory analyses.",
+                    },
+                    "groups": {
+                        "members": "C-001",
+                        "rationale": "Document-grounded decision requirement.",
+                    },
+                }
+
+            manager = LaunchManager(settings, runner=FakeRunner(), intake_planner=planner)
+            prepared = manager.prepare(
+                {
+                    "mode": "new",
+                    "projectName": "Document aliases",
+                    "intakeBlocks": [],
+                    "sources": [{"kind": "upload", "uploadId": upload.upload_id}],
+                    "maxAgents": 2,
+                    "capacity": {"total": 2, "entityResolution": 1, "analyticalOwner": 1, "specialist": 0},
+                }
+            )
+            result = manager.execute(
+                draft_id=prepared["draftId"],
+                fingerprint=prepared["fingerprint"],
+                confirmed=True,
+            )
+            self.assertEqual(result["status"], "accepted")
+            self.assertEqual(len(calls), 1)
+            plan = json.loads((Path(result["runRoot"]) / "requirement_supervisor_plan.json").read_text())
+            self.assertEqual(plan["input_records"][0]["original_text"], canonical_text)
+            binding = plan["input_records"][0]["metadata"]["source_bindings"][0]
+            self.assertEqual(binding["text"], canonical_text)
+            self.assertEqual(binding["content_hash"], hashlib.sha256(canonical_text.encode()).hexdigest())
+
+    def test_intake_semantic_failure_is_not_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = self.settings(root, enabled=True)
+            calls: list[dict[str, object]] = []
+
+            def semantic_failure(**kwargs):
+                calls.append(dict(kwargs))
+                return fake_intake_response(
+                    ["One exact requirement"],
+                    groups=[["not-a-requirement"]],
+                )
+
+            manager = LaunchManager(settings, runner=FakeRunner(), intake_planner=semantic_failure)
+            prepared = manager.prepare(
+                {
+                    "mode": "new",
+                    "projectName": "No semantic rerun",
+                    "intakeBlocks": ["One exact requirement"],
+                    "sources": [],
+                    "maxAgents": 1,
+                    "capacity": {"total": 1, "entityResolution": 0, "analyticalOwner": 1, "specialist": 0},
+                }
+            )
+            with self.assertRaisesRegex(LaunchConflictError, "unknown requirement"):
+                manager.execute(
+                    draft_id=prepared["draftId"],
+                    fingerprint=prepared["fingerprint"],
+                    confirmed=True,
+                )
+            self.assertEqual(len(calls), 1)
+
+    def test_intake_trusted_source_failure_is_not_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = self.settings(root, enabled=True)
+            calls: list[dict[str, object]] = []
+
+            def source_failure(**kwargs):
+                calls.append(dict(kwargs))
+                return fake_intake_response(
+                    ["One exact requirement"],
+                    candidates=[{"documentRefs": ["missing.md"]}],
+                )
+
+            manager = LaunchManager(settings, runner=FakeRunner(), intake_planner=source_failure)
+            prepared = manager.prepare(
+                {
+                    "mode": "new",
+                    "projectName": "No trusted source rerun",
+                    "intakeBlocks": ["One exact requirement"],
+                    "sources": [],
+                    "maxAgents": 1,
+                    "capacity": {"total": 1, "entityResolution": 0, "analyticalOwner": 1, "specialist": 0},
+                }
+            )
+            with self.assertRaisesRegex(LaunchConflictError, "unavailable document"):
+                manager.execute(
+                    draft_id=prepared["draftId"],
+                    fingerprint=prepared["fingerprint"],
+                    confirmed=True,
+                )
+            self.assertEqual(len(calls), 1)
+
     def test_upload_rejects_traversal_and_hashes_body(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = LaunchManager(self.settings(Path(directory)))
@@ -636,6 +980,66 @@ class LaunchTests(unittest.TestCase):
             self.assertEqual(record.size, 8)
             self.assertEqual(len(record.sha256), 64)
             self.assertEqual(record.path.read_bytes(), b"a,b\n1,2\n")
+
+    def test_local_upload_and_sqlite_sources_are_admitted_without_extension_gates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = LaunchManager(self.settings(root))
+            database = root / "source" / "sample.sqlite3"
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE orders (id INTEGER, amount REAL)")
+                connection.execute("INSERT INTO orders VALUES (1, 12.5)")
+                connection.commit()
+            extensionless = root / "source" / "README"
+            extensionless.write_text("opaque local payload\n", encoding="utf-8")
+            uploaded = manager.upload(
+                io.BytesIO(b"opaque upload bytes"),
+                filename="payload.bin",
+                relative_path="payload.bin",
+                content_length=len(b"opaque upload bytes"),
+            )
+            prepared = manager.prepare(
+                {
+                    "mode": "new",
+                    "projectName": "Universal local sources",
+                    "intakeBlocks": ["r"],
+                    "sources": [
+                        {"kind": "local_path", "path": str(database)},
+                        {"kind": "local_path", "path": str(extensionless)},
+                        {"kind": "upload", "uploadId": uploaded.upload_id},
+                    ],
+                    "maxAgents": 1,
+                    "capacity": {"total": 1, "entityResolution": 0, "analyticalOwner": 1, "specialist": 0},
+                }
+            )
+            self.assertTrue(prepared["valid"], prepared.get("errors"))
+            draft = manager._load_draft(prepared["draftId"], prepared["fingerprint"])
+            destination = root / "package.zip"
+            manager._package_zip(draft, destination)
+            with zipfile.ZipFile(destination) as archive:
+                self.assertEqual(archive.namelist(), ["payload.bin", "README", "sample.sqlite3"])
+                self.assertIn(b"SQLite format 3", archive.read("sample.sqlite3")[:32])
+
+    def test_planner_document_catalog_does_not_readmit_large_structured_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_root = Path(directory) / "RUN-MIXED"
+            inputs = run_root / "inputs"
+            inputs.mkdir(parents=True)
+            archive_path = inputs / "data_room.zip"
+            with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as archive:
+                archive.writestr("erp_transactions.parquet", b"p" * (17 * 1024 * 1024))
+                archive.writestr("requirements.md", b"Analyze the admitted data room.")
+
+            projection, catalog = LaunchManager._document_catalog_for_planner(
+                run_root,
+                "inputs/data_room.zip",
+                allowed_roots=(run_root,),
+            )
+
+            self.assertIsNotNone(catalog)
+            assert catalog is not None
+            self.assertEqual([document.document_ref for document in catalog.documents], ["requirements.md"])
+            self.assertEqual([document["document_ref"] for document in projection["documents"]], ["requirements.md"])
 
     def test_locked_execute_has_no_run_or_status_write(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -688,6 +1092,945 @@ class LaunchTests(unittest.TestCase):
             self.assertTrue((run_root / "control_center" / "launch_manifest.json").is_file())
             self.assertFalse((settings.runtime_root / "runtime-mutated").exists())
             self.assertEqual(manager.execute(draft_id=prepared["draftId"], fingerprint=prepared["fingerprint"], confirmed=True)["status"], "accepted")
+
+    def test_initial_status_write_failure_cleans_token_owned_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner = FakeRunner()
+            settings = self.settings(root, enabled=True)
+            manager = LaunchManager(settings, runner=runner)
+            prepared = manager.prepare(self.payload(manager, root))
+            original_atomic_write = launch_module.atomic_write_json
+
+            def fail_accepted_status(path, value):
+                if value.get("status") == "accepted":
+                    raise OSError("test accepted status write failure")
+                return original_atomic_write(path, value)
+
+            with patch("apps.control_center_operational.launch.atomic_write_json", side_effect=fail_accepted_status):
+                with patch(
+                    "apps.control_center_operational.launch._terminate_token_owned_process_group",
+                    return_value=True,
+                ) as terminate:
+                    with self.assertRaises(OSError):
+                        manager.execute(
+                            draft_id=prepared["draftId"],
+                            fingerprint=prepared["fingerprint"],
+                            confirmed=True,
+                        )
+            terminate.assert_called_once_with(5252, "fake-runner-token")
+            self.assertEqual(manager.status(prepared["draftId"])["status"], "failed")
+            self.assertNotIn("processGroupToken", manager.status(prepared["draftId"]))
+
+    def test_continuation_status_write_failure_cleans_token_owned_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner = FakeRunner()
+            settings = self.settings(root, enabled=True)
+            repository = OperationalRepository(None, [settings.runs_root])
+            manager = LaunchManager(settings, repository=repository, runner=runner)
+            initial = manager.prepare(self.payload(manager, root))
+            created = manager.execute(
+                draft_id=initial["draftId"],
+                fingerprint=initial["fingerprint"],
+                confirmed=True,
+            )
+            run_id = repository.list_runs()[0]["id"]
+            continuation = manager.prepare(
+                {
+                    "mode": "continue",
+                    "runId": run_id,
+                    "intakeBlocks": ["Continuation status failure"],
+                    "sources": [],
+                    "maxAgents": 64,
+                    "capacity": {"total": 64, "entityResolution": 32, "analyticalOwner": 8, "specialist": 24},
+                }
+            )
+            original_atomic_write = launch_module.atomic_write_json
+
+            def fail_accepted_status(path, value):
+                if value.get("status") == "accepted":
+                    raise OSError("test continuation status write failure")
+                return original_atomic_write(path, value)
+
+            with patch("apps.control_center_operational.launch.atomic_write_json", side_effect=fail_accepted_status):
+                with patch(
+                    "apps.control_center_operational.launch._terminate_token_owned_process_group",
+                    return_value=True,
+                ) as terminate:
+                    with self.assertRaises(OSError):
+                        manager.execute(
+                            draft_id=continuation["draftId"],
+                            fingerprint=continuation["fingerprint"],
+                            confirmed=True,
+                        )
+            terminate.assert_called_once_with(5252, "fake-runner-token")
+            self.assertEqual(manager.status(continuation["draftId"])["status"], "failed")
+            self.assertEqual(created["status"], "accepted")
+
+    def test_continuation_cleanup_unconfirmed_is_idempotent_while_identity_is_owned(self) -> None:
+        """An in-flight continuation must not spawn a duplicate Supervisor."""
+
+        class ContinuationFailureRunner(FakeRunner):
+            def start(self, **kwargs):
+                started = super().start(**kwargs)
+                if len(self.calls) == 2:
+                    started.update(
+                        {
+                            "startupToken": "startup-token-5252",
+                            "processGroupToken": "group-token-5252",
+                        }
+                    )
+                return started
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = self.settings(root, enabled=True)
+            runner = ContinuationFailureRunner()
+            repository = OperationalRepository(None, [settings.runs_root], launch_state_root=settings.state_root)
+            manager = LaunchManager(settings, repository=repository, runner=runner)
+            initial = manager.prepare(self.payload(manager, root))
+            manager.execute(
+                draft_id=initial["draftId"],
+                fingerprint=initial["fingerprint"],
+                confirmed=True,
+            )
+            run_id = repository.list_runs()[0]["id"]
+            continuation = manager.prepare(
+                {
+                    "mode": "continue",
+                    "runId": run_id,
+                    "intakeBlocks": ["Continuation cleanup failure"],
+                    "sources": [],
+                    "maxAgents": 64,
+                    "capacity": {"total": 64, "entityResolution": 32, "analyticalOwner": 8, "specialist": 24},
+                }
+            )
+            original_atomic_write = launch_module.atomic_write_json
+
+            def fail_accepted_status(path, value):
+                if value.get("status") == "accepted":
+                    raise OSError("test continuation final status failure")
+                return original_atomic_write(path, value)
+
+            with patch("apps.control_center_operational.launch.atomic_write_json", side_effect=fail_accepted_status), patch(
+                "apps.control_center_operational.launch._terminate_token_owned_process_group",
+                return_value=False,
+            ) as terminate:
+                with self.assertRaisesRegex(LaunchConflictError, "cleanup failed after launch error"):
+                    manager.execute(
+                        draft_id=continuation["draftId"],
+                        fingerprint=continuation["fingerprint"],
+                        confirmed=True,
+                    )
+            terminate.assert_called_once_with(5252, "group-token-5252")
+
+            private_status = json.loads(manager._status_path(continuation["draftId"]).read_text(encoding="utf-8"))
+            self.assertEqual(private_status["status"], "starting")
+            self.assertEqual(private_status["processGroupId"], 5252)
+            self.assertEqual(private_status["processGroupToken"], "group-token-5252")
+            self.assertEqual(private_status["startupToken"], "startup-token-5252")
+
+            # The process-group is still live/unknown, so both same-process
+            # and fresh-manager continuation retries return the recoverable
+            # status without invoking runner.start again.
+            with patch(
+                "apps.control_center_operational.launch._process_group_has_token",
+                return_value=True,
+            ):
+                observed = manager.status(continuation["draftId"])
+                self.assertEqual(observed["status"], "starting")
+                self.assertTrue(observed["recoverable"])
+                self.assertNotIn("processGroupToken", observed)
+                self.assertNotIn("startupToken", observed)
+                retried = manager.execute(
+                    draft_id=continuation["draftId"],
+                    fingerprint=continuation["fingerprint"],
+                    confirmed=True,
+                )
+                reloaded = LaunchManager(settings, repository=repository, runner=runner)
+                reloaded_result = reloaded.execute(
+                    draft_id=continuation["draftId"],
+                    fingerprint=continuation["fingerprint"],
+                    confirmed=True,
+                )
+            self.assertEqual(retried["status"], "starting")
+            self.assertEqual(reloaded_result["status"], "starting")
+            self.assertEqual(len(runner.calls), 2)
+
+    def test_same_continuation_execute_instances_spawn_exactly_once(self) -> None:
+        """The per-run flock serializes concurrent continuation admission."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = self.settings(root, enabled=True)
+            runner = FakeRunner()
+            repository = OperationalRepository(None, [settings.runs_root], launch_state_root=settings.state_root)
+            initial_manager = LaunchManager(settings, repository=repository, runner=runner)
+            initial = initial_manager.prepare(self.payload(initial_manager, root))
+            initial_manager.execute(
+                draft_id=initial["draftId"],
+                fingerprint=initial["fingerprint"],
+                confirmed=True,
+            )
+            run_id = repository.list_runs()[0]["id"]
+            continuation = initial_manager.prepare(
+                {
+                    "mode": "continue",
+                    "runId": run_id,
+                    "intakeBlocks": ["Concurrent continuation"],
+                    "sources": [],
+                    "maxAgents": 64,
+                    "capacity": {"total": 64, "entityResolution": 32, "analyticalOwner": 8, "specialist": 24},
+                }
+            )
+            managers = [
+                LaunchManager(settings, repository=repository, runner=runner),
+                LaunchManager(settings, repository=repository, runner=runner),
+            ]
+            barrier = threading.Barrier(len(managers))
+            results: list[dict[str, Any]] = []
+            errors: list[BaseException] = []
+
+            def invoke(manager: LaunchManager) -> None:
+                try:
+                    barrier.wait(timeout=5)
+                    results.append(
+                        manager.execute(
+                            draft_id=continuation["draftId"],
+                            fingerprint=continuation["fingerprint"],
+                            confirmed=True,
+                        )
+                    )
+                except BaseException as exc:  # pragma: no cover - assertion below reports any race failure
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=invoke, args=(manager,)) for manager in managers]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+                self.assertFalse(thread.is_alive(), "concurrent continuation admission deadlocked")
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 2)
+            self.assertTrue(all(result["status"] == "accepted" for result in results))
+            self.assertEqual(len(runner.calls), 2)  # initial launch + exactly one continuation start
+            private_status = json.loads(initial_manager._status_path(continuation["draftId"]).read_text(encoding="utf-8"))
+            self.assertEqual(private_status["status"], "accepted")
+            self.assertEqual(private_status["processGroupId"], 5252)
+            self.assertTrue(private_status["processGroupToken"])
+
+    def test_distinct_continuation_drafts_share_one_run_owned_supervisor(self) -> None:
+        """A newer draft cannot hide an older token-owned child."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, settings, repository, created, run_id = self._initial_continue_context(root)
+            authoritative_run_id = created["runId"]
+            manager = LaunchManager(settings, repository=repository, runner=runner)
+            first = manager.prepare(
+                {
+                    "mode": "continue",
+                    "runId": run_id,
+                    "intakeBlocks": ["First distinct continuation"],
+                    "sources": [],
+                    "maxAgents": 4,
+                    "capacity": {"total": 4, "entityResolution": 2, "analyticalOwner": 1, "specialist": 1},
+                }
+            )
+            manager.execute(draft_id=first["draftId"], fingerprint=first["fingerprint"], confirmed=True)
+
+            # Prepare a second draft after the first generation is durable so
+            # its parent lineage is compatible.  The queued record is newer
+            # but intentionally has no identity; it must not hide the first
+            # draft's live process-group ownership.
+            second = manager.prepare(
+                {
+                    "mode": "continue",
+                    "runId": run_id,
+                    "intakeBlocks": ["Second distinct continuation"],
+                    "sources": [],
+                    "maxAgents": 4,
+                    "capacity": {"total": 4, "entityResolution": 2, "analyticalOwner": 1, "specialist": 1},
+                }
+            )
+            newer = settings.state_root / "statuses" / "D-newer-queued.json"
+            newer.write_text(
+                json.dumps(
+                    {
+                        "draftId": "D-newer-queued",
+                        "runId": authoritative_run_id,
+                        "runRoot": str(Path(manager.status(first["draftId"])["runRoot"])),
+                        "status": "queued",
+                        "startedAt": "9999-01-01T00:00:00Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            newer_gone = settings.state_root / "statuses" / "D-newer-gone.json"
+            newer_gone.write_text(
+                json.dumps(
+                    {
+                        "draftId": "D-newer-gone",
+                        "runId": authoritative_run_id,
+                        "runRoot": str(Path(manager.status(first["draftId"])["runRoot"])),
+                        "status": "accepted",
+                        "startedAt": "9998-01-01T00:00:00Z",
+                        "pid": 6262,
+                        "processGroupId": 6262,
+                        "processGroupToken": "gone-token-6262",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "apps.control_center_operational.launch._process_group_has_token",
+                side_effect=lambda _process_group_id, process_group_token: process_group_token == "fake-runner-token",
+            ):
+                attached = manager.execute(
+                    draft_id=second["draftId"],
+                    fingerprint=second["fingerprint"],
+                    confirmed=True,
+                )
+            self.assertIn(attached["status"], {"accepted", "running", "starting", "queued"})
+            self.assertEqual(len(runner.calls), 2)  # initial launch + first continuation only
+            private = json.loads(manager._status_path(second["draftId"]).read_text(encoding="utf-8"))
+            self.assertEqual(private["processGroupId"], 5252)
+            self.assertEqual(private["processGroupToken"], "fake-runner-token")
+            self.assertNotIn("processGroupToken", attached)
+            self.assertNotIn("startupToken", attached)
+
+            class OrphanController:
+                def find(self, _run_id, _run_root):
+                    return None
+
+                def group_alive(self, process_group_id, process_group_token=None):
+                    return (process_group_id, process_group_token) == (5252, "fake-runner-token")
+
+            run_root = Path(private["runRoot"])
+            RunLifecycle.load(RunContext(run_id=created["runId"], run_root=run_root)).pause("test distinct draft ownership")
+            control = RunControlManager(manager, process_controller=OrphanController())
+            observed = control.status(repository.list_runs()[0]["id"])
+            self.assertTrue(observed["coordinatorOrphaned"])
+            self.assertFalse(observed["canResume"])
+
+            # Once every distinct identity is positively gone, the run is
+            # quiescent again; duplicate status copies do not change that.
+            with patch(
+                "apps.control_center_operational.launch._process_group_has_token",
+                return_value=False,
+            ):
+                self.assertIsNone(
+                    manager._run_owned_supervisor_status(
+                        authoritative_run_id,
+                        run_root,
+                    )
+                )
+            class GoneController:
+                def find(self, _run_id, _run_root):
+                    return None
+
+                def group_alive(self, _process_group_id, _process_group_token=None):
+                    return False
+
+            quiescent_control = RunControlManager(manager, process_controller=GoneController())
+            quiescent = quiescent_control.status(repository.list_runs()[0]["id"])
+            self.assertFalse(quiescent["coordinatorOrphaned"])
+            self.assertTrue(quiescent["canResume"])
+
+    def test_run_admission_lock_identity_is_distinct_per_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = self.settings(root, enabled=True)
+            first = launch_module._run_admission_lock_path(settings, "RUN-A", root / "runs" / "RUN-A")
+            second = launch_module._run_admission_lock_path(settings, "RUN-B", root / "runs" / "RUN-B")
+            self.assertNotEqual(first, second)
+            self.assertEqual(first.parent, second.parent)
+            self.assertTrue(first.parent.is_dir())
+
+    def test_starting_owner_alias_is_queued_and_not_cancellable(self) -> None:
+        """A continuation alias cannot cancel the shared starting owner."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, settings, repository, _created, run_id = self._initial_continue_context(root)
+            manager = LaunchManager(settings, repository=repository, runner=runner)
+            first = manager.prepare(
+                {
+                    "mode": "continue",
+                    "runId": run_id,
+                    "intakeBlocks": ["Starting owner continuation"],
+                    "sources": [],
+                    "maxAgents": 4,
+                    "capacity": {"total": 4, "entityResolution": 2, "analyticalOwner": 1, "specialist": 1},
+                }
+            )
+            manager.execute(draft_id=first["draftId"], fingerprint=first["fingerprint"], confirmed=True)
+            owner_path = manager._status_path(first["draftId"])
+            owner = json.loads(owner_path.read_text(encoding="utf-8"))
+            owner.update(
+                {
+                    "status": "starting",
+                    "startupTimedOut": True,
+                    "startupToken": "startup-token-5252",
+                }
+            )
+            atomic_write_json(owner_path, owner)
+
+            second = manager.prepare(
+                {
+                    "mode": "continue",
+                    "runId": run_id,
+                    "intakeBlocks": ["Starting owner alias"],
+                    "sources": [],
+                    "maxAgents": 4,
+                    "capacity": {"total": 4, "entityResolution": 2, "analyticalOwner": 1, "specialist": 1},
+                }
+            )
+            with patch(
+                "apps.control_center_operational.launch._process_group_has_token",
+                return_value=True,
+            ):
+                alias = manager.execute(
+                    draft_id=second["draftId"],
+                    fingerprint=second["fingerprint"],
+                    confirmed=True,
+                )
+            self.assertEqual(alias["status"], "queued")
+            self.assertNotIn("processGroupToken", alias)
+            self.assertNotIn("startupToken", alias)
+            private_alias = json.loads(manager._status_path(second["draftId"]).read_text(encoding="utf-8"))
+            self.assertEqual(private_alias["status"], "queued")
+            self.assertEqual(private_alias["processGroupToken"], "fake-runner-token")
+            self.assertEqual(private_alias["startupToken"], "startup-token-5252")
+
+            with patch(
+                "apps.control_center_operational.launch._terminate_token_owned_process_group",
+                return_value=True,
+            ) as terminate:
+                with self.assertRaisesRegex(LaunchConflictError, "Only an unstarted or failed launch preparation"):
+                    manager.cancel(
+                        draft_id=second["draftId"],
+                        fingerprint=second["fingerprint"],
+                        confirmed=True,
+                    )
+            terminate.assert_not_called()
+
+            # Once the shared group is explicitly gone, the queued alias may
+            # retry its durable continuation and start a replacement.
+            with patch(
+                "apps.control_center_operational.launch._process_group_has_token",
+                return_value=False,
+            ):
+                retry = manager.execute(
+                    draft_id=second["draftId"],
+                    fingerprint=second["fingerprint"],
+                    confirmed=True,
+                )
+            self.assertIn(retry["status"], {"accepted", "running", "starting"})
+            self.assertEqual(len(runner.calls), 3)
+
+    def test_cancel_wins_preidentity_race_without_launch_overwrite(self) -> None:
+        """A cancellation serialized first cannot be overwritten by execute."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = self.settings(root, enabled=True)
+            runner = FakeRunner()
+            prepared_manager = LaunchManager(settings, runner=runner)
+            prepared = prepared_manager.prepare(self.payload(prepared_manager, root))
+            execute_manager = LaunchManager(settings, runner=runner)
+            cancel_manager = LaunchManager(settings, runner=runner)
+            barrier = threading.Barrier(2)
+            execute_load_entered = threading.Event()
+            release_execute_load = threading.Event()
+            cancel_done = threading.Event()
+            original_load = execute_manager._load_draft
+            load_calls = 0
+
+            def delayed_load(*args, **kwargs):
+                nonlocal load_calls
+                load_calls += 1
+                if load_calls == 1:
+                    execute_load_entered.set()
+                    if not release_execute_load.wait(timeout=5):
+                        raise RuntimeError("test execute admission barrier timed out")
+                return original_load(*args, **kwargs)
+
+            execute_manager._load_draft = delayed_load
+            results: dict[str, dict[str, Any]] = {}
+            errors: list[BaseException] = []
+
+            def execute_worker() -> None:
+                try:
+                    barrier.wait(timeout=5)
+                    results["execute"] = execute_manager.execute(
+                        draft_id=prepared["draftId"],
+                        fingerprint=prepared["fingerprint"],
+                        confirmed=True,
+                    )
+                except BaseException as exc:  # pragma: no cover - assertion below reports any race failure
+                    errors.append(exc)
+
+            def cancel_worker() -> None:
+                try:
+                    barrier.wait(timeout=5)
+                    results["cancel"] = cancel_manager.cancel(
+                        draft_id=prepared["draftId"],
+                        fingerprint=prepared["fingerprint"],
+                        confirmed=True,
+                    )
+                except BaseException as exc:  # pragma: no cover - assertion below reports any race failure
+                    errors.append(exc)
+                finally:
+                    cancel_done.set()
+
+            execute_thread = threading.Thread(target=execute_worker)
+            cancel_thread = threading.Thread(target=cancel_worker)
+            execute_thread.start()
+            cancel_thread.start()
+            self.assertTrue(execute_load_entered.wait(timeout=5), "execute did not reach the preidentity barrier")
+            self.assertTrue(cancel_done.wait(timeout=5), "cancel did not complete while execute was preidentity")
+            release_execute_load.set()
+            execute_thread.join(timeout=10)
+            cancel_thread.join(timeout=10)
+            self.assertFalse(execute_thread.is_alive(), "cancel/execute admission deadlocked")
+            self.assertFalse(cancel_thread.is_alive(), "cancel/execute admission deadlocked")
+            self.assertEqual(errors, [])
+            self.assertEqual(results["cancel"]["status"], "cancelled")
+            self.assertEqual(results["execute"]["status"], "cancelled")
+            self.assertEqual(runner.calls, [])
+            self.assertEqual(prepared_manager.status(prepared["draftId"])["status"], "cancelled")
+
+            # Cancellation remains idempotent after the serialized loser has
+            # observed the terminal cancelled record.
+            again = cancel_manager.cancel(
+                draft_id=prepared["draftId"],
+                fingerprint=prepared["fingerprint"],
+                confirmed=True,
+            )
+            self.assertEqual(again["status"], "cancelled")
+
+    def test_invalid_returned_process_identity_cleans_token_owned_group(self) -> None:
+        class InvalidIdentityRunner(FakeRunner):
+            def start(self, **kwargs):
+                self.calls.append(kwargs)
+                return {
+                    "monitorRunId": "invalid-identity",
+                    "pid": 5251,
+                    "processGroupId": 5252,
+                    "processGroupToken": "fake-runner-token",
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner = InvalidIdentityRunner()
+            settings = self.settings(root, enabled=True)
+            manager = LaunchManager(settings, runner=runner)
+            prepared = manager.prepare(self.payload(manager, root))
+            with patch(
+                "apps.control_center_operational.launch._terminate_token_owned_process_group",
+                return_value=True,
+            ) as terminate:
+                with self.assertRaisesRegex(LaunchConflictError, "complete process identity"):
+                    manager.execute(
+                        draft_id=prepared["draftId"],
+                        fingerprint=prepared["fingerprint"],
+                        confirmed=True,
+                    )
+            terminate.assert_called_once_with(5252, "fake-runner-token")
+            self.assertEqual(manager.status(prepared["draftId"])["status"], "failed")
+
+    def test_post_spawn_readiness_identity_mismatch_cleans_exact_group(self) -> None:
+        """A readiness exception cannot strand the child before manager ownership."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = self.settings(root, enabled=True)
+            with patch(
+                "apps.control_center_operational.launch.subprocess.Popen",
+                return_value=RecordingProcess(),
+            ) as popen, patch.object(
+                SubprocessRunner,
+                "_wait_for_ready",
+                side_effect=LaunchConflictError("Foundry Supervisor readiness identity does not match this launch"),
+            ), patch(
+                "apps.control_center_operational.launch._terminate_token_owned_process_group",
+                return_value=True,
+            ) as terminate:
+                runner = SubprocessRunner("codex")
+                manager = LaunchManager(
+                    settings,
+                    runner=runner,
+                    intake_planner=FakeRunner(),
+                )
+                prepared = manager.prepare(self.payload(manager, root))
+                with self.assertRaisesRegex(LaunchConflictError, "readiness identity"):
+                    manager.execute(
+                        draft_id=prepared["draftId"],
+                        fingerprint=prepared["fingerprint"],
+                        confirmed=True,
+                    )
+
+                process_group_token = popen.call_args.kwargs["env"][
+                    "AUTO_FOUNDRY_SUPERVISOR_PROCESS_GROUP_TOKEN"
+                ]
+                terminate.assert_called_once_with(91234, process_group_token)
+                status = manager.status(prepared["draftId"])
+                self.assertEqual(status["status"], "failed")
+                self.assertTrue(status["recoverable"])
+
+    def test_post_spawn_identity_extraction_failure_cleans_exact_group(self) -> None:
+        """A failure before readiness still cleans the exact spawned group."""
+
+        class IdentityExtractionFailureProcess:
+            pid = 91234
+
+            @property
+            def pgid(self):
+                raise RuntimeError("identity extraction failed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = self.settings(root, enabled=True)
+            with patch(
+                "apps.control_center_operational.launch.subprocess.Popen",
+                return_value=IdentityExtractionFailureProcess(),
+            ) as popen, patch(
+                "apps.control_center_operational.launch._terminate_token_owned_process_group",
+                return_value=True,
+            ) as terminate:
+                runner = SubprocessRunner("codex")
+                manager = LaunchManager(
+                    settings,
+                    runner=runner,
+                    intake_planner=FakeRunner(),
+                )
+                prepared = manager.prepare(self.payload(manager, root))
+                with self.assertRaisesRegex(RuntimeError, "identity extraction failed"):
+                    manager.execute(
+                        draft_id=prepared["draftId"],
+                        fingerprint=prepared["fingerprint"],
+                        confirmed=True,
+                    )
+
+                process_group_token = popen.call_args.kwargs["env"][
+                    "AUTO_FOUNDRY_SUPERVISOR_PROCESS_GROUP_TOKEN"
+                ]
+                terminate.assert_called_once_with(91234, process_group_token)
+                status = manager.status(prepared["draftId"])
+                self.assertEqual(status["status"], "failed")
+                self.assertTrue(status["recoverable"])
+
+    def test_post_return_promotion_failure_retains_identity_when_cleanup_unconfirmed(self) -> None:
+        """Post-start admission errors cannot strand an untracked Supervisor."""
+
+        class PostReturnRunner(FakeRunner):
+            def start(self, **kwargs):
+                started = super().start(**kwargs)
+                started.update(
+                    {
+                        "startupToken": "startup-token-5252",
+                        "processGroupToken": "group-token-5252",
+                        "ready": False,
+                        "startupTimedOut": True,
+                    }
+                )
+                return started
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = self.settings(root, enabled=True)
+            runner = PostReturnRunner()
+            repository = OperationalRepository(None, [settings.runs_root], launch_state_root=settings.state_root)
+            manager = LaunchManager(settings, repository=repository, runner=runner)
+            prepared = manager.prepare(self.payload(manager, root))
+            with patch.object(
+                manager,
+                "_promote_staged_mission_artifacts",
+                side_effect=RuntimeError("test promotion failure after Supervisor start"),
+            ), patch(
+                "apps.control_center_operational.launch._terminate_token_owned_process_group",
+                return_value=False,
+            ) as terminate:
+                with self.assertRaisesRegex(LaunchConflictError, "cleanup failed after launch error"):
+                    manager.execute(
+                        draft_id=prepared["draftId"],
+                        fingerprint=prepared["fingerprint"],
+                        confirmed=True,
+                    )
+            terminate.assert_called_once_with(5252, "group-token-5252")
+
+            private_path = manager._status_path(prepared["draftId"])
+            private_status = json.loads(private_path.read_text(encoding="utf-8"))
+            self.assertEqual(private_status["status"], "starting")
+            self.assertEqual(private_status["pid"], 5252)
+            self.assertEqual(private_status["processGroupId"], 5252)
+            self.assertEqual(private_status["processGroupToken"], "group-token-5252")
+            self.assertEqual(private_status["startupToken"], "startup-token-5252")
+
+            class OrphanController:
+                def find(self, _run_id, _run_root):
+                    return None
+
+                def group_alive(self, process_group_id, process_group_token=None):
+                    return (process_group_id, process_group_token) == (5252, "group-token-5252")
+
+            # Run-control reload sees the same durable ownership and refuses
+            # a second Supervisor start while the group remains live.
+            run_id = private_status["runId"]
+            run_root = Path(private_status["runRoot"])
+            RunLifecycle.load(RunContext(run_id=run_id, run_root=run_root)).pause("test launch promotion failure")
+            control = RunControlManager(manager, process_controller=OrphanController())
+            browser_run_id = repository.list_runs()[0]["id"]
+            orphaned = control.status(browser_run_id)
+            self.assertTrue(orphaned["coordinatorOrphaned"])
+            self.assertFalse(orphaned["canResume"])
+            with self.assertRaisesRegex(Exception, "process-group members are still active"):
+                control.resume(browser_run_id, confirmed=True)
+            self.assertEqual(len(runner.calls), 1)
+
+            # A fresh manager can prove the live token-owned group without
+            # exposing either private token, and a retry cannot spawn a
+            # duplicate Supervisor while ownership remains unresolved.
+            reloaded = LaunchManager(settings, runner=runner)
+            with patch(
+                "apps.control_center_operational.launch._process_group_has_token",
+                return_value=True,
+            ):
+                observed = reloaded.status(prepared["draftId"])
+                self.assertEqual(observed["status"], "starting")
+                self.assertTrue(observed["recoverable"])
+                self.assertNotIn("processGroupToken", observed)
+                self.assertNotIn("startupToken", observed)
+                retried = reloaded.execute(
+                    draft_id=prepared["draftId"],
+                    fingerprint=prepared["fingerprint"],
+                    confirmed=True,
+                )
+            self.assertEqual(retried["status"], "starting")
+            self.assertEqual(len(runner.calls), 1)
+
+    def test_transferred_start_cleanup_unconfirmed_retains_identity(self) -> None:
+        """Transferred startup ownership stays durable when manager cleanup is uncertain."""
+
+        class TransferredStartRunner(FakeRunner):
+            def start(self, **kwargs):
+                self.calls.append(dict(kwargs))
+                raise launch_module._SupervisorStartCleanupError(
+                    "test transferred startup cleanup",
+                    started={
+                        "monitorRunId": "transferred-monitor",
+                        "pid": 5252,
+                        "processGroupId": 5252,
+                        "processGroupToken": "group-token-5252",
+                        "startupToken": "startup-token-5252",
+                        "ready": False,
+                        "startupTimedOut": True,
+                    },
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = self.settings(root, enabled=True)
+            runner = TransferredStartRunner()
+            manager = LaunchManager(settings, runner=runner)
+            prepared = manager.prepare(self.payload(manager, root))
+            with patch(
+                "apps.control_center_operational.launch._terminate_token_owned_process_group",
+                return_value=False,
+            ) as terminate:
+                with self.assertRaisesRegex(LaunchConflictError, "cleanup failed after launch error"):
+                    manager.execute(
+                        draft_id=prepared["draftId"],
+                        fingerprint=prepared["fingerprint"],
+                        confirmed=True,
+                    )
+            terminate.assert_called_once_with(5252, "group-token-5252")
+            private_status = json.loads(manager._status_path(prepared["draftId"]).read_text(encoding="utf-8"))
+            self.assertEqual(private_status["status"], "starting")
+            self.assertEqual(private_status["processGroupToken"], "group-token-5252")
+            self.assertEqual(private_status["startupToken"], "startup-token-5252")
+
+    def test_timeout_cancel_terminates_owned_group_before_reload(self) -> None:
+        """A timed-out start is cancellable only after exact group cleanup."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = self.settings(root, enabled=True)
+            runner = TimeoutRunner()
+            manager = LaunchManager(settings, runner=runner)
+            prepared = manager.prepare(self.payload(manager, root))
+            started = manager.execute(
+                draft_id=prepared["draftId"],
+                fingerprint=prepared["fingerprint"],
+                confirmed=True,
+            )
+            self.assertEqual(started["status"], "starting")
+            self.assertTrue(started["startupTimedOut"])
+
+            with patch(
+                "apps.control_center_operational.launch._terminate_token_owned_process_group",
+                return_value=True,
+            ) as terminate:
+                cancelled = manager.cancel(
+                    draft_id=prepared["draftId"],
+                    fingerprint=prepared["fingerprint"],
+                    confirmed=True,
+                )
+            terminate.assert_called_once_with(5252, "fake-runner-token")
+            self.assertEqual(cancelled["status"], "cancelled")
+            self.assertFalse(cancelled["recoverable"])
+
+            # A fresh manager sees the durable cancellation only after the
+            # private identity has been retained for reload-time liveness
+            # checks.  No child is hidden behind a dropped token.
+            reloaded = LaunchManager(settings, runner=TimeoutRunner())
+            observed = reloaded.status(prepared["draftId"])
+            self.assertEqual(observed["status"], "cancelled")
+            self.assertFalse(observed["cancelable"])
+            self.assertFalse(observed["recoverable"])
+
+    def test_timeout_cancel_termination_failure_stays_recoverable(self) -> None:
+        """Failed cleanup leaves the timeout in starting, never cancelled."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = self.settings(root, enabled=True)
+            manager = LaunchManager(settings, runner=TimeoutRunner())
+            prepared = manager.prepare(self.payload(manager, root))
+            started = manager.execute(
+                draft_id=prepared["draftId"],
+                fingerprint=prepared["fingerprint"],
+                confirmed=True,
+            )
+            self.assertEqual(started["status"], "starting")
+            with patch(
+                "apps.control_center_operational.launch._terminate_token_owned_process_group",
+                side_effect=LaunchConflictError("group stop could not be verified"),
+            ) as terminate:
+                with self.assertRaisesRegex(LaunchConflictError, "remains recoverable"):
+                    manager.cancel(
+                        draft_id=prepared["draftId"],
+                        fingerprint=prepared["fingerprint"],
+                        confirmed=True,
+                    )
+            terminate.assert_called_once_with(5252, "fake-runner-token")
+            observed = manager.status(prepared["draftId"])
+            self.assertEqual(observed["status"], "starting")
+            self.assertTrue(observed["recoverable"])
+            self.assertTrue(observed["cancelable"])
+
+    def test_reload_running_uses_process_group_token_not_startup_token(self) -> None:
+        """Receipt and process-group tokens remain independent on reload."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = LaunchManager(self.settings(root, enabled=True), runner=FakeRunner())
+            draft_id = "reconcile-running"
+            run_root = root / "runs" / "running"
+            launch_module.atomic_write_json(
+                manager._status_path(draft_id),
+                {
+                    "draftId": draft_id,
+                    "status": "running",
+                    "runId": "run-running",
+                    "runRoot": str(run_root),
+                    "pid": 5252,
+                    "processGroupId": 5252,
+                    "startupToken": "startup-token-1234",
+                    "processGroupToken": "group-token-5678",
+                    "startedAt": "2026-01-01T00:00:00+00:00",
+                },
+            )
+            with patch(
+                "apps.control_center_operational.launch._process_group_has_token",
+                return_value=True,
+            ) as has_token:
+                observed = manager.status(draft_id)
+            has_token.assert_called_once_with(5252, "group-token-5678")
+            self.assertEqual(observed["status"], "running")
+            self.assertEqual(observed["liveness"], "live")
+
+    def test_reload_timed_out_starting_uses_process_group_token_not_startup_token(self) -> None:
+        """A stale timeout remains recoverable while its owned group is live."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = LaunchManager(self.settings(root, enabled=True), runner=FakeRunner())
+            draft_id = "reconcile-timeout"
+            run_root = root / "runs" / "timed-out"
+            launch_module.atomic_write_json(
+                manager._status_path(draft_id),
+                {
+                    "draftId": draft_id,
+                    "status": "starting",
+                    "runId": "run-timeout",
+                    "runRoot": str(run_root),
+                    "pid": 5252,
+                    "processGroupId": 5252,
+                    "startupToken": "startup-token-1234",
+                    "processGroupToken": "group-token-5678",
+                    "startupTimedOut": True,
+                    "startedAt": "2020-01-01T00:00:00+00:00",
+                },
+            )
+            with patch(
+                "apps.control_center_operational.launch._process_group_has_token",
+                return_value=True,
+            ) as has_token:
+                observed = manager.status(draft_id)
+            has_token.assert_called_once_with(5252, "group-token-5678")
+            self.assertEqual(observed["status"], "starting")
+            self.assertEqual(observed["liveness"], "live")
+            self.assertTrue(observed["startupTimedOut"])
+            self.assertTrue(observed["recoverable"])
+
+    def test_malformed_receipt_fallback_uses_process_group_token_for_live_or_unknown(self) -> None:
+        """Malformed receipts do not false-fail a live/unknown owned child."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = LaunchManager(self.settings(root, enabled=True), runner=FakeRunner())
+            draft_id = "reconcile-malformed"
+            run_root = root / "runs" / "malformed"
+            control = run_root / "control_plane"
+            control.mkdir(parents=True)
+            (control / launch_module.SUPERVISOR_READY_FILENAME).write_text("{}\n", encoding="utf-8")
+            launch_module.atomic_write_json(
+                manager._status_path(draft_id),
+                {
+                    "draftId": draft_id,
+                    "status": "running",
+                    "runId": "run-malformed",
+                    "runRoot": str(run_root),
+                    "pid": 5252,
+                    "processGroupId": 5252,
+                    "startupToken": "startup-token-1234",
+                    "processGroupToken": "group-token-5678",
+                    "startedAt": "2026-01-01T00:00:00+00:00",
+                },
+            )
+            with patch(
+                "apps.control_center_operational.launch._process_group_has_token",
+                return_value=True,
+            ) as has_token:
+                live = manager.status(draft_id)
+            has_token.assert_called_once_with(5252, "group-token-5678")
+            self.assertEqual(live["status"], "starting")
+            self.assertEqual(live["liveness"], "live")
+            self.assertTrue(live["recoverable"])
+
+            with patch(
+                "apps.control_center_operational.launch._process_group_has_token",
+                side_effect=LaunchConflictError("process liveness unavailable"),
+            ) as has_token:
+                unknown = manager.status(draft_id)
+            has_token.assert_called_once_with(5252, "group-token-5678")
+            self.assertEqual(unknown["status"], "starting")
+            self.assertEqual(unknown["liveness"], "unknown")
+            self.assertTrue(unknown["recoverable"])
 
     def test_semantic_planner_splits_five_requirements_from_one_free_form_block(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -775,6 +2118,99 @@ class LaunchTests(unittest.TestCase):
                     confirmed=True,
                 )
 
+    def test_mission_context_sidecar_is_hash_bound_into_launch_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner = FakeRunner()
+            brief = "Analyse revenue trends. Build an operations dashboard. Do not expose personal data."
+            first_end = brief.index(" Build")
+            dashboard_start = brief.index("Build")
+            dashboard_end = brief.index(" Do not")
+            runner.intake_responses.append({
+                "schemaVersion": 1,
+                "missionIntent": "hybrid",
+                "portfolioStrategy": "separate analysis from product constraints",
+                "requirements": [{
+                    "candidateId": "C-001",
+                    "sourceSpans": [{"blockId": "INPUT-001", "start": 0, "end": first_end}],
+                    "businessObjective": "Analyse revenue trends.",
+                    "expectedAnalyticalOutputs": [],
+                    "expectedVisualOutputs": [],
+                    "dependencies": [],
+                    "dataNeeds": [],
+                    "ontologyNeeds": [],
+                    "preparedDataNeeds": [],
+                    "workingDefinitions": [],
+                    "limitations": [],
+                    "explicitPriority": None,
+                    "scope": "analytics",
+                }],
+                "groups": [{"members": ["C-001"], "rationale": "Independent analysis.", "sharedAnalysisIntent": None, "suggestedSpecialists": []}],
+                "productBrief": {"audience": [{"text": "Build an operations dashboard.", "sourceSpans": [{"blockId": "INPUT-001", "start": dashboard_start, "end": dashboard_end}]}]},
+                "technicalConstraints": [{"text": "Do not expose personal data.", "sourceSpans": [{"blockId": "INPUT-001", "start": dashboard_end + 1, "end": len(brief)}]}],
+                "sourceContext": [],
+                "additionalContext": [],
+                "unassignedContext": [],
+            })
+            manager = LaunchManager(self.settings(root, enabled=True), runner=runner)
+            prepared = manager.prepare({
+                "mode": "new",
+                "projectName": "Mission context",
+                "intakeBlocks": [brief],
+                "sources": [],
+                "maxAgents": 2,
+                "capacity": {"total": 2, "entityResolution": 1, "analyticalOwner": 1, "specialist": 0},
+            })
+            result = manager.execute(draft_id=prepared["draftId"], fingerprint=prepared["fingerprint"], confirmed=True)
+            run_root = Path(result["runRoot"])
+            artifact_root = run_root / "control_center" / "launches" / prepared["draftId"]
+            context = json.loads((artifact_root / "mission_context.json").read_text())
+            manifest = json.loads((run_root / "control_center" / "launch_manifest.json").read_text())
+            intake_plan = json.loads((artifact_root / "intake_plan.json").read_text())
+            self.assertEqual(context["contextHash"], manifest["missionContextHash"])
+            self.assertEqual(context["contextHash"], intake_plan["missionContextHash"])
+            self.assertEqual(context["context"]["mission_intent"], "hybrid")
+            self.assertTrue((artifact_root / "mission_plan.json").is_file())
+
+    def test_mission_context_artifacts_stage_without_advancing_active_pointer(self) -> None:
+        from auto_foundry_core.mission_context import MissionContext
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manager = LaunchManager(self.settings(root, enabled=True), runner=FakeRunner())
+            run_root = (root / "runs" / "RUN-STAGE").resolve()
+            run_root.mkdir(parents=True)
+            parent_draft = {"draftId": "D-PARENT", "runId": "RUN-STAGE", "fingerprint": "parent"}
+            parent_artifacts = manager._write_mission_artifacts(
+                run_root,
+                parent_draft,
+                mission_context=MissionContext("specification"),
+                requirement_ids=("REQ-001",),
+                portfolio_strategy="parent",
+            )
+            self.assertFalse((run_root / "control_center" / "mission_context_active.json").exists())
+            manager._promote_staged_mission_artifacts(run_root, {"activePointer": parent_artifacts["activePointer"]})
+            pointer_path = run_root / "control_center" / "mission_context_active.json"
+            before = pointer_path.read_bytes()
+
+            child_artifacts = manager._write_mission_artifacts(
+                run_root,
+                {"draftId": "D-CHILD", "runId": "RUN-STAGE", "fingerprint": "child"},
+                mission_context=MissionContext("hybrid"),
+                requirement_ids=("REQ-001", "REQ-002"),
+                portfolio_strategy="child",
+            )
+            # Simulate a staged D publication/admission failure before the
+            # promotion boundary: the authoritative bytes and parent remain.
+            self.assertEqual(pointer_path.read_bytes(), before)
+            active, _ref, _hash = manager._load_existing_mission_context(run_root)
+            self.assertEqual(active.mission_intent, "specification")
+
+            manager._promote_staged_mission_artifacts(run_root, {"activePointer": child_artifacts["activePointer"]})
+            self.assertNotEqual(pointer_path.read_bytes(), before)
+            active, _ref, _hash = manager._load_existing_mission_context(run_root)
+            self.assertEqual(active.mission_intent, "hybrid")
+
     def test_document_only_intake_is_planned_without_a_required_text_format(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -793,7 +2229,14 @@ class LaunchTests(unittest.TestCase):
                     "candidateId": "C-001",
                     "sourceSpans": [],
                     "documentRefs": ["brief.md"],
-                    "originalText": "Investigate margin and inventory as separate business decisions.",
+                    "sourceBindings": [{
+                        "source_ref": "brief.md",
+                        "locator": {"section": 1, "paragraph": 1},
+                        "content_hash": hashlib.sha256(
+                            b"Investigate margin and inventory as separate decisions."
+                        ).hexdigest(),
+                    }],
+                    "originalText": "Investigate margin and inventory as separate decisions.",
                     "businessObjective": "Determine the required margin and inventory analyses.",
                     "expectedAnalyticalOutputs": [],
                     "expectedVisualOutputs": [],
@@ -831,7 +2274,7 @@ class LaunchTests(unittest.TestCase):
             plan = json.loads((Path(result["runRoot"]) / "requirement_supervisor_plan.json").read_text())
             self.assertEqual(plan["input_records"][0]["source_refs"], ["data_room:brief.md"])
 
-    def test_production_runner_uses_canonical_coordinator_cli_and_resume(self) -> None:
+    def test_production_runner_uses_canonical_supervisor_cli_for_launch_and_continuation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             popen = RecordingPopen()
@@ -861,13 +2304,34 @@ class LaunchTests(unittest.TestCase):
             self.assertEqual(spec["run_id"], created["runId"])
             self.assertEqual(spec["generation_id"], "G-0001")
             self.assertEqual(spec["codex_exec"]["binary"], settings.codex_bin)
+            self.assertEqual(
+                spec["codex_exec"]["role_models"]["foundry_supervisor"],
+                "gpt-5.6-sol",
+            )
+            self.assertEqual(
+                spec["codex_exec"]["role_reasoning_efforts"]["foundry_supervisor"],
+                "high",
+            )
+            self.assertEqual(created["processGroupId"], 91234)
+            self.assertNotIn("processGroupToken", created)
+            private_statuses = sorted((settings.state_root / "statuses").glob("*.json"))
+            self.assertEqual(len(private_statuses), 1)
+            private_status = json.loads(private_statuses[0].read_text(encoding="utf-8"))
+            process_group_token = private_status["processGroupToken"]
+            self.assertRegex(process_group_token, r"^[A-Za-z0-9_-]{8,128}$")
             initial_argv = popen.calls[0][0]
-            self.assertEqual(initial_argv[:5], [sys.executable, "-m", "auto_foundry_core.cli", "coordinator", "run"])
+            self.assertEqual(initial_argv[:5], [sys.executable, "-m", "auto_foundry_core.cli", "supervisor", "run"])
+            self.assertNotIn("coordinator", initial_argv[:5])
             self.assertNotIn("--spec", initial_argv)
             self.assertNotIn("$auto-foundry-agentic-e2e", initial_argv)
             self.assertNotIn("exec", initial_argv)
             initial_kwargs = popen.calls[0][1]
             self.assertEqual(initial_kwargs["cwd"], str(run_root))
+            self.assertEqual(
+                initial_kwargs["env"]["AUTO_FOUNDRY_SUPERVISOR_PROCESS_GROUP_TOKEN"],
+                process_group_token,
+            )
+            self.assertNotIn(process_group_token, " ".join(initial_argv))
             child_python_path = str(Path(__file__).resolve().parents[3] / "src")
             child_python_entries = str(initial_kwargs["env"]["PYTHONPATH"]).split(os.pathsep)
             self.assertEqual(child_python_entries[0], child_python_path)
@@ -884,7 +2348,8 @@ class LaunchTests(unittest.TestCase):
             })
             manager.execute(draft_id=continued["draftId"], fingerprint=continued["fingerprint"], confirmed=True)
             resume_argv = popen.calls[1][0]
-            self.assertEqual(resume_argv[:5], [sys.executable, "-m", "auto_foundry_core.cli", "coordinator", "run"])
+            self.assertEqual(resume_argv[:5], [sys.executable, "-m", "auto_foundry_core.cli", "supervisor", "run"])
+            self.assertNotIn("coordinator", resume_argv[:5])
             rebound_spec = json.loads(spec_path.read_text())
             self.assertEqual(rebound_spec["generation_id"], "G-0002")
             self.assertNotIn("--spec", resume_argv)
@@ -1032,8 +2497,16 @@ class LaunchTests(unittest.TestCase):
             self.assertEqual(persisted["codex_exec"]["binary"], str(fake_codex))
             self.assertEqual(persisted["codex_exec"]["sandbox"], "workspace-write")
             self.assertTrue(persisted["codex_exec"]["ephemeral"])
-            self.assertEqual(persisted["codex_exec"]["skill_version"], "0.7.1")
-            self.assertEqual(persisted["codex_exec"]["core_version"], "0.8.0")
+            self.assertEqual(
+                persisted["codex_exec"]["role_models"]["foundry_supervisor"],
+                "gpt-5.6-sol",
+            )
+            self.assertEqual(
+                persisted["codex_exec"]["role_reasoning_efforts"]["foundry_supervisor"],
+                "high",
+            )
+            self.assertEqual(persisted["codex_exec"]["skill_version"], "0.7.2")
+            self.assertEqual(persisted["codex_exec"]["core_version"], "0.8.1")
             self.assertEqual(
                 persisted["codex_exec"]["skill_sha256"],
                 coordinator_module.PRODUCTION_SKILL_SHA256,
@@ -1062,7 +2535,6 @@ class LaunchTests(unittest.TestCase):
                 run_root=root,
                 manifest_path=root / "control_center" / "launch_manifest.json",
                 capacity={},
-                coordinator_operation=coordinator["operation"],
             )
             child_pid = int(accepted["pid"])
             deadline = time.monotonic() + 10.0
@@ -1093,6 +2565,274 @@ class LaunchTests(unittest.TestCase):
             self.assertIn('"event":"dispatch_started"', events_text)
             self.assertIn('"event":"role_exit"', events_text)
             self.assertNotIn("$auto-foundry-agentic-e2e", events_text)
+
+    def test_resume_rebinds_legacy_spec_before_supervisor_spawn(self) -> None:
+        from auto_foundry_core import (
+            ItemWorkspace,
+            RequirementRecord,
+            RequirementSupervisorWorkspace,
+            RunContext,
+            RunLifecycle,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_id = "RUN-G5-RESUME"
+            _write_legacy_g5_control_plane(root, run_id=run_id, generation_id="G-0001")
+            context = RunContext(run_id, root)
+            RunLifecycle.create(context, ["REQ-001"], mode="requirement")
+            ItemWorkspace.create(context, "REQ-001", mode="requirement", original_text="Legacy resume")
+            plan = RequirementSupervisorWorkspace(context).plan_requirements(
+                (RequirementRecord("REQ-001", "Legacy resume"),),
+                planner_ref="control-center-planner",
+                persist=True,
+            )
+            settings = self.settings(root, enabled=True)
+            manager = LaunchManager(settings)
+
+            prepared = manager.prepare_resume_coordinator(run_id, root)
+
+            self.assertEqual(prepared["operation"], "run")
+            persisted = json.loads((root / "control_plane" / "coordinator_spec.json").read_text(encoding="utf-8"))
+            self.assertEqual(persisted["generation_id"], "G-0001")
+            self.assertEqual(persisted["planner_ref"], plan.planner_ref)
+            self.assertEqual(persisted["codex_exec"]["role_models"]["foundry_supervisor"], "gpt-5.6-sol")
+            self.assertEqual(persisted["codex_exec"]["role_reasoning_efforts"]["foundry_supervisor"], "high")
+            events = [
+                json.loads(line)
+                for line in (root / "control_plane" / "coordinator_events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(events[0]["event"], "legacy_imported")
+            self.assertEqual(events[-1]["event"], "plan_rebound")
+
+    def test_resume_rebinds_same_lineage_transport_without_losing_paused_progress(self) -> None:
+        from auto_foundry_core import (
+            CoordinatorRunSpec,
+            ItemWorkspace,
+            RequirementRecord,
+            RequirementSupervisorWorkspace,
+            RunContext,
+            RunCoordinator,
+            RunLifecycle,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_id = "RUN-TRANSPORT-RESUME"
+            context = RunContext(run_id, root)
+            lifecycle = RunLifecycle.create(context, ["REQ-001"], mode="requirement")
+            ItemWorkspace.create(context, "REQ-001", mode="requirement", original_text="Transport resume")
+            plan = RequirementSupervisorWorkspace(context).plan_requirements(
+                (RequirementRecord("REQ-001", "Transport resume"),),
+                planner_ref="control-center-planner",
+                persist=True,
+            )
+            lifecycle.pause("test transport resume")
+            settings = self.settings(root, enabled=True)
+            binding = coordinator_module.resolve_production_skill_binding(repo_root=root, role_cwd=root)
+            old_spec = CoordinatorRunSpec(
+                run_id=run_id,
+                generation_id="G-0001",
+                planner_ref=plan.planner_ref,
+                planner_hash=_planner_plan_hash(plan.to_dict()),
+                publication_policy={"enabled": False},
+                codex_exec={
+                    "binary": settings.codex_bin,
+                    "sandbox": "workspace-write",
+                    "ephemeral": True,
+                    **binding,
+                },
+            )
+            coordinator = RunCoordinator(context, planner=lambda _state: ())
+            coordinator.start(old_spec)
+            before_state = json.loads(coordinator.state_path.read_text(encoding="utf-8"))
+            manager = LaunchManager(settings)
+
+            prepared = manager.prepare_resume_coordinator(run_id, root)
+
+            self.assertEqual(prepared["operation"], "run")
+            persisted = json.loads((root / "control_plane" / "coordinator_spec.json").read_text(encoding="utf-8"))
+            self.assertEqual(persisted["generation_id"], old_spec.generation_id)
+            self.assertEqual(persisted["planner_ref"], old_spec.planner_ref)
+            self.assertEqual(persisted["planner_hash"], old_spec.planner_hash)
+            self.assertEqual(persisted["codex_exec"]["role_models"]["foundry_supervisor"], "gpt-5.6-sol")
+            self.assertEqual(persisted["codex_exec"]["role_reasoning_efforts"]["foundry_supervisor"], "high")
+            after_state = json.loads(coordinator.state_path.read_text(encoding="utf-8"))
+            self.assertEqual(after_state["status"], before_state["status"])
+            self.assertEqual(after_state["phase"], before_state["phase"])
+            self.assertEqual(after_state["active_dispatches"], before_state["active_dispatches"])
+            events = [
+                json.loads(line)
+                for line in (root / "control_plane" / "coordinator_events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(events[-1]["event"], "coordinator_transport_rebound")
+            self.assertEqual(lifecycle.status, "paused")
+
+    def test_resume_rebinds_rotated_skill_transport_after_coordinator_restart(self) -> None:
+        from auto_foundry_core import (
+            CoordinatorRunSpec,
+            ItemWorkspace,
+            RequirementRecord,
+            RequirementSupervisorWorkspace,
+            RunContext,
+            RunCoordinator,
+            RunLifecycle,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_id = "RUN-TRANSPORT-ROTATED-RESUME"
+            settings = self.settings(root, enabled=True)
+            context = RunContext(run_id, root)
+            lifecycle = RunLifecycle.create(context, ["REQ-001"], mode="requirement")
+            ItemWorkspace.create(context, "REQ-001", mode="requirement", original_text="Rotated transport resume")
+            plan = RequirementSupervisorWorkspace(context).plan_requirements(
+                (RequirementRecord("REQ-001", "Rotated transport resume"),),
+                planner_ref="control-center-planner",
+                persist=True,
+            )
+            lifecycle.pause("test rotated transport resume")
+            old_binding = coordinator_module.resolve_production_skill_binding(repo_root=root, role_cwd=root)
+            old_spec = CoordinatorRunSpec(
+                run_id=run_id,
+                generation_id="G-0001",
+                planner_ref=plan.planner_ref,
+                planner_hash=_planner_plan_hash(plan.to_dict()),
+                publication_policy={"enabled": False},
+                codex_exec={
+                    "binary": settings.codex_bin,
+                    "sandbox": "workspace-write",
+                    "ephemeral": True,
+                    **old_binding,
+                },
+            )
+            coordinator = RunCoordinator(context, planner=lambda _state: ())
+            coordinator.start(old_spec)
+            before_state = json.loads(coordinator.state_path.read_text(encoding="utf-8"))
+
+            skill_path = Path(old_binding["skill_path"])
+            (skill_path / "README.md").write_text("rotated release fixture\n", encoding="utf-8")
+            new_hash = hashlib.sha256(coordinator_module._skill_release_bytes(skill_path)).hexdigest()
+            self.assertNotEqual(old_binding["skill_sha256"], new_hash)
+            coordinator_module.PRODUCTION_SKILL_SHA256 = new_hash
+
+            # Recreate the launch manager after the skill release changed. The
+            # persisted coordinator object above is intentionally not reused;
+            # preparation must rotate transport before reconstructing it.
+            manager = LaunchManager(settings)
+            prepared = manager.prepare_resume_coordinator(run_id, root)
+
+            self.assertEqual(prepared["operation"], "run")
+            persisted = json.loads((root / "control_plane" / "coordinator_spec.json").read_text(encoding="utf-8"))
+            self.assertEqual(persisted["codex_exec"]["skill_sha256"], new_hash)
+            after_state = json.loads(coordinator.state_path.read_text(encoding="utf-8"))
+            for field in ("generation_id", "planner_ref", "planner_hash", "status", "phase", "active_dispatches", "attempt", "no_progress_count", "last_action"):
+                self.assertEqual(after_state[field], before_state[field])
+            events = [
+                json.loads(line)
+                for line in (root / "control_plane" / "coordinator_events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(events[-1]["event"], "coordinator_transport_rebound")
+            self.assertEqual(lifecycle.status, "paused")
+
+    def test_resume_rebinds_pending_plan_after_rotated_skill_and_restart(self) -> None:
+        """A pending plan intent is retargeted before a resumed child is built."""
+
+        from auto_foundry_core import (
+            CoordinatorRunSpec,
+            ItemWorkspace,
+            RequirementRecord,
+            RequirementRunExtension,
+            RequirementSupervisorWorkspace,
+            RunCoordinator,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_id = "RUN-PENDING-ROTATED-RESUME"
+            settings = self.settings(root, enabled=True)
+            context = RunContext(run_id, root)
+            lifecycle = RunLifecycle.create(context, ["REQ-001"], mode="requirement")
+            ItemWorkspace.create(context, "REQ-001", mode="requirement", original_text="Pending resume")
+            workspace = RequirementSupervisorWorkspace(context)
+            first_plan = workspace.plan_requirements(
+                (RequirementRecord("REQ-001", "Pending resume"),),
+                planner_ref="control-center-planner",
+                persist=True,
+            )
+            RequirementRunExtension.append(
+                context,
+                RequirementRecord("REQ-002", "New pending requirement"),
+            )
+            second_plan = workspace.load()
+            self.assertEqual(lifecycle.active_generation_id(context), "G-0002")
+
+            manager = LaunchManager(settings)
+            role_models, role_reasoning = manager._production_role_bindings(manager._core_imports())
+            old_binding = coordinator_module.resolve_production_skill_binding(repo_root=root, role_cwd=root)
+            old_codex = {
+                "binary": settings.codex_bin,
+                "sandbox": "workspace-write",
+                "ephemeral": True,
+                "role_models": role_models,
+                "role_reasoning_efforts": role_reasoning,
+                **old_binding,
+            }
+            source = CoordinatorRunSpec(
+                run_id,
+                "G-0001",
+                first_plan.planner_ref,
+                _planner_plan_hash(first_plan.to_dict()),
+                publication_policy={"enabled": False},
+                codex_exec=old_codex,
+            )
+            old_target = CoordinatorRunSpec(
+                run_id,
+                "G-0002",
+                second_plan.planner_ref,
+                _planner_plan_hash(second_plan.to_dict()),
+                publication_policy={"enabled": False},
+                codex_exec=old_codex,
+            )
+            coordinator = RunCoordinator(context, planner=lambda _state: ())
+            coordinator.start(source)
+
+            def fail_started(name: str) -> None:
+                if name == "plan_rebind_after_spec":
+                    raise RuntimeError(name)
+
+            coordinator._failpoint = fail_started
+            with self.assertRaises(RuntimeError):
+                coordinator.publish_and_rebind(old_target, lambda _spec: None)
+            raw_spec = json.loads((root / "control_plane" / "coordinator_spec.json").read_text(encoding="utf-8"))
+            state = json.loads((root / "control_plane" / "coordinator_state.json").read_text(encoding="utf-8"))
+            pending = state["pending_plan_rebind"]
+            self.assertEqual(raw_spec["generation_id"], old_target.generation_id)
+            self.assertNotEqual(state["generation_id"], raw_spec["generation_id"])
+            self.assertEqual(pending["old_spec_hash"], state["spec_hash"])
+            self.assertEqual(pending["new_spec_hash"], coordinator._spec_hash(old_target))
+            coordinator.close()
+
+            skill_path = Path(old_binding["skill_path"])
+            (skill_path / "README.md").write_text("rotated release fixture\n", encoding="utf-8")
+            new_hash = hashlib.sha256(coordinator_module._skill_release_bytes(skill_path)).hexdigest()
+            coordinator_module.PRODUCTION_SKILL_SHA256 = new_hash
+            os.environ["AUTO_FOUNDRY_TEST_SKILL_SHA256"] = new_hash
+
+            prepared = LaunchManager(settings).prepare_resume_coordinator(run_id, root)
+
+            self.assertEqual(prepared["operation"], "run")
+            persisted = json.loads((root / "control_plane" / "coordinator_spec.json").read_text(encoding="utf-8"))
+            self.assertEqual(persisted["generation_id"], "G-0002")
+            self.assertEqual(persisted["codex_exec"]["skill_sha256"], new_hash)
+            events = [
+                json.loads(line)
+                for line in (root / "control_plane" / "coordinator_events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                [event["event"] for event in events][-2:],
+                ["plan_rebind_transport_retargeted", "plan_rebound"],
+            )
 
     def test_production_launch_uses_planner_order_and_reusable_need_grouping(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1244,12 +2984,16 @@ class LaunchTests(unittest.TestCase):
                     "mode": "continue", "runId": run_id, "intakeBlocks": ["Blocked append"], "sources": [],
                     "maxAgents": 2, "capacity": {"total": 2, "entityResolution": 1, "analyticalOwner": 1, "specialist": 0},
                 })
-                with self.assertRaises(CoordinatorConflictError):
-                    manager.execute(
-                        draft_id=continuation["draftId"],
-                        fingerprint=continuation["fingerprint"],
-                        confirmed=True,
-                    )
+                result = manager.execute(
+                    draft_id=continuation["draftId"],
+                    fingerprint=continuation["fingerprint"],
+                    confirmed=True,
+                )
+                self.assertEqual(result["status"], "queued")
+                self.assertTrue(result["pendingDataRefresh"])
+                self.assertTrue(
+                    (run_root / "control_center" / "launches" / continuation["draftId"] / "pending_data_refresh.json").is_file()
+                )
                 self.assertFalse((run_root / "active_generation.json").exists())
                 self.assertFalse((run_root / "extensions" / "G-0002").exists())
                 self.assertEqual(
@@ -1283,6 +3027,9 @@ class LaunchTests(unittest.TestCase):
             })
             created = initial.execute(draft_id=first["draftId"], fingerprint=first["fingerprint"], confirmed=True)
             run_id = repository.list_runs()[0]["id"]
+            run_root = Path(created["runRoot"])
+            mission_pointer_path = run_root / "control_center" / "mission_context_active.json"
+            mission_pointer_before = mission_pointer_path.read_bytes()
             continuation = initial.prepare({
                 "mode": "continue", "runId": run_id, "intakeBlocks": ["Retry append"], "sources": [],
                 "maxAgents": 4, "capacity": {"total": 4, "entityResolution": 2, "analyticalOwner": 1, "specialist": 1},
@@ -1303,17 +3050,18 @@ class LaunchTests(unittest.TestCase):
 
             RunCoordinator.publish_and_rebind = fail_after_public_revise
             try:
-                with self.assertRaises(LaunchConflictError):
-                    initial.execute(
-                        draft_id=continuation["draftId"],
-                        fingerprint=continuation["fingerprint"],
-                        confirmed=True,
-                    )
+                queued = initial.execute(
+                    draft_id=continuation["draftId"],
+                    fingerprint=continuation["fingerprint"],
+                    confirmed=True,
+                )
+                self.assertEqual(queued["status"], "queued")
+                self.assertTrue(queued["pendingDataRefresh"])
             finally:
                 RunCoordinator.publish_and_rebind = original_publish
 
-            run_root = Path(created["runRoot"])
             self.assertTrue((run_root / "extensions" / "G-0002" / "requirement_supervisor_plan.json").is_file())
+            self.assertEqual(mission_pointer_path.read_bytes(), mission_pointer_before)
             self.assertEqual(json.loads((run_root / "active_generation.json").read_text())["generation_id"], "G-0002")
             self.assertEqual(
                 json.loads((run_root / "control_plane" / "coordinator_spec.json").read_text())["generation_id"],
@@ -1328,10 +3076,102 @@ class LaunchTests(unittest.TestCase):
                 confirmed=True,
             )
             self.assertEqual(result["status"], "accepted")
+            self.assertNotEqual(mission_pointer_path.read_bytes(), mission_pointer_before)
             self.assertEqual(json.loads((run_root / "control_plane" / "coordinator_spec.json").read_text())["generation_id"], "G-0002")
             events = events_path.read_text(encoding="utf-8")
             self.assertEqual(events.count('"event":"plan_rebound"'), 1)
             self.assertEqual(len(runner.calls), 2)
+
+    def test_queued_data_refresh_retries_through_consumer_and_promotes_once(self) -> None:
+        """The launch retry is the production pending->applied boundary.
+
+        The first consumer pass leaves the canonical D admission pending.  A
+        retry invokes the same ``RunCoordinator.consume_pending_data_refresh``
+        entrypoint, then promotes the staged MissionContext exactly once when
+        that consumer reports a non-pending phase.
+        """
+
+        from auto_foundry_core.coordinator import RunCoordinator
+        from auto_foundry_core.run_extension import RequirementRunExtension
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner = FakeRunner()
+            settings = self.settings(root, enabled=True)
+            repository = OperationalRepository(None, [settings.runs_root])
+            manager = LaunchManager(settings, repository=repository, runner=runner)
+            initial = manager.prepare({
+                "mode": "new",
+                "projectName": "Queued refresh consumer",
+                "intakeBlocks": ["Initial"],
+                "sources": [],
+                "maxAgents": 4,
+                "capacity": {"total": 4, "entityResolution": 2, "analyticalOwner": 1, "specialist": 1},
+            })
+            created = manager.execute(
+                draft_id=initial["draftId"],
+                fingerprint=initial["fingerprint"],
+                confirmed=True,
+            )
+            run_id = repository.list_runs()[0]["id"]
+            upload = manager.upload(
+                io.BytesIO(b"id,value\n2,3\n"),
+                filename="refresh.csv",
+                relative_path="refresh.csv",
+                content_length=len(b"id,value\n2,3\n"),
+            )
+            continuation = manager.prepare({
+                "mode": "continue",
+                "runId": run_id,
+                "intakeBlocks": ["Refresh"],
+                "sources": [{"kind": "upload", "uploadId": upload.upload_id}],
+                "maxAgents": 4,
+                "capacity": {"total": 4, "entityResolution": 2, "analyticalOwner": 1, "specialist": 1},
+            })
+            run_root = Path(created["runRoot"])
+            mission_pointer = run_root / "control_center" / "mission_context_active.json"
+            before = mission_pointer.read_bytes()
+            consume_calls = 0
+
+            def consume_once_then_apply(_coordinator):
+                nonlocal consume_calls
+                consume_calls += 1
+                if consume_calls == 1:
+                    return SimpleNamespace(phase="data_refresh_pending", active_dispatches=())
+                return SimpleNamespace(phase="waiting", active_dispatches=())
+
+            class LoadedExtension:
+                generation_id = "G-0002"
+
+            LoadedExtension.plan_path = run_root / "requirement_supervisor_plan.json"
+
+            with patch.object(RunCoordinator, "consume_pending_data_refresh", consume_once_then_apply), patch.object(
+                RequirementRunExtension,
+                "load",
+                return_value=LoadedExtension(),
+            ), patch.object(manager, "_prepare_coordinator", return_value={"operation": "run"}), patch.object(
+                manager,
+                "_promote_staged_mission_artifacts",
+                wraps=manager._promote_staged_mission_artifacts,
+            ) as promote:
+                queued = manager.execute(
+                    draft_id=continuation["draftId"],
+                    fingerprint=continuation["fingerprint"],
+                    confirmed=True,
+                )
+                self.assertTrue(queued["pendingDataRefresh"])
+                self.assertEqual(queued["status"], "queued")
+                self.assertEqual(mission_pointer.read_bytes(), before)
+                applied = manager.execute(
+                    draft_id=continuation["draftId"],
+                    fingerprint=continuation["fingerprint"],
+                    confirmed=True,
+                )
+
+            self.assertEqual(applied["status"], "accepted")
+            self.assertEqual(consume_calls, 2)
+            self.assertEqual(promote.call_count, 1)
+            self.assertNotEqual(mission_pointer.read_bytes(), before)
 
     def test_continuation_uses_public_revision_when_planner_splits_an_existing_group(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1449,7 +3289,10 @@ class LaunchTests(unittest.TestCase):
             archive_bytes = b"immutable external archive"
             archive.write_bytes(archive_bytes)
             digest = hashlib.sha256(archive_bytes).hexdigest()
-            (run_root / "inputs" / "data_room.zip").unlink()
+            # New-run bootstrap owns an immutable D-0001 alias.  Keep the
+            # legacy archive in place; an unrelated external catalog must not
+            # replace or invalidate that authoritative revision.
+            self.assertTrue((run_root / "inputs" / "data_room.zip").is_file())
             context_manifest = {
                 "run_id": created["runId"],
                 "run_root": str(run_root),
@@ -1468,20 +3311,14 @@ class LaunchTests(unittest.TestCase):
                 "mode": "continue", "runId": discoverable_id, "intakeBlocks": ["External append"], "sources": [],
                 "maxAgents": 4, "capacity": {"total": 4, "entityResolution": 2, "analyticalOwner": 1, "specialist": 1},
             })
-            result = manager.execute(draft_id=continuation["draftId"], fingerprint=continuation["fingerprint"], confirmed=True)
-            manifest_path = Path(runner.calls[-1]["manifest_path"])
-            manifest = json.loads(manifest_path.read_text())
-            self.assertEqual(manifest["dataRoom"], str(archive))
-            self.assertEqual(manifest["dataRoomSha256"], digest)
-            self.assertFalse((run_root / "inputs" / "data_room.zip").exists())
-            self.assertTrue((run_root / "control_center" / "launches" / continuation["draftId"] / "launch_receipt.json").is_file())
-            second = manager.prepare({
-                "mode": "continue", "runId": discoverable_id, "intakeBlocks": ["Second external append"], "sources": [],
-                "maxAgents": 4, "capacity": {"total": 4, "entityResolution": 2, "analyticalOwner": 1, "specialist": 1},
-            })
-            manager.execute(draft_id=second["draftId"], fingerprint=second["fingerprint"], confirmed=True)
-            self.assertTrue((run_root / "control_center" / "launches" / second["draftId"] / "launch_receipt.json").is_file())
-            self.assertTrue((run_root / "control_center" / "launches" / continuation["draftId"] / "launch_receipt.json").is_file())
+            result = manager.execute(
+                draft_id=continuation["draftId"],
+                fingerprint=continuation["fingerprint"],
+                confirmed=True,
+            )
+            self.assertEqual(result["status"], "accepted")
+            self.assertEqual(result["dataRevisionId"], "D-0001")
+            self.assertTrue((run_root / "inputs" / "data_room.zip").is_file())
 
     def test_continue_intent_recovers_after_append_before_runner_and_status_loss(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1932,6 +3769,41 @@ class LaunchTests(unittest.TestCase):
             self.assertEqual([source["memberCount"] for source in draft["sources"]], [1, 1])
             self.assertEqual([source["expandedSize"] for source in draft["sources"]], [len(b"id,value\n1,2\n"), len(b'{"event":"open"}\n')])
 
+    def test_zip_member_over_64_mib_is_streamed_without_business_size_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source" / "large-member.zip"
+            source.parent.mkdir(parents=True)
+            member_size = 64 * 1024 * 1024 + 1
+            info = zipfile.ZipInfo("payload.bin")
+            info.compress_type = zipfile.ZIP_STORED
+            with zipfile.ZipFile(source, "w", allowZip64=True) as archive:
+                with archive.open(info, "w") as target:
+                    chunk = b"x" * (1024 * 1024)
+                    remaining = member_size
+                    while remaining:
+                        piece = chunk if remaining >= len(chunk) else chunk[:remaining]
+                        target.write(piece)
+                        remaining -= len(piece)
+            manager = LaunchManager(self.settings(root))
+            prepared = manager.prepare(
+                {
+                    "mode": "new",
+                    "projectName": "Large archive member",
+                    "intakeBlocks": ["r"],
+                    "sources": [{"kind": "local_path", "path": str(source)}],
+                    "maxAgents": 1,
+                    "capacity": {"total": 1, "entityResolution": 0, "analyticalOwner": 1, "specialist": 0},
+                }
+            )
+            self.assertTrue(prepared["valid"], prepared.get("errors"))
+            draft = manager._load_draft(prepared["draftId"], prepared["fingerprint"])
+            destination = root / "large-package.zip"
+            entries = manager._package_zip(draft, destination)
+            self.assertEqual(entries[0]["size"], member_size)
+            with zipfile.ZipFile(destination) as packaged:
+                self.assertEqual(packaged.getinfo("payload.bin").file_size, member_size)
+
     def test_zip_mixed_members_flatten_and_open_with_core_dataroom(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2032,14 +3904,104 @@ class LaunchTests(unittest.TestCase):
             self.assertIn("sources[1]", rejected["errors"])
             self.assertIn("PLAIN.CSV", rejected["errors"]["sources[1]"])
 
+    def test_local_package_binds_one_descriptor_and_keeps_destination_on_mutation(self) -> None:
+        """A source mutation during streaming cannot publish a partial package."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source" / "mutable.bin"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"a" * (2 * 1024 * 1024))
+            manager = LaunchManager(self.settings(root))
+            prepared = manager.prepare(
+                {
+                    "mode": "new",
+                    "projectName": "Local descriptor binding",
+                    "intakeBlocks": ["r"],
+                    "sources": [{"kind": "local_path", "path": str(source)}],
+                    "maxAgents": 1,
+                    "capacity": {"total": 1, "entityResolution": 0, "analyticalOwner": 1, "specialist": 0},
+                }
+            )
+            self.assertTrue(prepared["prepared"], prepared.get("errors"))
+            draft = manager._load_draft(prepared["draftId"], prepared["fingerprint"])
+            destination = root / "package.zip"
+            destination.write_bytes(b"previous package remains intact")
+            original_open = launch_module.Path.open
+            mutated = False
+
+            class MutatingReader:
+                def __init__(self, stream):
+                    self.stream = stream
+
+                def __enter__(self):
+                    self.stream.__enter__()
+                    return self
+
+                def __exit__(self, *args):
+                    return self.stream.__exit__(*args)
+
+                def read(self, *args, **kwargs):
+                    nonlocal mutated
+                    data = self.stream.read(*args, **kwargs)
+                    if data and not mutated:
+                        mutated = True
+                        descriptor = os.open(source, os.O_RDWR)
+                        try:
+                            os.pwrite(descriptor, b"b", 1_500_000)
+                        finally:
+                            os.close(descriptor)
+                    return data
+
+                def __getattr__(self, name):
+                    return getattr(self.stream, name)
+
+            def hooked_open(path, *args, **kwargs):
+                stream = original_open(path, *args, **kwargs)
+                mode = args[0] if args else kwargs.get("mode", "r")
+                if Path(path) == source.resolve() and mode == "rb":
+                    return MutatingReader(stream)
+                return stream
+
+            with patch("apps.control_center_operational.launch.Path.open", new=hooked_open):
+                with self.assertRaisesRegex(ValueError, "local source changed after prepare"):
+                    manager._package_zip(draft, destination)
+            self.assertTrue(mutated)
+            self.assertEqual(destination.read_bytes(), b"previous package remains intact")
+            self.assertEqual(list(root.glob(f".{destination.name}.*.tmp")), [])
+
+    def test_symlink_component_walk_reaches_deep_ancestors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_root = root / "source"
+            source_root.mkdir()
+            target = source_root / "target"
+            target.mkdir()
+            alias = source_root / "deep-alias"
+            alias.symlink_to(target, target_is_directory=True)
+            deep_alias = alias
+            for index in range(130):
+                deep_alias = deep_alias / f"d{index}"
+            deep_alias.mkdir(parents=True)
+            aliased_file = deep_alias / "payload.bin"
+            aliased_file.write_bytes(b"x")
+            with self.assertRaisesRegex(ValueError, "symlink source paths"):
+                launch_module.reject_symlink_components(aliased_file, source_root)
+
+            deep_plain = source_root / "deep-plain"
+            for index in range(130):
+                deep_plain = deep_plain / f"d{index}"
+            deep_plain.mkdir(parents=True)
+            plain_file = deep_plain / "payload.bin"
+            plain_file.write_bytes(b"x")
+            launch_module.reject_symlink_components(plain_file, source_root)
+
     def test_zip_adversarial_members_report_concrete_errors(self) -> None:
         cases = [
             ("traversal", [("../evil.csv", b"x")], "evil.csv"),
             ("absolute", [("/evil.csv", b"x")], "evil.csv"),
             ("backslash", [("dir\\evil.csv", b"x")], "evil.csv"),
             ("drive", [("C:evil.csv", b"x")], "evil.csv"),
-            ("nested", [("inner.zip", b"x")], "inner.zip"),
-            ("unsupported", [("payload.bin", b"x")], "payload.bin"),
             ("duplicate", [("Thing.CSV", b"x"), ("thing.csv", b"y")], "thing.csv"),
         ]
         with tempfile.TemporaryDirectory() as directory:
@@ -2062,6 +4024,28 @@ class LaunchTests(unittest.TestCase):
                 self.assertFalse(result["valid"], label)
                 self.assertIn("sources[0]", result["errors"], label)
                 self.assertIn(expected, result["errors"]["sources[0]"], label)
+
+            for label, member_name in (("nested", "inner.zip"), ("unknown", "payload.bin")):
+                path = root / "source" / f"{label}.zip"
+                path.write_bytes(_zip_payload([(member_name, b"opaque")]))
+                manager = LaunchManager(self.settings(root))
+                result = manager.prepare(
+                    {
+                        "mode": "new",
+                        "projectName": label,
+                        "intakeBlocks": ["r"],
+                        "sources": [{"kind": "local_path", "path": str(path)}],
+                        "maxAgents": 1,
+                        "capacity": {"total": 1, "entityResolution": 0, "analyticalOwner": 1, "specialist": 0},
+                    }
+                )
+                self.assertTrue(result["valid"], label)
+                draft = json.loads((manager.drafts_root / f"{result['draftId']}.json").read_text())
+                self.assertEqual(draft["sources"][0]["memberCount"], 1)
+                packaged = root / f"{label}-package.zip"
+                manager._package_zip(draft, packaged)
+                with zipfile.ZipFile(packaged) as output:
+                    self.assertEqual(output.namelist(), [member_name])
 
             symlink_path = root / "source" / "symlink.zip"
             symlink_output = io.BytesIO()
@@ -2181,10 +4165,14 @@ class LaunchTests(unittest.TestCase):
             source.parent.mkdir(parents=True)
             valid = _zip_payload([("safe.csv", b"x")], compression=zipfile.ZIP_STORED)
 
-            source.write_bytes(_forge_eocd_fields(valid, entries=MAX_ZIP_MEMBER_COUNT + 1))
-            with patch("apps.control_center_operational.launch.zipfile.ZipFile", side_effect=AssertionError("ZipFile allocation was not bounded")):
-                with self.assertRaisesRegex(ValueError, "physical entry limit"):
-                    _inspect_zip_source(source, max_total_bytes=100, read_members=True)
+            source.write_bytes(_forge_eocd_fields(valid, entries=4097))
+            # The historical count is now an explicit opt-in cap.  Keep this
+            # pre-allocation guard regression without coupling it to the
+            # unbounded default.
+            with patch("apps.control_center_operational.launch.MAX_ZIP_MEMBER_COUNT", 4096):
+                with patch("apps.control_center_operational.launch.zipfile.ZipFile", side_effect=AssertionError("ZipFile allocation was not bounded")):
+                    with self.assertRaisesRegex(ValueError, "physical entry limit"):
+                        _inspect_zip_source(source, max_total_bytes=100, read_members=True)
 
             source.write_bytes(_forge_eocd_fields(valid, central_size=65))
             with patch("apps.control_center_operational.launch.MAX_ZIP_CENTRAL_DIRECTORY_BYTES", 64):
@@ -2201,6 +4189,22 @@ class LaunchTests(unittest.TestCase):
             inspection = _inspect_zip_source(source, max_total_bytes=100, read_members=True)
             self.assertEqual(inspection.member_count, 1)
             self.assertEqual(inspection.members[0].name, "safe.csv")
+            manager = LaunchManager(self.settings(root))
+            prepared = manager.prepare(
+                {
+                    "mode": "new",
+                    "projectName": "ZIP64 package",
+                    "intakeBlocks": ["r"],
+                    "sources": [{"kind": "local_path", "path": str(source)}],
+                    "maxAgents": 1,
+                    "capacity": {"total": 1, "entityResolution": 0, "analyticalOwner": 1, "specialist": 0},
+                }
+            )
+            self.assertTrue(prepared["valid"], prepared.get("errors"))
+            packaged = root / "zip64-package.zip"
+            manager._package_zip(manager._load_draft(prepared["draftId"], prepared["fingerprint"]), packaged)
+            with zipfile.ZipFile(packaged) as output:
+                self.assertEqual(output.namelist(), ["safe.csv"])
 
             ordinary_sfx = root / "source" / "ordinary-sfx.zip"
             ordinary_sfx.write_bytes(b"SFX-PREFIX" + _zip_payload([("safe.csv", b"x")], compression=zipfile.ZIP_STORED))
@@ -2431,6 +4435,59 @@ class LaunchTests(unittest.TestCase):
             )
             result = prepare("aggregate-bound-reduced", _zip_payload([("aggregate.csv", b"12345")]), settings=reduced)
             self.assertIn("aggregate.csv", result["errors"]["sources[0]"])
+
+    def test_default_source_and_zip_counts_are_unbounded_but_explicit_caps_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = self.settings(root)
+            manager = LaunchManager(settings)
+            source_root = root / "source"
+            source_paths = []
+            for index in range(257):
+                path = source_root / f"source-{index:03d}.txt"
+                path.write_text("x", encoding="utf-8")
+                source_paths.append({"kind": "local_path", "path": str(path)})
+
+            canonical, errors = manager._canonical_sources(source_paths, mode="new")
+            self.assertEqual(len(canonical), 257)
+            self.assertNotIn("sources", errors)
+            prepared = manager.prepare(
+                {
+                    "mode": "new",
+                    "projectName": "many local sources",
+                    "intakeBlocks": ["r"],
+                    "sources": source_paths,
+                    "maxAgents": 1,
+                    "capacity": {"total": 1, "entityResolution": 0, "analyticalOwner": 1, "specialist": 0},
+                }
+            )
+            self.assertTrue(prepared["valid"], prepared.get("errors"))
+            self.assertEqual(prepared["summary"]["sources"], 257)
+
+            capped = LaunchSettings(
+                runtime_root=root,
+                runs_root=root / "capped-runs",
+                source_roots=(source_root,),
+                max_source_count=2,
+            )
+            capped_manager = LaunchManager(capped)
+            _canonical, capped_errors = capped_manager._canonical_sources(source_paths[:3], mode="new")
+            self.assertEqual(capped_errors.get("sources"), "Too many source entries.")
+
+            archive = source_root / "more-than-legacy-members.zip"
+            archive.write_bytes(
+                _zip_payload(
+                    [(f"member-{index:04d}.txt", b"") for index in range(4097)],
+                    compression=zipfile.ZIP_STORED,
+                )
+            )
+            inspection = _inspect_zip_source(archive, max_total_bytes=None, read_members=False)
+            self.assertEqual(inspection.member_count, 4097)
+            self.assertEqual(inspection.physical_entry_count, 4097)
+            with patch("apps.control_center_operational.launch.MAX_ZIP_MEMBER_COUNT", 2), self.assertRaisesRegex(
+                ValueError, "physical entry limit"
+            ):
+                _inspect_zip_source(archive, max_total_bytes=None, read_members=False)
 
     def test_zip_physical_entry_and_ignored_metadata_bytes_honor_reduced_bounds(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

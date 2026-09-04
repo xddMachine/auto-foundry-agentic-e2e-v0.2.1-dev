@@ -58,6 +58,66 @@ def _receipt(
     )
 
 
+def _committed_boundary(item_id: str) -> dict[str, object]:
+    """Return the typed boundary emitted by Planner's commit inspector.
+
+    Lifecycle reconciliation must consume the validated committed-manifest
+    projection, not infer integration success from the item-level label.  The
+    receipt tests use mapping projections, so carry the same typed proof that
+    a persisted ``inspect_committed_integration`` view provides.
+    """
+
+    return {
+        "valid": True,
+        "stage": "committed",
+        "verdict": "committed",
+        "diagnostics": [],
+        "session_id": f"session-{item_id}",
+        "records_count": 1,
+        "records_hash": "b" * 64,
+        "manifest_hash": "c" * 64,
+    }
+
+
+def _accepted_item(item_id: str, *, outcome: str = "accepted") -> dict[str, object]:
+    return {
+        "item_id": item_id,
+        "lifecycle_state": "accepted",
+        "terminal_outcome": {"outcome": outcome},
+        "integration_state": "integrated",
+        "committed_integration_validation": _committed_boundary(item_id),
+    }
+
+
+def _preacceptance_failure_item(item_id: str = "Q-001", *, validated: bool) -> dict[str, object]:
+    """Return a serialized pre-acceptance failure projection.
+
+    Mapping projections must carry the same typed proof as the pure
+    ``inspect_committed_integration`` view.  The unvalidated shape is useful
+    for proving that a terminal-looking label cannot satisfy the lifecycle
+    integration barrier by itself.
+    """
+
+    item: dict[str, object] = {
+        "item_id": item_id,
+        "lifecycle_state": "technical_failure",
+        "terminal_outcome": {
+            "status": "technical_failure",
+            "outcome": "technical_failure",
+        },
+        "integration_state": "pending",
+        "integration_stage": "technical_failure",
+    }
+    if validated:
+        item["committed_integration_validation"] = {
+            "valid": True,
+            "stage": "technical_failure",
+            "pre_acceptance": True,
+            "recovery_exhausted": True,
+        }
+    return item
+
+
 def _append_receipt_in_process(args: tuple[str, str, str]) -> tuple[str, str]:
     """Process worker used to exercise the POSIX ledger advisory lock."""
 
@@ -142,12 +202,7 @@ def test_run_lifecycle_reconciles_objective_barriers_and_limits(tmp_path: Path) 
     ]
     assert lifecycle.reconcile(incomplete).state == "running"
     accepted = [
-        {
-            "item_id": "Q-001",
-            "lifecycle_state": "accepted",
-            "terminal_outcome": {"outcome": "accepted"},
-            "integration_state": "integrated",
-        },
+        _accepted_item("Q-001"),
         {
             "item_id": "Q-002",
             "lifecycle_state": "accepted",
@@ -155,11 +210,59 @@ def test_run_lifecycle_reconciles_objective_barriers_and_limits(tmp_path: Path) 
             "integration_state": "technical_failure",
         },
     ]
-    assert lifecycle.reconcile(accepted).state == "integration_complete"
-    assert lifecycle.reconcile(accepted, product_terminal_status="draft").state == "integration_complete"
-    assert lifecycle.reconcile(accepted, product_terminal_status="complete", optimizer_terminal={"status": "technical_failure", "nonblocking": True}).state == "complete_with_limits"
+    # Business acceptance is preserved, but a technical integration failure
+    # remains actionable and cannot satisfy the integration barrier.
+    assert lifecycle.reconcile(accepted).state == "analytical_complete"
+    assert lifecycle.reconcile(accepted, product_terminal_status="draft").state == "analytical_complete"
+
+    # Once the same item is repaired and the Planner's typed committed proof
+    # is present, the ordinary integration/product barriers can advance.
+    repaired = [_accepted_item("Q-001"), _accepted_item("Q-002", outcome="accepted_with_limits")]
+    assert lifecycle.reconcile(repaired).state == "integration_complete"
+    assert lifecycle.reconcile(repaired, product_terminal_status="draft").state == "integration_complete"
+    assert lifecycle.reconcile(
+        repaired,
+        product_terminal_status="complete",
+        optimizer_terminal={"status": "technical_failure", "nonblocking": True},
+    ).state == "complete_with_limits"
     with pytest.raises(ValueError, match="item IDs"):
         RunLifecycle.create(_context(tmp_path / "other"), ["Q-001"]).reconcile(accepted)
+
+
+def test_mapping_preacceptance_failure_without_typed_boundary_cannot_settle_run(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    lifecycle = RunLifecycle.create(context, ["Q-001"])
+    fabricated = [_preacceptance_failure_item(validated=False)]
+
+    snapshot = lifecycle.reconcile(fabricated, product_terminal_status="complete")
+
+    # The terminal item outcome is enough to complete analysis, but the
+    # unvalidated label must not satisfy the integration barrier.
+    assert snapshot.state == "analytical_complete"
+
+
+def test_mapping_preacceptance_failure_with_typed_boundary_settles_limited_run(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    lifecycle = RunLifecycle.create(context, ["Q-001"])
+    validated = [_preacceptance_failure_item(validated=True)]
+
+    snapshot = lifecycle.reconcile(validated, product_terminal_status="complete")
+
+    assert snapshot.state == "complete_with_limits"
+
+
+def test_workspace_preacceptance_failure_mixed_with_accepted_item_settles_limited_run(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    lifecycle = RunLifecycle.create(context, ["Q-001", "Q-002"])
+    failed = ItemWorkspace.create(context, "Q-001", original_text="bounded")
+    failed.technical_failure("analysis transport exhausted", recovery_exhausted=True)
+
+    snapshot = lifecycle.reconcile(
+        [failed, _accepted_item("Q-002")],
+        product_terminal_status="complete",
+    )
+
+    assert snapshot.state == "complete_with_limits"
 
 
 def test_run_lifecycle_existing_identity_is_exact(tmp_path: Path) -> None:
@@ -181,10 +284,7 @@ def test_run_lifecycle_stale_instances_reload_and_never_regress_terminal_state(t
     ]
     assert first.reconcile(working).state == "running"
     assert stale.reconcile(working).state == "running"
-    accepted = [
-        {"item_id": "Q-001", "lifecycle_state": "accepted", "terminal_outcome": {"outcome": "accepted"}, "integration_state": "integrated"},
-        {"item_id": "Q-002", "lifecycle_state": "accepted", "terminal_outcome": {"outcome": "accepted"}, "integration_state": "integrated"},
-    ]
+    accepted = [_accepted_item("Q-001"), _accepted_item("Q-002")]
     assert stale.reconcile(accepted).state == "integration_complete"
     assert first.reconcile(accepted, product_terminal_status="complete").state == "complete"
     # The stale object receives incomplete facts, but authoritative reload

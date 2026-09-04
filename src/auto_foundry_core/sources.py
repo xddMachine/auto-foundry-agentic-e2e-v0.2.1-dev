@@ -7,15 +7,20 @@ from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
+import sqlite3
 from typing import Any, Iterable, Iterator, Mapping
+from urllib.parse import quote
 
 from .contracts import DataAssetRef, DocumentRef, TableRef
 from .workspace import validate_allowed_path
 
 
-TABULAR_FORMATS = frozenset({"csv", "tsv", "json", "jsonl", "ndjson", "xlsx", "parquet"})
+TABULAR_FORMATS = frozenset({"csv", "tsv", "json", "jsonl", "ndjson", "xlsx", "parquet", "sqlite"})
+SQLITE_SUFFIXES = frozenset({"db", "sqlite", "sqlite3"})
 TEXT_FORMATS = frozenset({"txt", "md", "markdown", "rst", "html", "htm", "xml", "log"})
-DEFAULT_JSON_MAX_BYTES = 16 * 1024 * 1024
+# JSON is decoded without an arbitrary default byte ceiling.  Callers that
+# need a bounded operation may provide ``max_json_bytes`` explicitly.
+DEFAULT_JSON_MAX_BYTES: int | None = None
 
 
 def hash_file(
@@ -39,6 +44,8 @@ def _format(path: Path, explicit: str | None = None) -> str:
     value = value.lower().lstrip(".")
     if value == "ndjson":
         return "jsonl"
+    if value in SQLITE_SUFFIXES:
+        return "sqlite"
     return value
 
 
@@ -109,6 +116,59 @@ def _pyarrow():
     return pq
 
 
+def _quote_sqlite_identifier(identifier: str) -> str:
+    """Quote one SQLite identifier without allowing SQL fragments."""
+
+    value = str(identifier)
+    if not value or "\x00" in value:
+        raise ValueError("SQLite identifiers must be non-empty and NUL-free")
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _sqlite_connect(path: Path) -> sqlite3.Connection:
+    """Open a SQLite database read-only and force query-only mode."""
+
+    # URI mode=ro prevents accidental creation or writes.  Quote the complete
+    # path so ``?``, ``#`` and other URI-significant bytes cannot alter the
+    # connection flags.
+    uri = f"file:{quote(str(path), safe='/:')}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True)
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        connection.row_factory = sqlite3.Row
+    except Exception:
+        connection.close()
+        raise
+    return connection
+
+
+def _sqlite_tables(path: Path) -> list[str]:
+    """Return user tables in deterministic binary-name order."""
+
+    connection = _sqlite_connect(path)
+    try:
+        rows = connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
+            "ORDER BY name COLLATE BINARY"
+        ).fetchall()
+        return [str(row[0]) for row in rows]
+    finally:
+        connection.close()
+
+
+def _sqlite_table_name(path: Path, table: str | None) -> str:
+    names = _sqlite_tables(path)
+    if table is None:
+        if not names:
+            raise ValueError(f"SQLite database contains no user tables: {path.name}")
+        return names[0]
+    value = str(table)
+    if value not in names:
+        raise KeyError(f"unknown SQLite table: {value}")
+    return value
+
+
 def discover(
     source: DataAssetRef | str | Path,
     *,
@@ -118,7 +178,7 @@ def discover(
 
     asset = _asset(source, allowed_roots)
     path = Path(asset.uri)
-    fmt = asset.format or _format(path)
+    fmt = _format(path, asset.format)
     if fmt == "xls":
         raise ValueError("unsupported source format: xls; use xlsx or convert the workbook explicitly")
     if fmt == "xlsx":
@@ -127,6 +187,8 @@ def discover(
             return [TableRef(asset=asset, name=str(name), kind="sheet") for name in workbook.sheetnames]
         finally:
             workbook.close()
+    if fmt == "sqlite":
+        return [TableRef(asset=asset, name=name, kind="table") for name in _sqlite_tables(path)]
     if fmt in TABULAR_FORMATS:
         return [TableRef(asset=asset, name=path.stem, kind="table")]
     return [DocumentRef(asset=asset, title=path.name)]
@@ -138,7 +200,7 @@ def _rows_csv(path: Path, *, delimiter: str = ",") -> Iterator[dict[str, Any]]:
             yield dict(row)
 
 
-def _rows_json(path: Path, fmt: str, *, max_bytes: int = DEFAULT_JSON_MAX_BYTES) -> Iterator[dict[str, Any]]:
+def _rows_json(path: Path, fmt: str, *, max_bytes: int | None = DEFAULT_JSON_MAX_BYTES) -> Iterator[dict[str, Any]]:
     if fmt == "jsonl":
         with path.open("r", encoding="utf-8-sig") as stream:
             for line_number, line in enumerate(stream, 1):
@@ -147,10 +209,10 @@ def _rows_json(path: Path, fmt: str, *, max_bytes: int = DEFAULT_JSON_MAX_BYTES)
                 value = json.loads(line)
                 yield value if isinstance(value, dict) else {"value": value, "_line": line_number}
         return
-    if max_bytes < 0:
+    if max_bytes is not None and (isinstance(max_bytes, bool) or max_bytes < 0):
         raise ValueError("max_json_bytes cannot be negative")
     size_bytes = path.stat().st_size
-    if size_bytes > max_bytes:
+    if max_bytes is not None and size_bytes > max_bytes:
         raise ValueError(
             f"ordinary JSON materialization boundary exceeded: {size_bytes} bytes > {max_bytes} max_json_bytes"
         )
@@ -198,6 +260,23 @@ def _rows_parquet(path: Path, *, batch_size: int = 1024) -> Iterator[dict[str, A
         yield from batch.to_pylist()
 
 
+def _rows_sqlite(path: Path, table: str | None, *, batch_size: int = 1024) -> Iterator[dict[str, Any]]:
+    if batch_size <= 0:
+        raise ValueError("sqlite_batch_size must be positive")
+    name = _sqlite_table_name(path, table)
+    connection = _sqlite_connect(path)
+    try:
+        cursor = connection.execute(f"SELECT * FROM {_quote_sqlite_identifier(name)}")
+        while True:
+            batch = cursor.fetchmany(batch_size)
+            if not batch:
+                break
+            for row in batch:
+                yield {str(key): row[key] for key in row.keys()}
+    finally:
+        connection.close()
+
+
 def _rows_text(path: Path) -> Iterator[dict[str, Any]]:
     with path.open("r", encoding="utf-8", errors="replace") as stream:
         for line in stream:
@@ -210,7 +289,7 @@ def read_rows(
     table: str | None = None,
     limit: int | None = None,
     offset: int = 0,
-    max_json_bytes: int = DEFAULT_JSON_MAX_BYTES,
+    max_json_bytes: int | None = DEFAULT_JSON_MAX_BYTES,
     parquet_batch_size: int = 1024,
     allowed_roots: Iterable[str | Path] | None = None,
 ) -> list[dict[str, Any]]:
@@ -226,7 +305,7 @@ def read_rows(
         table = sheet
     asset = _asset(source, allowed_roots)
     path = Path(asset.uri)
-    fmt = asset.format or _format(path)
+    fmt = _format(path, asset.format)
     if fmt == "csv":
         rows = _rows_csv(path)
     elif fmt == "tsv":
@@ -239,6 +318,8 @@ def read_rows(
         raise ValueError("unsupported source format: xls; use xlsx or convert the workbook explicitly")
     elif fmt == "parquet":
         rows = _rows_parquet(path, batch_size=parquet_batch_size)
+    elif fmt == "sqlite":
+        rows = _rows_sqlite(path, table)
     elif fmt in TEXT_FORMATS:
         rows = _rows_text(path)
     else:
@@ -257,7 +338,7 @@ def preview(
     source: DataAssetRef | TableRef | str | Path,
     *,
     limit: int = 20,
-    max_json_bytes: int = DEFAULT_JSON_MAX_BYTES,
+    max_json_bytes: int | None = DEFAULT_JSON_MAX_BYTES,
     parquet_batch_size: int = 1024,
     allowed_roots: Iterable[str | Path] | None = None,
 ) -> dict[str, Any]:

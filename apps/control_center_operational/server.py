@@ -1,8 +1,10 @@
-"""Loopback operational Control Center server.
+"""Single loopback Operational Control Center runtime.
 
-The original dark Control Center and the light dashboard prototype remain
-unchanged.  This server composes their read-only repository/assets and adds a
-small, token-protected operational API for staged new-run launches.
+The operational package owns the HTTP surface, read model, and static shell.
+It is the only supported Control Center entry point; all browser operations
+remain bounded and local while launch/run-control commands require the explicit
+fingerprint and token checks implemented by :mod:`launch` and
+:mod:`run_control`.
 """
 
 from __future__ import annotations
@@ -13,18 +15,17 @@ import ipaddress
 import mimetypes
 import sys
 from http import HTTPStatus
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-from apps.control_center.server import (
+from .read_model import (
     DEFAULT_FIXTURE,
-    ControlCenterHandler,
     ReadOnlyRepository,
+    _utc_now,
     _safe_text,
 )
-from apps.control_center_dashboard_prototype.server import render_index as render_dashboard_index
 
 from .launch import (
     MAX_REQUEST_BYTES,
@@ -41,34 +42,16 @@ from .run_control import RunControlManager
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 REPO_ROOT = APP_DIR.parents[1]
-OPERATIONAL_ASSETS = {"/operational.css": STATIC_DIR / "operational.css", "/operational.js": STATIC_DIR / "operational.js"}
-
-
 def render_index() -> bytes:
-    """Layer operational assets/text on the dashboard prototype shell only."""
+    """Return the canonical operational shell from this package's static dir."""
 
-    html = render_dashboard_index().decode("utf-8")
-    replacements = {
-        "<em>deferred</em>": "<em>fetched on execute</em>",
-        "Compose and validate a launch draft. Runtime commands remain disabled in the safe Layer 1 build.": "Prepare an immutable launch package, then explicitly confirm before starting a local Planner session.",
-        "DRAFT VALIDATION ONLY": "TWO-STEP LAUNCH",
-        "Validate draft": "Prepare launch",
-        "This action validates only. It cannot start, stop, or change a run.": "Preparation is non-mutating; Start run requires a second fingerprint-bound confirmation.",
-        'type="range" min="1" max="8" value="8"': 'type="range" min="1" max="64" value="64"',
-        '<script src="/app.js" defer></script>': '<script src="/app.js" defer></script>\n    <script src="/operational.js" defer></script>',
-    }
-    for old, new in replacements.items():
-        html = html.replace(old, new)
-    # The base prototype adds base.css and theme.css.  Keep both links and
-    # append the operational layer after them so cascade order is explicit.
-    html = html.replace(
-        '<link rel="stylesheet" href="/theme.css" />',
-        '<link rel="stylesheet" href="/theme.css" />\n    <link rel="stylesheet" href="/operational.css" />',
-    )
-    return html.encode("utf-8")
+    path = STATIC_DIR / "index.html"
+    if path.is_symlink() or not path.is_file():
+        raise FileNotFoundError(path)
+    return path.read_bytes()
 
 
-class OperationalHandler(ControlCenterHandler):
+class OperationalHandler(BaseHTTPRequestHandler):
     server_version = "AutoFoundryControlCenterOperational/0.1"
 
     @property
@@ -83,31 +66,103 @@ class OperationalHandler(ControlCenterHandler):
     def run_control(self) -> RunControlManager:
         return self.server.run_control  # type: ignore[attr-defined]
 
+    def log_message(self, format: str, *args: Any) -> None:
+        sys.stderr.write(f"[control-center-operational] {self.address_string()} {format % args}\n")
+
+    def _security_headers(self, *, product: bool = False) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        if product:
+            # Generated products are untrusted reviewed artifacts.  The
+            # sandboxed response has script execution but no same-origin
+            # privilege, forms, navigation, workers, or network access.  The
+            # canonical product manifest still governs which files can be
+            # requested.
+            policy = (
+                "sandbox allow-scripts; default-src 'none'; script-src 'self'; "
+                "connect-src 'none'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data:; "
+                "font-src 'self'; base-uri 'none'; form-action 'none'; "
+                "frame-ancestors 'none'; object-src 'none'"
+            )
+            # A sandboxed document has an opaque origin (no
+            # ``allow-same-origin`` by design).  ``same-origin`` CORP would
+            # therefore block its own hash-bound CSS/JS/SVG subresources;
+            # ``cross-origin`` permits those bytes while retaining the
+            # origin-isolation boundary enforced by the sandbox/CSP.
+            self.send_header("Cross-Origin-Resource-Policy", "cross-origin")
+            self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        else:
+            policy = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'"
+        self.send_header("Content-Security-Policy", policy)
+        self.send_header("Cache-Control", "no-store")
+
     def _json(self, payload: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
-        super()._json(payload, status)
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self._security_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _error(self, status: HTTPStatus, message: str) -> None:
+        self._json({"error": message, "status": int(status)}, status)
 
     def _serve_static(self, request_path: str) -> None:
-        if request_path in {"", "/", "/index.html"}:
-            self._send_asset(render_index(), "index.html")
+        relative = "index.html" if request_path in {"", "/", "/index.html"} else unquote(request_path.lstrip("/"))
+        candidate = STATIC_DIR / relative
+        # Reject traversal and every symlink component before resolving.  A
+        # symlink whose target happens to remain under STATIC_DIR is still not
+        # a canonical operational asset.
+        if not relative or Path(relative).is_absolute() or Path(relative).as_posix() != relative or ".." in Path(relative).parts:
+            self._error(HTTPStatus.NOT_FOUND, "Not found")
             return
-        assets = {
-            "/base.css": APP_DIR.parent / "control_center" / "static" / "styles.css",
-            "/theme.css": APP_DIR.parent / "control_center_dashboard_prototype" / "static" / "theme.css",
-            "/app.js": APP_DIR.parent / "control_center" / "static" / "app.js",
-            **OPERATIONAL_ASSETS,
-        }
-        requested = assets.get(request_path)
+        current = STATIC_DIR
+        try:
+            for part in Path(relative).parts:
+                current = current / part
+                if current.is_symlink():
+                    self._error(HTTPStatus.NOT_FOUND, "Not found")
+                    return
+        except OSError:
+            self._error(HTTPStatus.NOT_FOUND, "Not found")
+            return
+        requested = candidate.resolve(strict=False)
+        try:
+            requested.relative_to(STATIC_DIR.resolve())
+        except (OSError, ValueError):
+            requested = None
         if requested is None or not requested.is_file() or requested.is_symlink():
             self._error(HTTPStatus.NOT_FOUND, "Not found")
             return
         self._send_asset(requested.read_bytes(), requested.name)
 
-    def _send_asset(self, body: bytes, filename: str) -> None:
+    def _serve_product_asset(self, request_path: str, query: str = "", *, preview: bool = False) -> None:
+        """Serve one validated final/preview dashboard asset from an active run."""
+
+        prefix = "/api/product/preview/" if preview else "/api/product/dashboard/"
+        if query or not request_path.startswith(prefix):
+            self._error(HTTPStatus.NOT_FOUND, "Not found")
+            return
+        tail = unquote(request_path[len(prefix):])
+        parts = tail.split("/", 1)
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            self._error(HTTPStatus.NOT_FOUND, "Not found")
+            return
+        result = self.repository.product_asset(parts[0], parts[1], preview=preview)
+        if result is None:
+            self._error(HTTPStatus.NOT_FOUND, "Not found")
+            return
+        body, relative = result
+        self._send_asset(body, relative, product=True)
+
+    def _send_asset(self, body: bytes, filename: str, *, product: bool = False) -> None:
         content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", f"{content_type}; charset=utf-8" if content_type.startswith("text/") else content_type)
         self.send_header("Content-Length", str(len(body)))
-        self._security_headers()
+        self._security_headers(product=product)
         self.end_headers()
         self.wfile.write(body)
 
@@ -209,8 +264,49 @@ class OperationalHandler(ControlCenterHandler):
         if not self._request_host_valid() or not self._origin_valid():
             return
         parsed = urlparse(self.path)
+        if parsed.path == "/api/health":
+            self._json({"status": "ok", "mode": "operational", "time": _utc_now()})
+            return
         if parsed.path == "/api/config":
             self._json(self.manager.settings.config_payload())
+            return
+        if parsed.path == "/api/runs":
+            # A browser reload has no in-memory draft to poll.  Reconcile the
+            # bounded launch-status store first so stale starting/running
+            # placeholders consume any hash-bound Supervisor readiness/exit
+            # receipt before the read-only projection is returned.
+            reconcile = getattr(self.manager, "reconcile_launch_statuses", None)
+            if callable(reconcile):
+                reconcile()
+            self._json({"runs": self.repository.list_runs(), "observedAt": _utc_now()})
+            return
+        if parsed.path == "/api/snapshot":
+            run_id = parse_qs(parsed.query).get("run_id", [""])[0]
+            try:
+                reconcile = getattr(self.manager, "reconcile_launch_statuses", None)
+                if callable(reconcile):
+                    reconcile()
+                self._json(self.repository.snapshot(run_id))
+            except KeyError:
+                self._error(HTTPStatus.NOT_FOUND, "Unknown run")
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                self._error(HTTPStatus.UNPROCESSABLE_ENTITY, f"Could not project run: {_safe_text(exc)}")
+            return
+        if parsed.path == "/api/events":
+            query = parse_qs(parsed.query)
+            run_id = query.get("run_id", [""])[0]
+            stream_id = _safe_text(query.get("stream", [""])[0], 120)
+            try:
+                cursor = max(0, int(query.get("after", ["0"])[0]))
+            except ValueError:
+                self._error(HTTPStatus.BAD_REQUEST, "Invalid event cursor")
+                return
+            try:
+                self._json(self.repository.events_after(run_id, cursor, stream_id))
+            except KeyError:
+                self._error(HTTPStatus.NOT_FOUND, "Unknown run")
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                self._error(HTTPStatus.UNPROCESSABLE_ENTITY, f"Could not read events: {_safe_text(exc)}")
             return
         if parsed.path == "/api/launch/status":
             draft_id = parse_qs(parsed.query).get("draft_id", [""])[0]
@@ -231,7 +327,16 @@ class OperationalHandler(ControlCenterHandler):
                     HTTPStatus.UNPROCESSABLE_ENTITY,
                 )
             return
-        super().do_GET()
+        if parsed.path.startswith("/api/product/preview/"):
+            self._serve_product_asset(parsed.path, parsed.query, preview=True)
+            return
+        if parsed.path.startswith("/api/product/dashboard/"):
+            self._serve_product_asset(parsed.path, parsed.query, preview=False)
+            return
+        if parsed.path.startswith("/api/"):
+            self._error(HTTPStatus.NOT_FOUND, "Unknown API endpoint")
+            return
+        self._serve_static(parsed.path)
 
     def do_POST(self) -> None:  # noqa: N802
         if not self._request_host_valid():
@@ -241,23 +346,35 @@ class OperationalHandler(ControlCenterHandler):
             "/api/launch/upload",
             "/api/launch/prepare",
             "/api/launch/execute",
+            "/api/launch/cancel",
             "/api/run/pause",
             "/api/run/resume",
+            "/api/run/regenerate-product",
         }:
             self._error(HTTPStatus.METHOD_NOT_ALLOWED, "Unknown operational command")
             return
         if not self._mutating_guard():
             return
         try:
-            if parsed.path in {"/api/run/pause", "/api/run/resume"}:
+            if parsed.path in {"/api/run/pause", "/api/run/resume", "/api/run/regenerate-product"}:
                 payload = self._read_json()
                 run_id = str(payload.get("runId") or "")
                 confirmed = payload.get("confirmed") is True
-                result = (
-                    self.run_control.pause(run_id, confirmed=confirmed)
-                    if parsed.path.endswith("/pause")
-                    else self.run_control.resume(run_id, confirmed=confirmed)
-                )
+                if parsed.path.endswith("/pause"):
+                    result = self.run_control.pause(run_id, confirmed=confirmed)
+                elif parsed.path.endswith("/resume"):
+                    result = self.run_control.resume(run_id, confirmed=confirmed)
+                else:
+                    raw_key = payload.get("idempotencyKey", payload.get("idempotency_key"))
+                    idempotency_key = raw_key if isinstance(raw_key, str) else None
+                    raw_reason = payload.get("reason")
+                    reason = raw_reason if isinstance(raw_reason, str) and raw_reason.strip() else "operator requested Product dashboard regeneration"
+                    result = self.run_control.regenerate_product(
+                        run_id,
+                        confirmed=confirmed,
+                        reason=reason,
+                        idempotency_key=idempotency_key,
+                    )
                 self._json(result, HTTPStatus.ACCEPTED)
                 return
             if parsed.path == "/api/launch/upload":
@@ -274,6 +391,15 @@ class OperationalHandler(ControlCenterHandler):
             if parsed.path == "/api/launch/prepare":
                 self._json(self.manager.prepare(self._read_json()))
                 return
+            if parsed.path == "/api/launch/cancel":
+                payload = self._read_json()
+                result = self.manager.cancel(
+                    draft_id=str(payload.get("draftId") or ""),
+                    fingerprint=str(payload.get("fingerprint") or ""),
+                    confirmed=payload.get("confirmed") is True,
+                )
+                self._json(result, HTTPStatus.ACCEPTED)
+                return
             payload = self._read_json()
             result = self.manager.execute(
                 draft_id=str(payload.get("draftId") or ""),
@@ -287,6 +413,12 @@ class OperationalHandler(ControlCenterHandler):
                 body["errors"] = exc.errors
             self._json(body, HTTPStatus(exc.status_code))
         except (OSError, ValueError, TypeError) as exc:
+            self._json({"error": _safe_text(exc), "message": "Operational request failed."}, HTTPStatus.UNPROCESSABLE_ENTITY)
+        except RuntimeError as exc:
+            # Coordinator integrity/admission and other program-owned launch
+            # failures are expected command outcomes, not transport failures.
+            # Always complete the HTTP response so the browser can leave its
+            # disabled ``Starting…`` state and show the durable failure.
             self._json({"error": _safe_text(exc), "message": "Operational request failed."}, HTTPStatus.UNPROCESSABLE_ENTITY)
 
 
@@ -345,6 +477,11 @@ def main(argv: list[str] | None = None) -> int:
     fixture = args.fixture if args.fixture and args.fixture.is_file() else None
     repository = OperationalRepository(fixture, [runs_root], launch_state_root=settings.state_root)
     manager = LaunchManager(settings, repository=repository)
+    # Bind the checkout-owned core before the first repository projection.
+    # OperationalRepository validates durable lifecycle state lazily, so a
+    # documented server invocation without ``PYTHONPATH=src`` must still
+    # resolve the same checkout core before any /api/runs request.
+    manager._core_imports()  # noqa: SLF001 - canonical startup bootstrap
     server = OperationalServer((args.host, args.port), repository, manager)
     print(f"Auto Foundry Control Center — Operational: http://{args.host}:{args.port}")
     print(f"Launch commands enabled: {settings.commands_enabled}")

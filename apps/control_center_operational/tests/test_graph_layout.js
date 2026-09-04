@@ -1,7 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
-const { state, graphPositions } = require("../../control_center/static/app.js");
+const { state, graphPositions } = require("../../control_center_operational/static/app.js");
 
 const nodes = [{ id: "planner", role: "planner", label: "Planner" }];
 const edges = [];

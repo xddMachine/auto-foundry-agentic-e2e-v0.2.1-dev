@@ -1,0 +1,31 @@
+{
+  "context_hash": "4710e8f7b623f2121ae92cb453dcf331dbd8331db104fda00b817dc9c283f849",
+  "context_path": "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-001/work/analysis_context.json",
+  "error_category": null,
+  "error_type": null,
+  "exit_code": 0,
+  "finished_at": "2026-08-31T15:37:26.380493+00:00",
+  "output_hashes": {
+    "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-001/work/profile_communications.json": "e50ddd86c7fbd0caad77934c11f63c55c9146ef669ba6d852122a62e0d9ac456",
+    "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-001/work/profile_erp.json": "95d51cd5c1680323955a68b21592014252ea2e97aa6062917dd5dfd9d800b99d",
+    "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-001/work/profile_supporting.json": "f957ac9fc2c764c1adc076081caa5183b9bbb9964f446707017dd2337db9d2ff",
+    "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-001/work/profiles_projection.json": "7f1abf0f893394c138e4a743c19f91842c3f0c4079de8624c5f2a65a36816de2",
+    "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-001/work/watchlist_analysis.json": "f488a70028f65bd052bf1b37f6c52237144bd1824e25daf9729d120dbb786977",
+    "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-001/work/watchlist_projection.json": "d64c3778493350479896a649fff0c729259120e2904132dd30454daa9e45d32a"
+  },
+  "output_limited": false,
+  "phase": "smoke",
+  "receipt_id": "receipt-59cd3ee25c904ebeb4dd277e242e69f9",
+  "receipt_path": "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-001/work/script_receipts/receipt-59cd3ee25c904ebeb4dd277e242e69f9.json",
+  "script_hash": "a32a28d69a031adc2730c74b2a8239128d506ed6d981096d7ca65d92410d51d7",
+  "script_path": "/Users/fedorlebedev/Desktop/Dashboard/auto-foundry-agentic-e2e-v0.2.1-dev/runs/RUN-2192ca59eb4a4718/requirements/REQ-001/work/analysis_req001.py",
+  "source_hash": "86e1f0e5c443ac4fa9049f538aa671d9fbca183368bfa355be80a17fe880c3d4",
+  "started_at": "2026-08-31T15:26:45.557701+00:00",
+  "stderr": "/Users/runner/work/crossbow/crossbow/arrow/cpp/src/arrow/util/cpu_info.cc:239: IOError: sysctlbyname failed for 'hw.l1dcachesize'. Detail: [errno 1] Operation not permitted\n/Users/runner/work/crossbow/crossbow/arrow/cpp/src/arrow/util/cpu_info.cc:239: IOError: sysctlbyname failed for 'hw.l2cachesize'. Detail: [errno 1] Operation not permitted\n/Users/runner/work/crossbow/crossbow/arrow/cpp/src/arrow/util/cpu_info.cc:239: IOError: sysctlbyname failed for 'hw.l3cachesize'. Detail: [errno 1] Operation not permitted\n/Users/runner/work/crossbow/crossbow/arrow/cpp/src/arrow/util/cpu_info.cc:239: IOError: sysctlbyname failed for 'hw.optional.neon'. Detail: [errno 1] Operation not permitted\n",
+  "stderr_truncated": false,
+  "stdout": "{\"communication_to_erp_customer_coverage\": 0.406918, \"high_priority_count\": 0, \"main_watchlist_count\": 0, \"sensitivity_intersection_count\": 0}\n",
+  "stdout_truncated": false,
+  "timed_out": false,
+  "traceback": null,
+  "wall_seconds": 640.8190635840001
+}

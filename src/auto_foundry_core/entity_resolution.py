@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import tempfile
 import threading
@@ -68,6 +69,9 @@ _IDENTITY_REQUEST_FIELDS = frozenset({
     "rationale",
     "source_hints",
     "representation_item_ids",
+    "required_revision",
+    "generation_id",
+    "data_revision_id",
 })
 _LEGACY_STATE_FIELDS = frozenset({
     "schema_version",
@@ -197,13 +201,34 @@ def _is_hash(value: Any) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(char in _HEX for char in value.lower())
 
 
-_MANIFEST_FIELDS = frozenset({
+_GENERATION_ID_RE = re.compile(r"^G-(\d{4,})$")
+_DATA_REVISION_ID_RE = re.compile(r"^D-(\d{4,})$")
+
+
+def _lineage_id(value: Any, label: str, pattern: re.Pattern[str]) -> str:
+    text = _text(value, label)
+    if pattern.fullmatch(text) is None:
+        raise ValueError(f"{label} is invalid")
+    return text
+
+
+_LEGACY_MANIFEST_FIELDS = frozenset({
     "schema_version", "kind", "domain_id", "canonical_identity", "object_type",
     "discovered_by_item_id", "result_hash", "source_hash", "records_path",
     "records_hash", "records_count", "reviewer_ref", "review_verdict", "coverage",
     "population", "exceptions", "unresolved", "evidence_refs", "script_receipt_refs",
     "metadata", "committed_at", "manifest_hash",
 })
+_REVISION_MANIFEST_FIELDS = frozenset({
+    *_LEGACY_MANIFEST_FIELDS,
+    "revision",
+    "scope_hash",
+    "supersedes_manifest_hash",
+})
+# Kept as a named alias for callers/tests that imported the old internal
+# constant; validation below explicitly admits the exact legacy or revision
+# shape rather than accepting arbitrary supersets.
+_MANIFEST_FIELDS = _REVISION_MANIFEST_FIELDS
 
 
 def _text(value: Any, label: str) -> str:
@@ -355,6 +380,17 @@ class IdentityDomainRequest:
     source_hints: tuple[Any, ...] = ()
     representation_item_ids: tuple[str, ...] = ()
     owner_ref: str | None = None
+    # The first admission binds this request to the minimum immutable
+    # revision it needs.  ``None`` is reserved for exact older persisted
+    # request rows; readers infer revision 1 without rewriting those bytes.
+    required_revision: int | None = None
+    _required_revision_explicit: bool = field(default=True, repr=False, compare=False)
+    # Requests are bound to the authoritative run generation/data revision at
+    # admission.  Legacy rows omit these fields and are treated as G-0001
+    # provenance until the first post-refresh request is recorded.
+    generation_id: str | None = None
+    data_revision_id: str | None = None
+    _lineage_explicit: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "item_id", _text(self.item_id, "item_id"))
@@ -368,6 +404,21 @@ class IdentityDomainRequest:
         )
         if self.owner_ref is not None:
             object.__setattr__(self, "owner_ref", _text(self.owner_ref, "owner_ref"))
+        if self.required_revision is not None:
+            if (
+                isinstance(self.required_revision, bool)
+                or not isinstance(self.required_revision, int)
+                or self.required_revision < 1
+            ):
+                raise ValueError("identity domain request required_revision must be a positive integer")
+        if self.generation_id is not None:
+            object.__setattr__(self, "generation_id", _lineage_id(self.generation_id, "generation_id", _GENERATION_ID_RE))
+        if self.data_revision_id is not None:
+            object.__setattr__(self, "data_revision_id", _lineage_id(self.data_revision_id, "data_revision_id", _DATA_REVISION_ID_RE))
+            if self.generation_id is None:
+                raise ValueError("identity domain request data_revision_id requires generation_id")
+        if self._lineage_explicit and self.generation_id is None:
+            raise ValueError("identity domain request generation_id is required when lineage is explicit")
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -379,11 +430,22 @@ class IdentityDomainRequest:
         }
         if self.owner_ref is not None:
             payload["owner_ref"] = self.owner_ref
+        if self._required_revision_explicit and self.required_revision is not None:
+            payload["required_revision"] = self.required_revision
+        if self._lineage_explicit and self.generation_id is not None:
+            payload["generation_id"] = self.generation_id
+            if self.data_revision_id is not None:
+                payload["data_revision_id"] = self.data_revision_id
         return payload
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "IdentityDomainRequest":
-        required = _IDENTITY_REQUEST_FIELDS - {"owner_ref"}
+        required = _IDENTITY_REQUEST_FIELDS - {
+            "owner_ref",
+            "required_revision",
+            "generation_id",
+            "data_revision_id",
+        }
         if (
             not isinstance(value, Mapping)
             or not required.issubset(value)
@@ -397,7 +459,19 @@ class IdentityDomainRequest:
             rationale=value.get("rationale", ""),
             source_hints=value.get("source_hints", ()),
             representation_item_ids=value.get("representation_item_ids", ()),
+            required_revision=value.get("required_revision", 1),
+            _required_revision_explicit="required_revision" in value,
+            generation_id=value.get("generation_id"),
+            data_revision_id=value.get("data_revision_id"),
+            _lineage_explicit="generation_id" in value or "data_revision_id" in value,
         )
+
+
+def _request_required_revision(request: IdentityDomainRequest) -> int:
+    """Return the durable request boundary, inferring legacy rows as v1."""
+
+    value = request.required_revision
+    return 1 if value is None else value
 
 
 @dataclass(frozen=True)
@@ -459,6 +533,16 @@ class IdentityDomainReservation:
     requested_by: tuple[str, ...] = ()
     requests: tuple[Mapping[str, Any], ...] = ()
     review: Mapping[str, Any] | None = None
+    # ``revision`` is the mutable resolution attempt, while
+    # ``published_revision`` identifies the highest immutable manifest that
+    # current readers may use.  Legacy state omits both and is deterministically
+    # interpreted as revision 1 below.
+    revision: int = 1
+    published_revision: int = 0
+    published_scope_hash: str | None = None
+    generation_id: str | None = None
+    data_revision_id: str | None = None
+    _lineage_explicit: bool = field(default=False, repr=False, compare=False)
 
     @property
     def request_records(self) -> tuple[Mapping[str, Any], ...]:
@@ -508,8 +592,26 @@ class IdentityDomainReservation:
             raise ValueError("identity domain result_scope_hash is invalid")
         if self.commit_manifest_hash is not None and not _is_hash(self.commit_manifest_hash):
             raise ValueError("identity domain commit_manifest_hash is invalid")
+        if self.published_scope_hash is not None and not _is_hash(self.published_scope_hash):
+            raise ValueError("identity domain published_scope_hash is invalid")
         if not isinstance(self.accepted_pending_commit, bool):
             raise ValueError("identity domain accepted_pending_commit is invalid")
+        if isinstance(self.revision, bool) or not isinstance(self.revision, int) or self.revision < 1:
+            raise ValueError("identity domain revision must be a positive integer")
+        if isinstance(self.published_revision, bool) or not isinstance(self.published_revision, int) or self.published_revision < 0:
+            raise ValueError("identity domain published_revision must be a non-negative integer")
+        if self.published_revision > self.revision:
+            raise ValueError("identity domain published_revision cannot exceed revision")
+        if self.generation_id is not None:
+            object.__setattr__(self, "generation_id", _lineage_id(self.generation_id, "generation_id", _GENERATION_ID_RE))
+        if self.data_revision_id is not None:
+            object.__setattr__(self, "data_revision_id", _lineage_id(self.data_revision_id, "data_revision_id", _DATA_REVISION_ID_RE))
+            if self.generation_id is None:
+                raise ValueError("identity domain data_revision_id requires generation_id")
+        if self._lineage_explicit and self.generation_id is None:
+            raise ValueError("identity domain generation_id is required when lineage is explicit")
+        if self.commit_manifest_hash is not None and self.published_revision < 1:
+            object.__setattr__(self, "published_revision", 1)
         raw_requests = tuple(self.requests or ())
         if not raw_requests:
             raw_requests = (
@@ -519,6 +621,7 @@ class IdentityDomainReservation:
                     rationale=self.rationale,
                     source_hints=self.source_hints,
                     representation_item_ids=self.representation_item_ids,
+                    required_revision=1,
                 ).to_dict(),
             )
         request_values = tuple(
@@ -574,7 +677,14 @@ class IdentityDomainReservation:
             "resolution_owner_history": [dict(value) for value in self.resolution_owner_history],
             "requested_by": list(self.requested_by),
             "requests": [dict(value) for value in self.requests],
+            "revision": self.revision,
+            "published_revision": self.published_revision,
+            "published_scope_hash": self.published_scope_hash,
         }
+        if self._lineage_explicit and self.generation_id is not None:
+            payload["generation_id"] = self.generation_id
+            if self.data_revision_id is not None:
+                payload["data_revision_id"] = self.data_revision_id
         if self.review is not None:
             payload["review"] = dict(_jsonable(self.review))
         return payload
@@ -600,7 +710,10 @@ class IdentityDomainReservation:
             "requested_by",
             "requests",
         }
-        optional_fields = {"resolution_owner_history", "result_scope_hash"}
+        optional_fields = {
+            "resolution_owner_history", "result_scope_hash", "revision", "published_revision",
+            "published_scope_hash", "generation_id", "data_revision_id",
+        }
         if not isinstance(value, Mapping) or not fields.issubset(value) or set(value).difference(fields | optional_fields | {"review"}):
             raise ValueError("identity domain reservation fields are invalid")
         return cls(
@@ -608,6 +721,15 @@ class IdentityDomainReservation:
             result_scope_hash=value.get("result_scope_hash"),
             resolution_owner_history=value.get("resolution_owner_history", ()),
             review=value.get("review"),
+            revision=value.get("revision", 1),
+            published_revision=value.get(
+                "published_revision",
+                1 if value.get("commit_manifest_hash") is not None or value.get("state") == "ready" else 0,
+            ),
+            published_scope_hash=value.get("published_scope_hash"),
+            generation_id=value.get("generation_id"),
+            data_revision_id=value.get("data_revision_id"),
+            _lineage_explicit="generation_id" in value or "data_revision_id" in value,
         )
 
 def _tuple_refs(value: Any, label: str) -> tuple[str, ...]:
@@ -763,6 +885,9 @@ class ResolutionCommit:
     manifest_path: str
     source_hash: str
     record_count: int = 0
+    revision: int = 1
+    scope_hash: str | None = None
+    supersedes_manifest_hash: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -774,6 +899,9 @@ class ResolutionCommit:
             "manifest_path": self.manifest_path,
             "source_hash": self.source_hash,
             "record_count": self.record_count,
+            "revision": self.revision,
+            "scope_hash": self.scope_hash,
+            "supersedes_manifest_hash": self.supersedes_manifest_hash,
         }
 
 class EntityResolutionWorkspace:
@@ -867,6 +995,11 @@ class EntityResolutionWorkspace:
             # No owner_ref is invented.  If a later authoritative AO proposal
             # carries one, the Planner appends that requester separately.
             domain["requests"] = [request]
+            # Persist explicit revision authority on the first post-v1 write.
+            # A legacy ready/committed domain is revision 1; an unfinished
+            # reservation has no published revision yet.
+            domain["revision"] = 1
+            domain["published_revision"] = 1 if domain.get("commit_manifest_hash") is not None or domain.get("state") == "ready" else 0
             upgraded_domains[str(domain_id)] = domain
         upgraded = dict(state)
         upgraded["schema_version"] = STATE_SCHEMA_VERSION
@@ -908,11 +1041,15 @@ class EntityResolutionWorkspace:
             upgraded = cls._upgrade_legacy_state_value(context, authoritative)
             if upgraded is not None:
                 workspace._state = upgraded
+                # Reconcile the upgraded detached snapshot before replacing
+                # the legacy bytes.  A missing published artifact must fail
+                # closed without partially persisting the schema upgrade.
+                workspace._reconcile_commit_refs()
                 workspace._persist()
             else:
                 workspace._refresh()
-            if workspace._reconcile_commit_refs():
-                workspace._persist()
+                if workspace._reconcile_commit_refs():
+                    workspace._persist()
         return workspace
 
     @staticmethod
@@ -934,6 +1071,21 @@ class EntityResolutionWorkspace:
             if domain_id != raw.get("domain_id"):
                 raise ValueError("entity-resolution domain identity is invalid")
             IdentityDomainReservation.from_dict(raw)
+        for requirement_id, raw in state["waits"].items():
+            if not isinstance(raw, Mapping) or raw.get("requirement_id") != requirement_id:
+                raise ValueError("entity-resolution wait identity is invalid")
+            domain_ids = raw.get("domain_ids")
+            if not isinstance(domain_ids, list) or not domain_ids or any(
+                not isinstance(domain_id, str) or not domain_id.strip() for domain_id in domain_ids
+            ):
+                raise ValueError("entity-resolution wait domain_ids are invalid")
+            required = raw.get("required_revisions")
+            if required is not None:
+                if not isinstance(required, Mapping) or set(required) != set(domain_ids):
+                    raise ValueError("entity-resolution wait required_revisions are invalid")
+                for value in required.values():
+                    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                        raise ValueError("entity-resolution wait required revision is invalid")
 
     def _lock_key(self) -> str:
         return str(self.root.resolve())
@@ -990,56 +1142,156 @@ class EntityResolutionWorkspace:
         # workspace snapshot while the durable state file remains unchanged.
         staged_state = copy.deepcopy(self._state)
         changed = False
-        for path in sorted(self.commits_root.glob("*/")) if self.commits_root.exists() else ():
-            if path.is_symlink() or not path.is_dir():
-                raise AllowedRootError(f"entity-resolution commit directory is invalid: {path}")
-            manifest_path = path / _MANIFEST_FILENAME
-            if not manifest_path.is_file() or manifest_path.is_symlink():
-                raise ValueError("entity-resolution commit manifest is missing")
-            try:
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise ValueError("entity-resolution commit manifest is invalid") from exc
-            _validate_manifest(manifest)
-            _read_records(self, manifest, path)
-            domain_id = manifest.get("domain_id") if isinstance(manifest, Mapping) else None
+        entries = self._commit_entries()
+        grouped = _fold_commit_entries(self, entries)
+        state_domain_ids = set(staged_state["domains"])
+        commit_domain_ids = set(grouped)
+        for domain_id in sorted(state_domain_ids | commit_domain_ids):
+            group = grouped.get(domain_id)
+            if group is None:
+                # A domain with no filesystem group is valid only while it has
+                # never published a revision.  Once a pointer, ready state, or
+                # published revision exists, the immutable artifact chain is
+                # authoritative and its complete absence is corruption.
+                entry = staged_state["domains"][domain_id]
+                published_revision = self._published_revision_for_entry(entry)
+                if (
+                    published_revision > 0
+                    or entry.get("commit_manifest_hash") is not None
+                    or entry.get("state") == "ready"
+                ):
+                    raise ValueError("entity-resolution published artifact chain is missing")
+                continue
             if domain_id not in staged_state["domains"]:
                 raise ValueError("entity-resolution commit references an unknown domain")
-            entry = staged_state["domains"][domain_id]
-            if entry.get("state") == "failed":
+            entry = dict(staged_state["domains"][domain_id])
+            manifests = list(group["manifests"])
+            latest = manifests[-1]
+            latest_revision = _manifest_revision(latest)
+            active_revision = self._active_revision_for_entry(entry)
+            published_revision = self._published_revision_for_entry(entry)
+            if latest_revision > active_revision:
+                raise ValueError("entity-resolution commit revision is from the future")
+            if published_revision > latest_revision:
+                raise ValueError("entity-resolution state published revision is stale")
+            if entry.get("state") == "ready" and active_revision > published_revision and latest_revision < active_revision:
+                raise ValueError("ready identity domain is missing its active published revision")
+            if entry.get("state") == "failed" and latest_revision >= active_revision:
                 raise ValueError("failed identity domain cannot have a committed publication")
-            expected = entry.get("commit_manifest_hash")
-            if expected is not None and expected != manifest.get("manifest_hash"):
+
+            # A published pointer may legitimately remain on v1 while v2 is
+            # resolving/reviewing/failed, but when present it must identify
+            # exactly the state-published revision (never an older pointer).
+            pointer = entry.get("commit_manifest_hash")
+            by_hash = {manifest.get("manifest_hash"): manifest for manifest in manifests}
+            if pointer is not None and pointer not in by_hash:
                 raise ValueError("entity-resolution state commit binding is stale")
-            if manifest.get("result_hash") != entry.get("result_hash"):
-                raise ValueError(
-                    "crash-published entity-resolution commit result does not match the current candidate"
+            pointer_revision = _manifest_revision(by_hash[pointer]) if pointer is not None else 0
+            published_scope_hash = entry.get("published_scope_hash")
+            if published_scope_hash is not None and not _is_hash(published_scope_hash):
+                raise ValueError("entity-resolution state published scope is invalid")
+            if pointer is not None:
+                pointer_scope_hash = _manifest_scope_hash(by_hash[pointer])
+                if published_scope_hash is not None and pointer_scope_hash is not None and published_scope_hash != pointer_scope_hash:
+                    raise ValueError("entity-resolution state published scope is stale")
+                if published_scope_hash is None and pointer_scope_hash is not None:
+                    entry["published_scope_hash"] = pointer_scope_hash
+                    staged_state["domains"][domain_id] = entry
+                    changed = True
+                if pointer_revision != published_revision:
+                    raise ValueError("entity-resolution state published revision is stale")
+
+            def validate_candidate(
+                manifest: Mapping[str, Any],
+                candidate_revision: int,
+                *,
+                expected_supersedes_override: str | None = None,
+                _entry: Mapping[str, Any] = entry,
+                _domain_id: str = domain_id,
+                _entries: Sequence[tuple[Mapping[str, Any], Path]] = entries,
+            ) -> None:
+                if _entry.get("result_hash") not in {None, manifest.get("result_hash")}:
+                    raise ValueError("crash-published entity-resolution commit result does not match the current candidate")
+                result = self._load_result(_domain_id, _entry)
+                records = self._records_for_result(_domain_id, result)
+                records_bytes = b"".join(_canonical_bytes(record) for record in records)
+                predecessor = self._authoritative_predecessor(
+                    _domain_id,
+                    candidate_revision,
+                    entries=_entries,
                 )
-            result_scope_hash = entry.get("result_scope_hash")
-            if entry.get("state") != "ready":
-                if entry.get("accepted_pending_commit") is not True:
-                    raise ValueError(
-                        "crash-published entity-resolution commit lacks an accepted candidate boundary"
-                    )
-                current_scope = self._scope_for_entry(domain_id, entry)
-                if not _is_hash(result_scope_hash) or result_scope_hash != current_scope.scope_hash:
-                    raise ValueError(
-                        "crash-published entity-resolution commit scope does not match the current candidate"
-                    )
-            elif result_scope_hash is not None:
-                current_scope = self._scope_for_entry(domain_id, entry)
-                if result_scope_hash != current_scope.scope_hash:
-                    raise ValueError(
-                        "ready entity-resolution commit scope does not match the current material scope"
-                    )
-            self._load_result(domain_id, entry)
-            if expected != manifest.get("manifest_hash"):
-                entry = dict(staged_state["domains"][domain_id])
-                entry["commit_manifest_hash"] = manifest.get("manifest_hash")
+                expected_supersedes = (
+                    expected_supersedes_override
+                    if expected_supersedes_override is not None
+                    else _entry.get("commit_manifest_hash") if candidate_revision > 1 else None
+                )
+                if candidate_revision > 1 and expected_supersedes != (predecessor or {}).get("manifest_hash"):
+                    raise ValueError("crash-published entity-resolution commit predecessor is not authoritative")
+                candidate_scope_hash = _entry.get("result_scope_hash")
+                if candidate_revision >= 2 and not _is_hash(candidate_scope_hash):
+                    raise ValueError("crash-published additive revision scope binding is missing")
+                self._assert_manifest_matches_candidate(
+                    _domain_id,
+                    _entry,
+                    result,
+                    hashlib.sha256(records_bytes).hexdigest(),
+                    len(records),
+                    manifest,
+                    revision=candidate_revision,
+                    supersedes_manifest_hash=expected_supersedes,
+                    candidate_scope_hash=candidate_scope_hash,
+                )
+
+            if latest_revision > published_revision:
+                if latest_revision != active_revision:
+                    raise ValueError("entity-resolution commit revision cannot advance the active domain")
+                if entry.get("state") != "ready":
+                    if entry.get("accepted_pending_commit") is not True:
+                        raise ValueError("crash-published entity-resolution commit lacks an accepted candidate boundary")
+                    if entry.get("result_hash") != latest.get("result_hash"):
+                        raise ValueError("crash-published entity-resolution commit result does not match the current candidate")
+                    validate_candidate(latest, latest_revision)
+                else:
+                    if entry.get("result_scope_hash") is not None:
+                        current_scope = self._scope_for_entry(domain_id, entry)
+                        if entry.get("result_scope_hash") != current_scope.scope_hash:
+                            raise ValueError("ready entity-resolution commit scope does not match the current material scope")
+                    validate_candidate(latest, latest_revision)
+                entry["published_revision"] = latest_revision
+                entry["commit_manifest_hash"] = latest.get("manifest_hash")
+                entry["published_scope_hash"] = _manifest_scope_hash(latest)
                 entry["state"] = "ready"
                 entry["accepted_pending_commit"] = False
                 staged_state["domains"][domain_id] = entry
                 changed = True
+            elif pointer is None and latest_revision == published_revision:
+                # A missing pointer is accepted only for the explicit ready
+                # state crash window; all other missing bindings fail closed.
+                if entry.get("state") != "ready":
+                    raise ValueError("missing entity-resolution commit binding is not an explicit crash window")
+                validate_candidate(latest, latest_revision)
+                entry["commit_manifest_hash"] = latest.get("manifest_hash")
+                entry["state"] = "ready"
+                entry["accepted_pending_commit"] = False
+                entry["published_revision"] = latest_revision
+                entry["published_scope_hash"] = _manifest_scope_hash(latest)
+                staged_state["domains"][domain_id] = entry
+                changed = True
+            elif pointer is not None and pointer_revision == published_revision:
+                # Historical result artifacts may have been superseded by a
+                # later active revision.  Validate only the current published
+                # result when it is still the active ready revision.
+                if published_revision == active_revision and entry.get("state") == "ready":
+                    predecessor = self._authoritative_predecessor(
+                        domain_id,
+                        published_revision,
+                        entries=entries,
+                    )
+                    validate_candidate(
+                        by_hash[pointer],
+                        published_revision,
+                        expected_supersedes_override=(predecessor or {}).get("manifest_hash") if published_revision > 1 else None,
+                    )
         if changed:
             self._state = staged_state
         return changed
@@ -1084,6 +1336,127 @@ class EntityResolutionWorkspace:
             representation_item_ids.extend(request.representation_item_ids)
         return IdentityDomainScope(domain_id, tuple(source_hints), tuple(representation_item_ids))
 
+    @staticmethod
+    def _published_revision_for_entry(entry: Mapping[str, Any]) -> int:
+        """Read the highest immutable revision visible to current readers."""
+
+        value = entry.get("published_revision")
+        if value is None:
+            value = 1 if entry.get("commit_manifest_hash") is not None or entry.get("state") == "ready" else 0
+        elif value == 0 and entry.get("state") == "ready":
+            # Exact older/test-fixture ready rows predate the explicit
+            # published pointer; retain their deterministic v1 wakeup view.
+            value = 1
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("identity domain published_revision is invalid")
+        return value
+
+    @staticmethod
+    def _active_revision_for_entry(entry: Mapping[str, Any]) -> int:
+        value = entry.get("revision", 1)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError("identity domain revision is invalid")
+        return value
+
+    def _request_revision_for_requirement(
+        self,
+        requirement_id: str,
+        domain_id: str,
+        entry: Mapping[str, Any],
+    ) -> int:
+        """Resolve one request's durable minimum revision.
+
+        Exact older request rows have no field and deterministically infer
+        revision 1.  New direct wait callers without a matching request bind
+        to the active unpublished revision (or current published revision).
+        """
+
+        request = self.authoritative_request_for_requirement(requirement_id, domain_id, entry=entry)
+        if request is not None:
+            return _request_required_revision(request)
+        active = self._active_revision_for_entry(entry)
+        published = self._published_revision_for_entry(entry)
+        return active if active > published else max(published, 1)
+
+    @staticmethod
+    def _request_lineage_rank(request: IdentityDomainRequest) -> tuple[int, int, int]:
+        """Return a deterministic recency rank for a request lineage."""
+
+        generation = 0
+        data_revision = 0
+        if request.generation_id is not None:
+            match = _GENERATION_ID_RE.fullmatch(request.generation_id)
+            if match:
+                generation = int(match.group(1))
+        if request.data_revision_id is not None:
+            match = _DATA_REVISION_ID_RE.fullmatch(request.data_revision_id)
+            if match:
+                data_revision = int(match.group(1))
+        return generation, data_revision, _request_required_revision(request)
+
+    def authoritative_request_for_requirement(
+        self,
+        requirement_id: str,
+        domain_id: str,
+        *,
+        entry: Mapping[str, Any] | None = None,
+        lineage: tuple[str, str | None] | None = None,
+    ) -> IdentityDomainRequest | None:
+        """Select the latest compatible request for one item/domain.
+
+        Requests are append-only provenance.  Reopened work must bind to the
+        current G/D lineage when one exists, and otherwise to the newest
+        lineage-compatible historical row; selecting the first row would
+        silently resurrect an obsolete request and its older revision.
+        """
+
+        requirement = _text(requirement_id, "requirement_id")
+        domain = _domain_text(domain_id)
+        if entry is None:
+            candidate_entry: Mapping[str, Any] = self._domain_entry(domain)
+        elif isinstance(entry, IdentityDomainReservation):
+            # ``reserve_identity_domain`` passes its immutable reservation
+            # view while the public helper also accepts raw state mappings.
+            # Normalize both representations at this boundary so request
+            # selection remains the single authoritative implementation.
+            candidate_entry = entry.to_dict()
+        elif isinstance(entry, Mapping):
+            candidate_entry = entry
+        else:
+            raise TypeError("identity domain entry must be a mapping or reservation")
+        requests = tuple(
+            IdentityDomainRequest.from_dict(raw)
+            for raw in candidate_entry.get("requests", ())
+            if isinstance(raw, Mapping)
+        )
+        matching = [(index, request) for index, request in enumerate(requests) if request.item_id == requirement]
+        if not matching:
+            return None
+        current_lineage = lineage if lineage is not None else self._authoritative_lineage()
+        compatible = [
+            (index, request)
+            for index, request in matching
+            if self._request_matches_lineage(request, current_lineage)
+        ]
+        if compatible:
+            # A compatible lineage should normally be unique.  The index tie
+            # breaker makes a repaired/legacy duplicate deterministic while
+            # still preferring the highest required revision.
+            return max(
+                compatible,
+                key=lambda value: (*self._request_lineage_rank(value[1]), value[0]),
+            )[1]
+        # No current-lineage row exists (for example while reopening a prior
+        # generation).  Preserve a positive continuation by selecting the
+        # latest known request instead of the oldest historical row.
+        return max(
+            matching,
+            key=lambda value: (*self._request_lineage_rank(value[1]), value[0]),
+        )[1]
+
+    # Concise alias for planner/host callers that use selection terminology.
+    select_authoritative_request = authoritative_request_for_requirement
+
     def current_scope(self, domain_id: str) -> IdentityDomainScope:
         """Return the lock-consistent material scope and its stable token."""
 
@@ -1091,6 +1464,67 @@ class EntityResolutionWorkspace:
         with self._locked():
             self._refresh()
             return self._scope_for_entry(domain_id, self._domain_entry(domain_id))
+
+    def _authoritative_lineage(self) -> tuple[str, str | None]:
+        """Return the current run generation/data revision binding.
+
+        The caller's proposal/request payload is deliberately not consulted.
+        RunLifecycle owns the generation identity and the shared
+        DataRevisionStore resolver owns the immutable physical revision.  A
+        pending upload may advance the mutable D pointer, but it is never
+        allowed to change this active analytical lineage.
+        """
+
+        from .data_revisions import DataRevisionStore
+        from .lifecycle import RunLifecycle
+
+        try:
+            lifecycle = RunLifecycle.load(self.context)
+        except FileNotFoundError:
+            lifecycle = None
+        if lifecycle is None:
+            # Run-level Question Mode tests and legacy callers may not have a
+            # lifecycle yet.  Preserve only the immutable D-0001 bootstrap;
+            # never infer lineage from the mutable current pointer.
+            store = DataRevisionStore(self.context)
+            first = None
+            first_directory = store.revisions_root / "D-0001"
+            if first_directory.exists() or first_directory.is_symlink():
+                first = store.load("D-0001")
+            return "G-0001", None if first is None else _lineage_id(first.revision_id, "data_revision_id", _DATA_REVISION_ID_RE)
+
+        store = DataRevisionStore(self.context)
+        # Keep G/D resolution on the same explicit active-generation path for
+        # both the manifest-less G-0001 bootstrap and later generation
+        # manifests.  The shared resolver owns the D selection and never
+        # consults the mutable current pointer.
+        revision = store.active_generation_revision(
+            generation_id=lifecycle.generation_id,
+            generation_metadata=lifecycle.generation_metadata,
+        )
+        generation_id = _lineage_id(lifecycle.generation_id, "generation_id", _GENERATION_ID_RE)
+        data_revision_id = None if revision is None else _lineage_id(
+            revision.revision_id,
+            "data_revision_id",
+            _DATA_REVISION_ID_RE,
+        )
+        return generation_id, data_revision_id
+
+    @staticmethod
+    def _request_matches_lineage(
+        request: IdentityDomainRequest,
+        lineage: tuple[str, str | None],
+    ) -> bool:
+        """Match a request against current G/D, preserving old rows once."""
+
+        generation_id, data_revision_id = lineage
+        if not request._lineage_explicit:
+            # Exact pre-binding rows are from the initial run generation.  A
+            # missing D is intentionally tolerated for G-0001 so upgrading a
+            # run after D-0001 was materialized does not duplicate its first
+            # requirement; any later generation is a successor.
+            return generation_id == "G-0001"
+        return request.generation_id == generation_id and request.data_revision_id == data_revision_id
 
     def _has_active_resolution_lease(self, domain_id: str, owner_ref: str) -> bool:
         return any(
@@ -1144,7 +1578,18 @@ class EntityResolutionWorkspace:
                 persist_reconciliation()
                 raise KeyError(domain_id)
             entry = self._domain_entry(domain_id)
-            if entry.get("state") in {"failed", "ready"} or entry.get("commit_manifest_hash") is not None:
+            # Discovery is allowed while an additive revision is active but
+            # unpublished.  Once the latest revision is fully published,
+            # owner discovery remains prohibited so immutable history cannot
+            # be mutated in place.
+            active_revision = int(entry.get("revision", 1))
+            published_revision = int(
+                entry.get(
+                    "published_revision",
+                    1 if entry.get("commit_manifest_hash") or entry.get("state") == "ready" else 0,
+                )
+            )
+            if entry.get("state") == "failed" or active_revision <= published_revision:
                 persist_reconciliation()
                 raise ValueError("identity domain is not an active, uncommitted resolution domain")
             if entry.get("resolution_owner") != owner:
@@ -1210,6 +1655,7 @@ class EntityResolutionWorkspace:
         domain_id = _domain_text(domain_id)
         canonical_supplied = canonical_identity is not None
         canonical = _text(canonical_identity if canonical_supplied else domain_id, "canonical_identity")
+        lineage = self._authoritative_lineage()
         source_hints_tuple = tuple(source_hints or ())
         representation_item_ids_tuple = tuple(representation_item_ids or ())
         request = IdentityDomainRequest(
@@ -1219,6 +1665,9 @@ class EntityResolutionWorkspace:
             rationale=rationale,
             source_hints=source_hints_tuple,
             representation_item_ids=representation_item_ids_tuple,
+            generation_id=lineage[0],
+            data_revision_id=lineage[1],
+            _lineage_explicit=True,
         )
         # A materialized Requirement Mode item is the authority for discovering
         # its semantic dependency.  This prevents a Planner/bootstrap process
@@ -1239,11 +1688,11 @@ class EntityResolutionWorkspace:
                 request.item_id,
                 mode="requirement",
             )
-        except FileNotFoundError:
+        except FileNotFoundError as exc:
             if requirement_mode:
                 raise ValueError(
                     "requirement identity domain reservation requires a materialized Requirement item"
-                )
+                ) from exc
             item = None
         except ValueError as exc:
             # A Question Mode item may legitimately use the run-level API;
@@ -1312,21 +1761,33 @@ class EntityResolutionWorkspace:
                     persist_reconciliation()
                     raise ValueError("identity domain object_type conflicts with first reservation")
                 existing_requests = [IdentityDomainRequest.from_dict(value) for value in existing.requests]
-                for prior in existing_requests:
-                    if prior.item_id != request.item_id:
-                        continue
-                    # A repeated request from one requirement is idempotent;
-                    # a materially different semantic request is not.
+                same_item = [prior for prior in existing_requests if prior.item_id == request.item_id]
+                same_lineage = self.authoritative_request_for_requirement(
+                    request.item_id,
+                    domain_id,
+                    entry=existing,
+                    lineage=lineage,
+                )
+                if same_lineage is not None and not self._request_matches_lineage(same_lineage, lineage):
+                    same_lineage = None
+                if same_lineage is not None:
+                    # A repeated request from one requirement and one G/D
+                    # lineage is idempotent; a materially different semantic
+                    # request on that same lineage is not.
                     if (
-                        prior.object_type != request.object_type
-                        or prior.rationale != request.rationale
-                        or tuple(prior.source_hints) != tuple(request.source_hints)
-                        or tuple(prior.representation_item_ids) != tuple(request.representation_item_ids)
+                        same_lineage.object_type != request.object_type
+                        or same_lineage.rationale != request.rationale
+                        or tuple(same_lineage.source_hints) != tuple(request.source_hints)
+                        or tuple(same_lineage.representation_item_ids) != tuple(request.representation_item_ids)
                     ):
                         persist_reconciliation()
                         raise ValueError("identity domain request conflicts with prior request")
                     persist_reconciliation()
                     return existing
+                # The same item in a later generation/data revision is a
+                # legitimate successor request, even when its semantic bytes
+                # are unchanged.  It must not reuse a ready result.
+                lineage_changed = bool(same_item)
                 updated_requests = (*existing_requests, request)
                 prior_scope = self._scope_for_entry(domain_id, existing_raw)
                 updated_scope = IdentityDomainScope(
@@ -1341,28 +1802,67 @@ class EntityResolutionWorkspace:
                     ),
                 )
                 material_scope_changed = prior_scope.scope_hash != updated_scope.scope_hash
-                if material_scope_changed and (
-                    existing.commit_manifest_hash is not None or existing.state == "ready"
-                ):
-                    persist_reconciliation()
-                    raise ValueError(
-                        "identity domain is committed and cannot expand material scope"
+                published_revision = int(
+                    existing.published_revision
+                    or (
+                        1
+                        if existing.commit_manifest_hash is not None or existing.state == "ready"
+                        else 0
                     )
+                )
+                active_revision = int(existing.revision)
+                if active_revision <= published_revision:
+                    request_revision = (
+                        max(active_revision, published_revision) + 1
+                        if material_scope_changed or lineage_changed
+                        else max(published_revision, 1)
+                    )
+                else:
+                    # A request joining an already-open additive revision is
+                    # bound to that same revision; a later scope expansion
+                    # invalidates the candidate but never creates v3.
+                    request_revision = active_revision
+                request = replace(request, required_revision=request_revision)
+                updated_requests = (*existing_requests, request)
+                requested_by = (
+                    (*existing.requested_by, request.item_id)
+                    if request.item_id not in existing.requested_by
+                    else existing.requested_by
+                )
                 updated = replace(
                     existing,
-                    requested_by=tuple((*existing.requested_by, request.item_id)),
+                    requested_by=tuple(requested_by),
                     requests=tuple(value.to_dict() for value in updated_requests),
                     source_hints=updated_scope.source_hints,
                     representation_item_ids=updated_scope.representation_item_ids,
+                    generation_id=lineage[0],
+                    data_revision_id=lineage[1],
+                    _lineage_explicit=True,
                 )
                 updated_payload = updated.to_dict()
-                if material_scope_changed:
-                    # The prior candidate was bound to a narrower scope.  It
-                    # remains useful as an orphaned historical artifact, but
-                    # no longer has review or commit authority.  Keep the
-                    # existing owner marker so Planner resume can reacquire
-                    # the same domain instead of launching another resolver.
-                    self._invalidate_review_candidate(updated_payload)
+                if material_scope_changed or lineage_changed:
+                    published_revision = int(updated_payload.get("published_revision", 0))
+                    active_revision = int(updated_payload.get("revision", 1))
+                    if active_revision <= published_revision:
+                        # A material request after a published revision opens
+                        # the next immutable revision of the same logical
+                        # domain.  Keep the v1 manifest pointer/history while
+                        # resetting only mutable resolver/review fields.
+                        updated_payload["revision"] = max(active_revision, published_revision) + 1
+                        updated_payload["state"] = "reserved"
+                        updated_payload["resolution_owner"] = None
+                        updated_payload["reviewer_ref"] = None
+                        updated_payload["review_verdict"] = None
+                        updated_payload["review"] = None
+                        updated_payload["result_hash"] = None
+                        updated_payload["result_scope_hash"] = None
+                        updated_payload["accepted_pending_commit"] = False
+                        updated_payload["repair_count"] = 0
+                    else:
+                        # Expansion during an already-active unpublished
+                        # revision does not create v3; it only invalidates a
+                        # stale candidate/review under the same scope frontier.
+                        self._invalidate_review_candidate(updated_payload)
                 self._state["domains"][domain_id] = updated_payload
                 self._persist()
                 return IdentityDomainReservation.from_dict(updated_payload)
@@ -1375,7 +1875,10 @@ class EntityResolutionWorkspace:
                 source_hints=request.source_hints,
                 representation_item_ids=request.representation_item_ids,
                 requested_by=(request.item_id,),
-                requests=(request.to_dict(),),
+                requests=(replace(request, required_revision=1).to_dict(),),
+                generation_id=lineage[0],
+                data_revision_id=lineage[1],
+                _lineage_explicit=True,
             )
             # Distinct canonical domain keys stay distinct even when a caller
             # happens to provide the same optional identity label.  Any
@@ -1391,6 +1894,43 @@ class EntityResolutionWorkspace:
             raise ValueError("planner/control-plane work is not a leaseable worker type")
         return value
 
+    def _claim_worker_unlocked(
+        self,
+        worker_type: str,
+        owner: str,
+        subject_value: str | None,
+        *,
+        enforce_capacity: bool,
+    ) -> WorkerLease:
+        """Claim one exact worker subject while the workspace lock is held.
+
+        Generic worker claims enforce the workspace's physical capacity.  A
+        resolution-owner claim is a domain lease and intentionally skips that
+        duplicate physical check: Coordinator admission is the sole authority
+        for total/subcap scheduling, while this boundary retains exact
+        subject/owner exclusivity and CAS persistence.
+        """
+
+        lease_id = "lease-" + hashlib.sha256(
+            f"{worker_type}\0{owner}\0{subject_value or ''}".encode()
+        ).hexdigest()[:24]
+        leases = [WorkerLease.from_dict(value) for value in self._state["leases"]]
+        for lease in leases:
+            if lease.worker_type == worker_type and lease.subject_id == subject_value:
+                if lease.owner_ref == owner:
+                    return lease
+                raise ValueError("worker subject is already leased by another owner")
+        if enforce_capacity:
+            capacity = self.capacity
+            if len(leases) >= capacity.total_active:
+                raise ValueError("total active worker capacity is exhausted")
+            per_type = sum(lease.worker_type == worker_type for lease in leases)
+            if per_type >= getattr(capacity, worker_type):
+                raise ValueError(f"{worker_type} active worker capacity is exhausted")
+        lease = WorkerLease(lease_id, worker_type, owner, subject_value, _now())
+        self._state["leases"].append(lease.to_dict())
+        return lease
+
     def claim_worker(
         self,
         worker_type: str,
@@ -1400,23 +1940,14 @@ class EntityResolutionWorkspace:
         worker_type = self._normalize_worker_type(worker_type)
         owner = _text(owner_ref, "owner_ref")
         subject_value = None if subject_id is None else _text(subject_id, "subject_id")
-        lease_id = "lease-" + hashlib.sha256(f"{worker_type}\0{owner}\0{subject_value or ''}".encode()).hexdigest()[:24]
         with self._locked():
             self._refresh()
-            leases = [WorkerLease.from_dict(value) for value in self._state["leases"]]
-            for lease in leases:
-                if lease.worker_type == worker_type and lease.subject_id == subject_value:
-                    if lease.owner_ref == owner:
-                        return lease
-                    raise ValueError("worker subject is already leased by another owner")
-            capacity = self.capacity
-            if len(leases) >= capacity.total_active:
-                raise ValueError("total active worker capacity is exhausted")
-            per_type = sum(lease.worker_type == worker_type for lease in leases)
-            if per_type >= getattr(capacity, worker_type):
-                raise ValueError(f"{worker_type} active worker capacity is exhausted")
-            lease = WorkerLease(lease_id, worker_type, owner, subject_value, _now())
-            self._state["leases"].append(lease.to_dict())
+            lease = self._claim_worker_unlocked(
+                worker_type,
+                owner,
+                subject_value,
+                enforce_capacity=True,
+            )
             self._persist()
             return lease
 
@@ -1488,7 +2019,12 @@ class EntityResolutionWorkspace:
             prior_owner = entry.get("resolution_owner")
             if prior_owner is not None and prior_owner != owner:
                 raise ValueError("identity domain is owned by another resolution owner")
-            lease = self.claim_worker("entity_resolution", owner, domain_id)
+            lease = self._claim_worker_unlocked(
+                "entity_resolution",
+                owner,
+                domain_id,
+                enforce_capacity=False,
+            )
             entry["resolution_owner"] = owner
             if entry["state"] == "reserved":
                 entry["state"] = "resolving"
@@ -1641,11 +2177,11 @@ class EntityResolutionWorkspace:
             before_token = self._resolution_authority_token()
             if before_token != optimistic_token:
                 continue
-            base = self._base_model_for_validation()
+            base = self._validation_base()
             after_token = self._resolution_authority_token()
             if before_token != after_token:
                 continue
-            self._apply_result(base, normalized)
+            self._model_for_result_candidate(base, domain_id, normalized)
             with self._locked():
                 self._refresh()
                 entry = self._domain_entry(domain_id)
@@ -1874,23 +2410,12 @@ class EntityResolutionWorkspace:
         published: list[dict[str, Any]] = []
         if self.commits_root.exists() or self.commits_root.is_symlink():
             _assert_no_symlink(self.commits_root, label="entity-resolution commits")
-            for directory in sorted(self.commits_root.iterdir(), key=lambda path: path.name):
-                if directory.name.startswith("."):
-                    # Atomic commit staging directories are not published
-                    # authority and may be incomplete while another process
-                    # holds the entity lock.
-                    continue
-                _assert_no_symlink(directory, label="entity-resolution commit directory")
+            for _manifest, directory in self._commit_entries():
                 manifest_path = directory / _MANIFEST_FILENAME
-                _assert_no_symlink(manifest_path, label="entity-resolution commit manifest")
                 published.append(
                     {
-                        "directory": directory.name,
-                        "manifest_hash": (
-                            hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-                            if manifest_path.is_file()
-                            else None
-                        ),
+                        "directory": str(directory.relative_to(self.commits_root)),
+                        "manifest_hash": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
                     }
                 )
         return _digest(
@@ -1905,7 +2430,9 @@ class EntityResolutionWorkspace:
         projection_succeeded = False
         try:
             from .lem_projection import LivingEnterpriseModelProjector
-            projection = LivingEnterpriseModelProjector.project(self.context)
+            projection = LivingEnterpriseModelProjector.project(
+                self.context,
+            )
             model = LivingEnterpriseModel.from_export(projection.model.export())
             projection_succeeded = True
         except FileNotFoundError:
@@ -1926,21 +2453,42 @@ class EntityResolutionWorkspace:
         # empty; malformed prior commits fail closed in that path as well.
         if not projection_succeeded:
             try:
-                _replay_commits_with_bindings(self.context, model)
+                _replay_commits_with_bindings(
+                    self.context,
+                    model,
+                )
             except FileNotFoundError:
                 # No entity-resolution workspace means no prior resolution
                 # authority; an empty base is valid only in that case.
                 pass
         return model
 
+    def _model_for_result_candidate(
+        self,
+        base: LivingEnterpriseModel,
+        domain_id: str,
+        result: EntityResolutionResult,
+    ) -> LivingEnterpriseModel:
+        """Apply a candidate additively to the full projected validation view.
+
+        Commit revisions are immutable evidence, not replacement snapshots.
+        The candidate therefore goes through the same canonical semantic
+        ensure/merge path as replay, preserving all previously accepted
+        domain state while allowing newly reviewed structured facts to fill
+        missing ontology fields.
+        """
+        self._apply_result(base, result)
+        return LivingEnterpriseModel.from_export(base.export())
+
+    def _validation_base(self) -> LivingEnterpriseModel:
+        """Build the complete model used to validate a candidate result."""
+
+        return self._base_model_for_validation()
+
     @staticmethod
     def _apply_result(model: LivingEnterpriseModel, result: EntityResolutionResult) -> None:
         for item in result.ontology_items:
-            existing = model.ontology.get(item.item_id)
-            if existing is None:
-                model.add_ontology_item(item)
-            elif existing != item:
-                raise ValueError(f"ontology item collision: {item.item_id}")
+            model.ensure_ontology_item(item)
         for decision in result.identity_decisions:
             if decision.review_status not in {"reviewed", "accepted"}:
                 raise ValueError("identity decisions must be reviewed or accepted before commit")
@@ -1958,34 +2506,162 @@ class EntityResolutionWorkspace:
         for relationship in result.representation_relationships:
             payload = dict(relationship)
             relationship_id = payload.get("relationship_id") or payload.get("item_id") or payload.get("id")
+            if relationship_id is None:
+                raise ValueError("resolution representation relationships require explicit relationship_id")
+            relationship_key = str(relationship_id)
+            if relationship_key in model.relationships:
+                # Existing relationship IDs are canonical edge identities.
+                # Defer entirely to the model's stored record before looking
+                # at incoming endpoints or analytical shape; the low-level
+                # helper also repairs a missing generated ontology companion.
+                model.add_relationship(payload)
+                continue
             if "source_id" not in payload or "target_id" not in payload:
                 raise ValueError("resolution representation relationships require source_id and target_id")
             source = payload["source_id"]
             target = payload["target_id"]
-            if relationship_id is None:
-                raise ValueError("resolution representation relationships require explicit relationship_id")
             model._validate_relationship_endpoints(source, target)
-            existing = model.relationships.get(str(relationship_id))
-            if existing is None:
-                model.add_relationship(payload)
-            elif existing != payload:
-                raise ValueError(f"relationship collision: {relationship_id}")
+            # Normal duplicate IDs are idempotent; the model also repairs a
+            # missing generated ontology companion without replacing the edge.
+            model.add_relationship(payload)
 
-    def _records_for_result(self, domain_id: str, result: EntityResolutionResult) -> list[dict[str, Any]]:
+    @staticmethod
+    def _scoped_record_id(domain_id: str, kind: str, object_id: Any) -> str:
+        """Derive a domain-local audit ID without reusing semantic IDs.
+
+        Ontology and relationship object IDs are intentionally run-global and
+        may be reused by multiple identity domains.  Their durable audit rows
+        still need independent ledger identities so cross-domain folding can
+        retain both reviewed payloads while replay merges the shared object.
+        """
+
+        return f"{kind}:{_digest({'domain_id': _domain_text(domain_id), 'object_id': str(object_id)})}"
+
+    def _published_relationship_ids(self) -> set[str]:
+        """Read canonical relationship IDs from immutable ER commit rows."""
+
+        identifiers: set[str] = set()
+        for manifest, directory in self._commit_entries():
+            for record in _read_records(self, manifest, directory):
+                if record.get("kind") != "relationship":
+                    continue
+                payload = record.get("payload")
+                if not isinstance(payload, Mapping):
+                    raise ValueError("entity-resolution relationship record payload is invalid")
+                relationship_id = (
+                    payload.get("relationship_id")
+                    or payload.get("item_id")
+                    or payload.get("id")
+                )
+                if relationship_id is not None:
+                    identifiers.add(str(relationship_id))
+        return identifiers
+
+    def _records_for_result(
+        self,
+        domain_id: str,
+        result: EntityResolutionResult,
+        *,
+        existing_relationship_ids: Iterable[Any] | None = None,
+    ) -> list[dict[str, Any]]:
         records: list[dict[str, Any]] = []
+        if existing_relationship_ids is None:
+            existing_relationship_ids = self._published_relationship_ids()
+        else:
+            existing_relationship_ids = {str(value) for value in existing_relationship_ids}
         for item in result.ontology_items:
-            records.append({"record_id": f"ontology:{item.item_id}", "kind": "ontology_item", "domain_id": domain_id, "payload": item.to_dict()})
+            records.append({"record_id": self._scoped_record_id(domain_id, "ontology", item.item_id), "kind": "ontology_item", "domain_id": domain_id, "payload": item.to_dict()})
         for decision in result.identity_decisions:
             records.append({"record_id": f"identity_decision:{decision.decision_id}", "kind": "identity_decision", "domain_id": domain_id, "payload": decision.to_dict()})
         for mapping in result.canonical_mappings:
             records.append({"record_id": f"canonical_mapping:{mapping.canonical_id}", "kind": "canonical_mapping", "domain_id": domain_id, "payload": mapping.to_dict()})
         for index, relationship in enumerate(result.representation_relationships):
             relationship = dict(relationship)
-            if "source_id" not in relationship or "target_id" not in relationship:
-                raise ValueError("resolution representation relationships require source_id and target_id")
             relationship_id = relationship.get("relationship_id") or relationship.get("item_id") or relationship.get("id") or f"relationship-{index + 1}"
-            records.append({"record_id": f"relationship:{relationship_id}", "kind": "relationship", "domain_id": domain_id, "payload": _jsonable(relationship)})
+            if (
+                str(relationship_id) not in existing_relationship_ids
+                and ("source_id" not in relationship or "target_id" not in relationship)
+            ):
+                raise ValueError("resolution representation relationships require source_id and target_id")
+            records.append({"record_id": self._scoped_record_id(domain_id, "relationship", relationship_id), "kind": "relationship", "domain_id": domain_id, "payload": _jsonable(relationship)})
         return records
+
+    def _authoritative_predecessor(
+        self,
+        domain_id: str,
+        revision: int,
+        *,
+        entries: Iterable[tuple[Mapping[str, Any], Path]] | None = None,
+    ) -> Mapping[str, Any] | None:
+        """Return the immutable manifest immediately preceding ``revision``."""
+
+        if revision <= 1:
+            return None
+        values = [
+            manifest
+            for manifest, _ in (self._commit_entries() if entries is None else entries)
+            if manifest.get("domain_id") == domain_id
+            and _manifest_revision(manifest) == revision - 1
+        ]
+        if len(values) != 1:
+            raise ValueError("entity-resolution additive revision predecessor is not authoritative")
+        return values[0]
+
+    def _assert_manifest_matches_candidate(
+        self,
+        domain_id: str,
+        entry: Mapping[str, Any],
+        result: EntityResolutionResult,
+        records_hash: str,
+        record_count: int,
+        manifest: Mapping[str, Any],
+        *,
+        revision: int,
+        supersedes_manifest_hash: str | None,
+        candidate_scope_hash: str | None,
+    ) -> None:
+        """Fail closed when a durable manifest is not this exact candidate."""
+
+        expected_identity = {
+            "domain_id": domain_id,
+            "canonical_identity": entry.get("canonical_identity"),
+            "object_type": entry.get("object_type"),
+            "discovered_by_item_id": entry.get("discovered_by_item_id"),
+            "result_hash": result.result_hash,
+            "records_hash": records_hash,
+            "records_count": record_count,
+            "source_hash": result.source_hash,
+        }
+        for name, expected in expected_identity.items():
+            if manifest.get(name) != expected:
+                raise ValueError(f"entity-resolution commit {name} does not match the current candidate")
+        if _manifest_revision(manifest) != revision:
+            raise ValueError("entity-resolution commit revision does not match the current candidate")
+        manifest_scope_hash = manifest.get("scope_hash")
+        if revision >= 2:
+            if not _is_hash(candidate_scope_hash) or manifest_scope_hash != candidate_scope_hash:
+                raise ValueError("entity-resolution commit scope_hash does not match the current candidate")
+            if manifest.get("supersedes_manifest_hash") != supersedes_manifest_hash:
+                raise ValueError("entity-resolution commit predecessor does not match the authoritative revision")
+            predecessor_values = [
+                prior
+                for prior, _ in self._commit_entries()
+                if prior.get("manifest_hash") == supersedes_manifest_hash
+            ]
+            if len(predecessor_values) != 1:
+                raise ValueError("entity-resolution commit predecessor is not authoritative")
+            predecessor = predecessor_values[0]
+            for name in ("domain_id", "canonical_identity", "object_type", "discovered_by_item_id"):
+                if predecessor.get(name) != manifest.get(name) or predecessor.get(name) != expected_identity[name]:
+                    raise ValueError("entity-resolution commit predecessor identity does not match the current domain")
+        else:
+            # Legacy v1 manifests may lack additive metadata, but a present
+            # scope binding is still integrity-checked rather than ignored.
+            if manifest_scope_hash is not None:
+                if not _is_hash(candidate_scope_hash) or manifest_scope_hash != candidate_scope_hash:
+                    raise ValueError("entity-resolution commit scope_hash does not match the current candidate")
+            if manifest.get("supersedes_manifest_hash") is not None:
+                raise ValueError("initial entity-resolution revision cannot supersede a manifest")
 
     def _commit_with_precomputed_base(
         self,
@@ -2016,16 +2692,47 @@ class EntityResolutionWorkspace:
                 self._assert_result_scope_current(domain_id, entry)
             result = self._load_result(domain_id, entry)
             _resolution_outcome(result)
-            # The validation base is private to this operation.  Applying the
-            # candidate result in place avoids a lossy export/rehydration
-            # round-trip for representation relationships that target a
-            # canonical mapping rather than an ontology item.
-            self._apply_result(base, result)
-            records = self._records_for_result(domain_id, result)
+            records = self._records_for_result(
+                domain_id,
+                result,
+                existing_relationship_ids=base.relationships,
+            )
             records_bytes = b"".join(_canonical_bytes(record) for record in records)
             records_hash = hashlib.sha256(records_bytes).hexdigest()
             commit_digest = hashlib.sha256(domain_id.encode("utf-8")).hexdigest()
-            final_root = self.commits_root / commit_digest
+            revision = int(entry.get("revision", 1))
+            published_revision = int(
+                entry.get(
+                    "published_revision",
+                    1 if entry.get("commit_manifest_hash") or entry.get("state") == "ready" else 0,
+                )
+            )
+            if revision < 1 or published_revision > revision:
+                raise ValueError("identity domain revision authority is invalid")
+            candidate_scope_hash = entry.get("result_scope_hash")
+            if candidate_scope_hash is None:
+                candidate_scope_hash = self._scope_for_entry(domain_id, entry).scope_hash
+            commit_entries = self._commit_entries()
+            predecessor = self._authoritative_predecessor(
+                domain_id,
+                revision,
+                entries=commit_entries,
+            )
+            supersedes_manifest_hash = predecessor.get("manifest_hash") if predecessor is not None else None
+            if revision > 1:
+                if published_revision not in {revision - 1, revision}:
+                    raise ValueError("additive identity revision predecessor boundary is invalid")
+                if published_revision == revision - 1:
+                    if entry.get("commit_manifest_hash") != supersedes_manifest_hash:
+                        raise ValueError("additive identity revision superseded manifest is not authoritative")
+            elif published_revision not in {0, 1}:
+                raise ValueError("initial identity revision publication boundary is invalid")
+            if revision == 1:
+                final_root = self.commits_root / commit_digest
+            else:
+                final_root = self.commits_root / commit_digest / f"revision-{revision}"
+            if published_revision == revision and not final_root.exists() and not final_root.is_symlink():
+                raise ValueError("published entity-resolution revision artifact is missing")
             manifest_path = final_root / _MANIFEST_FILENAME
             if final_root.exists() or final_root.is_symlink():
                 _assert_no_symlink(final_root, label="entity-resolution commit")
@@ -2033,16 +2740,41 @@ class EntityResolutionWorkspace:
                     raise ValueError("entity-resolution commit manifest is missing")
                 existing = json.loads(manifest_path.read_text(encoding="utf-8"))
                 _validate_manifest(existing)
-                if existing.get("result_hash") != result.result_hash or existing.get("records_hash") != records_hash:
-                    raise ValueError("entity-resolution commit conflicts with existing publication")
-                commit = ResolutionCommit(domain_id, str(existing["manifest_hash"]), records_hash, result.result_hash, f"{_COMMITS_DIR}/{commit_digest}/{_RECORDS_FILENAME}", f"{_COMMITS_DIR}/{commit_digest}/{_MANIFEST_FILENAME}", result.source_hash, len(records))
+                self._assert_manifest_matches_candidate(
+                    domain_id,
+                    entry,
+                    result,
+                    records_hash,
+                    len(records),
+                    existing,
+                    revision=revision,
+                    supersedes_manifest_hash=supersedes_manifest_hash,
+                    candidate_scope_hash=candidate_scope_hash,
+                )
+                commit = ResolutionCommit(
+                    domain_id,
+                    str(existing["manifest_hash"]),
+                    records_hash,
+                    result.result_hash,
+                    str(final_root.relative_to(self.root) / Path(_RECORDS_FILENAME)),
+                    str(final_root.relative_to(self.root) / Path(_MANIFEST_FILENAME)),
+                    result.source_hash,
+                    len(records),
+                    revision,
+                    _manifest_scope_hash(existing),
+                    existing.get("supersedes_manifest_hash"),
+                )
                 entry["commit_manifest_hash"] = commit.manifest_hash
                 entry["state"] = "ready"
                 entry["accepted_pending_commit"] = False
+                entry["published_revision"] = revision
+                entry["published_scope_hash"] = _manifest_scope_hash(existing)
                 self._state["domains"][domain_id] = entry
                 self._persist()
                 self.release_worker(worker_type="entity_resolution", owner_ref=entry.get("resolution_owner"), subject_id=domain_id, recovery=True)
                 return commit
+            if revision > 1 and not _is_hash(supersedes_manifest_hash):
+                raise ValueError("additive identity revision is missing its superseded manifest")
             manifest_unsigned = {
                 "schema_version": SCHEMA_VERSION,
                 "kind": "entity_resolution_commit",
@@ -2065,13 +2797,18 @@ class EntityResolutionWorkspace:
                 "script_receipt_refs": list(result.script_receipt_refs),
                 "metadata": _jsonable(result.metadata),
                 "committed_at": _now(),
+                "revision": revision,
+                "scope_hash": candidate_scope_hash,
+                "supersedes_manifest_hash": supersedes_manifest_hash,
             }
             manifest = {**manifest_unsigned, "manifest_hash": _digest(manifest_unsigned)}
             _ensure_dir(self.commits_root, label="entity-resolution commits")
+            _ensure_dir(final_root.parent, label="entity-resolution commit domain directory")
             temporary = Path(tempfile.mkdtemp(prefix=".resolution-commit-", dir=self.commits_root))
             try:
                 _atomic_write_bytes(temporary / _RECORDS_FILENAME, records_bytes)
                 _atomic_write_json(temporary / _MANIFEST_FILENAME, manifest)
+                _assert_no_symlink(final_root, label="entity-resolution commit")
                 os.replace(temporary, final_root)
             except Exception:
                 shutil.rmtree(temporary, ignore_errors=True)
@@ -2079,10 +2816,24 @@ class EntityResolutionWorkspace:
             entry["commit_manifest_hash"] = manifest["manifest_hash"]
             entry["state"] = "ready"
             entry["accepted_pending_commit"] = False
+            entry["published_revision"] = revision
+            entry["published_scope_hash"] = manifest.get("scope_hash")
             self._state["domains"][domain_id] = entry
             self._persist()
             self.release_worker(worker_type="entity_resolution", owner_ref=entry.get("resolution_owner"), subject_id=domain_id, recovery=True)
-            return ResolutionCommit(domain_id, manifest["manifest_hash"], records_hash, result.result_hash, f"{_COMMITS_DIR}/{commit_digest}/{_RECORDS_FILENAME}", f"{_COMMITS_DIR}/{commit_digest}/{_MANIFEST_FILENAME}", result.source_hash, len(records))
+            return ResolutionCommit(
+                domain_id,
+                manifest["manifest_hash"],
+                records_hash,
+                result.result_hash,
+                str(final_root.relative_to(self.root) / Path(_RECORDS_FILENAME)),
+                str(final_root.relative_to(self.root) / Path(_MANIFEST_FILENAME)),
+                result.source_hash,
+                len(records),
+                revision,
+                manifest.get("scope_hash"),
+                manifest.get("supersedes_manifest_hash"),
+            )
 
     def commit(self, domain_id: str) -> ResolutionCommit:
         """Optimistically project outside the entity lock, then publish.
@@ -2098,10 +2849,17 @@ class EntityResolutionWorkspace:
         domain_id = _domain_text(domain_id)
         for _attempt in range(3):
             before_token = self._resolution_authority_token()
-            base = self._base_model_for_validation()
+            base = self._validation_base()
             after_token = self._resolution_authority_token()
             if before_token != after_token:
                 continue
+            with self._locked():
+                self._refresh()
+                entry = self._domain_entry(domain_id)
+                if entry.get("result_scope_hash") is not None:
+                    self._assert_result_scope_current(domain_id, entry)
+                result = self._load_result(domain_id, entry)
+            self._model_for_result_candidate(base, domain_id, result)
             try:
                 return self._commit_with_precomputed_base(domain_id, base, after_token)
             except _RetryResolutionCommit:
@@ -2115,17 +2873,47 @@ class EntityResolutionWorkspace:
         reason: str,
         *,
         owner_ref: str,
+        required_revisions: Mapping[str, int] | None = None,
     ) -> Mapping[str, Any]:
         requirement = _safe_path_component(requirement_id, "requirement_id")
         domains = tuple(dict.fromkeys(_domain_text(value) for value in domain_ids))
         if not domains:
             raise ValueError("domain_ids must be non-empty")
         owner = _text(owner_ref, "owner_ref")
+        if required_revisions is not None and not isinstance(required_revisions, Mapping):
+            raise TypeError("required_revisions must be a mapping")
         with self._locked():
             self._refresh()
             for domain_id in domains:
                 self._domain_entry(domain_id)
             prior = self._state["waits"].get(requirement)
+            if required_revisions is None:
+                # Preserve a prior wait's exact durable boundary on retries.
+                # For a new direct caller, derive it from the matching
+                # request, or from the current active/published revision.
+                required = {
+                    domain_id: (
+                        int(prior.get("required_revisions", {}).get(domain_id))
+                        if isinstance(prior, Mapping)
+                        and isinstance(prior.get("required_revisions"), Mapping)
+                        and domain_id in prior.get("required_revisions", {})
+                        else self._request_revision_for_requirement(
+                            requirement,
+                            domain_id,
+                            self._domain_entry(domain_id),
+                        )
+                    )
+                    for domain_id in domains
+                }
+            else:
+                if set(required_revisions) != set(domains):
+                    raise ValueError("required_revisions must exactly cover domain_ids")
+                required = {}
+                for domain_id in domains:
+                    value = required_revisions[domain_id]
+                    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                        raise ValueError("required revision must be a positive integer")
+                    required[domain_id] = value
             if isinstance(prior, Mapping):
                 comparable = {
                     "requirement_id": requirement,
@@ -2133,7 +2921,15 @@ class EntityResolutionWorkspace:
                     "reason": str(reason or ""),
                     "owner_ref": owner,
                 }
-                if all(prior.get(key) == value for key, value in comparable.items()):
+                prior_required = prior.get("required_revisions")
+                # Rows written before revision-aware waits are read as v1 and
+                # remain byte-identical on exact retries.
+                required_matches = (
+                    prior_required is None
+                    or prior_required == required
+                    or prior_required == {domain_id: required[domain_id] for domain_id in domains}
+                )
+                if all(prior.get(key) == value for key, value in comparable.items()) and required_matches:
                     # Exact planner retries must not churn the wait record or
                     # the run-level state hash.
                     return dict(prior)
@@ -2147,6 +2943,7 @@ class EntityResolutionWorkspace:
                 "reason": str(reason or ""),
                 "owner_ref": owner,
                 "state": "waiting_on_resolution",
+                "required_revisions": dict(required),
                 "updated_at": _now(),
                 "resumed_at": None,
             }
@@ -2157,12 +2954,34 @@ class EntityResolutionWorkspace:
     def requirement_runtime_statuses(self) -> Mapping[str, Mapping[str, Any]]:
         with self._locked():
             self._refresh()
-            changed = False
+            # Reconcile immutable publication bindings before projecting any
+            # waiter readiness.  This keeps the public release path subject
+            # to the same fail-closed artifact-chain checks as ``load`` and
+            # allows only an explicit pointer-less crash window to bind.
+            reconciled = self._reconcile_commit_refs()
+            changed = reconciled
             statuses: dict[str, Mapping[str, Any]] = {}
             for requirement, raw in self._state["waits"].items():
                 entry = dict(raw)
                 if entry.get("state") == "waiting_on_resolution":
-                    ready = all(self._state["domains"].get(domain_id, {}).get("state") == "ready" for domain_id in entry.get("domain_ids", ()))
+                    required = entry.get("required_revisions")
+                    if not isinstance(required, Mapping):
+                        # Exact older persisted wait rows have no revision
+                        # field.  Infer v1 in the detached status view without
+                        # rewriting the old wait bytes.
+                        required = {
+                            domain_id: 1
+                            for domain_id in entry.get("domain_ids", ())
+                        }
+                    ready = all(
+                        self._published_revision_for_entry(self._state["domains"].get(domain_id, {}))
+                        >= int(required.get(domain_id, 1))
+                        for domain_id in entry.get("domain_ids", ())
+                        if domain_id in self._state["domains"]
+                    ) and all(
+                        domain_id in self._state["domains"]
+                        for domain_id in entry.get("domain_ids", ())
+                    )
                     expected = "ready_to_resume" if ready else "waiting_on_resolution"
                     if entry.get("state") != expected:
                         entry["state"] = expected
@@ -2179,8 +2998,14 @@ class EntityResolutionWorkspace:
         requirement_id: str,
         *,
         owner_ref: str,
-        reacquire: bool = True,
-    ) -> WorkerLease | Mapping[str, Any]:
+    ) -> Mapping[str, Any]:
+        """Move a released requirement wait back to the analytical queue.
+
+        Analytical Owner capacity is owned by the durable item attempt and
+        the coordinator dispatch claim.  The entity-resolution workspace may
+        still load historical Analytical Owner lease records, but resuming a
+        requirement must never create another one.
+        """
         requirement = _safe_path_component(requirement_id, "requirement_id")
         owner = _text(owner_ref, "owner_ref")
         statuses = self.requirement_runtime_statuses()
@@ -2191,7 +3016,6 @@ class EntityResolutionWorkspace:
             raise ValueError("requirement wait is owned by another analytical owner")
         if current.get("state") != "ready_to_resume":
             raise ValueError("requirement is not ready to resume")
-        lease = self.claim_worker("analytical_owner", owner, requirement) if reacquire else None
         with self._locked():
             self._refresh()
             value = dict(self._state["waits"][requirement])
@@ -2199,29 +3023,85 @@ class EntityResolutionWorkspace:
             value["resumed_at"] = _now()
             self._state["waits"][requirement] = value
             self._persist()
-        return lease if lease is not None else value
+        return value
 
     def _commit_manifests(self) -> list[Mapping[str, Any]]:
-        manifests: list[Mapping[str, Any]] = []
+        return [manifest for manifest, _ in self._commit_entries()]
+
+    def _commit_entries(self) -> list[tuple[Mapping[str, Any], Path]]:
+        """Load immutable manifest/path pairs, including revision children.
+
+        Revision 1 keeps its historical ``committed/<domain-hash>`` directory
+        unchanged.  Additive revisions use deterministic children named
+        ``revision-<n>`` under that directory, so every prior byte remains
+        auditable and readers retain the actual path instead of deriving one
+        from the logical domain alone.
+        """
         if not self.commits_root.exists():
             raise ValueError("entity-resolution commits directory is missing")
-        for directory in sorted(self.commits_root.iterdir(), key=lambda path: path.name):
-            if directory.is_symlink() or not directory.is_dir():
-                raise AllowedRootError(f"entity-resolution commit directory is invalid: {directory}")
-            path = directory / _MANIFEST_FILENAME
-            _assert_no_symlink(path, label="entity-resolution commit manifest")
-            if not path.is_file():
+        entries: list[tuple[Mapping[str, Any], Path]] = []
+        for domain_dir in sorted(self.commits_root.iterdir(), key=lambda path: path.name):
+            if domain_dir.name.startswith("."):
+                continue
+            if domain_dir.is_symlink() or not domain_dir.is_dir():
+                raise AllowedRootError(f"entity-resolution commit directory is invalid: {domain_dir}")
+            direct_manifest = domain_dir / _MANIFEST_FILENAME
+            paths_list: list[tuple[Path, Path]] = []
+            if direct_manifest.exists() or direct_manifest.is_symlink():
+                paths_list.append((domain_dir, direct_manifest))
+            for revision_dir in sorted(domain_dir.iterdir(), key=lambda path: path.name):
+                if revision_dir.name.startswith("."):
+                    continue
+                if revision_dir.name in {_MANIFEST_FILENAME, _RECORDS_FILENAME}:
+                    continue
+                if revision_dir.is_symlink() or not revision_dir.is_dir():
+                    raise AllowedRootError(f"entity-resolution commit revision directory is invalid: {revision_dir}")
+                if not revision_dir.name.startswith("revision-"):
+                    raise ValueError("entity-resolution commit revision directory name is invalid")
+                manifest_path = revision_dir / _MANIFEST_FILENAME
+                if not manifest_path.is_file() or manifest_path.is_symlink():
+                    raise ValueError("entity-resolution commit manifest is missing")
+                paths_list.append((revision_dir, manifest_path))
+            if not paths_list:
                 raise ValueError("entity-resolution commit manifest is missing")
-            value = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(value, Mapping):
-                raise ValueError("entity-resolution commit manifest is invalid")
-            _validate_manifest(value)
-            manifests.append(value)
-        return manifests
+            paths = tuple(paths_list)
+            for directory, manifest_path in paths:
+                _assert_no_symlink(manifest_path, label="entity-resolution commit manifest")
+                if not manifest_path.is_file():
+                    raise ValueError("entity-resolution commit manifest is missing")
+                try:
+                    value = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ValueError("entity-resolution commit manifest is invalid") from exc
+                if not isinstance(value, Mapping):
+                    raise ValueError("entity-resolution commit manifest is invalid")
+                _validate_manifest(value)
+                expected_domain_dir = hashlib.sha256(str(value.get("domain_id")).encode("utf-8")).hexdigest()
+                if domain_dir.name != expected_domain_dir:
+                    raise ValueError("entity-resolution commit directory does not match domain")
+                revision = _manifest_revision(value)
+                if directory == domain_dir:
+                    # The historical domain root is exclusively revision 1.
+                    # A later revision must never be smuggled into the legacy
+                    # path, even when its manifest/hash content is valid.
+                    if revision != 1:
+                        raise ValueError("entity-resolution revision 1 root path is invalid")
+                else:
+                    if revision < 2 or directory.name != f"revision-{revision}":
+                        raise ValueError("entity-resolution commit revision path does not match manifest revision")
+                entries.append((value, directory))
+        return entries
 
     @classmethod
     def committed_bindings(cls, context: RunContext) -> tuple[Mapping[str, Any], ...]:
         workspace = cls.load(context)
+        latest: dict[str, Mapping[str, Any]] = {}
+        for manifest, _ in workspace._commit_entries():
+            domain_id = str(manifest["domain_id"])
+            revision = _manifest_revision(manifest)
+            prior = latest.get(domain_id)
+            if prior is None or revision > _manifest_revision(prior):
+                latest[domain_id] = manifest
         return tuple(
             {
                 "domain_id": manifest["domain_id"],
@@ -2230,8 +3110,11 @@ class EntityResolutionWorkspace:
                 "result_hash": manifest["result_hash"],
                 "source_hash": manifest.get("source_hash"),
                 "records_count": manifest["records_count"],
+                "revision": _manifest_revision(manifest),
+                "scope_hash": manifest.get("scope_hash"),
+                "supersedes_manifest_hash": manifest.get("supersedes_manifest_hash"),
             }
-            for manifest in sorted(workspace._commit_manifests(), key=lambda value: str(value["domain_id"]))
+            for manifest in sorted(latest.values(), key=lambda value: str(value["domain_id"]))
         )
 
 
@@ -2259,7 +3142,7 @@ def _read_records(workspace: EntityResolutionWorkspace, manifest: Mapping[str, A
 
 
 def _validate_manifest(manifest: Mapping[str, Any]) -> None:
-    if not isinstance(manifest, Mapping) or set(manifest) != _MANIFEST_FIELDS:
+    if not isinstance(manifest, Mapping) or set(manifest) not in {_LEGACY_MANIFEST_FIELDS, _REVISION_MANIFEST_FIELDS}:
         raise ValueError("entity-resolution commit manifest fields are invalid")
     if manifest.get("schema_version") != SCHEMA_VERSION or manifest.get("kind") != "entity_resolution_commit":
         raise ValueError("entity-resolution commit manifest identity is invalid")
@@ -2278,6 +3161,105 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> None:
         raise ValueError("entity-resolution commit receipt references are invalid")
     if manifest.get("manifest_hash") != _digest({key: value for key, value in manifest.items() if key != "manifest_hash"}):
         raise ValueError("entity-resolution commit manifest hash does not match content")
+    revision = _manifest_revision(manifest)
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        raise ValueError("entity-resolution commit revision is invalid")
+    if set(manifest) == _REVISION_MANIFEST_FIELDS:
+        scope_hash = manifest.get("scope_hash")
+        if not _is_hash(scope_hash):
+            raise ValueError("entity-resolution commit scope_hash is invalid")
+        supersedes = manifest.get("supersedes_manifest_hash")
+        if supersedes is not None and not _is_hash(supersedes):
+            raise ValueError("entity-resolution commit supersedes_manifest_hash is invalid")
+
+
+def _manifest_revision(manifest: Mapping[str, Any]) -> int:
+    """Read revision metadata while deterministically upgrading legacy v1."""
+
+    value = manifest.get("revision", 1)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("entity-resolution commit revision is invalid")
+    return value
+
+
+def _manifest_scope_hash(manifest: Mapping[str, Any]) -> str | None:
+    value = manifest.get("scope_hash")
+    return value if value is None or _is_hash(value) else None
+
+
+def _fold_commit_entries(
+    workspace: EntityResolutionWorkspace,
+    entries: Iterable[tuple[Mapping[str, Any], Path]],
+) -> dict[str, dict[str, Any]]:
+    """Validate revision chains and retain immutable records chronologically.
+
+    The helper is intentionally shared by reconciliation and replay.  Every
+    immutable row remains in ascending manifest-revision/original-file order;
+    replay's canonical model layer performs semantic reuse and additive merge.
+    Reusable ontology/relationship rows carry domain-scoped audit IDs, while
+    any remaining cross-domain reuse is still treated as corruption.
+    """
+    grouped: dict[str, list[tuple[Mapping[str, Any], Path]]] = {}
+    for manifest, directory in entries:
+        domain_id = _domain_text(manifest.get("domain_id"))
+        grouped.setdefault(domain_id, []).append((manifest, directory))
+    folded: dict[str, dict[str, Any]] = {}
+    record_domains: dict[str, str] = {}
+    for domain_id, values in grouped.items():
+        values.sort(key=lambda pair: _manifest_revision(pair[0]))
+        by_revision: dict[int, tuple[Mapping[str, Any], Path]] = {}
+        ordered_records: list[Mapping[str, Any]] = []
+        ordered_batches: list[tuple[Mapping[str, Any], tuple[Mapping[str, Any], ...]]] = []
+        chain_identity: Mapping[str, Any] | None = None
+        for manifest, directory in values:
+            revision = _manifest_revision(manifest)
+            if revision in by_revision:
+                raise ValueError("entity-resolution commit contains duplicate revision")
+            by_revision[revision] = (manifest, directory)
+            if revision == 1:
+                if manifest.get("supersedes_manifest_hash") is not None:
+                    raise ValueError("initial entity-resolution revision cannot supersede a manifest")
+            else:
+                prior = by_revision.get(revision - 1)
+                supersedes = manifest.get("supersedes_manifest_hash")
+                if prior is None or supersedes != prior[0].get("manifest_hash"):
+                    raise ValueError("entity-resolution revision chain is broken")
+            if chain_identity is None:
+                chain_identity = manifest
+            else:
+                for name in ("domain_id", "canonical_identity", "object_type", "discovered_by_item_id"):
+                    if manifest.get(name) != chain_identity.get(name):
+                        raise ValueError("entity-resolution revision chain identity is inconsistent")
+            records = _read_records(workspace, manifest, directory)
+            seen_in_revision: set[str] = set()
+            for record in records:
+                record_id = record.get("record_id")
+                if not isinstance(record_id, str) or not record_id.strip():
+                    raise ValueError("entity-resolution record_id is invalid")
+                if record.get("domain_id") != domain_id:
+                    raise ValueError("entity-resolution record domain identity is invalid")
+                if record_id in seen_in_revision:
+                    raise ValueError("entity-resolution revision contains duplicate record_id")
+                seen_in_revision.add(record_id)
+                prior_domain = record_domains.get(record_id)
+                if prior_domain is not None and prior_domain != domain_id:
+                    raise ValueError("entity-resolution record_id collides across domains")
+                record_domains[record_id] = domain_id
+                ordered_records.append(record)
+            ordered_batches.append((manifest, tuple(records)))
+        expected_revisions = list(range(1, max(by_revision, default=0) + 1))
+        if sorted(by_revision) != expected_revisions:
+            raise ValueError("entity-resolution revision history has a gap")
+        folded[domain_id] = {
+            "manifests": [by_revision[revision][0] for revision in expected_revisions],
+            "directories": [by_revision[revision][1] for revision in expected_revisions],
+            "records": tuple(ordered_records),
+            # Keep immutable manifest boundaries so replay can perform a
+            # global committed-at merge while retaining each manifest's
+            # records.jsonl order and each domain's revision chain order.
+            "batches": tuple(ordered_batches),
+        }
+    return folded
 
 
 def _apply_record(model: LivingEnterpriseModel, record: Mapping[str, Any]) -> None:
@@ -2287,11 +3269,7 @@ def _apply_record(model: LivingEnterpriseModel, record: Mapping[str, Any]) -> No
         raise ValueError("entity-resolution record payload is invalid")
     if kind == "ontology_item":
         item = OntologyItem.from_dict(payload)
-        existing = model.ontology.get(item.item_id)
-        if existing is None:
-            model.add_ontology_item(item)
-        elif existing != item:
-            raise ValueError(f"entity-resolution ontology collision: {item.item_id}")
+        model.ensure_ontology_item(item)
     elif kind == "identity_decision":
         decision = IdentityDecision.from_dict(payload)
         if decision.review_status not in {"reviewed", "accepted"}:
@@ -2308,44 +3286,98 @@ def _apply_record(model: LivingEnterpriseModel, record: Mapping[str, Any]) -> No
         model.add_mapping(mapping)
     elif kind == "relationship":
         payload = dict(payload)
+        relationship_id = payload.get("relationship_id") or payload.get("item_id") or payload.get("id")
+        if relationship_id is None:
+            raise ValueError("entity-resolution relationship requires relationship_id")
+        relationship_key = str(relationship_id)
+        if relationship_key in model.relationships:
+            # Existing IDs are authoritative and must be reused before
+            # validating incoming endpoints or analytical shape.
+            model.add_relationship(payload)
+            return
         if "source_id" not in payload or "target_id" not in payload:
             raise ValueError("entity-resolution representation relationship requires source_id and target_id")
         source = payload["source_id"]
         target = payload["target_id"]
         model._validate_relationship_endpoints(source, target)
-        relationship_id = payload.get("relationship_id") or payload.get("item_id") or payload.get("id")
-        if relationship_id is None:
-            raise ValueError("entity-resolution relationship requires relationship_id")
-        existing = model.relationships.get(str(relationship_id))
-        if existing is None:
-            model.add_relationship(payload)
-        elif existing != dict(payload):
-            raise ValueError(f"entity-resolution relationship collision: {relationship_id}")
+        # Normal duplicate IDs are idempotent; the model also repairs a
+        # missing generated ontology companion without replacing the edge.
+        model.add_relationship(payload)
     else:
         raise ValueError(f"unknown entity-resolution record kind: {kind}")
 
 
-def _replay_commits_with_bindings(context: RunContext, model: LivingEnterpriseModel) -> tuple[Mapping[str, Any], ...]:
+def _iter_replay_batches(
+    grouped: Mapping[str, Mapping[str, Any]],
+) -> Iterable[tuple[str, Mapping[str, Any], tuple[Mapping[str, Any], ...]]]:
+    """Yield immutable resolution batches in authoritative commit order.
+
+    Each domain's batches are already revision-ascending from
+    ``_fold_commit_entries``.  Selecting only the next head from each domain
+    gives a small k-way merge: committed timestamps determine global order,
+    while a clock anomaly cannot cause a later revision to precede its own
+    predecessor.  Domain, revision, and manifest hash make equal timestamps
+    deterministic without changing the immutable artifacts.
+    """
+
+    heads: dict[str, int] = {
+        domain_id: 0
+        for domain_id, group in grouped.items()
+        if group.get("batches")
+    }
+    while heads:
+        def sort_key(entry: tuple[str, int]) -> tuple[datetime, str, int, str]:
+            domain_id, index = entry
+            manifest, _records = grouped[domain_id]["batches"][index]
+            committed_at = _timestamp(
+                manifest.get("committed_at"),
+                "entity-resolution commit committed_at",
+            )
+            return (
+                committed_at,
+                domain_id,
+                _manifest_revision(manifest),
+                str(manifest.get("manifest_hash", "")),
+            )
+
+        domain_id, index = min(heads.items(), key=sort_key)
+        manifest, records = grouped[domain_id]["batches"][index]
+        yield domain_id, manifest, records
+        next_index = index + 1
+        if next_index < len(grouped[domain_id]["batches"]):
+            heads[domain_id] = next_index
+        else:
+            del heads[domain_id]
+
+
+def _replay_commits_with_bindings(
+    context: RunContext,
+    model: LivingEnterpriseModel,
+) -> tuple[Mapping[str, Any], ...]:
     workspace = EntityResolutionWorkspace.load(context)
     if model.run_id != context.run_id:
         raise ValueError("entity-resolution replay model belongs to another run")
     candidate = LivingEnterpriseModel.from_export(model.export())
     bindings: list[Mapping[str, Any]] = []
-    for manifest in sorted(workspace._commit_manifests(), key=lambda value: str(value["domain_id"])):
-        domain_id = _domain_text(manifest.get("domain_id"))
-        directory = workspace.commits_root / hashlib.sha256(domain_id.encode("utf-8")).hexdigest()
-        records = _read_records(workspace, manifest, directory)
+    grouped = _fold_commit_entries(workspace, workspace._commit_entries())
+    for domain_id, _manifest, records in _iter_replay_batches(grouped):
         for record in records:
-            if record.get("domain_id") != domain_id:
-                raise ValueError("entity-resolution record domain identity is invalid")
             _apply_record(candidate, record)
+    # Bindings are a read-model concern: retain one latest manifest per
+    # domain in deterministic domain order independently of replay order.
+    for domain_id in sorted(grouped):
+        group = grouped[domain_id]
+        latest = group["manifests"][-1]
         bindings.append({
             "domain_id": domain_id,
-            "manifest_hash": manifest["manifest_hash"],
-            "records_hash": manifest["records_hash"],
-            "result_hash": manifest["result_hash"],
-            "source_hash": manifest.get("source_hash"),
-            "records_count": manifest["records_count"],
+            "manifest_hash": latest["manifest_hash"],
+            "records_hash": latest["records_hash"],
+            "result_hash": latest["result_hash"],
+            "source_hash": latest.get("source_hash"),
+            "records_count": latest["records_count"],
+            "revision": _manifest_revision(latest),
+            "scope_hash": latest.get("scope_hash"),
+            "supersedes_manifest_hash": latest.get("supersedes_manifest_hash"),
         })
     model.__dict__.clear()
     model.__dict__.update(candidate.__dict__)

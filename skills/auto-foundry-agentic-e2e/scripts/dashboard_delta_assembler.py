@@ -27,6 +27,7 @@ import secrets
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
 try:
@@ -45,7 +46,7 @@ except ModuleNotFoundError:  # pragma: no cover - direct script execution
     from auto_foundry_core.workspace import AllowedRootError, RunContext
 
 
-DELTA_SCHEMA = "dashboard.delta_receipt.v1"
+DELTA_SCHEMA = "dashboard.delta_receipt.v2"
 FIXTURE_SCHEMA = "dashboard.reviewed_fixture.v4"
 CHART_MAP_SCHEMA = "dashboard.chart_map.v4"
 ASSEMBLER_SCHEMA = "dashboard.assembler_receipt.v1"
@@ -85,6 +86,7 @@ _DELTA_RECEIPT_KEYS = frozenset(
         "parent_generation_id",
         "source_policy",
         "new_analytics",
+        "analytical_artifacts",
         "parent",
         "request_binding",
         "plan_binding",
@@ -104,6 +106,7 @@ _DELTA_RECEIPT_KEYS = frozenset(
         "presentation_plan_ref",
         "presentation_plan_sha256",
         "manager_widget_ids",
+        "blueprint_binding",
     }
 )
 _DELTA_PARENT_KEYS = frozenset(
@@ -137,26 +140,22 @@ _DELTA_REQUEST_KEYS = frozenset(
         "manager_widget_ids",
     }
 )
-# A planless receipt is a narrowly scoped historical shape used only as the
-# immutable old target during an explicit same-generation plan migration.
-# Keep this separate from the current schema instead of making the ordinary
-# validator permissive: every field other than the additive presentation-plan
-# fields must still be present and exact.
-_LEGACY_DELTA_RECEIPT_KEYS = frozenset(
-    _DELTA_RECEIPT_KEYS - {"presentation_plan_ref", "presentation_plan_sha256", "manager_widget_ids"}
-)
-_LEGACY_DELTA_REQUEST_KEYS = frozenset(
-    _DELTA_REQUEST_KEYS - {"presentation_plan_ref", "presentation_plan_sha256", "manager_widget_ids"}
-)
 _DELTA_PLAN_KEYS = frozenset({"ref", "sha256", "admission_sha256", "generation_id", "revision", "route"})
-_DELTA_OUTPUT_KEYS = frozenset({"fixture_ref", "chart_map_ref", "chart_registry_ref", "site_ref", "receipt_ref"})
-_DELTA_HASH_KEYS = frozenset({"fixture_sha256", "chart_map_sha256", "chart_registry_sha256", "site_manifest_sha256"})
+_DELTA_OUTPUT_KEYS = frozenset({"fixture_ref", "chart_map_ref", "chart_registry_ref", "blueprint_ref", "site_ref", "receipt_ref"})
+_DELTA_HASH_KEYS = frozenset({"fixture_sha256", "chart_map_sha256", "chart_registry_sha256", "blueprint_sha256", "site_manifest_sha256"})
 _DELTA_PROJECTION_KEYS = frozenset({"projection_hash", "export_sha256"})
 _DELTA_ROLLBACK_KEYS = frozenset(
     {"generation_id", "product_manifest_ref", "product_manifest_sha256", "receipt_ref", "receipt_sha256", "site_tree_sha256"}
 )
 _DELTA_INPUT_KEYS = frozenset(
-    {"item_id", "accepted_content_hash", "accepted_manifest_hash", "integration_manifest_hash", "record_count"}
+    {
+        "item_id",
+        "accepted_content_hash",
+        "accepted_manifest_hash",
+        "integration_manifest_hash",
+        "record_count",
+        "analytical_artifacts",
+    }
 )
 _DELTA_PATH_KEYS = frozenset({"path", "sha256"})
 _DELTA_FREEZE_KEYS = frozenset(
@@ -169,6 +168,7 @@ _DELTA_FREEZE_KEYS = frozenset(
         "prepared_registry",
         "prepared_index",
         "telemetry",
+        "analytical_artifacts",
         "product_manifest_ref",
         "product_manifest_sha256",
         "freeze_markers",
@@ -520,6 +520,16 @@ def _validate_delta_receipt_shape(receipt: Mapping[str, Any]) -> None:
         value = receipt.get(field)
         if not isinstance(value, Mapping) or set(value) != expected:
             raise DashboardDeltaError(f"delta receipt {field} schema is not exact")
+    blueprint = receipt.get("blueprint_binding")
+    if (
+        not isinstance(blueprint, Mapping)
+        or set(blueprint) != {"ref", "sha256", "schema_version", "status"}
+        or not isinstance(blueprint.get("ref"), str)
+        or not _is_sha256(blueprint.get("sha256"))
+        or blueprint.get("schema_version") != "dashboard.business_presentation_plan.v2"
+        or blueprint.get("status") not in {"Preview", "Reviewed"}
+    ):
+        raise DashboardDeltaError("delta receipt blueprint binding is invalid")
     for field in ("old_projection", "new_projection"):
         value = receipt.get(field)
         if not isinstance(value, Mapping) or set(value) != _DELTA_PROJECTION_KEYS:
@@ -531,6 +541,8 @@ def _validate_delta_receipt_shape(receipt: Mapping[str, Any]) -> None:
     for item in receipt["input_items"]:
         if not isinstance(item, Mapping) or set(item) != _DELTA_INPUT_KEYS:
             raise DashboardDeltaError("delta receipt input item schema is not exact")
+        if not isinstance(item.get("analytical_artifacts"), list):
+            raise DashboardDeltaError("delta receipt input item analytical_artifacts must be a list")
     for field in ("affected_paths", "unchanged_paths"):
         for item in receipt[field]:
             if not isinstance(item, Mapping) or set(item) != _DELTA_PATH_KEYS:
@@ -550,6 +562,51 @@ def _validate_delta_receipt_shape(receipt: Mapping[str, Any]) -> None:
     markers = freeze.get("freeze_markers")
     if not isinstance(markers, Mapping) or set(markers) != {"answers_frozen", "living_enterprise_model_frozen", "prepared_data_registry_frozen", "dashboard_frozen", "telemetry_frozen"}:
         raise DashboardDeltaError("delta receipt freeze marker schema is not exact")
+    if not isinstance(receipt.get("analytical_artifacts"), list):
+        raise DashboardDeltaError("delta receipt analytical_artifacts must be a list")
+    if not isinstance(freeze.get("analytical_artifacts"), list):
+        raise DashboardDeltaError("delta receipt freeze analytical_artifacts must be a list")
+
+
+def _delta_artifacts_from_input_items(input_items: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Flatten exact per-item artifact bindings in cumulative item order."""
+
+    flattened: list[dict[str, Any]] = []
+    for item in input_items:
+        values = item.get("analytical_artifacts")
+        if not isinstance(values, list):
+            raise DashboardDeltaError("delta input item analytical_artifacts must be a list")
+        for value in values:
+            if not isinstance(value, Mapping):
+                raise DashboardDeltaError("delta analytical artifact binding must be an object")
+            flattened.append(copy.deepcopy(dict(value)))
+    return flattened
+
+
+def _validate_delta_artifact_bindings(
+    receipt: Mapping[str, Any],
+    *,
+    fixture: Mapping[str, Any] | None = None,
+    expected_artifacts: Sequence[Mapping[str, Any]] | None = None,
+) -> None:
+    """Require one identical cumulative artifact binding in every product view."""
+
+    _validate_delta_receipt_shape(receipt)
+    receipt_artifacts = receipt.get("analytical_artifacts")
+    freeze = receipt.get("freeze_inputs")
+    if not isinstance(receipt_artifacts, list) or not isinstance(freeze, Mapping):
+        raise DashboardDeltaError("delta analytical artifact bindings are invalid")
+    if freeze.get("analytical_artifacts") != receipt_artifacts:
+        raise DashboardDeltaError("delta freeze analytical artifact bindings differ from receipt")
+    flattened = _delta_artifacts_from_input_items(receipt.get("input_items", []))
+    if flattened != receipt_artifacts:
+        raise DashboardDeltaError("delta input item analytical artifact bindings differ from receipt")
+    if fixture is not None:
+        fixture_artifacts = fixture.get("analytical_artifacts")
+        if not isinstance(fixture_artifacts, list) or fixture_artifacts != receipt_artifacts:
+            raise DashboardDeltaError("delta fixture analytical artifact bindings differ from receipt")
+    if expected_artifacts is not None and [dict(value) for value in expected_artifacts] != receipt_artifacts:
+        raise DashboardDeltaError("delta analytical artifact bindings differ from current committed inputs")
 
 
 def _parent_output_root(context: RunContext, receipt_path: Path, receipt: Mapping[str, Any]) -> tuple[Path, dict[str, Path]]:
@@ -566,6 +623,22 @@ def _parent_output_root(context: RunContext, receipt_path: Path, receipt: Mappin
         if path.is_symlink():
             raise DashboardDeltaError(f"parent output is symlinked: {key}")
         refs[key] = path
+    # Current assembler/delta parents bind one canonical V2 blueprint
+    # alongside the fixture.  Legacy root bridges may omit it, but a delta
+    # receipt must never silently drop the binding across generations.
+    blueprint_ref = outputs.get("blueprint_ref")
+    blueprint_binding = receipt.get("blueprint_binding")
+    if receipt.get("schema_version") == DELTA_SCHEMA and (not isinstance(blueprint_ref, str) or not blueprint_ref):
+        raise DashboardDeltaError("delta parent blueprint reference is missing")
+    if isinstance(blueprint_ref, str) and blueprint_ref:
+        blueprint_path = _safe_run_path(context, blueprint_ref, label="parent blueprint")
+        if blueprint_path.is_symlink() or not blueprint_path.is_file():
+            raise DashboardDeltaError("parent blueprint is missing or symlinked")
+        if not isinstance(blueprint_binding, Mapping) or blueprint_binding.get("ref") != blueprint_ref or not _is_sha256(blueprint_binding.get("sha256")):
+            raise DashboardDeltaError("parent blueprint binding is invalid")
+        if _sha256_bytes(blueprint_path.read_bytes()) != blueprint_binding.get("sha256"):
+            raise DashboardDeltaError("parent blueprint hash mismatch")
+        refs["blueprint_ref"] = blueprint_path
     if refs["receipt_ref"].resolve(strict=False) != receipt_path.resolve(strict=False):
         raise DashboardDeltaError("parent receipt path does not match its output binding")
     expected_hashes = {
@@ -573,6 +646,8 @@ def _parent_output_root(context: RunContext, receipt_path: Path, receipt: Mappin
         "chart_map_ref": hashes.get("chart_map_sha256"),
         "chart_registry_ref": hashes.get("chart_registry_sha256"),
     }
+    if "blueprint_ref" in refs:
+        expected_hashes["blueprint_ref"] = hashes.get("blueprint_sha256")
     for key, expected in expected_hashes.items():
         if not _is_sha256(expected) or not refs[key].is_file() or _sha256_bytes(refs[key].read_bytes()) != expected:
             raise DashboardDeltaError(f"parent output hash mismatch: {key}")
@@ -596,23 +671,13 @@ def _validate_delta_output(
     context: RunContext,
     receipt_path: Path,
     receipt: Mapping[str, Any],
-    *,
-    legacy_raw_receipt: Mapping[str, Any] | None = None,
-    legacy_raw_bytes: bytes | None = None,
 ) -> None:
     """Revalidate an already-published child without rewriting it."""
 
     _validate_delta_receipt_shape(receipt)
     receipt_bytes = receipt_path.read_bytes()
     if receipt_bytes != _canonical_bytes(receipt):
-        # The only permitted non-canonical input is a historical planless
-        # receipt being used as the immutable old target while an explicit
-        # presentation plan is published.  Its raw parsed shape is checked
-        # independently below; all ordinary retries and any plan-bearing
-        # non-canonical receipt remain fail-closed.
-        if legacy_raw_receipt is None:
-            raise DashboardDeltaError("delta receipt is not canonical")
-        _validate_planless_legacy_receipt_shape(legacy_raw_receipt, raw_bytes=legacy_raw_bytes)
+        raise DashboardDeltaError("delta receipt is not canonical")
     outputs = receipt.get("outputs")
     hashes = receipt.get("output_hashes")
     if not isinstance(outputs, Mapping) or not isinstance(hashes, Mapping):
@@ -621,6 +686,7 @@ def _validate_delta_output(
         "fixture_ref": (outputs.get("fixture_ref"), hashes.get("fixture_sha256")),
         "chart_map_ref": (outputs.get("chart_map_ref"), hashes.get("chart_map_sha256")),
         "chart_registry_ref": (outputs.get("chart_registry_ref"), hashes.get("chart_registry_sha256")),
+        "blueprint_ref": (outputs.get("blueprint_ref"), hashes.get("blueprint_sha256")),
     }
     for label, (reference, digest) in expected.items():
         if not isinstance(reference, str) or not _is_sha256(digest):
@@ -628,6 +694,25 @@ def _validate_delta_output(
         path = _safe_run_path(context, reference, label=f"delta {label}")
         if not path.is_file() or path.is_symlink() or _sha256_bytes(path.read_bytes()) != digest:
             raise DashboardDeltaError(f"delta output hash mismatch: {label}")
+    blueprint_binding = receipt.get("blueprint_binding")
+    if (
+        not isinstance(blueprint_binding, Mapping)
+        or blueprint_binding.get("ref") != outputs.get("blueprint_ref")
+        or blueprint_binding.get("sha256") != hashes.get("blueprint_sha256")
+        or blueprint_binding.get("schema_version") != "dashboard.business_presentation_plan.v2"
+        or blueprint_binding.get("status") not in {"Preview", "Reviewed"}
+    ):
+        raise DashboardDeltaError("delta blueprint binding does not match outputs")
+    try:
+        blueprint_value = json.loads(_safe_run_path(context, outputs["blueprint_ref"], label="delta blueprint").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DashboardDeltaError("delta blueprint is invalid") from exc
+    if not isinstance(blueprint_value, Mapping) or blueprint_value.get("schema_version") != "dashboard.business_presentation_plan.v2":
+        raise DashboardDeltaError("delta blueprint schema is invalid")
+    fixture = _read_json(context, outputs["fixture_ref"], label="delta fixture")
+    if not isinstance(fixture, Mapping):
+        raise DashboardDeltaError("delta fixture is invalid")
+    _validate_delta_artifact_bindings(receipt, fixture=fixture)
     site_ref = outputs.get("site_ref")
     if not isinstance(site_ref, str) or not site_ref:
         raise DashboardDeltaError("delta site reference is missing")
@@ -641,6 +726,415 @@ def _validate_delta_output(
     receipt_ref = outputs.get("receipt_ref")
     if not isinstance(receipt_ref, str) or _safe_run_path(context, receipt_ref, label="delta receipt reference").resolve(strict=False) != receipt_path.resolve(strict=False):
         raise DashboardDeltaError("delta receipt output reference is invalid")
+
+
+def _validate_delta_generation_identity(context: RunContext, receipt: Mapping[str, Any]) -> None:
+    """Bind a delta receipt to the active run/generation before product use."""
+
+    if receipt.get("status") != "complete":
+        raise DashboardDeltaError("generation product delta receipt is not complete")
+    if receipt.get("run_id") != context.run_id:
+        raise DashboardDeltaError("generation product delta receipt run identity is stale")
+    if receipt.get("new_analytics") is not False:
+        raise DashboardDeltaError("generation product delta receipt claims new analytics")
+    try:
+        lifecycle = RunLifecycle.load(context)
+    except Exception as exc:
+        raise DashboardDeltaError("generation product delta lifecycle cannot be loaded") from exc
+    metadata = lifecycle.generation_metadata
+    if metadata is None:
+        raise DashboardDeltaError("generation product delta has no active generation")
+    expected_top_level = {
+        "generation_id": metadata.generation_id,
+        "generation_ordinal": metadata.generation_ordinal,
+        "parent_generation_id": metadata.parent_generation_id,
+    }
+    for field, expected in expected_top_level.items():
+        if receipt.get(field) != expected:
+            raise DashboardDeltaError(f"generation product delta {field} lineage is stale")
+    request = receipt.get("request_binding")
+    plan = receipt.get("plan_binding")
+    parent = receipt.get("parent")
+    rollback = receipt.get("rollback_parent")
+    if not isinstance(request, Mapping) or not isinstance(plan, Mapping) or not isinstance(parent, Mapping) or not isinstance(rollback, Mapping):
+        raise DashboardDeltaError("generation product delta lineage bindings are missing")
+    if request.get("generation_id") != metadata.generation_id or request.get("generation_ordinal") != metadata.generation_ordinal:
+        raise DashboardDeltaError("generation product delta request lineage is stale")
+    if request.get("parent_generation_id") != metadata.parent_generation_id:
+        raise DashboardDeltaError("generation product delta request parent lineage is stale")
+    if plan.get("generation_id") != metadata.generation_id:
+        raise DashboardDeltaError("generation product delta plan lineage is stale")
+    if request.get("generation_manifest_hash") != metadata.manifest_hash:
+        raise DashboardDeltaError("generation product delta generation manifest lineage is stale")
+    if request.get("admission_state_hash") != metadata.state_manifest_hash:
+        raise DashboardDeltaError("generation product delta admission state lineage is stale")
+    if request.get("admission_plan_sha256") != metadata.plan_hash:
+        raise DashboardDeltaError("generation product delta admission plan lineage is stale")
+    if plan.get("admission_sha256") != metadata.plan_hash:
+        raise DashboardDeltaError("generation product delta plan admission lineage is stale")
+    parent_receipt_ref = request.get("parent_receipt_ref")
+    parent_receipt_sha256 = request.get("parent_receipt_sha256")
+    if parent.get("receipt_ref") != parent_receipt_ref or parent.get("receipt_sha256") != parent_receipt_sha256:
+        raise DashboardDeltaError("generation product delta parent receipt lineage is stale")
+    if rollback.get("generation_id") != metadata.parent_generation_id or rollback.get("receipt_ref") != parent_receipt_ref or rollback.get("receipt_sha256") != parent_receipt_sha256:
+        raise DashboardDeltaError("generation product delta rollback lineage is stale")
+
+
+def _validate_product_manifest_binding(
+    context: RunContext,
+    manifest_ref: str | Path,
+    *,
+    receipt: Mapping[str, Any],
+    validated: Mapping[str, Any],
+    revision_id: str | None = None,
+    output_root_ref: str | Path | None = None,
+) -> dict[str, Any]:
+    """Validate the lifecycle-owned product manifest and exact receipt assets."""
+
+    manifest_path = _safe_run_path(context, manifest_ref, label="generation product manifest")
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise DashboardDeltaError("generation product manifest is missing or symlinked")
+    try:
+        lifecycle = RunLifecycle.load(context)
+    except Exception as exc:
+        raise DashboardDeltaError("generation product lifecycle cannot be loaded") from exc
+    generation_id = validated.get("generation_id")
+    if not isinstance(generation_id, str) or not generation_id:
+        raise DashboardDeltaError("generation product generation binding is missing")
+    revision = None
+    revision_root: Path | None = None
+    if revision_id is not None or output_root_ref is not None:
+        if not isinstance(revision_id, str) or not revision_id.strip() or output_root_ref is None:
+            raise DashboardDeltaError("generation product revision output binding is incomplete")
+        try:
+            from auto_foundry_core.product_review import ProductReviewStore
+
+            store = ProductReviewStore(context, generation_id)
+            revision = store.load_revision(revision_id.strip())
+            expected_ref = store.revision_artifacts_ref(revision.revision_id)
+            revision_root = store.revision_artifacts_root(revision.revision_id)
+        except Exception as exc:
+            raise DashboardDeltaError("generation product revision output namespace is unavailable") from exc
+        supplied_ref = Path(str(output_root_ref)).as_posix()
+        if supplied_ref != Path(expected_ref).as_posix():
+            raise DashboardDeltaError("generation product revision output root binding is stale")
+        if revision.status not in {"pending", "candidate", "reviewed", "accepted"}:
+            raise DashboardDeltaError("generation product revision is not validatable")
+        expected_manifest_path = revision_root / "product_manifest.json"
+        if manifest_path.resolve(strict=False) != expected_manifest_path.resolve(strict=False):
+            raise DashboardDeltaError("generation product manifest is outside its revision namespace")
+    else:
+        expected_manifest_path = lifecycle.product_manifest_path
+        if manifest_path.resolve(strict=False) != expected_manifest_path.resolve(strict=False):
+            raise DashboardDeltaError("generation product manifest is not the active lifecycle manifest")
+    if receipt.get("schema_version") == DELTA_SCHEMA:
+        metadata = lifecycle.generation_metadata
+        parent = receipt.get("parent")
+        if metadata is None or not isinstance(parent, Mapping):
+            raise DashboardDeltaError("generation product delta manifest lineage is missing")
+        parent_ref = parent.get("product_manifest_ref")
+        parent_hash = parent.get("product_manifest_sha256")
+        if not isinstance(parent_ref, str) or not _is_sha256(parent_hash):
+            raise DashboardDeltaError("generation product delta parent manifest binding is invalid")
+        manifest_value = _read_json(
+            context,
+            _relative_run_ref(context, manifest_path),
+            label="generation product manifest",
+        )
+        try:
+            _validate_product_manifest(
+                context,
+                manifest_path,
+                manifest_value,
+                receipt,
+                lifecycle,
+                metadata,
+                parent_ref,
+                parent_hash,
+            )
+        except DashboardDeltaError:
+            raise
+        except Exception as exc:
+            raise DashboardDeltaError("generation product manifest validation failed") from exc
+    elif revision is None:
+        try:
+            from auto_foundry_core.requirement_planning import inspect_product_manifest
+
+            inspected = inspect_product_manifest(
+                context,
+                generation_id,
+                _relative_run_ref(context, manifest_path),
+                metadata=lifecycle.generation_metadata,
+            )
+        except Exception as exc:
+            raise DashboardDeltaError("generation product manifest validation failed") from exc
+        if inspected.get("valid") is not True:
+            diagnostics = inspected.get("diagnostics")
+            detail = diagnostics[0] if isinstance(diagnostics, list) and diagnostics else "invalid manifest"
+            raise DashboardDeltaError(f"generation product manifest validation failed: {detail}")
+        manifest_value = inspected.get("manifest")
+        if not isinstance(manifest_value, Mapping):
+            raise DashboardDeltaError("generation product manifest validation returned no manifest")
+    else:
+        try:
+            manifest_value = _read_json(
+                context,
+                _relative_run_ref(context, manifest_path),
+                label="generation product revision manifest",
+            )
+        except Exception as exc:
+            raise DashboardDeltaError("generation product revision manifest is invalid") from exc
+        if set(manifest_value) != _PRODUCT_MANIFEST_KEYS:
+            raise DashboardDeltaError("generation product revision manifest schema is not exact")
+        if manifest_path.read_bytes() != _canonical_bytes(manifest_value):
+            raise DashboardDeltaError("generation product revision manifest is not canonical")
+        if (
+            manifest_value.get("schema_version") != "1"
+            or manifest_value.get("product_type") != "reviewed_run_product_bundle"
+            or manifest_value.get("source_status") != "reviewed_outputs_only"
+            or manifest_value.get("run_id") != context.run_id
+            or manifest_value.get("status") not in {"complete", "complete_with_limits"}
+            or manifest_value.get("terminal") is not True
+            or manifest_value.get("new_analytics") is not False
+        ):
+            raise DashboardDeltaError("generation product revision manifest identity is invalid")
+        try:
+            from auto_foundry_core.product_contracts import validate_product_manifest
+
+            validate_product_manifest(manifest_value, require_all=True)
+        except Exception as exc:
+            raise DashboardDeltaError("generation product revision manifest contract is invalid") from exc
+        lifecycle_value = manifest_value.get("lifecycle")
+        if not isinstance(lifecycle_value, Mapping) or lifecycle_value.get("generation_id") != generation_id:
+            raise DashboardDeltaError("generation product revision lifecycle lineage is stale")
+        dashboard_value = manifest_value.get("dashboard")
+        if not isinstance(dashboard_value, Mapping):
+            raise DashboardDeltaError("generation product revision dashboard binding is missing")
+    outputs = validated.get("outputs")
+    if not isinstance(outputs, Mapping):
+        raise DashboardDeltaError("generation product output bindings are missing")
+    dashboard = manifest_value.get("dashboard")
+    expected_receipt_ref = outputs.get("receipt_ref")
+    expected_receipt_sha256 = validated.get("receipt_sha256")
+    if (
+        not isinstance(dashboard, Mapping)
+        or dashboard.get("receipt_ref") != expected_receipt_ref
+        or dashboard.get("receipt_sha256") != expected_receipt_sha256
+    ):
+        raise DashboardDeltaError("generation product manifest receipt binding is stale")
+    receipt_for_assets = {**dict(receipt), "receipt_sha256": expected_receipt_sha256}
+    expected_assets = _product_assets(receipt_for_assets, str(expected_receipt_ref))
+    if receipt.get("schema_version") == ASSEMBLER_SCHEMA:
+        expected_assets[-1] = {**expected_assets[-1], "role": "dashboard_assembler_receipt"}
+    assets = manifest_value.get("assets")
+    if not isinstance(assets, list) or assets != expected_assets:
+        raise DashboardDeltaError("generation product manifest asset bindings are not exact")
+    return dict(manifest_value)
+
+
+def validate_generation_product(
+    context: RunContext,
+    receipt: Mapping[str, Any] | str | Path,
+    *,
+    product_manifest_ref: str | Path | None = None,
+    revision_id: str | None = None,
+    output_root_ref: str | Path | None = None,
+) -> dict[str, Any]:
+    """Validate one canonical generation product and return candidate bindings.
+
+    Product Agents must use this program-owned boundary after
+    :func:`assemble_generation_product`.  It understands that the receipt's
+    ``site_binding`` is the complete tree (including ``site_manifest.json``),
+    while the manifest's internal ``site_file_hashes``/``site_tree_sha256``
+    intentionally exclude that self-referential file.  The returned
+    ``artifact_bindings`` are ready for the existing refs-only
+    ``ProductReviewStore``; callers never need to recalculate either tree hash.
+    """
+
+    if not isinstance(context, RunContext):
+        raise TypeError("generation product validation requires a RunContext")
+    if (revision_id is None) != (output_root_ref is None):
+        raise DashboardDeltaError("generation product revision output binding is incomplete")
+    if isinstance(receipt, (str, Path)):
+        receipt_ref: str | Path | None = receipt
+        receipt_value = _read_json(context, receipt_ref, label="generation product receipt")
+    elif isinstance(receipt, Mapping):
+        receipt_ref = None
+        receipt_value = dict(receipt)
+    else:
+        raise TypeError("receipt must be a mapping or run-relative receipt reference")
+
+    outputs = receipt_value.get("outputs")
+    if not isinstance(outputs, Mapping):
+        raise DashboardDeltaError("generation product receipt output bindings are missing")
+    bound_receipt_ref = outputs.get("receipt_ref")
+    if not isinstance(bound_receipt_ref, str) or not bound_receipt_ref.strip():
+        raise DashboardDeltaError("generation product receipt reference is missing")
+    if receipt_ref is not None:
+        receipt_path = _safe_run_path(context, receipt_ref, label="generation product receipt")
+        bound_path = _safe_run_path(context, bound_receipt_ref, label="generation product receipt reference")
+        if receipt_path.resolve(strict=False) != bound_path.resolve(strict=False):
+            raise DashboardDeltaError("generation product receipt reference does not match its output binding")
+    else:
+        receipt_path = _safe_run_path(context, bound_receipt_ref, label="generation product receipt reference")
+
+    schema = receipt_value.get("schema_version")
+    if schema == ASSEMBLER_SCHEMA:
+        assembler = _assembler()
+        try:
+            validated = assembler._validate_assembled_receipt(context, receipt_value)
+        except Exception as exc:
+            # Keep the public generation-product boundary typed even when a
+            # canonical run-path validator raises ``AllowedRootError`` (or a
+            # filesystem/parser error) before the assembler can translate it.
+            # The underlying diagnostic remains chained for callers that need
+            # the exact fail-closed reason.
+            raise DashboardDeltaError(str(exc) or "generation product root receipt is invalid") from exc
+        site_root = _safe_run_path(context, outputs.get("site_ref"), label="generation product site")
+    elif schema == DELTA_SCHEMA:
+        try:
+            _validate_delta_output(context, receipt_path, receipt_value)
+        except DashboardDeltaError:
+            raise
+        except Exception as exc:
+            raise DashboardDeltaError("generation product delta receipt is invalid") from exc
+        _validate_delta_generation_identity(context, receipt_value)
+        assembler = _assembler()
+        site_ref = outputs.get("site_ref")
+        if not isinstance(site_ref, str) or not site_ref.strip():
+            raise DashboardDeltaError("generation product site reference is missing")
+        site_root = _safe_run_path(context, site_ref, label="generation product site")
+        try:
+            site_manifest_binding = assembler._validate_site_manifest_binding(
+                site_root,
+                expected_blueprint_ref=outputs.get("blueprint_ref"),
+                expected_blueprint_sha256=(receipt_value.get("output_hashes") or {}).get("blueprint_sha256"),
+                expected_chart_map_ref=outputs.get("chart_map_ref"),
+            )
+        except Exception as exc:
+            if isinstance(exc, assembler.AssemblyError):
+                raise DashboardDeltaError(str(exc)) from exc
+            raise
+        try:
+            assembler._validate_site_links_in_tree(site_root)
+        except Exception as exc:
+            if isinstance(exc, assembler.AssemblyError):
+                raise DashboardDeltaError(str(exc)) from exc
+            raise
+        validated = {
+            "valid": True,
+            "stage": "assembled",
+            "run_id": receipt_value.get("run_id"),
+            "generation_id": receipt_value.get("generation_id"),
+            "receipt_ref": bound_receipt_ref,
+            "receipt_sha256": _sha256_bytes(receipt_path.read_bytes()),
+            "outputs": copy.deepcopy(dict(outputs)),
+            "output_hashes": copy.deepcopy(dict(receipt_value.get("output_hashes") or {})),
+            "site_binding": copy.deepcopy(dict(receipt_value.get("site_binding") or {})),
+            "site_manifest_binding": site_manifest_binding,
+        }
+    else:
+        raise DashboardDeltaError("generation product receipt schema is unsupported")
+
+    outputs_value = validated.get("outputs")
+    hashes_value = validated.get("output_hashes")
+    site_binding = validated.get("site_binding")
+    if not isinstance(outputs_value, Mapping) or not isinstance(hashes_value, Mapping) or not isinstance(site_binding, Mapping):
+        raise DashboardDeltaError("generation product validation result is incomplete")
+    if not _is_sha256(validated.get("receipt_sha256")):
+        raise DashboardDeltaError("generation product receipt hash is invalid")
+
+    artifact_bindings: dict[str, dict[str, Any]] = {}
+    if product_manifest_ref is not None:
+        manifest_path = _safe_run_path(context, product_manifest_ref, label="generation product manifest")
+        manifest_value = _validate_product_manifest_binding(
+            context,
+            manifest_ref=product_manifest_ref,
+            receipt=receipt_value,
+            validated=validated,
+            revision_id=revision_id,
+            output_root_ref=output_root_ref,
+        )
+        artifact_bindings["manifest"] = {
+            "ref": _relative_run_ref(context, manifest_path),
+            "kind": "file",
+            "sha256": _sha256_bytes(manifest_path.read_bytes()),
+        }
+
+    for name, ref_key, hash_key in (
+        ("fixture", "fixture_ref", "fixture_sha256"),
+        ("chart_map", "chart_map_ref", "chart_map_sha256"),
+        ("chart_registry", "chart_registry_ref", "chart_registry_sha256"),
+        ("blueprint", "blueprint_ref", "blueprint_sha256"),
+    ):
+        reference = outputs_value.get(ref_key)
+        digest = hashes_value.get(hash_key)
+        if not isinstance(reference, str) or not _is_sha256(digest):
+            raise DashboardDeltaError(f"generation product artifact binding is invalid: {name}")
+        artifact_bindings[name] = {"ref": reference, "kind": "file", "sha256": digest}
+
+    site_reference = outputs_value.get("site_ref")
+    if not isinstance(site_reference, str) or not site_reference.strip():
+        raise DashboardDeltaError("generation product site artifact binding is missing")
+    site_files = site_binding.get("files")
+    if not isinstance(site_files, Mapping) or not site_files:
+        raise DashboardDeltaError("generation product site artifact binding is invalid")
+    if revision_id is not None:
+        try:
+            from auto_foundry_core.product_review import ProductReviewStore
+
+            store = ProductReviewStore(context, str(validated.get("generation_id")))
+            revision = store.load_revision(str(revision_id).strip())
+            expected_root = store.revision_artifacts_root(revision.revision_id).resolve(strict=False)
+            expected_ref = store.revision_artifacts_ref(revision.revision_id)
+        except Exception as exc:
+            raise DashboardDeltaError("generation product revision output namespace is unavailable") from exc
+        if Path(str(output_root_ref)).as_posix() != Path(expected_ref).as_posix():
+            raise DashboardDeltaError("generation product revision output root binding is stale")
+        scoped_refs = {
+            "fixture": outputs_value.get("fixture_ref"),
+            "chart_map": outputs_value.get("chart_map_ref"),
+            "chart_registry": outputs_value.get("chart_registry_ref"),
+            "blueprint": outputs_value.get("blueprint_ref"),
+            "site": site_reference,
+            "receipt": bound_receipt_ref,
+        }
+        expected_names = {
+            "fixture": "dashboard_fixture_v4.json",
+            "chart_map": "dashboard_chart_map_v4.json",
+            "chart_registry": "dashboard_chart_registry_v4.json",
+            "blueprint": "dashboard_blueprint_v2.json",
+            "site": "site",
+            "receipt": "build_receipt.json",
+        }
+        for label, reference in scoped_refs.items():
+            if not isinstance(reference, str) or not reference.strip():
+                raise DashboardDeltaError(f"generation product revision {label} reference is missing")
+            path = _safe_run_path(context, reference, label=f"generation product revision {label}")
+            if path.is_symlink() or path.resolve(strict=False) != (expected_root / expected_names[label]).resolve(strict=False):
+                raise DashboardDeltaError(f"generation product revision {label} escapes its namespace")
+        if product_manifest_ref is not None:
+            manifest_path = _safe_run_path(context, product_manifest_ref, label="generation product revision manifest")
+            if manifest_path.is_symlink() or manifest_path.resolve(strict=False) != (expected_root / "product_manifest.json").resolve(strict=False):
+                raise DashboardDeltaError("generation product revision manifest escapes its namespace")
+    artifact_bindings["site"] = {
+        "ref": site_reference,
+        "kind": "tree",
+        # ProductReviewStore's tree artifact contract wraps the complete file
+        # map; this is intentionally distinct from the assembler receipt's
+        # direct-map ``site_binding.tree_sha256``.
+        "sha256": _json_hash({"files": dict(site_files)}),
+        "files": copy.deepcopy(dict(site_files)),
+    }
+    artifact_bindings["receipt"] = {
+        "ref": bound_receipt_ref,
+        "kind": "file",
+        "sha256": validated["receipt_sha256"],
+    }
+    return {
+        **validated,
+        "artifact_bindings": artifact_bindings,
+    }
 
 
 def _load_plan(context: RunContext, lifecycle: RunLifecycle) -> tuple[Mapping[str, Any], Path, str]:
@@ -767,6 +1261,69 @@ def _parent_generation_bindings(
     if metadata.parent_plan_hash != plan_hash:
         raise DashboardDeltaError("generation parent_plan_hash does not match its parent plan file")
     return state_path, state_hash, _sha256_bytes(state_raw), plan_path, plan_hash
+
+
+def _validate_generation_data_binding(
+    context: RunContext,
+    metadata: Any,
+) -> tuple[str | None, str | None]:
+    """Validate the native generation data-revision binding.
+
+    ``DataRevisionStore`` is the sole authority for revision manifests.  The
+    product route must never create a second interpretation of a data
+    revision, nor trust a path/hash pair merely because lifecycle metadata
+    parsed it.  A data-only append (or a reopened/current-head rebuild) keeps
+    the exact canonical manifest reference and logical manifest hash in the
+    generation lineage; ordinary append/revise generations retain explicit
+    nulls.
+    """
+
+    data_ref = getattr(metadata, "data_revision_ref", None)
+    data_hash = getattr(metadata, "data_revision_hash", None)
+    reopened = tuple(getattr(metadata, "reopened_item_ids", ()) or ())
+    if data_ref is None:
+        if data_hash is not None:
+            raise DashboardDeltaError("generation data revision hash requires a manifest reference")
+        if reopened:
+            raise DashboardDeltaError("reopened generation requires a bound data revision")
+        return None, None
+    if (
+        not isinstance(data_ref, str)
+        or not data_ref
+        or Path(data_ref).is_absolute()
+        or data_ref != Path(data_ref).as_posix()
+        or not data_ref.startswith("data_room/revisions/")
+        or not data_ref.endswith("/revision_manifest.json")
+        or not _is_sha256(data_hash)
+    ):
+        raise DashboardDeltaError("generation data revision binding is invalid")
+    parts = Path(data_ref).parts
+    revision_id = parts[2] if len(parts) == 4 else ""
+    if (
+        len(parts) != 4
+        or parts[:2] != ("data_room", "revisions")
+        or not re.fullmatch(r"D-[0-9]{4,}", revision_id)
+        or parts[3] != "revision_manifest.json"
+    ):
+        raise DashboardDeltaError("generation data revision reference is invalid")
+    path = _safe_run_path(context, data_ref, label="generation data revision manifest")
+    if path.is_symlink() or not path.is_file():
+        raise DashboardDeltaError("generation data revision manifest is missing or symlinked")
+    try:
+        from auto_foundry_core.data_revisions import DataRevisionStore
+
+        store = DataRevisionStore(context)
+        revision = store.load(revision_id)
+    except Exception as exc:
+        raise DashboardDeltaError("generation data revision cannot be validated") from exc
+    if (
+        revision.run_id != context.run_id
+        or revision.revision_id != revision_id
+        or revision.manifest_path != path
+        or revision.manifest_hash != data_hash
+    ):
+        raise DashboardDeltaError("generation data revision binding is stale or inconsistent")
+    return data_ref, data_hash
 
 
 def _route_map(route: Mapping[str, Any], added_ids: Sequence[str]) -> dict[str, Mapping[str, Any]]:
@@ -976,6 +1533,12 @@ def _copy_bound_parent(parent_root: Path, parent_refs: Mapping[str, Path], desti
     destination.mkdir(parents=True, exist_ok=False)
     for key in ("fixture_ref", "chart_map_ref", "chart_registry_ref"):
         source = parent_refs[key]
+        relative = source.relative_to(parent_root)
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(source.read_bytes())
+    if "blueprint_ref" in parent_refs:
+        source = parent_refs["blueprint_ref"]
         relative = source.relative_to(parent_root)
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1779,8 +2342,8 @@ def _generation_lineage_binding(context: RunContext, generation_id: str) -> dict
     expected_fields = {
         "schema_version", "kind", "run_id", "run_root", "generation_id", "generation_ordinal",
         "parent_generation_id", "parent_state_hash", "parent_plan_hash", "added_item_ids",
-        "cumulative_item_ids", "state_ref", "plan_ref", "state_manifest_hash", "plan_hash",
-        "request_hash", "product_manifest_ref", "created_at", "manifest_hash",
+        "reopened_item_ids", "cumulative_item_ids", "state_ref", "plan_ref", "state_manifest_hash", "plan_hash",
+        "request_hash", "data_revision_ref", "data_revision_hash", "product_manifest_ref", "created_at", "manifest_hash",
     }
     if set(value) != expected_fields or value.get("generation_id") != generation_id or value.get("run_id") != context.run_id:
         raise DashboardDeltaError("transaction generation manifest identity is invalid")
@@ -1789,6 +2352,21 @@ def _generation_lineage_binding(context: RunContext, generation_id: str) -> dict
     for key in ("parent_state_hash", "parent_plan_hash", "state_manifest_hash", "plan_hash", "request_hash", "manifest_hash"):
         if not _is_sha256(value.get(key)):
             raise DashboardDeltaError(f"transaction generation manifest {key} is invalid")
+    reopened = value.get("reopened_item_ids")
+    if (
+        not isinstance(reopened, list)
+        or len(reopened) != len(set(reopened))
+        or any(not isinstance(item_id, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", item_id) for item_id in reopened)
+    ):
+        raise DashboardDeltaError("transaction generation manifest reopened item IDs are invalid")
+    # Reuse the canonical DataRevisionStore validation for the native data
+    # binding.  It also rejects stale pointers, path aliases, and manifest
+    # tampering instead of treating a generation manifest as a second store.
+    _validate_generation_data_binding(context, SimpleNamespace(
+        data_revision_ref=value.get("data_revision_ref"),
+        data_revision_hash=value.get("data_revision_hash"),
+        reopened_item_ids=tuple(reopened),
+    ))
     state_path = _safe_run_path(
         context,
         f"extensions/{generation_id}/run_state.json",
@@ -1818,6 +2396,9 @@ def _generation_lineage_binding(context: RunContext, generation_id: str) -> dict
         "parent_generation_id": value["parent_generation_id"],
         "parent_state_hash": value["parent_state_hash"],
         "parent_plan_hash": value["parent_plan_hash"],
+        "reopened_item_ids": tuple(reopened),
+        "data_revision_ref": value.get("data_revision_ref"),
+        "data_revision_hash": value.get("data_revision_hash"),
     }
 
 
@@ -2313,11 +2894,42 @@ def _merge_ontology(parent_fixture: Mapping[str, Any], new_records: Sequence[Map
 
 def _input_item(context: RunContext, assembler: Any, item_id: str) -> tuple[dict[str, Any], list[Mapping[str, Any]], dict[str, Any]]:
     try:
-        content, accepted_manifest, accepted_meta = assembler._load_public_accepted_bundle(context, item_id)
-        integration_manifest, records = assembler._load_committed_records(context, item_id, accepted_manifest, accepted_meta["bundle"])
+        state_probe = assembler._read_json(context, f"requirements/{item_id}/item_state.json", label=f"{item_id} item state")
+        preaccept_failure = state_probe.get("lifecycle_state") == "technical_failure"
+        if preaccept_failure:
+            terminal_manifest = assembler._load_item_technical_failure_manifest(context, item_id, state_probe)
+            content, accepted_manifest, accepted_meta = {}, terminal_manifest, {
+                "state": state_probe,
+                "envelope": {},
+                "bundle": None,
+            }
+            integration_manifest = {"manifest_hash": terminal_manifest["manifest_hash"]}
+            records = []
+        else:
+            content, accepted_manifest, accepted_meta = assembler._load_public_accepted_bundle(context, item_id)
+        if accepted_meta["state"].get("integration_state") == "technical_failure":
+            integration_manifest = assembler._load_technical_failure_manifest(context, item_id, accepted_meta)
+            records = []
+        elif state_probe.get("lifecycle_state") != "technical_failure":
+            integration_manifest, records = assembler._load_committed_records(context, item_id, accepted_manifest, accepted_meta["bundle"])
     except Exception as exc:
         raise DashboardDeltaError(f"{item_id} accepted/committed input validation failed") from exc
     state = accepted_meta["state"]
+    bundle = accepted_meta.get("bundle")
+    accepted_manifest_hash = bundle.manifest_hash if bundle is not None else accepted_manifest.get("manifest_hash")
+    accepted_content_hash = bundle.content_hash if bundle is not None else accepted_manifest.get("content_hash")
+    accepted_visual_widgets = (
+        assembler._accepted_visual_widgets(
+            context,
+            item_id,
+            content,
+            accepted_manifest,
+            accepted_content_hash,
+            accepted_manifest_hash,
+        )
+        if bundle is not None
+        else []
+    )
     raw_scope = assembler._text(content.get("scope") or content.get("method"))
     compact_scope = ""
     item = {
@@ -2340,12 +2952,489 @@ def _input_item(context: RunContext, assembler: Any, item_id: str) -> tuple[dict
             records,
             assembler._text(state.get("original_text") or content.get("scope") or item_id),
         ),
-        "accepted_manifest_hash": accepted_meta["bundle"].manifest_hash,
-        "accepted_content_hash": accepted_meta["bundle"].content_hash,
+        "accepted_manifest_hash": accepted_manifest_hash,
+        "accepted_content_hash": accepted_content_hash,
         "integration_manifest_hash": integration_manifest["manifest_hash"],
         "records": records,
+        "accepted_visual_widgets": accepted_visual_widgets,
     }
+    if preaccept_failure:
+        item["integration_failure"] = {
+            "status": "technical_failure",
+            "recovery_exhausted": True,
+            "manifest_hash": integration_manifest["manifest_hash"],
+            "manifest_ref": f"requirements/{item_id}/accepted/manifest.json",
+            "reason_hash": assembler._json_hash({"reason": accepted_manifest.get("reason")}),
+            "pre_acceptance": True,
+        }
+        item["limitations"] = tuple(
+            [*item["limitations"], "Requirement failed before business acceptance; no accepted answer or committed records feed analytics."]
+        )
+    elif state.get("integration_state") == "technical_failure":
+        item["integration_failure"] = {
+            "status": "technical_failure",
+            "recovery_exhausted": True,
+            "manifest_hash": integration_manifest["manifest_hash"],
+            "manifest_ref": f"requirements/{item_id}/integration/technical_failure/manifest.json",
+            "reason_hash": assembler._json_hash({"reason": integration_manifest.get("reason")}),
+        }
+        item["limitations"] = tuple(
+            [*item["limitations"], "Integration failed after recovery exhaustion; accepted business output is retained but no committed records feed analytics."]
+        )
     return item, records, integration_manifest
+
+
+def _copy_full_rebuild_inputs(
+    context: RunContext,
+    scratch_root: Path,
+    metadata: Any,
+    item_ids: Sequence[str],
+    *,
+    plan_path: Path,
+    presentation_plan_ref: str | None = None,
+) -> RunContext:
+    """Create a product-only scratch run for a current-head full rebuild.
+
+    Only native presentation inputs are copied: lifecycle/generation metadata,
+    current item state + accepted/integration commits, the public prepared
+    registry/index, telemetry metadata, and the bound data-revision manifest,
+    validated semantic history envelope.  Work/raw/calculation trees are
+    intentionally never traversed.  History is copied at the same
+    ``history/requirements/<item>/<generation>`` paths, but only the immutable
+    state/accepted/committed files required by ``LivingEnterpriseModelProjector``
+    are admitted to scratch.  This keeps predecessor KnowledgeDelta records
+    replayable without turning the scratch run into a second ontology store or
+    inheriting an unreviewed workspace.
+    """
+
+    scratch_context = RunContext(
+        run_id=context.run_id,
+        run_root=scratch_root,
+        core_version=context.core_version,
+        skill_version=context.skill_version,
+    )
+    copied: set[str] = set()
+
+    def copy_ref(reference: str | Path, *, optional: bool = False) -> None:
+        value = Path(reference)
+        try:
+            source = _safe_run_path(context, value, label="full rebuild input")
+        except Exception:
+            if optional:
+                return
+            raise
+        rel = source.relative_to(context.run_root).as_posix()
+        if rel in copied:
+            return
+        if source.is_symlink():
+            raise DashboardDeltaError(f"full rebuild input is symlinked: {rel}")
+        target = scratch_root / rel
+        if source.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target, follow_symlinks=False)
+        elif source.is_dir():
+            for nested in source.rglob("*"):
+                if nested.is_symlink():
+                    raise DashboardDeltaError(f"full rebuild input contains a symlink: {nested.relative_to(context.run_root)}")
+            shutil.copytree(source, target, symlinks=False)
+        elif not optional:
+            raise DashboardDeltaError(f"full rebuild input is not regular: {rel}")
+        copied.add(rel)
+
+    def copy_regular_file(source: Path, *, label: str) -> None:
+        """Copy one immutable file after rejecting aliases and non-regular nodes."""
+
+        if source.is_symlink() or not source.is_file():
+            raise DashboardDeltaError(f"{label} is missing, symlinked, or non-regular")
+        copy_ref(source.relative_to(context.run_root))
+
+    def copy_accepted_visual_sources(
+        source: Path,
+        item_id: str,
+        accepted_dir: Path,
+        *,
+        relative_root: Path,
+    ) -> None:
+        """Copy only hash-bound files named by accepted answer visuals.
+
+        A delta/full-rebuild scratch run intentionally excludes each item's
+        broad ``work`` tree.  Accepted visual candidates are nevertheless
+        allowed to bind reviewed CSV/JSON/JSONL values from that tree, so the
+        exact referenced files must travel with the accepted bundle.  This
+        mirrors the assembler's source boundary without copying unrelated
+        analytical workspace data.
+        """
+
+        content_path = accepted_dir / "answer_content.json"
+        if not content_path.exists():
+            return
+        try:
+            content = json.loads(content_path.read_text(encoding="utf-8"))
+            manifest = json.loads((accepted_dir / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise DashboardDeltaError(f"{relative_root} accepted visual source envelope is invalid") from exc
+        if not isinstance(content, Mapping) or not isinstance(manifest, Mapping):
+            raise DashboardDeltaError(f"{relative_root} accepted visual source envelope is invalid")
+        visuals = content.get("visuals")
+        if visuals is None:
+            return
+        if not isinstance(visuals, list) or any(not isinstance(value, Mapping) for value in visuals):
+            raise DashboardDeltaError(f"{relative_root} accepted visuals are invalid")
+        progress = manifest.get("artifact_progress")
+        hashes = progress.get("hashes") if isinstance(progress, Mapping) else None
+        if not isinstance(hashes, Mapping):
+            hashes = {}
+        references: set[str] = set()
+        for visual in visuals:
+            for key in ("source_ref", "artifact_ref", "evidence_ref"):
+                value = visual.get(key)
+                if value in (None, ""):
+                    continue
+                if not isinstance(value, str):
+                    raise DashboardDeltaError(f"{relative_root} accepted visual reference is invalid")
+                references.add(value)
+        for reference in sorted(references):
+            ref_path = Path(reference)
+            if (
+                not reference
+                or "\x00" in reference
+                or "\\" in reference
+                or ref_path.is_absolute()
+                or not ref_path.parts
+                or any(part in {"", ".", ".."} for part in ref_path.parts)
+                or ref_path.parts[0] in {"requirements", "products"}
+            ):
+                raise DashboardDeltaError(f"{relative_root} accepted visual reference is invalid")
+            expected = hashes.get(reference)
+            if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected):
+                raise DashboardDeltaError(f"{relative_root} accepted visual reference is not hash-bound: {reference}")
+            source_path = source.joinpath(*ref_path.parts)
+            copy_regular_file(source_path, label=f"{relative_root} accepted visual source {reference}")
+            actual = _sha256_bytes(source_path.read_bytes())
+            if actual != expected:
+                raise DashboardDeltaError(f"{relative_root} accepted visual source hash mismatch: {reference}")
+
+    def copy_history_root(source: Path, relative_root: Path) -> None:
+        """Copy the reviewed semantic envelope for one archived item head.
+
+        Archived item roots contain the complete old workspace.  Only
+        ``item_state.json``, the exact accepted snapshot files, and the exact
+        committed integration files are presentation/LEM inputs.  The rest
+        remains in the live run for audit/replay but is deliberately not
+        traversed, inspected, or copied into scratch.
+        """
+
+        if source.is_symlink() or not source.is_dir():
+            raise DashboardDeltaError(f"historical generation is missing or symlinked: {relative_root}")
+
+        state_path = source / "item_state.json"
+        copy_regular_file(state_path, label=f"historical item state {relative_root}")
+        try:
+            state_value = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise DashboardDeltaError(f"historical item state is invalid: {relative_root}") from exc
+        if not isinstance(state_value, Mapping):
+            raise DashboardDeltaError(f"historical item state is invalid: {relative_root}")
+
+        preaccept_failure = state_value.get("lifecycle_state") == "technical_failure"
+        accepted = source / "accepted"
+        if accepted.exists() or accepted.is_symlink():
+            if accepted.is_symlink() or not accepted.is_dir():
+                raise DashboardDeltaError(f"historical accepted bundle is missing or symlinked: {relative_root}")
+            expected_accepted = {"manifest.json"} if preaccept_failure else {
+                "manifest.json", "answer_content.json", "acceptance_envelope.json"
+            }
+            entries = {child.name for child in accepted.iterdir()}
+            if entries != expected_accepted:
+                raise DashboardDeltaError(f"historical accepted bundle inventory is invalid: {relative_root}")
+            for name in sorted(expected_accepted):
+                copy_regular_file(accepted / name, label=f"historical accepted artifact {relative_root / name}")
+            copy_accepted_visual_sources(
+                source,
+                relative_root.parts[-2] if len(relative_root.parts) >= 2 else "unknown",
+                accepted,
+                relative_root=relative_root,
+            )
+        elif preaccept_failure:
+            raise DashboardDeltaError(f"historical pre-acceptance terminal failure snapshot is missing: {relative_root}")
+
+        integration = source / "integration"
+        if integration.exists() or integration.is_symlink():
+            if integration.is_symlink() or not integration.is_dir():
+                raise DashboardDeltaError(f"historical integration root is missing or symlinked: {relative_root}")
+            if preaccept_failure:
+                for leaf in ("committed", "technical_failure", "staging"):
+                    residue = integration / leaf
+                    if residue.exists() or residue.is_symlink():
+                        raise DashboardDeltaError(f"historical pre-acceptance technical failure has integration residue: {relative_root}")
+                return
+            committed = integration / "committed"
+            if committed.exists() or committed.is_symlink():
+                if committed.is_symlink() or not committed.is_dir():
+                    raise DashboardDeltaError(f"historical committed integration is missing or symlinked: {relative_root}")
+                required_committed = {"manifest.json", "records.jsonl"}
+                allowed_committed = required_committed | {"artifacts"}
+                entries = {child.name for child in committed.iterdir()}
+                if not required_committed <= entries or not entries <= allowed_committed:
+                    raise DashboardDeltaError(f"historical committed integration inventory is invalid: {relative_root}")
+                for name in sorted(required_committed):
+                    copy_regular_file(
+                        committed / name,
+                        label=f"historical committed integration artifact {relative_root / 'integration' / 'committed' / name}",
+                    )
+                artifacts = committed / "artifacts"
+                if artifacts.exists() or artifacts.is_symlink():
+                    if artifacts.is_symlink() or not artifacts.is_dir():
+                        raise DashboardDeltaError(
+                            f"historical committed analytical artifacts are missing or symlinked: {relative_root}"
+                        )
+                    for artifact_path in sorted(artifacts.iterdir(), key=lambda path: path.name):
+                        if artifact_path.is_symlink() or not artifact_path.is_file() or not re.fullmatch(r"[A-Za-z0-9_.-]+\.json", artifact_path.name):
+                            raise DashboardDeltaError(
+                                f"historical committed analytical artifact is invalid: {artifact_path.relative_to(context.run_root)}"
+                            )
+                        copy_regular_file(
+                            artifact_path,
+                            label=f"historical committed analytical artifact {relative_root / 'integration' / 'committed' / 'artifacts' / artifact_path.name}",
+                        )
+
+    def copy_semantic_history() -> None:
+        """Copy all archived generations, including requirements removed from the current plan."""
+
+        history = _safe_run_path(context, "history", label="full rebuild semantic history")
+        if not history.exists():
+            if history.is_symlink():
+                raise DashboardDeltaError("full rebuild semantic history is symlinked")
+            return
+        if history.is_symlink() or not history.is_dir():
+            raise DashboardDeltaError("full rebuild semantic history root is not a regular directory")
+        requirements = history / "requirements"
+        if not requirements.exists():
+            if requirements.is_symlink():
+                raise DashboardDeltaError("full rebuild semantic history requirements root is symlinked")
+            return
+        if requirements.is_symlink() or not requirements.is_dir():
+            raise DashboardDeltaError("full rebuild semantic history requirements root is not a regular directory")
+
+        for item_entry in sorted(requirements.iterdir(), key=lambda path: path.name):
+            if item_entry.is_symlink() or not item_entry.is_dir():
+                raise DashboardDeltaError(f"historical item path is malformed: {item_entry.relative_to(context.run_root)}")
+            if not item_entry.name or item_entry.name in {".", ".."} or "\\" in item_entry.name or "\x00" in item_entry.name:
+                raise DashboardDeltaError(f"historical item identity is invalid: {item_entry.name!r}")
+            for generation_entry in sorted(item_entry.iterdir(), key=lambda path: path.name):
+                if generation_entry.is_symlink() or not generation_entry.is_dir():
+                    raise DashboardDeltaError(f"historical generation path is malformed: {generation_entry.relative_to(context.run_root)}")
+                match = re.fullmatch(r"G-(\d{4})", generation_entry.name)
+                if match is None or int(match.group(1)) < 2:
+                    raise DashboardDeltaError(f"historical generation path is malformed: {generation_entry.relative_to(context.run_root)}")
+                relative_root = generation_entry.relative_to(context.run_root)
+                copy_history_root(generation_entry, relative_root)
+
+    # Lifecycle pointer and the active generation's exact state/plan/manifest
+    # are sufficient for RunLifecycle/LEM validation in the scratch context.
+    copy_ref("active_generation.json")
+    for path in (Path(metadata.state_path), Path(metadata.plan_path), Path(metadata.manifest_path)):
+        copy_ref(path.relative_to(context.run_root))
+
+    for item_id in item_ids:
+        item_root = _safe_run_path(context, f"requirements/{item_id}", label=f"{item_id} current head")
+        if item_root.is_symlink() or not item_root.is_dir():
+            raise DashboardDeltaError(f"{item_id} current head is missing or symlinked")
+        state_probe_path = item_root / "item_state.json"
+        try:
+            state_probe = json.loads(state_probe_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise DashboardDeltaError(f"{item_id} current item state is invalid") from exc
+        if not isinstance(state_probe, Mapping):
+            raise DashboardDeltaError(f"{item_id} current item state is invalid")
+        preaccept_failure = state_probe.get("lifecycle_state") == "technical_failure"
+        integration_leaf = None if preaccept_failure else Path("integration") / (
+            "technical_failure" if state_probe.get("integration_state") == "technical_failure" else "committed"
+        )
+        if preaccept_failure:
+            # A pre-acceptance terminal item contributes only its immutable
+            # failure snapshot.  Any committed/failure/staging subtree would
+            # make the no-integration boundary ambiguous and is rejected.
+            integration_root = item_root / "integration"
+            if integration_root.exists() or integration_root.is_symlink():
+                if integration_root.is_symlink() or not integration_root.is_dir():
+                    raise DashboardDeltaError(f"{item_id} terminal failure integration root is invalid")
+                for leaf in ("committed", "technical_failure", "staging"):
+                    residue = integration_root / leaf
+                    if residue.exists() or residue.is_symlink():
+                        raise DashboardDeltaError(f"{item_id} terminal failure has integration residue")
+        presentations = [Path("item_state.json"), Path("accepted")]
+        if integration_leaf is not None:
+            presentations.append(integration_leaf)
+        for relative in presentations:
+            source = item_root / relative
+            if not source.exists() and not source.is_symlink():
+                raise DashboardDeltaError(f"{item_id} current presentation input is missing: {relative}")
+            copy_ref(source.relative_to(context.run_root))
+        copy_accepted_visual_sources(
+            item_root,
+            item_id,
+            item_root / "accepted",
+            relative_root=Path(f"requirements/{item_id}"),
+        )
+        # ``ItemWorkspace.load`` reconciles terminal snapshots against the
+        # absolute accepted-manifest path persisted in item_state.json.  The
+        # accepted bytes remain immutable, while this scratch-only envelope
+        # must point at its copied manifest rather than the live run root.
+        scratch_state_path = scratch_root / f"requirements/{item_id}/item_state.json"
+        try:
+            item_state = json.loads(scratch_state_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise DashboardDeltaError(f"{item_id} scratch item state is invalid") from exc
+        if not isinstance(item_state, Mapping):
+            raise DashboardDeltaError(f"{item_id} scratch item state is invalid")
+        terminal = item_state.get("terminal_outcome")
+        if isinstance(terminal, Mapping) and terminal.get("manifest_path") is not None:
+            item_state = dict(item_state)
+            terminal = dict(terminal)
+            terminal["manifest_path"] = str(
+                (scratch_root / f"requirements/{item_id}/accepted/manifest.json").resolve()
+            )
+            item_state["terminal_outcome"] = terminal
+            scratch_state_path.write_bytes(_canonical_bytes(item_state))
+
+    # Replay the immutable predecessor frontier as part of the same scratch
+    # input envelope.  This includes removed requirements as well as reopened
+    # current heads; the LEM projector itself decides which validated records
+    # remain current after applying typed supersedes links.
+    copy_semantic_history()
+
+    for reference in (
+        "lem/prepared_data_registry.jsonl",
+        "indexes/prepared_index.json",
+        "telemetry/events.jsonl",
+        "telemetry/inventory_counters.json",
+    ):
+        copy_ref(reference, optional=True)
+
+    data_ref = getattr(metadata, "data_revision_ref", None)
+    if data_ref:
+        # Live lifecycle/data validation already proves the immutable
+        # revision's archive and catalog hashes.  Scratch only needs the
+        # exact manifest bytes for generation metadata/hash binding; copying
+        # the archive or catalog would cross the product no-raw boundary.
+        copy_ref(data_ref)
+
+    # The full assembler validates only the immediate parent's product
+    # lineage.  Copy that manifest and its bound receipt, but deliberately do
+    # not copy any parent fixture/map/site: those are semantic presentation
+    # artifacts and must never become hidden rebuild inputs.
+    parent_generation_id = getattr(metadata, "parent_generation_id", None)
+    if isinstance(parent_generation_id, str) and parent_generation_id:
+        parent_manifest_path_live = _parent_manifest_path(context, parent_generation_id)
+        parent_manifest_ref = _relative_run_ref(context, parent_manifest_path_live)
+        copy_ref(parent_manifest_ref)
+        # Legacy G-0001 runs may still use the root product manifest as the
+        # parent authority.  The assembler's generation-parent helper expects
+        # the canonical generation path, so materialize the same validated
+        # bytes there in scratch only; this is not a live compatibility alias.
+        scratch_parent_ref = parent_manifest_ref
+        if parent_generation_id == "G-0001" and parent_manifest_ref == "products/product_manifest.json":
+            scratch_parent_ref = "products/generations/G-0001/product_manifest.json"
+            scratch_parent_path = scratch_root / scratch_parent_ref
+            scratch_parent_path.parent.mkdir(parents=True, exist_ok=True)
+            scratch_parent_path.write_bytes((scratch_root / parent_manifest_ref).read_bytes())
+        parent_manifest_path = scratch_root / scratch_parent_ref
+        try:
+            parent_manifest = json.loads(parent_manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise DashboardDeltaError("full rebuild parent product manifest is invalid") from exc
+        if not isinstance(parent_manifest, Mapping):
+            raise DashboardDeltaError("full rebuild parent product manifest is invalid")
+        dashboard = parent_manifest.get("dashboard")
+        receipt_ref = dashboard.get("receipt_ref") if isinstance(dashboard, Mapping) else None
+        if not isinstance(receipt_ref, str) or not receipt_ref:
+            raise DashboardDeltaError("full rebuild parent product manifest lacks a dashboard receipt")
+        copy_ref(receipt_ref)
+
+    # Lifecycle files bind their absolute run root and hashes.  Rebase just
+    # those native metadata envelopes to the scratch context; accepted,
+    # committed, and data-revision bytes remain byte-identical.  The live
+    # generation manifest is never modified.
+    pointer_path = scratch_root / "active_generation.json"
+    try:
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DashboardDeltaError("full rebuild active generation pointer is invalid") from exc
+    if not isinstance(pointer, Mapping):
+        raise DashboardDeltaError("full rebuild active generation pointer is invalid")
+    pointer = dict(pointer)
+    manifest_ref = pointer.get("manifest_ref")
+    state_ref = pointer.get("state_ref")
+    if not isinstance(manifest_ref, str) or not isinstance(state_ref, str):
+        raise DashboardDeltaError("full rebuild lifecycle references are invalid")
+    scratch_manifest_path = scratch_root / manifest_ref
+    scratch_state_path = scratch_root / state_ref
+    try:
+        manifest = json.loads(scratch_manifest_path.read_text(encoding="utf-8"))
+        state = json.loads(scratch_state_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DashboardDeltaError("full rebuild lifecycle metadata is invalid") from exc
+    if not isinstance(manifest, Mapping) or not isinstance(state, Mapping):
+        raise DashboardDeltaError("full rebuild lifecycle metadata is invalid")
+    state = dict(state)
+    state["run_root"] = str(scratch_root.resolve())
+    state_unsigned = {key: value for key, value in state.items() if key != "manifest_hash"}
+    state["manifest_hash"] = _json_hash(state_unsigned)
+    scratch_state_path.write_bytes(_canonical_bytes(state))
+    manifest = dict(manifest)
+    manifest["run_root"] = str(scratch_root.resolve())
+    manifest["state_manifest_hash"] = _sha256_bytes(scratch_state_path.read_bytes())
+    manifest_unsigned = {key: value for key, value in manifest.items() if key != "manifest_hash"}
+    manifest["manifest_hash"] = _json_hash(manifest_unsigned)
+    scratch_manifest_path.write_bytes(_canonical_bytes(manifest))
+    pointer["run_root"] = str(scratch_root.resolve())
+    pointer["generation_manifest_hash"] = _sha256_bytes(scratch_manifest_path.read_bytes())
+    pointer_unsigned = {key: value for key, value in pointer.items() if key != "manifest_hash"}
+    pointer["manifest_hash"] = _json_hash(pointer_unsigned)
+    pointer_path.write_bytes(_canonical_bytes(pointer))
+
+    if presentation_plan_ref:
+        copy_ref(presentation_plan_ref)
+    return scratch_context
+
+
+def _render_full_generation_candidate(
+    context: RunContext,
+    metadata: Any,
+    item_ids: Sequence[str],
+    *,
+    plan_path: Path,
+    presentation_plan_ref: str | None,
+) -> tuple[tempfile.TemporaryDirectory[str], RunContext, Path, dict[str, Any]]:
+    """Render a complete current-head candidate outside the live run tree."""
+
+    scratch_workspace: tempfile.TemporaryDirectory[str] = tempfile.TemporaryDirectory(prefix="dashboard-full-rebuild-")
+    scratch_root = Path(scratch_workspace.name)
+    scratch_context = _copy_full_rebuild_inputs(
+        context,
+        scratch_root,
+        metadata,
+        item_ids,
+        plan_path=plan_path,
+        presentation_plan_ref=presentation_plan_ref,
+    )
+    assembler = _assembler()
+    output_ref = f"generations/{metadata.generation_id}/dashboard"
+    plan_ref = _relative_run_ref(context, plan_path)
+    full_receipt = assembler.assemble_dashboard(
+        scratch_context,
+        output_dir=output_ref,
+        item_ids=item_ids,
+        plan_ref=plan_ref,
+        presentation_plan_ref=presentation_plan_ref,
+    )
+    dashboard_root = scratch_context.resolve_product_path(output_ref)
+    if not dashboard_root.is_dir() or dashboard_root.is_symlink():
+        raise DashboardDeltaError("full rebuild candidate namespace is missing or symlinked")
+    if not isinstance(full_receipt, Mapping) or full_receipt.get("status") != "complete":
+        raise DashboardDeltaError("full rebuild assembler did not produce a complete receipt")
+    return scratch_workspace, scratch_context, dashboard_root.parent, dict(full_receipt)
 
 
 def _rebuild_cumulative_dashboard_projection(
@@ -2355,6 +3444,7 @@ def _rebuild_cumulative_dashboard_projection(
     cumulative_ids: Sequence[str],
     old_ids: Sequence[str],
     added_ids: Sequence[str],
+    reopened_ids: Sequence[str] = (),
     loaded: Mapping[str, Mapping[str, Any]],
     parent_fixture: Mapping[str, Any],
     parent_map: Mapping[str, Any],
@@ -2398,10 +3488,18 @@ def _rebuild_cumulative_dashboard_projection(
     # Parent fixture bytes are already bound by the parent receipt.  Reusing
     # them as hints preserves chart values/types while keeping current record
     # provenance and manager metadata authoritative.
+    reopened_set = set(reopened_ids)
+    reopened_widget_ids = {
+        _text(widget.get("id"))
+        for widget in parent_widgets
+        if isinstance(widget, Mapping) and _text(widget.get("requirement_id")) in reopened_set
+    }
     legacy_hints = {
         _text(widget.get("id")): widget
         for widget in parent_widgets
-        if isinstance(widget, Mapping) and _text(widget.get("id"))
+        if isinstance(widget, Mapping)
+        and _text(widget.get("id"))
+        and _text(widget.get("id")) not in reopened_widget_ids
     }
     parent_widget_ids = set(legacy_hints)
     parent_chart_entries = parent_map.get("charts")
@@ -2413,6 +3511,8 @@ def _rebuild_cumulative_dashboard_projection(
         if not isinstance(entry, Mapping) or not _text(entry.get("id")):
             raise DashboardDeltaError("parent chart map entry is invalid")
         entry_id = _text(entry.get("id"))
+        if entry_id in reopened_widget_ids:
+            continue
         if entry_id in chart_by_id:
             raise DashboardDeltaError(f"parent chart map contains duplicate widget ID: {entry_id}")
         chart_by_id[entry_id] = entry
@@ -2481,6 +3581,9 @@ def _rebuild_cumulative_dashboard_projection(
             item = loaded.get(item_id)
             if not isinstance(item, Mapping):
                 raise DashboardDeltaError(f"cumulative item input is missing: {item_id}")
+            # Empty failed-item flows are omitted below; surviving flow order
+            # must remain contiguous for the renderer contract.
+            flow_order = len(flow_defs) + 1
             records = item.get("records")
             if not isinstance(records, list):
                 raise DashboardDeltaError(f"cumulative item records are invalid: {item_id}")
@@ -2490,6 +3593,7 @@ def _rebuild_cumulative_dashboard_projection(
                 item_id,
                 widget_content,
                 records,
+                accepted_visuals=item.get("accepted_visual_widgets", ()),
                 legacy_hints=legacy_hints,
                 manager_widget_ids=manager_widget_ids,
                 manager_entries=manager_entries,
@@ -2546,7 +3650,15 @@ def _rebuild_cumulative_dashboard_projection(
                 flow["scope"] = item["requirement_scope"]
             if item.get("limitations"):
                 flow["limitations"] = list(item["limitations"])
-            flow_defs.append(flow)
+            if item.get("integration_failure"):
+                flow["failure"] = copy.deepcopy(item["integration_failure"])
+            # Failed requirements have no committed business records and
+            # therefore no valid widget.  Keep the failure in the fixture's
+            # explicit failed-items/limitations projection; the renderer
+            # rejects empty decision flows and a synthetic widget would imply
+            # analytics that never existed.
+            if item_widgets:
+                flow_defs.append(flow)
             if item_id in route_by_item:
                 route_info = route_by_item[item_id]
                 route_manifest.append({
@@ -2562,7 +3674,12 @@ def _rebuild_cumulative_dashboard_projection(
             "order": domain_order,
             "decision_flow": flow_defs,
         }
-        domains.append(domain)
+        # Failed requirements are disclosed in ``failed_items`` and
+        # limitations, but an empty section would violate the renderer's
+        # non-empty decision-flow contract and imply analytics that do not
+        # exist.
+        if flow_defs:
+            domains.append(domain)
 
     if assigned != set(cumulative_ids):
         missing = sorted(set(cumulative_ids) - assigned)
@@ -2606,6 +3723,7 @@ def _product_assets(receipt: Mapping[str, Any], receipt_ref: str) -> list[dict[s
         {"ref": outputs.get("fixture_ref"), "role": "reviewed_dashboard_fixture", "sha256": hashes.get("fixture_sha256")},
         {"ref": outputs.get("chart_map_ref"), "role": "dashboard_chart_map", "sha256": hashes.get("chart_map_sha256")},
         {"ref": outputs.get("chart_registry_ref"), "role": "dashboard_chart_registry", "sha256": hashes.get("chart_registry_sha256")},
+        {"ref": outputs.get("blueprint_ref"), "role": "dashboard_blueprint_v2", "sha256": hashes.get("blueprint_sha256")},
         {"ref": _text(outputs.get("site_ref")).rstrip("/") + "/site_manifest.json", "role": "dashboard_site_manifest", "sha256": hashes.get("site_manifest_sha256")},
         {"ref": receipt_ref, "role": "dashboard_delta_receipt", "sha256": receipt_sha256},
     ]
@@ -2937,56 +4055,6 @@ def _assert_generation_current(context: RunContext, expected: Any) -> RunLifecyc
     return current
 
 
-def _validate_planless_legacy_receipt_shape(
-    receipt: Mapping[str, Any],
-    *,
-    raw_bytes: bytes | None = None,
-) -> None:
-    """Validate the exact pre-plan receipt shape used for one migration.
-
-    This is deliberately not a compatibility mode for current retries.  It
-    accepts only the historical schema/version, with both top-level and
-    request-level presentation fields absent.  The normalized receipt is
-    passed through the current nested shape validator so all output, freeze,
-    parent, route, and lineage fields remain mandatory.
-    """
-
-    if not isinstance(receipt, Mapping) or set(receipt) != _LEGACY_DELTA_RECEIPT_KEYS:
-        raise DashboardDeltaError("legacy planless delta receipt schema is not exact")
-    request_binding = receipt.get("request_binding")
-    if not isinstance(request_binding, Mapping) or set(request_binding) != _LEGACY_DELTA_REQUEST_KEYS:
-        raise DashboardDeltaError("legacy planless delta request binding schema is not exact")
-    if receipt.get("schema_version") != DELTA_SCHEMA or receipt.get("status") != "complete":
-        raise DashboardDeltaError("legacy planless delta receipt version/status is invalid")
-    if raw_bytes is not None and raw_bytes != _canonical_bytes(receipt):
-        raise DashboardDeltaError("legacy planless delta receipt is not canonical under its recorded schema")
-    normalized = _normalize_existing_presentation_receipt(receipt)
-    _validate_delta_receipt_shape(normalized)
-
-
-def _normalize_existing_presentation_receipt(receipt: Mapping[str, Any]) -> dict[str, Any]:
-    """Normalize only the additive presentation-plan fields of an old receipt.
-
-    Older same-generation products predate the explicit plan contract.  Their
-    immutable lineage remains validated exactly; these three presentation
-    fields are the sole permitted absence for the documented plan migration.
-    No other schema field is defaulted or ignored.
-    """
-
-    value = dict(receipt)
-    value.setdefault("presentation_plan_ref", None)
-    value.setdefault("presentation_plan_sha256", None)
-    value.setdefault("manager_widget_ids", [])
-    request = value.get("request_binding")
-    if isinstance(request, Mapping):
-        request_value = dict(request)
-        request_value.setdefault("presentation_plan_ref", None)
-        request_value.setdefault("presentation_plan_sha256", None)
-        request_value.setdefault("manager_widget_ids", [])
-        value["request_binding"] = request_value
-    return value
-
-
 def _validate_existing_delta_receipt(
     context: RunContext,
     receipt: Mapping[str, Any],
@@ -2996,6 +4064,7 @@ def _validate_existing_delta_receipt(
     fixture_rel: Path,
     map_rel: Path,
     registry_rel: Path,
+    blueprint_rel: Path,
     site_rel: Path,
     parent_receipt_path: Path,
     parent_receipt: Mapping[str, Any],
@@ -3004,6 +4073,7 @@ def _validate_existing_delta_receipt(
     parent_site_binding: Mapping[str, Any],
     parent_items: Sequence[Mapping[str, Any]],
     new_input_items: Sequence[Mapping[str, Any]],
+    expected_input_items: Sequence[Mapping[str, Any]] | None = None,
     request_binding: Mapping[str, Any],
     plan: Mapping[str, Any],
     plan_path: Path,
@@ -3027,12 +4097,14 @@ def _validate_existing_delta_receipt(
     expected_fixture = final_root / fixture_rel
     expected_map = final_root / map_rel
     expected_registry = final_root / registry_rel
+    expected_blueprint = final_root / blueprint_rel
     expected_site = final_root / site_rel
     expected_receipt_ref = _relative_run_ref(context, receipt_path)
     expected_outputs = {
         "fixture_ref": _relative_run_ref(context, expected_fixture),
         "chart_map_ref": _relative_run_ref(context, expected_map),
         "chart_registry_ref": _relative_run_ref(context, expected_registry),
+        "blueprint_ref": _relative_run_ref(context, expected_blueprint),
         "site_ref": _relative_run_ref(context, expected_site),
         "receipt_ref": expected_receipt_ref,
     }
@@ -3045,6 +4117,14 @@ def _validate_existing_delta_receipt(
         if not valid or path.is_symlink():
             raise DashboardDeltaError(f"existing delta output is missing or symlinked: {key}")
     fixture = _read_json(context, expected_outputs["fixture_ref"], label="existing delta fixture")
+    expected_artifacts = _delta_artifacts_from_input_items(
+        list(expected_input_items) if expected_input_items is not None else [*parent_items, *new_input_items]
+    )
+    _validate_delta_artifact_bindings(
+        receipt,
+        fixture=fixture,
+        expected_artifacts=expected_artifacts,
+    )
     site_manifest = paths["site_ref"] / "site_manifest.json"
     if not site_manifest.is_file() or site_manifest.is_symlink():
         raise DashboardDeltaError("existing delta site manifest is missing or symlinked")
@@ -3065,6 +4145,7 @@ def _validate_existing_delta_receipt(
         "fixture_sha256": _sha256_bytes(paths["fixture_ref"].read_bytes()),
         "chart_map_sha256": _sha256_bytes(paths["chart_map_ref"].read_bytes()),
         "chart_registry_sha256": _sha256_bytes(paths["chart_registry_ref"].read_bytes()),
+        "blueprint_sha256": _sha256_bytes(paths["blueprint_ref"].read_bytes()),
         "site_manifest_sha256": _sha256_bytes(site_manifest.read_bytes()),
     }
     expected_parent = {
@@ -3093,12 +4174,19 @@ def _validate_existing_delta_receipt(
         "parent_generation_id": metadata.parent_generation_id,
         "source_policy": "accepted_and_committed_only",
         "new_analytics": False,
+        "analytical_artifacts": expected_artifacts,
         "parent": expected_parent,
         "request_binding": dict(request_binding),
         "plan_binding": expected_plan,
-        "input_items": [*parent_items, *new_input_items],
+        "input_items": list(expected_input_items) if expected_input_items is not None else [*parent_items, *new_input_items],
         "outputs": expected_outputs,
         "output_hashes": output_hashes,
+        "blueprint_binding": {
+            "ref": expected_outputs["blueprint_ref"],
+            "sha256": output_hashes["blueprint_sha256"],
+            "schema_version": "dashboard.business_presentation_plan.v2",
+            "status": receipt.get("blueprint_binding", {}).get("status", "Preview"),
+        },
         "site_binding": child_site_binding,
         "freeze_inputs": dict(projection_metadata),
         "old_projection": {
@@ -3142,18 +4230,14 @@ def _validate_existing_delta_receipt(
         "plan_binding",
         "input_items",
         "outputs",
+        "blueprint_binding",
         "old_projection",
         "new_projection",
         "rollback_parent",
         "retry",
     )
     for field in stable_fields:
-        actual_field = receipt.get(field)
-        expected_field = expected_receipt.get(field)
-        if field == "request_binding" and isinstance(actual_field, Mapping) and isinstance(expected_field, Mapping):
-            actual_field = {key: value for key, value in actual_field.items() if key not in {"presentation_plan_ref", "presentation_plan_sha256", "manager_widget_ids"}}
-            expected_field = {key: value for key, value in expected_field.items() if key not in {"presentation_plan_ref", "presentation_plan_sha256", "manager_widget_ids"}}
-        if actual_field != expected_field:
+        if receipt.get(field) != expected_receipt.get(field):
             raise DashboardDeltaError(f"existing delta receipt stable binding is invalid: {field}")
 
     # The remaining fields are checked for internal consistency with the
@@ -3187,6 +4271,482 @@ def _validate_existing_delta_receipt(
         raise DashboardDeltaError("existing delta freeze summary is invalid")
 
 
+def _full_rebuild_receipt(
+    context: RunContext,
+    *,
+    metadata: Any,
+    parent_receipt_path: Path,
+    parent_receipt: Mapping[str, Any],
+    parent_manifest_ref: str,
+    parent_manifest_hash: str,
+    parent_site_binding: Mapping[str, Any],
+    plan_path: Path,
+    plan: Mapping[str, Any],
+    plan_hash: str,
+    request_binding: Mapping[str, Any],
+    current_input_items: Sequence[Mapping[str, Any]],
+    projection_metadata: Mapping[str, Any],
+    candidate_root: Path,
+    final_root: Path,
+    fixture_rel: Path,
+    map_rel: Path,
+    registry_rel: Path,
+    blueprint_rel: Path,
+    site_rel: Path,
+    receipt_rel: Path,
+    route_manifest: Sequence[Mapping[str, Any]] = (),
+    presentation_plan_ref: str | None = None,
+    presentation_plan_sha256: str | None = None,
+    manager_widget_ids: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Adapt a full assembler receipt to the generation delta contract."""
+
+    fixture_path = candidate_root / fixture_rel
+    map_path = candidate_root / map_rel
+    registry_path = candidate_root / registry_rel
+    blueprint_path = candidate_root / blueprint_rel
+    site_path = candidate_root / site_rel
+    if not all(path.is_file() for path in (fixture_path, map_path, registry_path, blueprint_path)) or not site_path.is_dir():
+        raise DashboardDeltaError("full rebuild candidate outputs are incomplete")
+    try:
+        blueprint_value = json.loads(blueprint_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DashboardDeltaError("full rebuild candidate blueprint is invalid") from exc
+    if not isinstance(blueprint_value, Mapping) or blueprint_value.get("schema_version") != "dashboard.business_presentation_plan.v2":
+        raise DashboardDeltaError("full rebuild candidate blueprint schema is invalid")
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    if not isinstance(fixture, Mapping) or fixture.get("schema_version") != FIXTURE_SCHEMA:
+        raise DashboardDeltaError("full rebuild candidate fixture schema is invalid")
+    fixture_artifacts = fixture.get("analytical_artifacts")
+    if not isinstance(fixture_artifacts, list):
+        raise DashboardDeltaError("full rebuild candidate analytical_artifacts are invalid")
+    expected_artifacts = _delta_artifacts_from_input_items(current_input_items)
+    if fixture_artifacts != expected_artifacts:
+        raise DashboardDeltaError("full rebuild candidate analytical artifact bindings differ from current inputs")
+    freeze_inputs = dict(projection_metadata)
+    if freeze_inputs.get("analytical_artifacts") != expected_artifacts:
+        raise DashboardDeltaError("full rebuild freeze analytical artifact bindings differ from current inputs")
+    candidate_binding = _assembler()._site_tree_binding(site_path)
+    old_files = parent_site_binding.get("files", {}) if isinstance(parent_site_binding.get("files"), Mapping) else {}
+    new_files = candidate_binding.get("files", {})
+    affected = [
+        {"path": value, "sha256": new_files.get(value)}
+        for value in sorted(set(old_files) | set(new_files))
+        if old_files.get(value) != new_files.get(value)
+    ]
+    unchanged = [
+        {"path": value, "sha256": new_files.get(value)}
+        for value in sorted(set(old_files) | set(new_files))
+        if old_files.get(value) == new_files.get(value)
+    ]
+    receipt = {
+        "schema_version": DELTA_SCHEMA,
+        "status": "complete",
+        "run_id": context.run_id,
+        "generation_id": metadata.generation_id,
+        "generation_ordinal": metadata.generation_ordinal,
+        "parent_generation_id": metadata.parent_generation_id,
+        "source_policy": "accepted_and_committed_only",
+        "new_analytics": False,
+        "analytical_artifacts": expected_artifacts,
+        "parent": {
+            "product_manifest_ref": parent_manifest_ref,
+            "product_manifest_sha256": parent_manifest_hash,
+            "receipt_ref": _relative_run_ref(context, parent_receipt_path),
+            "receipt_sha256": _sha256_bytes(parent_receipt_path.read_bytes()),
+            "site_binding": dict(parent_site_binding),
+            "site_tree_sha256": parent_site_binding.get("tree_sha256"),
+        },
+        "request_binding": dict(request_binding),
+        "plan_binding": {
+            "ref": _relative_run_ref(context, plan_path),
+            "sha256": plan_hash,
+            "admission_sha256": metadata.plan_hash,
+            "generation_id": metadata.generation_id,
+            "revision": plan.get("revision"),
+            "route": list(route_manifest),
+        },
+        "input_items": [dict(value) for value in current_input_items],
+        "outputs": {
+            "fixture_ref": _relative_run_ref(context, final_root / fixture_rel),
+            "chart_map_ref": _relative_run_ref(context, final_root / map_rel),
+            "chart_registry_ref": _relative_run_ref(context, final_root / registry_rel),
+            "blueprint_ref": _relative_run_ref(context, final_root / blueprint_rel),
+            "site_ref": _relative_run_ref(context, final_root / site_rel),
+            "receipt_ref": _relative_run_ref(context, final_root / receipt_rel),
+        },
+        "output_hashes": {
+            "fixture_sha256": _sha256_bytes(fixture_path.read_bytes()),
+            "chart_map_sha256": _sha256_bytes(map_path.read_bytes()),
+            "chart_registry_sha256": _sha256_bytes(registry_path.read_bytes()),
+            "blueprint_sha256": _sha256_bytes(blueprint_path.read_bytes()),
+            "site_manifest_sha256": _sha256_bytes((site_path / "site_manifest.json").read_bytes()),
+        },
+        "blueprint_binding": {
+            "ref": _relative_run_ref(context, final_root / blueprint_rel),
+            "sha256": _sha256_bytes(blueprint_path.read_bytes()),
+            "schema_version": blueprint_value.get("schema_version"),
+            "status": blueprint_value.get("review_status", "Preview"),
+        },
+        "site_binding": candidate_binding,
+        "freeze_inputs": freeze_inputs,
+        "old_projection": {
+            "projection_hash": parent_receipt.get("freeze_inputs", {}).get("projection_hash"),
+            "export_sha256": parent_receipt.get("freeze_inputs", {}).get("export_sha256"),
+        },
+        "new_projection": {
+            "projection_hash": projection_metadata["projection_hash"],
+            "export_sha256": projection_metadata["export_sha256"],
+        },
+        "affected_paths": affected,
+        "unchanged_paths": unchanged,
+        "rollback_parent": {
+            "generation_id": metadata.parent_generation_id,
+            "product_manifest_ref": parent_manifest_ref,
+            "product_manifest_sha256": parent_manifest_hash,
+            "receipt_ref": _relative_run_ref(context, parent_receipt_path),
+            "receipt_sha256": _sha256_bytes(parent_receipt_path.read_bytes()),
+            "site_tree_sha256": parent_site_binding.get("tree_sha256"),
+        },
+        "widget_count": len(fixture.get("widgets", [])) if isinstance(fixture.get("widgets"), list) else 0,
+        "domain_count": len(fixture.get("domains", [])) if isinstance(fixture.get("domains"), list) else 0,
+        "retry": "idempotent only when parent/input/route/projection/output hashes match",
+        "presentation_plan_ref": presentation_plan_ref,
+        "presentation_plan_sha256": presentation_plan_sha256,
+        "manager_widget_ids": list(manager_widget_ids),
+    }
+    _validate_delta_receipt_shape(receipt)
+    return receipt
+
+
+def _assemble_full_rebuild_locked(
+    context: RunContext,
+    *,
+    lifecycle: RunLifecycle,
+    metadata: Any,
+    parent_receipt_path: Path,
+    parent_receipt: Mapping[str, Any],
+    parent_root: Path,
+    parent_refs: Mapping[str, Path],
+    parent_site_binding: Mapping[str, Any],
+    parent_manifest_ref: str,
+    parent_manifest_hash: str,
+    parent_receipt_hash: str,
+    plan: Mapping[str, Any],
+    plan_path: Path,
+    plan_hash: str,
+    cumulative_ids: Sequence[str],
+    current_input_items: Sequence[Mapping[str, Any]],
+    changed_input_items: Sequence[Mapping[str, Any]],
+    projection_metadata: Mapping[str, Any],
+    request_binding: Mapping[str, Any],
+    final_root: Path,
+    generation_root: Path,
+    product_manifest_path: Path,
+    receipt_path: Path,
+    fixture_rel: Path,
+    map_rel: Path,
+    registry_rel: Path,
+    blueprint_rel: Path,
+    site_rel: Path,
+    failpoint: str | None,
+    presentation_plan_ref: str | None,
+    presentation_plan_sha256: str | None,
+    presentation_plan_bytes: bytes | None,
+    manager_widget_ids: Sequence[str],
+) -> dict[str, Any]:
+    """Publish a true current-head rebuild with existing CAS machinery."""
+
+    transaction_state: tuple[Path, dict[str, Any]] | None
+    with RunLifecycle._run_lock(context):  # noqa: SLF001 - recovery CAS boundary
+        latest = RunLifecycle._load_unlocked(context)  # noqa: SLF001
+        latest_meta = latest.generation_metadata
+        if latest_meta is None or latest_meta.generation_id != metadata.generation_id or latest_meta.manifest_hash != metadata.manifest_hash:
+            _abort_inactive_generation_product_transaction(
+                context,
+                latest=latest,
+                transaction_generation_id=metadata.generation_id,
+                target_root=generation_root,
+                defer_unbound_new=True,
+            )
+            raise _GenerationChanged("active generation changed before full rebuild recovery")
+        _assert_live_plan_binding(context, latest, plan_path, plan_hash)
+        _parent_generation_bindings(context, latest_meta)
+        transaction_state = _recover_generation_product_transaction(
+            context,
+            metadata=latest_meta,
+            target_root=generation_root,
+        )
+    if transaction_state is None:
+        transaction_state = _recover_generation_transaction(
+            context,
+            metadata=metadata,
+            final_root=final_root,
+        )
+
+    existing_receipt: dict[str, Any] | None = None
+    if final_root.exists() or final_root.is_symlink():
+        if not receipt_path.is_file() or receipt_path.is_symlink():
+            raise DashboardDeltaError("full rebuild output exists without a complete receipt")
+        try:
+            raw_bytes = receipt_path.read_bytes()
+            raw_value = json.loads(raw_bytes.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise DashboardDeltaError("full rebuild receipt is invalid") from exc
+        if not isinstance(raw_value, Mapping) or raw_value.get("schema_version") != DELTA_SCHEMA or raw_value.get("status") != "complete":
+            raise DashboardDeltaError("full rebuild receipt schema is invalid")
+        existing = dict(raw_value)
+        _validate_delta_output(context, receipt_path, existing)
+        _validate_existing_delta_receipt(
+            context,
+            existing,
+            receipt_path=receipt_path,
+            final_root=final_root,
+            fixture_rel=fixture_rel,
+            map_rel=map_rel,
+            registry_rel=registry_rel,
+            blueprint_rel=blueprint_rel,
+            site_rel=site_rel,
+            parent_receipt_path=parent_receipt_path,
+            parent_receipt=parent_receipt,
+            parent_manifest_ref=parent_manifest_ref,
+            parent_manifest_hash=parent_manifest_hash,
+            parent_site_binding=parent_site_binding,
+            parent_items=parent_receipt.get("input_items", []),
+            new_input_items=changed_input_items,
+            expected_input_items=current_input_items,
+            request_binding=request_binding,
+            plan=plan,
+            plan_path=plan_path,
+            plan_hash=plan_hash,
+            metadata=metadata,
+            route_manifest=(),
+            projection_metadata=projection_metadata,
+        )
+        if existing.get("request_binding") != dict(request_binding) or existing.get("input_items") != list(current_input_items):
+            raise DashboardDeltaError("existing full rebuild receipt binding conflicts")
+        if transaction_state is not None:
+            with RunLifecycle._run_lock(context):  # noqa: SLF001
+                if transaction_state[1].get("schema_version") == _PRODUCT_TRANSACTION_SCHEMA:
+                    _finish_generation_product_transaction(
+                        context,
+                        intent_path=transaction_state[0],
+                        intent=transaction_state[1],
+                        receipt=existing,
+                        receipt_path=receipt_path,
+                        lifecycle=lifecycle,
+                        metadata=metadata,
+                        plan_path=plan_path,
+                        plan_hash=plan_hash,
+                        parent_manifest_ref=parent_manifest_ref,
+                        parent_manifest_hash=parent_manifest_hash,
+                        failpoint=failpoint,
+                    )
+                else:
+                    _finish_generation_transaction(
+                        context,
+                        intent_path=transaction_state[0],
+                        intent=transaction_state[1],
+                        receipt=existing,
+                        receipt_path=receipt_path,
+                        product_manifest_path=product_manifest_path,
+                        lifecycle=lifecycle,
+                        metadata=metadata,
+                        plan_path=plan_path,
+                        plan_hash=plan_hash,
+                        parent_manifest_ref=parent_manifest_ref,
+                        parent_manifest_hash=parent_manifest_hash,
+                        failpoint=failpoint,
+                    )
+            return dict(existing)
+        product_value = _read_json(context, _relative_run_ref(context, product_manifest_path), label="active generation product manifest") if product_manifest_path.is_file() else None
+        if product_value is not None:
+            _validate_product_manifest(
+                context,
+                product_manifest_path,
+                product_value,
+                existing,
+                lifecycle,
+                metadata,
+                parent_manifest_ref,
+                parent_manifest_hash,
+            )
+        return dict(existing)
+
+    scratch_workspace, scratch_context, scratch_generation_root, _full_receipt = _render_full_generation_candidate(
+        context,
+        metadata,
+        cumulative_ids,
+        plan_path=plan_path,
+        presentation_plan_ref=presentation_plan_ref,
+    )
+    try:
+        scratch_final_root = scratch_generation_root / "dashboard"
+        if presentation_plan_ref is not None:
+            presentation_plan_path = _safe_run_path(context, presentation_plan_ref, label="business presentation plan")
+            scratch_plan_path = scratch_context.resolve_run_path(presentation_plan_ref)
+            if not scratch_plan_path.is_file() or scratch_plan_path.read_bytes() != presentation_plan_path.read_bytes():
+                raise DashboardDeltaError("full rebuild presentation plan copy drifted")
+        replacement_candidate = final_root.exists() and product_manifest_path.is_file()
+        if replacement_candidate:
+            manifest_rel = product_manifest_path.relative_to(generation_root)
+            staged_manifest = scratch_generation_root / manifest_rel
+            staged_manifest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(product_manifest_path, staged_manifest, follow_symlinks=False)
+        candidate_fixture = json.loads((scratch_final_root / fixture_rel).read_text(encoding="utf-8"))
+        if not isinstance(candidate_fixture, Mapping):
+            raise DashboardDeltaError("full rebuild fixture is invalid")
+        candidate_site_binding = _assembler()._site_tree_binding(scratch_final_root / site_rel)
+        receipt = _full_rebuild_receipt(
+            context,
+            metadata=metadata,
+            parent_receipt_path=parent_receipt_path,
+            parent_receipt=parent_receipt,
+            parent_manifest_ref=parent_manifest_ref,
+            parent_manifest_hash=parent_manifest_hash,
+            parent_site_binding=parent_site_binding,
+            plan_path=plan_path,
+            plan=plan,
+            plan_hash=plan_hash,
+            request_binding=request_binding,
+            current_input_items=current_input_items,
+            projection_metadata=projection_metadata,
+            candidate_root=scratch_final_root,
+            final_root=final_root,
+            fixture_rel=fixture_rel,
+            map_rel=map_rel,
+            registry_rel=registry_rel,
+            blueprint_rel=blueprint_rel,
+            site_rel=site_rel,
+            receipt_rel=receipt_path.relative_to(final_root),
+            presentation_plan_ref=presentation_plan_ref,
+            presentation_plan_sha256=presentation_plan_sha256,
+            manager_widget_ids=manager_widget_ids,
+        )
+        staged_receipt_path = scratch_final_root / receipt_path.relative_to(final_root)
+        _write_atomic_json(staged_receipt_path, receipt)
+        _fsync_tree(scratch_generation_root)
+        _fsync_directory(scratch_generation_root.parent)
+        candidate_dashboard_binding = _generation_product_binding(scratch_generation_root) if replacement_candidate else _transaction_tree_binding(scratch_final_root)
+        if not isinstance(candidate_dashboard_binding, Mapping):
+            raise DashboardDeltaError("full rebuild candidate binding is invalid")
+
+        with RunLifecycle._run_lock(context):  # noqa: SLF001 - publication CAS boundary
+            latest = RunLifecycle._load_unlocked(context)  # noqa: SLF001
+            latest_meta = latest.generation_metadata
+            if latest_meta is None or latest_meta.generation_id != metadata.generation_id or latest_meta.manifest_hash != metadata.manifest_hash:
+                raise _GenerationChanged("active generation changed before full rebuild publication")
+            _assert_live_plan_binding(context, latest, plan_path, plan_hash)
+            if presentation_plan_ref is not None and presentation_plan_bytes is not None and presentation_plan_sha256 is not None:
+                _assert_live_presentation_plan_binding(context, presentation_plan_ref, presentation_plan_bytes, presentation_plan_sha256)
+            new_receipt_hash = _sha256_bytes(staged_receipt_path.read_bytes())
+            if replacement_candidate:
+                staging_root = generation_root.parent / f".{generation_root.name}.product.staging-{secrets.token_hex(10)}"
+                if staging_root.exists() or staging_root.is_symlink():
+                    raise DashboardDeltaError("generation product staging path already exists")
+                product_value = _new_product_manifest(
+                    context,
+                    latest,
+                    latest_meta,
+                    {**receipt, "receipt_sha256": new_receipt_hash},
+                    _relative_run_ref(context, receipt_path),
+                    parent_manifest_ref,
+                    parent_manifest_hash,
+                    _terminal_product_status(context, latest),
+                )
+                try:
+                    from auto_foundry_core.product_contracts import validate_product_manifest
+
+                    validate_product_manifest(product_value, require_all=True)
+                except Exception as exc:
+                    raise DashboardDeltaError("full rebuild product manifest freeze markers are not fully frozen") from exc
+                manifest_rel = product_manifest_path.relative_to(generation_root)
+                expected_files = dict(candidate_dashboard_binding.get("files", {}))
+                expected_files[manifest_rel.as_posix()] = _json_hash(product_value)
+                candidate_product_binding = {"files": expected_files, "tree_sha256": _json_hash(expected_files), "file_count": len(expected_files)}
+                transaction_path, transaction_intent = _prepare_generation_product_transaction(
+                    context,
+                    metadata=latest_meta,
+                    target_root=generation_root,
+                    candidate_root=staging_root,
+                    receipt_path=receipt_path,
+                    product_manifest_path=product_manifest_path,
+                    old_receipt_hash=_sha256_bytes(receipt_path.read_bytes()) if receipt_path.is_file() and not receipt_path.is_symlink() else None,
+                    new_receipt_hash=new_receipt_hash,
+                    new_binding=candidate_product_binding,
+                    candidate_binding=candidate_dashboard_binding,
+                    preparing=True,
+                )
+                try:
+                    _copy_generation_product(scratch_generation_root, staging_root)
+                    staged_manifest_path = staging_root / manifest_rel
+                    _write_atomic_json(staged_manifest_path, product_value)
+                    _fsync_tree(staging_root)
+                    transaction_path, transaction_intent = _publish_generation_product_transaction(
+                        context,
+                        intent_path=transaction_path,
+                        intent=transaction_intent,
+                        failpoint=failpoint,
+                    )
+                    _finish_generation_product_transaction(
+                        context,
+                        intent_path=transaction_path,
+                        intent=transaction_intent,
+                        receipt=receipt,
+                        receipt_path=receipt_path,
+                        lifecycle=latest,
+                        metadata=latest_meta,
+                        plan_path=plan_path,
+                        plan_hash=plan_hash,
+                        parent_manifest_ref=parent_manifest_ref,
+                        parent_manifest_hash=parent_manifest_hash,
+                        failpoint=failpoint,
+                    )
+                except Exception:
+                    raise
+            else:
+                staging_root = final_root.parent / ".dashboard.staging"
+                if staging_root.exists() or staging_root.is_symlink():
+                    raise DashboardDeltaError("generation dashboard staging path already exists")
+                transaction_intent = _prepare_generation_transaction(
+                    context,
+                    metadata=latest_meta,
+                    final_root=final_root,
+                    receipt_path=receipt_path,
+                    product_manifest_path=product_manifest_path,
+                    lifecycle=latest,
+                    new_dashboard_binding=_transaction_tree_binding(scratch_final_root) or {},
+                    new_receipt_hash=new_receipt_hash,
+                    staging_root=staging_root,
+                    preparing=True,
+                )
+                transaction_path = _transaction_path(context, latest_meta.generation_id)
+                shutil.copytree(scratch_final_root, staging_root, symlinks=False)
+                transaction_intent = _transaction_phase(transaction_path, transaction_intent, "prepared")
+                _publish_staged = _assembler()._publish_staged_output
+                _publish_staged(staging_root, final_root, retain_backup=True)
+                transaction_intent = _transaction_phase(transaction_path, transaction_intent, "dashboard_published")
+                _finish_generation_transaction(
+                    context,
+                    intent_path=transaction_path,
+                    intent=transaction_intent,
+                    receipt=receipt,
+                    receipt_path=receipt_path,
+                    product_manifest_path=product_manifest_path,
+                    lifecycle=latest,
+                    metadata=latest_meta,
+                    plan_path=plan_path,
+                    plan_hash=plan_hash,
+                    parent_manifest_ref=parent_manifest_ref,
+                    parent_manifest_hash=parent_manifest_hash,
+                    failpoint=failpoint,
+                )
+            _reconcile_immediate_parent_transaction_locked(context, latest)
+        return receipt
+    finally:
+        scratch_workspace.cleanup()
+
+
 def _assemble_dashboard_delta_locked(
     context: RunContext,
     *,
@@ -3215,9 +4775,11 @@ def _assemble_dashboard_delta_locked(
     if lifecycle.snapshot.mode != "requirement":
         raise DashboardDeltaError("dashboard delta requires Requirement Mode")
     added_ids = tuple(metadata.added_item_ids)
-    if not added_ids:
-        raise DashboardDeltaError("active generation has no added requirements")
-    routes = _route_map(route, added_ids)
+    reopened_ids = tuple(getattr(metadata, "reopened_item_ids", ()) or ())
+    if not added_ids and not reopened_ids:
+        raise DashboardDeltaError("active generation has no product changes")
+    _validate_generation_data_binding(context, metadata)
+    routes = _route_map(route or {}, added_ids)
     plan, plan_path, plan_hash = _load_plan(context, lifecycle)
     assembler = _assembler()
     resolved_presentation_plan_ref: str | None = None
@@ -3249,8 +4811,7 @@ def _assemble_dashboard_delta_locked(
         plan_bytes = plan_path.read_bytes() if plan_path.is_file() else b""
         if plan_bytes != assembler._canonical_bytes(plan):
             raise DashboardDeltaError("active generation plan is not canonical")
-        if presentation_plan.get("schema_version") == assembler.PRESENTATION_PLAN_V2_SCHEMA:
-            manager_widget_ids = list(presentation_plan["manager_widget_ids"])
+        manager_widget_ids = list(presentation_plan["manager_widget_ids"])
         manager_entries = {entry["widget_id"]: entry for entry in presentation_plan["manager_entries"]}
     # ``metadata.plan_hash`` is immutable admission lineage.  The active plan
     # may legitimately be revised while the generation is running; receipt
@@ -3272,30 +4833,40 @@ def _assemble_dashboard_delta_locked(
         raise DashboardDeltaError("parent receipt run identity mismatch")
     parent_root, parent_refs = _parent_output_root(context, parent_receipt_path, parent_receipt)
     parent_site_binding = dict(parent_receipt["site_binding"])
-    parent_fixture = _read_json(context, _relative_run_ref(context, parent_refs["fixture_ref"]), label="parent dashboard fixture")
-    parent_map = _read_json(context, _relative_run_ref(context, parent_refs["chart_map_ref"]), label="parent chart map")
-    if parent_fixture.get("schema_version") != FIXTURE_SCHEMA or parent_map.get("schema_version") != CHART_MAP_SCHEMA:
-        raise DashboardDeltaError("parent dashboard fixture/map schema is unsupported")
+    full_rebuild = bool(reopened_ids)
+    # Append-only deltas use the immediate parent fixture/map as explicit
+    # routing/geometry inputs.  A data-refresh/current-head rebuild binds the
+    # parent only for rollback lineage; it never reads or inherits its
+    # dashboard semantics.
+    if full_rebuild:
+        parent_fixture: Mapping[str, Any] = {}
+        parent_map: Mapping[str, Any] = {}
+    else:
+        parent_fixture = _read_json(context, _relative_run_ref(context, parent_refs["fixture_ref"]), label="parent dashboard fixture")
+        parent_map = _read_json(context, _relative_run_ref(context, parent_refs["chart_map_ref"]), label="parent chart map")
+        if parent_fixture.get("schema_version") != FIXTURE_SCHEMA or parent_map.get("schema_version") != CHART_MAP_SCHEMA:
+            raise DashboardDeltaError("parent dashboard fixture/map schema is unsupported")
     parent_items = parent_receipt.get("input_items")
     if not isinstance(parent_items, list):
         raise DashboardDeltaError("parent receipt input_items are missing")
     old_ids = tuple(_text(value.get("item_id")) for value in parent_items if isinstance(value, Mapping))
-    if parent_fixture.get("run_id", context.run_id) != context.run_id:
+    if not full_rebuild and parent_fixture.get("run_id", context.run_id) != context.run_id:
         raise DashboardDeltaError("parent dashboard run identity mismatch")
     if set(added_ids).intersection(old_ids):
         raise DashboardDeltaError("parent receipt already contains an added requirement")
+    if any(item_id not in old_ids for item_id in reopened_ids):
+        raise DashboardDeltaError("reopened requirements must already exist in the parent product")
     if tuple(parent_receipt.get("freeze_inputs", {}).get("item_order", old_ids)) != old_ids:
         raise DashboardDeltaError("parent receipt item order is inconsistent")
-    _validate_routes_against_plan(plan, parent_fixture, old_ids, added_ids, routes)
+    if not full_rebuild:
+        _validate_routes_against_plan(plan, parent_fixture, old_ids, added_ids, routes)
 
-    cumulative_ids = old_ids + added_ids
+    cumulative_ids = tuple(metadata.cumulative_item_ids) if full_rebuild else old_ids + added_ids
     if tuple(metadata.cumulative_item_ids) != cumulative_ids:
-        raise DashboardDeltaError("active generation cumulative item order does not match parent plus added IDs")
+        raise DashboardDeltaError("active generation cumulative item order does not match the parent and current plan")
     loaded: dict[str, dict[str, Any]] = {}
-    authoritative_roots: dict[str, Mapping[str, Any]] = {}
-    record_file_hashes: dict[str, str] = {}
     new_records: list[Mapping[str, Any]] = []
-    new_input_items: list[dict[str, Any]] = []
+    changed_input_items: list[dict[str, Any]] = []
     parent_item_bindings = {
         _text(value.get("item_id")): value
         for value in parent_items
@@ -3309,25 +4880,20 @@ def _assemble_dashboard_delta_locked(
     for item_id in cumulative_ids:
         item, records, integration_manifest = _input_item(context, assembler, item_id)
         loaded[item_id] = item
-        records_path = context.resolve_run_path(f"requirements/{item_id}/integration/committed/records.jsonl")
-        records_file_sha = assembler._sha256_bytes(records_path.read_bytes())
-        for record in records:
-            record_id = assembler._text(record.get("record_id")).strip()
-            if record_id:
-                authoritative_roots[record_id] = assembler._presentation_authoritative_root(record, item["content"])
-                record_file_hashes[record_id] = records_file_sha
         if item_id in old_ids:
             bound = parent_item_bindings[item_id]
-            if (
+            if item_id not in reopened_ids and (
                 bound.get("accepted_content_hash") != item["accepted_content_hash"]
                 or bound.get("accepted_manifest_hash") != item["accepted_manifest_hash"]
                 or bound.get("integration_manifest_hash") != item["integration_manifest_hash"]
                 or bound.get("record_count") != len(records)
             ):
                 raise DashboardDeltaError(f"parent cumulative input binding drifted: {item_id}")
+            if item_id in reopened_ids:
+                changed_input_items.append({"item_id": item_id, "accepted_content_hash": item["accepted_content_hash"], "accepted_manifest_hash": item["accepted_manifest_hash"], "integration_manifest_hash": item["integration_manifest_hash"], "record_count": len(records)})
         else:
             new_records.extend(records)
-            new_input_items.append({"item_id": item_id, "accepted_content_hash": item["accepted_content_hash"], "accepted_manifest_hash": item["accepted_manifest_hash"], "integration_manifest_hash": item["integration_manifest_hash"], "record_count": len(records)})
+            changed_input_items.append({"item_id": item_id, "accepted_content_hash": item["accepted_content_hash"], "accepted_manifest_hash": item["accepted_manifest_hash"], "integration_manifest_hash": item["integration_manifest_hash"], "record_count": len(records)})
 
     lem_summary, projection_metadata = _load_delta_projection_metadata(context, cumulative_ids)
     # Freeze readiness is an admission check, not a post-publication cleanup.
@@ -3336,110 +4902,125 @@ def _assemble_dashboard_delta_locked(
     # active generation can retry after telemetry is frozen.
     _require_terminal_freeze({"freeze_inputs": projection_metadata})
 
-    current_input_items = [
-        *parent_items,
-        *new_input_items,
+    current_artifacts_by_item: dict[str, list[dict[str, Any]]] = {
+        item_id: assembler._analytical_artifact_input_entries({item_id: loaded[item_id]["records"]})
+        for item_id in cumulative_ids
+    }
+    # Keep top-level and per-item bindings in the same cumulative order.  The
+    # assembler helper sorts artifacts within an item; flattening that exact
+    # per-item projection makes the equality contract independent of plan or
+    # requirement ID lexical order.
+    current_artifact_inputs = [
+        copy.deepcopy(binding)
+        for item_id in cumulative_ids
+        for binding in current_artifacts_by_item[item_id]
     ]
+    current_input_items = [
+        {
+            "item_id": item_id,
+            "accepted_content_hash": loaded[item_id]["accepted_content_hash"],
+            "accepted_manifest_hash": loaded[item_id]["accepted_manifest_hash"],
+            "integration_manifest_hash": loaded[item_id]["integration_manifest_hash"],
+            "record_count": len(loaded[item_id]["records"]),
+            "analytical_artifacts": copy.deepcopy(current_artifacts_by_item[item_id]),
+        }
+        for item_id in cumulative_ids
+    ]
+    projection_metadata["analytical_artifacts"] = copy.deepcopy(current_artifact_inputs)
     presentation_parent = (
         assembler._presentation_parent_binding(context, metadata.generation_id, metadata)
-        if presentation_plan is not None
+        if presentation_plan is not None and not full_rebuild
         else None
     )
-    if presentation_plan is not None:
-        if presentation_plan.get("schema_version") == assembler.PRESENTATION_PLAN_V2_SCHEMA:
-            assembler._validate_v2_plan_lineage(
-                context,
-                presentation_plan,
-                generation_id=metadata.generation_id,
-                supervisor_ref=_relative_run_ref(context, plan_path),
-                input_items=current_input_items,
-                parent=presentation_parent,
-            )
-        else:
-            manager_widget_ids = assembler._validate_business_presentation_plan(
-                context,
-                presentation_plan,
-                generation_id=metadata.generation_id,
-                supervisor_ref=_relative_run_ref(context, plan_path),
-                supervisor_plan=plan,
-                input_items=current_input_items,
-                parent=presentation_parent,
-                authoritative_roots=authoritative_roots,
-                record_file_hashes=record_file_hashes,
-            )
+    if presentation_plan is not None and not full_rebuild:
+        assembler._validate_v2_plan_lineage(
+            context,
+            presentation_plan,
+            generation_id=metadata.generation_id,
+            supervisor_ref=_relative_run_ref(context, plan_path),
+            input_items=current_input_items,
+            parent=presentation_parent,
+        )
 
-    domains, widgets, route_manifest, candidate_map = _rebuild_cumulative_dashboard_projection(
-        assembler=assembler,
-        plan=plan,
-        cumulative_ids=cumulative_ids,
-        old_ids=old_ids,
-        added_ids=added_ids,
-        loaded=loaded,
-        parent_fixture=parent_fixture,
-        parent_map=parent_map,
-        routes=routes,
-        manager_widget_ids=manager_widget_ids,
-        manager_entries=manager_entries,
-        presentation_plan_ref=resolved_presentation_plan_ref,
-        presentation_plan_sha256=presentation_plan_sha256,
-    )
+    if full_rebuild:
+        domains: list[dict[str, Any]] = []
+        widgets: list[dict[str, Any]] = []
+        route_manifest: list[dict[str, Any]] = []
+        candidate_map: dict[str, Any] = {}
+        candidate_fixture: Mapping[str, Any] | None = None
+    else:
+        domains, widgets, route_manifest, candidate_map = _rebuild_cumulative_dashboard_projection(
+            assembler=assembler,
+            plan=plan,
+            cumulative_ids=cumulative_ids,
+            old_ids=old_ids,
+            added_ids=added_ids,
+            reopened_ids=(),
+            loaded=loaded,
+            parent_fixture=parent_fixture,
+            parent_map=parent_map,
+            routes=routes,
+            manager_widget_ids=manager_widget_ids,
+            manager_entries=manager_entries,
+            presentation_plan_ref=resolved_presentation_plan_ref,
+            presentation_plan_sha256=presentation_plan_sha256,
+        )
 
-    if presentation_plan is not None:
-        if presentation_plan.get("schema_version") == assembler.PRESENTATION_PLAN_V2_SCHEMA:
-            assembler._validate_business_presentation_plan_v2(
-                context,
-                presentation_plan,
-                fixture={"widgets": widgets},
-                fixture_ref=_relative_run_ref(context, parent_refs["fixture_ref"]),
-                chart_map=candidate_map,
-                chart_map_ref=_relative_run_ref(context, parent_refs["chart_map_ref"]),
-                widgets=widgets,
-                strict_source_hash=False,
-            )
-        else:
-            assembler._validate_business_presentation_plan(
-                context,
-                presentation_plan,
-                generation_id=metadata.generation_id,
-                supervisor_ref=_relative_run_ref(context, plan_path),
-                supervisor_plan=plan,
-                input_items=current_input_items,
-                parent=presentation_parent,
-                widgets=widgets,
-                authoritative_roots=authoritative_roots,
-                record_file_hashes=record_file_hashes,
-            )
+    if presentation_plan is not None and not full_rebuild:
+        assembler._validate_business_presentation_plan_v2(
+            context,
+            presentation_plan,
+            fixture={"widgets": widgets},
+            fixture_ref=_relative_run_ref(context, parent_refs["fixture_ref"]),
+            chart_map=candidate_map,
+            chart_map_ref=_relative_run_ref(context, parent_refs["chart_map_ref"]),
+            widgets=widgets,
+            strict_source_hash=False,
+        )
 
-    candidate_overview_ids = assembler._apply_overview_selection(widgets)
-    audit_records = assembler._audit_record_entries(
-        {item_id: loaded[item_id]["records"] for item_id in cumulative_ids},
-        widgets,
-    )
-    audit_widgets = assembler._audit_widget_entries(widgets)
+    if full_rebuild:
+        candidate_overview_ids: list[str] = []
+        audit_records: list[dict[str, Any]] = []
+        audit_widgets: list[dict[str, Any]] = []
+    else:
+        candidate_overview_ids = assembler._apply_overview_selection(widgets)
+        audit_records = assembler._audit_record_entries(
+            {item_id: loaded[item_id]["records"] for item_id in cumulative_ids},
+            widgets,
+        )
+        audit_widgets = assembler._audit_widget_entries(widgets)
 
-    candidate_fixture = copy.deepcopy(dict(parent_fixture))
-    candidate_fixture["domains"] = domains
-    candidate_fixture["widgets"] = widgets
-    candidate_fixture["audit_records"] = audit_records
-    candidate_fixture["audit_widgets"] = audit_widgets
-    candidate_fixture["audit_widget_entry_count"] = len(audit_widgets)
-    candidate_fixture["run_id"] = context.run_id
-    candidate_fixture["lem_projection_hash"] = projection_metadata["projection_hash"]
-    candidate_fixture["lem_export_sha256"] = projection_metadata["export_sha256"]
-    candidate_fixture["ontology_summary"] = lem_summary
-    candidate_fixture["prepared_registry_hash"] = projection_metadata["prepared_registry"]["sha256"]
-    candidate_fixture["telemetry_metadata_hash"] = projection_metadata["telemetry"]["sha256"]
-    nodes, edges, groups = _merge_ontology(parent_fixture, new_records)
-    candidate_fixture["ontology_objects"] = nodes
-    candidate_fixture["ontology_relationships"] = edges
-    candidate_fixture["ontology_groups"] = groups
-    candidate_fixture["freeze_markers"] = dict(projection_metadata["freeze_markers"])
-    candidate_fixture["overview_widget_ids"] = candidate_overview_ids
-    candidate_fixture["presentation_plan_ref"] = resolved_presentation_plan_ref
-    candidate_fixture["presentation_plan_sha256"] = presentation_plan_sha256
-    candidate_fixture["manager_widget_ids"] = list(manager_widget_ids)
-    candidate_fixture["manager_entries"] = [copy.deepcopy(manager_entries[key]) for key in manager_widget_ids]
-    candidate_fixture["manager_admission"] = {
+    if not full_rebuild:
+        candidate_fixture = copy.deepcopy(dict(parent_fixture))
+    if not full_rebuild:
+        candidate_fixture["domains"] = domains
+        candidate_fixture["widgets"] = widgets
+        candidate_fixture["audit_records"] = audit_records
+        candidate_fixture["audit_widgets"] = audit_widgets
+        candidate_fixture["audit_widget_entry_count"] = len(audit_widgets)
+        candidate_fixture["analytical_artifacts"] = copy.deepcopy(current_artifact_inputs)
+        candidate_fixture["run_id"] = context.run_id
+        candidate_fixture["generation_id"] = metadata.generation_id
+        candidate_fixture["skill_name"] = getattr(assembler, "SKILL_NAME", "auto-foundry-agentic-e2e")
+        candidate_fixture["skill_version"] = context.skill_version or "0.7.2"
+        candidate_fixture["core_name"] = getattr(assembler, "CORE_NAME", "auto_foundry_core")
+        candidate_fixture["core_version"] = context.core_version
+        candidate_fixture["lem_projection_hash"] = projection_metadata["projection_hash"]
+        candidate_fixture["lem_export_sha256"] = projection_metadata["export_sha256"]
+        candidate_fixture["ontology_summary"] = lem_summary
+        candidate_fixture["prepared_registry_hash"] = projection_metadata["prepared_registry"]["sha256"]
+        candidate_fixture["telemetry_metadata_hash"] = projection_metadata["telemetry"]["sha256"]
+        nodes, edges, groups = _merge_ontology(parent_fixture, new_records)
+        candidate_fixture["ontology_objects"] = nodes
+        candidate_fixture["ontology_relationships"] = edges
+        candidate_fixture["ontology_groups"] = groups
+        candidate_fixture["freeze_markers"] = dict(projection_metadata["freeze_markers"])
+        candidate_fixture["overview_widget_ids"] = candidate_overview_ids
+        candidate_fixture["presentation_plan_ref"] = resolved_presentation_plan_ref
+        candidate_fixture["presentation_plan_sha256"] = presentation_plan_sha256
+        candidate_fixture["manager_widget_ids"] = list(manager_widget_ids)
+        candidate_fixture["manager_entries"] = [copy.deepcopy(manager_entries[key]) for key in manager_widget_ids]
+        candidate_fixture["manager_admission"] = {
         "policy": "explicit_business_presentation_plan",
         "presentation_plan_ref": resolved_presentation_plan_ref,
         "presentation_plan_sha256": presentation_plan_sha256,
@@ -3455,12 +5036,25 @@ def _assemble_dashboard_delta_locked(
             if _text(widget.get("requirement_id"))
             and (not isinstance(widget.get("manager_admission"), Mapping) or widget["manager_admission"].get("status") != "admitted")
         }),
-    }
-    if presentation_plan is not None and presentation_plan.get("schema_version") == assembler.PRESENTATION_PLAN_V2_SCHEMA:
-        candidate_fixture["manager_visual_widget_ids"] = list(presentation_plan["manager_visual_widget_ids"])
-        candidate_fixture["audit_visual_widget_ids"] = list(presentation_plan["audit_visual_widget_ids"])
-        candidate_fixture["visual_entries"] = copy.deepcopy(presentation_plan["visual_entries"])
-        candidate_fixture["presentation_plan_schema"] = assembler.PRESENTATION_PLAN_V2_SCHEMA
+        }
+        failed_items = [
+            copy.deepcopy(item["integration_failure"])
+            | {"item_id": item_id}
+            for item_id, item in loaded.items()
+            if item.get("integration_failure")
+        ]
+        candidate_fixture["failed_items"] = failed_items
+        if failed_items:
+            limitations = list(candidate_fixture.get("limitations") or [])
+            marker = "Failed requirements are listed explicitly; accepted outputs remain immutable and do not contribute fabricated analytics or ontology records."
+            if marker not in limitations:
+                limitations.append(marker)
+            candidate_fixture["limitations"] = limitations
+        if presentation_plan is not None:
+            candidate_fixture["manager_visual_widget_ids"] = list(presentation_plan["manager_visual_widget_ids"])
+            candidate_fixture["audit_visual_widget_ids"] = list(presentation_plan["audit_visual_widget_ids"])
+            candidate_fixture["visual_entries"] = copy.deepcopy(presentation_plan["visual_entries"])
+            candidate_fixture["presentation_plan_schema"] = assembler.PRESENTATION_PLAN_V2_SCHEMA
 
     generation_root = _safe_product_path(context, f"generations/{metadata.generation_id}", label="generation product namespace")
     final_root = _safe_product_path(context, output_dir or f"generations/{metadata.generation_id}/dashboard", label="delta output namespace")
@@ -3476,6 +5070,11 @@ def _assemble_dashboard_delta_locked(
     fixture_rel = parent_refs["fixture_ref"].relative_to(parent_root)
     map_rel = parent_refs["chart_map_ref"].relative_to(parent_root)
     registry_rel = parent_refs["chart_registry_ref"].relative_to(parent_root)
+    blueprint_rel = (
+        parent_refs["blueprint_ref"].relative_to(parent_root)
+        if "blueprint_ref" in parent_refs
+        else Path("dashboard_blueprint_v2.json")
+    )
     site_rel = parent_refs["site_ref"].relative_to(parent_root)
     # Validate the generation-scoped terminal manifest leaf/components before
     # creating any candidate output.  RunLifecycle stores the reference, but
@@ -3514,12 +5113,49 @@ def _assemble_dashboard_delta_locked(
         "admission_plan_sha256": metadata.plan_hash,
         "output_root_ref": _relative_run_ref(context, final_root),
         "route": route_manifest,
-        "new_items": new_input_items,
+        "new_items": changed_input_items,
         "projection_hash": projection_metadata["projection_hash"],
         "presentation_plan_ref": resolved_presentation_plan_ref,
         "presentation_plan_sha256": presentation_plan_sha256,
         "manager_widget_ids": list(manager_widget_ids),
     }
+
+    if full_rebuild:
+        return _assemble_full_rebuild_locked(
+            context,
+            lifecycle=lifecycle,
+            metadata=metadata,
+            parent_receipt_path=parent_receipt_path,
+            parent_receipt=parent_receipt,
+            parent_root=parent_root,
+            parent_refs=parent_refs,
+            parent_site_binding=parent_site_binding,
+            parent_manifest_ref=parent_manifest_ref,
+            parent_manifest_hash=parent_manifest_hash,
+            parent_receipt_hash=parent_receipt_hash,
+            plan=plan,
+            plan_path=plan_path,
+            plan_hash=plan_hash,
+            cumulative_ids=cumulative_ids,
+            current_input_items=current_input_items,
+            changed_input_items=changed_input_items,
+            projection_metadata=projection_metadata,
+            request_binding=request_binding,
+            final_root=final_root,
+            generation_root=generation_root,
+            product_manifest_path=product_manifest_path,
+            receipt_path=receipt_path,
+            fixture_rel=fixture_rel,
+            map_rel=map_rel,
+            registry_rel=registry_rel,
+            blueprint_rel=blueprint_rel,
+            site_rel=site_rel,
+            failpoint=failpoint,
+            presentation_plan_ref=resolved_presentation_plan_ref,
+            presentation_plan_sha256=presentation_plan_sha256,
+            presentation_plan_bytes=presentation_plan_bytes,
+            manager_widget_ids=manager_widget_ids,
+        )
 
     # Recover a v2 whole-generation replacement first.  All v2 recovery
     # filesystem mutations are guarded by the lifecycle run lock.  The
@@ -3563,7 +5199,6 @@ def _assemble_dashboard_delta_locked(
             final_root=final_root,
         )
     existing_receipt: dict[str, Any] | None = None
-    v1_to_v2_migration = False
     if final_root.exists() or final_root.is_symlink():
         if not receipt_path.is_file() or receipt_path.is_symlink():
             raise DashboardDeltaError("candidate output exists without a complete delta receipt")
@@ -3574,118 +5209,22 @@ def _assemble_dashboard_delta_locked(
             raise DashboardDeltaError("existing delta receipt is invalid") from exc
         if not isinstance(existing_raw, Mapping) or existing_raw.get("schema_version") != DELTA_SCHEMA or existing_raw.get("status") != "complete":
             raise DashboardDeltaError("existing candidate output has an invalid delta receipt")
-        raw_plan_fields = {"presentation_plan_ref", "presentation_plan_sha256", "manager_widget_ids"}
-        raw_request_binding = existing_raw.get("request_binding")
-        # A planless receipt is recognized only by the historical shape: the
-        # additive presentation fields are absent at both receipt levels.  A
-        # current producer must omit those fields when no plan is supplied;
-        # accepting null/[] placeholders here would turn a non-canonical
-        # self-produced receipt into an implicit compatibility mode.
-        planless_legacy = (
-            isinstance(raw_request_binding, Mapping)
-            and not any(key in existing_raw for key in raw_plan_fields)
-            and not any(key in raw_request_binding for key in raw_plan_fields)
-        )
-        if planless_legacy:
-            _validate_planless_legacy_receipt_shape(existing_raw, raw_bytes=existing_raw_bytes)
-        existing = _normalize_existing_presentation_receipt(existing_raw)
+        existing = dict(existing_raw)
+        _validate_delta_receipt_shape(existing)
         existing_plan_ref = existing.get("presentation_plan_ref")
         existing_plan_hash = existing.get("presentation_plan_sha256")
         existing_manager_ids = existing.get("manager_widget_ids")
         if (
-            presentation_plan is not None
-            and presentation_plan.get("schema_version") == assembler.PRESENTATION_PLAN_V2_SCHEMA
-            and not planless_legacy
-            and existing_plan_ref not in (None, "")
-            and (
-                existing_plan_ref != resolved_presentation_plan_ref
-                or existing_plan_hash != presentation_plan_sha256
-                or existing_manager_ids != list(manager_widget_ids)
-            )
-        ):
-            # A live G3 product may have been published under the predecessor
-            # V1 plan before the public V1->V2 CAS revision.  Permit exactly
-            # that one lineage transition: the successor explicitly names
-            # the predecessor path/hash, and the existing fixture carries the
-            # same old ref/hash/IDs.  The old product manifest is revalidated
-            # below against this unchanged receipt before any replacement.
-            try:
-                predecessor_ids, predecessor_entries = assembler._v2_predecessor_manager_contract(presentation_plan)
-            except Exception as exc:
-                raise DashboardDeltaError("existing V1 presentation plan predecessor binding is invalid") from exc
-            source_bindings = presentation_plan.get("source_bindings")
-            predecessor_ref = source_bindings.get("previous_plan_ref") if isinstance(source_bindings, Mapping) else None
-            predecessor_hash = source_bindings.get("previous_plan_sha256") if isinstance(source_bindings, Mapping) else None
-            if (
-                existing_plan_ref != predecessor_ref
-                or existing_plan_hash != predecessor_hash
-                or existing_manager_ids != predecessor_ids
-            ):
-                raise DashboardDeltaError("existing V1 presentation plan is not the approved V2 predecessor")
-            predecessor_request = existing.get("request_binding")
-            if (
-                not isinstance(predecessor_request, Mapping)
-                or predecessor_request.get("presentation_plan_ref") != existing_plan_ref
-                or predecessor_request.get("presentation_plan_sha256") != existing_plan_hash
-                or predecessor_request.get("manager_widget_ids") != predecessor_ids
-            ):
-                raise DashboardDeltaError("existing V1 request presentation binding is not the approved predecessor")
-            legacy_fixture = _read_json(context, _relative_run_ref(context, final_root / fixture_rel), label="existing V1 dashboard fixture")
-            if (
-                legacy_fixture.get("presentation_plan_ref") != existing_plan_ref
-                or legacy_fixture.get("presentation_plan_sha256") != existing_plan_hash
-                or legacy_fixture.get("manager_widget_ids") != predecessor_ids
-                or legacy_fixture.get("manager_entries") != predecessor_entries
-                or legacy_fixture.get("presentation_plan_schema") == assembler.PRESENTATION_PLAN_V2_SCHEMA
-                or legacy_fixture.get("manager_visual_widget_ids") not in (None, [])
-                or legacy_fixture.get("audit_visual_widget_ids") not in (None, [])
-            ):
-                raise DashboardDeltaError("existing V1 dashboard fixture binding is invalid")
-            fixture_path = context.resolve_run_path(_relative_run_ref(context, final_root / fixture_rel))
-            if fixture_path.read_bytes() != assembler._canonical_bytes(legacy_fixture):
-                raise DashboardDeltaError("existing V1 dashboard fixture is not canonical")
-            v1_to_v2_migration = True
-        if (
-            presentation_plan is not None
-            and not planless_legacy
-            and existing_plan_ref in (None, "")
-            and existing_plan_hash in (None, "")
-            and existing_manager_ids in (None, [])
-        ):
-            raise DashboardDeltaError("explicit presentation-plan migration requires a planless legacy receipt")
-        if presentation_plan is None and (existing_plan_ref not in (None, "") or existing_plan_hash not in (None, "") or existing_manager_ids not in (None, [])):
-            raise DashboardDeltaError("existing delta output requires its explicit presentation plan")
-        if presentation_plan is not None and existing_plan_ref not in (None, "") and not v1_to_v2_migration and (
-            existing_plan_ref != resolved_presentation_plan_ref or existing_plan_hash != presentation_plan_sha256 or existing_manager_ids != list(manager_widget_ids)
+            existing_plan_ref != resolved_presentation_plan_ref
+            or existing_plan_hash != presentation_plan_sha256
+            or existing_manager_ids != list(manager_widget_ids)
         ):
             raise DashboardDeltaError("existing delta output presentation plan binding conflicts")
         if existing.get("request_binding") != request_binding:
-            # A pre-plan receipt may be migrated exactly once to a validated
-            # plan.  Stable lineage is still checked below; only the additive
-            # presentation fields may differ.
-            old_request = existing.get("request_binding")
-            stable_request = dict(request_binding)
-            for key in ("presentation_plan_ref", "presentation_plan_sha256", "manager_widget_ids"):
-                stable_request.pop(key, None)
-            old_stable_request = dict(old_request) if isinstance(old_request, Mapping) else None
-            if isinstance(old_stable_request, Mapping):
-                for key in ("presentation_plan_ref", "presentation_plan_sha256", "manager_widget_ids"):
-                    old_stable_request.pop(key, None)
-            if old_stable_request != stable_request or not (
-                presentation_plan is not None
-                and (
-                    (
-                        existing_plan_ref in (None, "")
-                        and existing_plan_hash in (None, "")
-                        and existing_manager_ids in (None, [])
-                    )
-                    or v1_to_v2_migration
-                )
-            ):
-                raise DashboardDeltaError("existing delta output conflicts with parent/input/route/projection")
+            raise DashboardDeltaError("existing delta output conflicts with parent/input/route/projection")
         if existing.get("run_id") != context.run_id or existing.get("generation_id") != metadata.generation_id or existing.get("generation_ordinal") != metadata.generation_ordinal or existing.get("parent_generation_id") != metadata.parent_generation_id or existing.get("new_analytics") is not False:
             raise DashboardDeltaError("existing delta receipt generation binding is invalid")
-        if existing.get("input_items") != [*parent_items, *new_input_items]:
+        if existing.get("input_items") != current_input_items:
             raise DashboardDeltaError("existing delta receipt input binding is invalid")
         existing_parent = existing.get("parent")
         if (
@@ -3708,18 +5247,7 @@ def _assemble_dashboard_delta_locked(
             or existing_plan.get("route") != route_manifest
         ):
             raise DashboardDeltaError("existing delta receipt plan binding is invalid")
-        _validate_delta_output(
-            context,
-            receipt_path,
-            existing,
-            # The normalized in-memory view carries additive presentation
-            # defaults for current validators, while the on-disk planless
-            # receipt remains the canonical historical shape.  Validate that
-            # raw shape on every retry/migration; it is not a permissive
-            # placeholder compatibility path.
-            legacy_raw_receipt=existing_raw if planless_legacy else None,
-            legacy_raw_bytes=existing_raw_bytes if planless_legacy else None,
-        )
+        _validate_delta_output(context, receipt_path, existing)
         _validate_existing_delta_receipt(
             context,
             existing,
@@ -3728,6 +5256,7 @@ def _assemble_dashboard_delta_locked(
             fixture_rel=fixture_rel,
             map_rel=map_rel,
             registry_rel=registry_rel,
+            blueprint_rel=blueprint_rel,
             site_rel=site_rel,
             parent_receipt_path=parent_receipt_path,
             parent_receipt=parent_receipt,
@@ -3735,7 +5264,8 @@ def _assemble_dashboard_delta_locked(
             parent_manifest_hash=parent_manifest_hash,
             parent_site_binding=parent_site_binding,
             parent_items=parent_items,
-            new_input_items=new_input_items,
+            new_input_items=changed_input_items,
+            expected_input_items=current_input_items,
             request_binding=request_binding,
             plan=plan,
             plan_path=plan_path,
@@ -3744,25 +5274,6 @@ def _assemble_dashboard_delta_locked(
             route_manifest=route_manifest,
             projection_metadata=projection_metadata,
         )
-        if v1_to_v2_migration:
-            # The predecessor product manifest is an immutable old-target
-            # binding.  Validate it against the old V1 receipt before the
-            # replacement path can publish a V2 candidate.
-            if not product_manifest_path.is_file() or product_manifest_path.is_symlink():
-                raise DashboardDeltaError("existing V1 product manifest is missing")
-            legacy_product = _read_json(context, child_manifest_ref, label="existing V1 product manifest")
-            if legacy_product.get("manager_widget_ids") != predecessor_ids:
-                raise DashboardDeltaError("existing V1 product manager binding is not the approved predecessor")
-            _validate_product_manifest(
-                context,
-                product_manifest_path,
-                legacy_product,
-                existing,
-                lifecycle,
-                metadata,
-                parent_manifest_ref or "",
-                parent_manifest_hash or "",
-            )
         _parent_output_root(context, parent_receipt_path, parent_receipt)
         if transaction_state is not None and transaction_state[1].get("schema_version") == _PRODUCT_TRANSACTION_SCHEMA:
             # v2 intents already bind a complete candidate generation tree,
@@ -3783,12 +5294,7 @@ def _assemble_dashboard_delta_locked(
                     parent_manifest_hash=parent_manifest_hash,
                     failpoint=failpoint,
                 )
-            # Keep the public result byte/shape-identical to the canonical
-            # on-disk planless receipt.  ``existing`` is normalized only for
-            # internal current-shape validation; returning that view would
-            # make crash recovery differ from an exact retry by reintroducing
-            # additive null/[] presentation fields.
-            return dict(existing_raw if planless_legacy else existing)
+            return dict(existing)
         product_value = _read_json(context, child_manifest_ref, label="active generation product manifest") if product_manifest_path.is_file() else None
         transaction_needs_finish = False
         if transaction_state is not None:
@@ -3844,7 +5350,7 @@ def _assemble_dashboard_delta_locked(
                     failpoint=failpoint,
                 )
                 transaction_state = (transaction_state[0], transaction_state_value)
-        existing_receipt = dict(existing_raw if planless_legacy else existing)
+        existing_receipt = dict(existing)
         if transaction_state is not None:
             return existing_receipt
 
@@ -3858,7 +5364,12 @@ def _assemble_dashboard_delta_locked(
     replacement_candidate = final_root.exists() and product_manifest_path.is_file()
     scratch_workspace = tempfile.TemporaryDirectory(prefix="dashboard-delta-")
     scratch_run_root = Path(scratch_workspace.name)
-    scratch_context = RunContext(run_id=context.run_id, run_root=scratch_run_root)
+    scratch_context = RunContext(
+        run_id=context.run_id,
+        run_root=scratch_run_root,
+        core_version=context.core_version,
+        skill_version=context.skill_version,
+    )
     scratch_generation_root = scratch_context.resolve_product_path(f"generations/{metadata.generation_id}")
     scratch_final_root = scratch_generation_root / "dashboard"
     if replacement_candidate:
@@ -3885,11 +5396,13 @@ def _assemble_dashboard_delta_locked(
     staged_fixture_path = staging_dashboard_root / fixture_rel
     staged_map_path = staging_dashboard_root / map_rel
     staged_registry_path = staging_dashboard_root / registry_rel
+    staged_blueprint_path = staging_dashboard_root / blueprint_rel
     staged_site_path = staging_dashboard_root / site_rel
     staged_receipt_path = staging_dashboard_root / receipt_path.relative_to(final_root)
     staged_fixture_ref = _relative_run_ref(scratch_context, staged_fixture_path)
     staged_map_ref = _relative_run_ref(scratch_context, staged_map_path)
     staged_registry_ref = _relative_run_ref(scratch_context, staged_registry_path)
+    staged_blueprint_ref = _relative_run_ref(scratch_context, staged_blueprint_path)
     # Renderer output/manifest refs are product-relative; fixture/map/registry
     # refs are run-relative because the renderer resolves those as run files.
     try:
@@ -3904,6 +5417,32 @@ def _assemble_dashboard_delta_locked(
     candidate_map["fixture_ref"] = staged_fixture_ref
     _write_atomic_json(staged_fixture_path, candidate_fixture)
     _write_atomic_json(staged_map_path, candidate_map)
+    # Bind the exact Product Agent selections before rendering.  The renderer
+    # validates this staged Blueprint, so delta pages cannot silently choose a
+    # family/layout from inherited fixture metadata and then patch the
+    # Blueprint after the fact.
+    try:
+        provisional_registry = json.loads(staged_registry_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DashboardDeltaError("candidate chart registry is invalid") from exc
+    if not isinstance(provisional_registry, Mapping):
+        raise DashboardDeltaError("candidate chart registry is invalid")
+    provisional_blueprint = _assembler()._dashboard_runtime().build_blueprint(
+        fixture=candidate_fixture,
+        chart_map=candidate_map,
+        registry=provisional_registry,
+        fixture_ref=staged_fixture_ref,
+        chart_map_ref=staged_map_ref,
+        registry_ref=staged_registry_ref,
+        fixture_sha256=_sha256_bytes(staged_fixture_path.read_bytes()),
+        chart_map_sha256=_sha256_bytes(staged_map_path.read_bytes()),
+        registry_sha256=_sha256_bytes(staged_registry_path.read_bytes()),
+        blueprint_ref=staged_blueprint_ref,
+        presentation_plan_ref=resolved_presentation_plan_ref,
+        presentation_plan_sha256=presentation_plan_sha256,
+        review_status="Preview",
+    )
+    _write_atomic_json(staged_blueprint_path, provisional_blueprint)
     _failpoint(failpoint, "before_dashboard_render")
     renderer_path = Path(__file__).with_name("dashboard_renderer.py")
     spec = importlib.util.spec_from_file_location("dashboard_renderer_for_delta", renderer_path)
@@ -3912,7 +5451,13 @@ def _assemble_dashboard_delta_locked(
     renderer = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = renderer
     spec.loader.exec_module(renderer)
-    renderer.render_site_fixture(scratch_context, staged_fixture_ref, staged_site_ref, staged_manifest_ref)
+    renderer.render_site_fixture(
+        scratch_context,
+        staged_fixture_ref,
+        staged_site_ref,
+        staged_manifest_ref,
+        blueprint_ref=staged_blueprint_ref,
+    )
     _replace_prefix(staging_dashboard_root, staging_prefix, final_prefix)
     final_fixture_path = staging_dashboard_root / fixture_rel
     final_map_path = staging_dashboard_root / map_rel
@@ -3920,6 +5465,46 @@ def _assemble_dashboard_delta_locked(
     candidate_map = json.loads(final_map_path.read_text(encoding="utf-8"))
     if not isinstance(candidate_fixture, Mapping) or not isinstance(candidate_map, Mapping):
         raise DashboardDeltaError("candidate fixture/map became invalid after path normalization")
+    try:
+        registry_payload = json.loads(staged_registry_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DashboardDeltaError("candidate chart registry is invalid") from exc
+    if not isinstance(registry_payload, Mapping):
+        raise DashboardDeltaError("candidate chart registry is invalid")
+    final_fixture_ref = _relative_run_ref(context, final_root / fixture_rel)
+    final_map_ref = _relative_run_ref(context, final_root / map_rel)
+    final_registry_ref = _relative_run_ref(context, final_root / registry_rel)
+    final_blueprint_ref = _relative_run_ref(context, final_root / blueprint_rel)
+    blueprint = _assembler()._dashboard_runtime().build_blueprint(
+        fixture=candidate_fixture,
+        chart_map=candidate_map,
+        registry=registry_payload,
+        fixture_ref=final_fixture_ref,
+        chart_map_ref=final_map_ref,
+        registry_ref=final_registry_ref,
+        fixture_sha256=_sha256_bytes(final_fixture_path.read_bytes()),
+        chart_map_sha256=_sha256_bytes(final_map_path.read_bytes()),
+        registry_sha256=_sha256_bytes(staged_registry_path.read_bytes()),
+        blueprint_ref=final_blueprint_ref,
+        presentation_plan_ref=resolved_presentation_plan_ref,
+        presentation_plan_sha256=presentation_plan_sha256,
+        review_status="Preview",
+    )
+    _write_atomic_json(staged_blueprint_path, blueprint)
+    blueprint_sha256 = _sha256_bytes(staged_blueprint_path.read_bytes())
+    site_manifest_path = staging_dashboard_root / site_rel / "site_manifest.json"
+    try:
+        site_manifest_value = json.loads(site_manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DashboardDeltaError("candidate site manifest is invalid") from exc
+    if not isinstance(site_manifest_value, Mapping):
+        raise DashboardDeltaError("candidate site manifest is invalid")
+    site_manifest_value = dict(site_manifest_value)
+    site_manifest_value["blueprint_ref"] = final_blueprint_ref
+    site_manifest_value["blueprint_sha256"] = blueprint_sha256
+    site_manifest_value["blueprint_schema"] = blueprint.get("schema_version")
+    site_manifest_value["status"] = "Preview"
+    site_manifest_path.write_bytes(_canonical_bytes(site_manifest_value))
     _site_manifest_update(staging_dashboard_root / site_rel, staging_dashboard_root / map_rel)
     candidate_site_binding = _assembler()._site_tree_binding(staging_dashboard_root / site_rel)
     old_site_binding = parent_site_binding
@@ -3966,6 +5551,7 @@ def _assemble_dashboard_delta_locked(
         "parent_generation_id": metadata.parent_generation_id,
         "source_policy": "accepted_and_committed_only",
         "new_analytics": False,
+        "analytical_artifacts": copy.deepcopy(current_artifact_inputs),
         "parent": {
             "product_manifest_ref": parent_manifest_ref,
             "product_manifest_sha256": parent_manifest_hash,
@@ -3983,11 +5569,12 @@ def _assemble_dashboard_delta_locked(
             "revision": plan.get("revision"),
             "route": route_manifest,
         },
-        "input_items": [*parent_items, *new_input_items],
-        "outputs": {"fixture_ref": staged_fixture_final_ref, "chart_map_ref": staged_map_final_ref, "chart_registry_ref": staged_registry_final_ref, "site_ref": staged_site_final_ref, "receipt_ref": staged_receipt_final_ref},
-        "output_hashes": {"fixture_sha256": _sha256_bytes((staging_dashboard_root / fixture_rel).read_bytes()), "chart_map_sha256": _sha256_bytes((staging_dashboard_root / map_rel).read_bytes()), "chart_registry_sha256": _sha256_bytes((staging_dashboard_root / registry_rel).read_bytes()), "site_manifest_sha256": _sha256_bytes((staging_dashboard_root / site_rel / "site_manifest.json").read_bytes())},
+        "input_items": current_input_items,
+        "outputs": {"fixture_ref": staged_fixture_final_ref, "chart_map_ref": staged_map_final_ref, "chart_registry_ref": staged_registry_final_ref, "blueprint_ref": final_blueprint_ref, "site_ref": staged_site_final_ref, "receipt_ref": staged_receipt_final_ref},
+        "output_hashes": {"fixture_sha256": _sha256_bytes((staging_dashboard_root / fixture_rel).read_bytes()), "chart_map_sha256": _sha256_bytes((staging_dashboard_root / map_rel).read_bytes()), "chart_registry_sha256": _sha256_bytes((staging_dashboard_root / registry_rel).read_bytes()), "blueprint_sha256": blueprint_sha256, "site_manifest_sha256": _sha256_bytes((staging_dashboard_root / site_rel / "site_manifest.json").read_bytes())},
+        "blueprint_binding": {"ref": final_blueprint_ref, "sha256": blueprint_sha256, "schema_version": blueprint.get("schema_version"), "status": blueprint.get("review_status", "Preview")},
         "site_binding": candidate_site_binding,
-        "freeze_inputs": projection_metadata,
+        "freeze_inputs": copy.deepcopy(projection_metadata),
         "old_projection": {"projection_hash": parent_receipt.get("freeze_inputs", {}).get("projection_hash"), "export_sha256": parent_receipt.get("freeze_inputs", {}).get("export_sha256")},
         "new_projection": {"projection_hash": projection_metadata["projection_hash"], "export_sha256": projection_metadata["export_sha256"]},
         "affected_paths": [{"path": value, "sha256": candidate_site_binding["files"].get(value)} for value in affected_paths],
@@ -4007,17 +5594,7 @@ def _assemble_dashboard_delta_locked(
         "presentation_plan_sha256": presentation_plan_sha256,
         "manager_widget_ids": list(manager_widget_ids),
     }
-    if presentation_plan is None:
-        # Keep first publication planless receipts in the historical
-        # canonical shape.  The explicit presentation fields are additive
-        # contract data, not null/empty placeholders; omitting them is what
-        # permits the one-time immutable legacy -> explicit-plan migration.
-        for field in ("presentation_plan_ref", "presentation_plan_sha256", "manager_widget_ids"):
-            receipt.pop(field, None)
-            request_binding.pop(field, None)
-        _validate_planless_legacy_receipt_shape(receipt)
-    else:
-        _validate_delta_receipt_shape(receipt)
+    _validate_delta_receipt_shape(receipt)
     _write_atomic_json(staged_receipt_path, receipt)
     _fsync_tree(staging_root)
     _fsync_directory(staging_root.parent)
@@ -4047,7 +5624,7 @@ def _assemble_dashboard_delta_locked(
                 presentation_plan_bytes,
                 presentation_plan_sha256,
             )
-            if existing_receipt is not None and not v1_to_v2_migration:
+            if existing_receipt is not None:
                 existing_plan_ref = existing_receipt.get("presentation_plan_ref")
                 existing_plan_hash = existing_receipt.get("presentation_plan_sha256")
                 if existing_plan_ref not in (None, resolved_presentation_plan_ref) or existing_plan_hash not in (None, presentation_plan_sha256):
@@ -4064,7 +5641,7 @@ def _assemble_dashboard_delta_locked(
         # The candidate differs, so (and only so) create the same-filesystem
         # sibling transaction staging namespace.  Copying from scratch keeps
         # all renderer work outside the live product tree while preserving the
-        # existing v1/v2 transaction and rollback paths below.
+        # existing transaction and rollback paths below.
         if replacement_candidate:
             # Reserve the explicit sibling name without creating it.  The
             # v2 intent below becomes the ownership record before any bytes
@@ -4257,7 +5834,7 @@ def assemble_dashboard_delta(
     context: RunContext,
     *,
     parent_receipt_ref: str | Path | None = None,
-    route: Mapping[str, Any],
+    route: Mapping[str, Any] | None = None,
     output_dir: str | Path | None = None,
     failpoint: str | None = None,
     presentation_plan_ref: str | Path | None = None,
@@ -4322,7 +5899,7 @@ def assemble_dashboard_delta(
                 return _assemble_dashboard_delta_locked(
                     context,
                     parent_receipt_ref=parent_receipt_ref,
-                    route=route,
+                    route=route or {},
                     output_dir=output_dir,
                     failpoint=failpoint,
                     presentation_plan_ref=presentation_plan_ref,
@@ -4331,6 +5908,507 @@ def assemble_dashboard_delta(
         except _GenerationChanged:
             continue
     raise DashboardDeltaError("active generation kept changing during dashboard delta assembly")
+
+
+def _publish_root_product_manifest_locked(
+    context: RunContext,
+    lifecycle: RunLifecycle,
+    receipt: Mapping[str, Any],
+    *,
+    replace_existing: bool = False,
+    expected_existing: Mapping[str, Any] | None = None,
+    manifest_path: Path | None = None,
+) -> Mapping[str, Any]:
+    """Publish the G-0001 terminal manifest after canonical assembly.
+
+    The ordinary assembler intentionally owns only the immutable dashboard
+    namespace and receipt.  This generation-aware wrapper owns the lifecycle
+    handoff, matching the manifest publication already performed by the
+    successor-generation transaction.
+    """
+
+    outputs = receipt.get("outputs")
+    if not isinstance(outputs, Mapping):
+        raise DashboardDeltaError("root product receipt output bindings are missing")
+    receipt_ref = outputs.get("receipt_ref")
+    if not isinstance(receipt_ref, str) or not receipt_ref.strip():
+        raise DashboardDeltaError("root product receipt reference is missing")
+    receipt_path = _safe_run_path(context, receipt_ref, label="root product receipt")
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise DashboardDeltaError("root product receipt is missing or symlinked")
+    receipt_sha256 = _sha256_bytes(receipt_path.read_bytes())
+    bound_receipt = {**dict(receipt), "receipt_sha256": receipt_sha256}
+    rendering_identity = receipt.get("rendering_identity")
+    if not isinstance(rendering_identity, Mapping):
+        raise DashboardDeltaError("root product receipt rendering identity is missing")
+    assets = _product_assets(bound_receipt, receipt_ref)
+    assets[-1]["role"] = "dashboard_assembler_receipt"
+    fixture_ref = outputs.get("fixture_ref")
+    if not isinstance(fixture_ref, str) or not fixture_ref.strip():
+        raise DashboardDeltaError("root product fixture reference is missing")
+    fixture_path = _safe_run_path(context, fixture_ref, label="root product fixture")
+    if fixture_path.is_symlink() or not fixture_path.is_file():
+        raise DashboardDeltaError("root product fixture is missing or symlinked")
+    output_hashes = receipt.get("output_hashes")
+    expected_fixture_hash = output_hashes.get("fixture_sha256") if isinstance(output_hashes, Mapping) else None
+    if not isinstance(expected_fixture_hash, str) or _sha256_bytes(fixture_path.read_bytes()) != expected_fixture_hash:
+        raise DashboardDeltaError("root product fixture hash is stale")
+    try:
+        fixture_value = json.loads(fixture_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DashboardDeltaError("root product fixture is invalid") from exc
+    if not isinstance(fixture_value, Mapping) or fixture_value.get("schema_version") != FIXTURE_SCHEMA:
+        raise DashboardDeltaError("root product fixture schema is invalid")
+    fixture_domains = fixture_value.get("domains")
+    if not isinstance(fixture_domains, list):
+        raise DashboardDeltaError("root product fixture domains are invalid")
+    # The product manifest describes the rendered dashboard, so its domain
+    # count must come from the receipt-bound fixture itself.  Ontology groups
+    # are a separate projection and may legitimately be empty.
+    domain_count = len(fixture_domains)
+    _state_path, _state_value, active_state_hash, active_state_sha256 = _authoritative_state_binding(
+        context,
+        lifecycle,
+    )
+    metadata = lifecycle.generation_metadata
+    plan_binding = receipt.get("plan_binding")
+    freeze_inputs = receipt.get("freeze_inputs")
+    if not isinstance(plan_binding, Mapping) or not isinstance(freeze_inputs, Mapping):
+        raise DashboardDeltaError("root product receipt freeze bindings are missing")
+    freeze_markers = freeze_inputs.get("freeze_markers")
+    summary = freeze_inputs.get("summary")
+    if not isinstance(freeze_markers, Mapping) or not isinstance(summary, Mapping):
+        raise DashboardDeltaError("root product receipt freeze bindings are invalid")
+    status = _terminal_product_status(context, lifecycle)
+    # A revision-scoped Product bundle still follows the active analytical
+    # generation's lineage.  The original root helper predates cumulative
+    # generations and hardcoded G-0001; keep that root contract only when no
+    # generation metadata is present.  Successor/revision targets instead
+    # carry the validated generation id/ordinal and the exact parent
+    # generation-manifest binding used by ProductReviewStore candidates.
+    if metadata is None:
+        manifest_generation_id = "G-0001"
+        manifest_generation_ordinal = 1
+        parent_generation_id = None
+        parent_manifest_ref = None
+        parent_manifest_hash = None
+        root_generation = True
+    else:
+        manifest_generation_id = metadata.generation_id
+        manifest_generation_ordinal = metadata.generation_ordinal
+        parent_generation_id = metadata.parent_generation_id
+        # Product revision bundles follow the same immediate-parent product
+        # manifest contract as ordinary successor generations.  The legacy
+        # G-0001 parent may be represented by the root product manifest (or
+        # its explicit generation bridge); do not invent an
+        # ``extensions/<parent>/generation_manifest.json`` product binding.
+        parent_manifest_path = _parent_manifest_path(context, parent_generation_id)
+        parent_manifest_ref = _relative_run_ref(context, parent_manifest_path)
+        if parent_manifest_path.is_symlink() or not parent_manifest_path.is_file():
+            raise DashboardDeltaError("product parent generation manifest is missing or symlinked")
+        parent_manifest_hash = _sha256_bytes(parent_manifest_path.read_bytes())
+        root_generation = False
+    lineage = {
+        "root_generation": root_generation,
+        "parent_generation_id": parent_generation_id,
+        "parent_manifest_ref": parent_manifest_ref,
+        "parent_manifest_hash": parent_manifest_hash,
+        "active_state_hash": active_state_hash,
+        "active_state_sha256": active_state_sha256,
+        "active_state_ref": _relative_run_ref(context, lifecycle.state_path),
+        "active_plan_hash": plan_binding.get("sha256"),
+        "admission_plan_hash": plan_binding.get("admission_sha256"),
+        "delta_receipt_ref": receipt_ref,
+    }
+    if metadata is not None:
+        lineage.update(
+            {
+                "generation_manifest_hash": metadata.manifest_hash,
+                "admission_state_hash": metadata.state_manifest_hash,
+            }
+        )
+    manifest = {
+        "schema_version": "1",
+        "product_type": "reviewed_run_product_bundle",
+        "run_id": context.run_id,
+        "status": status,
+        "terminal": True,
+        "source_status": "reviewed_outputs_only",
+        "new_analytics": False,
+        "freeze_markers": dict(freeze_markers),
+        "lifecycle": {
+            "generation_id": manifest_generation_id,
+            "generation_ordinal": manifest_generation_ordinal,
+            "all_items_terminal": True,
+            "all_items_integrated": True,
+            "state_at_product_freeze": lifecycle.state,
+        },
+        "dashboard": {
+            "assets_local": True,
+            "internal_links_checked": True,
+            "external_asset_refs": 0,
+            "missing_evidence_refs": 0,
+            "domain_count": domain_count,
+            "widget_count": receipt.get("widget_count", 0),
+            "receipt_ref": receipt_ref,
+            "receipt_sha256": receipt_sha256,
+            "rendering_identity": copy.deepcopy(dict(rendering_identity)),
+        },
+        "lem": dict(summary),
+        "assets": assets,
+        "lineage": lineage,
+        "limitations": list(_PRODUCT_LIMITATIONS),
+        "presentation_plan_ref": receipt.get("presentation_plan_ref"),
+        "presentation_plan_sha256": receipt.get("presentation_plan_sha256"),
+        "manager_widget_ids": list(receipt.get("manager_widget_ids") or []),
+    }
+    try:
+        from auto_foundry_core.product_contracts import validate_product_manifest
+
+        validate_product_manifest(manifest, require_all=True)
+    except Exception as exc:
+        raise DashboardDeltaError("root product manifest freeze markers are not fully frozen") from exc
+
+    target_manifest_path = manifest_path or _safe_product_path(context, "product_manifest.json", label="root product manifest")
+    if target_manifest_path.is_symlink():
+        raise DashboardDeltaError("product manifest cannot be a symlink")
+    try:
+        target_manifest_path.relative_to(context.run_root / "products")
+    except ValueError as exc:
+        raise DashboardDeltaError("product manifest must remain inside products") from exc
+    manifest_path = target_manifest_path
+    if manifest_path.exists():
+        existing = _read_json(context, _relative_run_ref(context, manifest_path), label="root product manifest")
+        if existing != manifest:
+            if not replace_existing:
+                raise DashboardDeltaError("root product manifest conflicts with the canonical assembly receipt")
+            # A presentation-only rebuild may repoint the root manifest, but
+            # only if the validated bytes we inspected before assembly are
+            # still current.  This keeps the old namespace intact and makes
+            # the final replace an atomic compare-and-publish boundary.
+            if expected_existing is not None and existing != expected_existing:
+                raise DashboardDeltaError("root product manifest changed during presentation rebuild")
+        else:
+            return existing
+    _write_atomic_json(manifest_path, manifest)
+    return manifest
+
+
+def _publish_root_product_manifest(
+    context: RunContext,
+    lifecycle: RunLifecycle,
+    receipt: Mapping[str, Any],
+    *,
+    replace_existing: bool = False,
+    expected_existing: Mapping[str, Any] | None = None,
+    manifest_path: Path | None = None,
+) -> Mapping[str, Any]:
+    """Publish the root manifest under one authoritative run-state lock.
+
+    Assembly happens before this boundary, but the active lifecycle and root
+    manifest compare-and-publish must be one serialized operation.  Reloading
+    the lifecycle while holding ``_run_lock`` prevents two concurrent
+    presentation rebuilds from both passing a stale expected-manifest check.
+    """
+
+    with RunLifecycle._run_lock(context):  # noqa: SLF001 - root publication CAS boundary
+        authoritative = RunLifecycle._load_unlocked(context)  # noqa: SLF001
+        if manifest_path is None:
+            root_manifest_path = _safe_product_path(
+                context,
+                "product_manifest.json",
+                label="root product manifest",
+            )
+            if authoritative.product_manifest_path != root_manifest_path:
+                raise DashboardDeltaError("active lifecycle product manifest reference is not the root manifest")
+            if authoritative.generation_metadata is not None:
+                raise DashboardDeltaError("active successor generation owns the product manifest")
+        return _publish_root_product_manifest_locked(
+            context,
+            authoritative,
+            receipt,
+            replace_existing=replace_existing,
+            expected_existing=expected_existing,
+            manifest_path=manifest_path,
+        )
+
+
+def _revision_output_namespace(
+    context: RunContext,
+    lifecycle: RunLifecycle,
+    revision_id: str,
+    output_root_ref: str | Path | None,
+) -> tuple[Path, Any]:
+    """Resolve and validate one Product revision's immutable output root."""
+
+    if not isinstance(revision_id, str) or re.fullmatch(r"rev-[0-9]{4,}", revision_id.strip()) is None:
+        raise DashboardDeltaError("product revision_id is invalid")
+    generation_id = getattr(lifecycle.generation_metadata, "generation_id", None) or "G-0001"
+    try:
+        from auto_foundry_core.product_review import ProductReviewStore
+
+        store = ProductReviewStore(context, generation_id)
+        revision = store.load_revision(revision_id.strip())
+        expected_ref = store.revision_artifacts_ref(revision.revision_id)
+        root = store.revision_artifacts_root(revision.revision_id)
+    except Exception as exc:
+        raise DashboardDeltaError("product revision output namespace is unavailable") from exc
+    supplied_ref = str(output_root_ref).strip() if output_root_ref is not None else ""
+    if not supplied_ref or Path(supplied_ref).as_posix() != Path(expected_ref).as_posix():
+        raise DashboardDeltaError("product revision output root binding is invalid")
+    if revision.status not in {"pending", "candidate", "reviewed"}:
+        raise DashboardDeltaError("product revision is not accepting product output")
+    if root.is_symlink() or (root.exists() and not root.is_dir()):
+        raise DashboardDeltaError("product revision output namespace is invalid")
+    root.mkdir(parents=True, exist_ok=True)
+    return root, revision
+
+
+def assemble_generation_product(
+    context: RunContext,
+    *,
+    output_dir: str | Path | None = None,
+    parent_receipt_ref: str | Path | None = None,
+    route: Mapping[str, Any] | None = None,
+    failpoint: str | None = None,
+    presentation_plan_ref: str | Path | None = None,
+    revision_id: str | None = None,
+    output_root_ref: str | Path | None = None,
+) -> dict[str, Any]:
+    """Dispatch one product build from native generation metadata only.
+
+    Root generations use the original full assembler.  Every cumulative
+    successor uses the generation delta transaction, whose projection is a
+    full current-head rebuild whenever ``reopened_item_ids`` is non-empty and
+    an append-only delta otherwise.  No requirement/business labels are
+    inspected to choose the route; the lifecycle manifest is the sole switch.
+    """
+
+    if not isinstance(context, RunContext):
+        raise TypeError("assemble_generation_product requires a RunContext")
+    try:
+        lifecycle = RunLifecycle.load(context)
+    except Exception as exc:
+        raise DashboardDeltaError("active lifecycle cannot be loaded") from exc
+
+    # Product regeneration is an immutable revision transaction.  It must
+    # never reuse or overwrite the generation-level product namespace.  The
+    # store-derived root is the sole output authority; the action's explicit
+    # binding is checked before any assembler staging begins.
+    if revision_id is not None or output_root_ref is not None:
+        if revision_id is None or output_root_ref is None:
+            raise DashboardDeltaError("product revision output binding is incomplete")
+        revision_root, _revision = _revision_output_namespace(
+            context,
+            lifecycle,
+            revision_id,
+            output_root_ref,
+        )
+        assembler = _assembler()
+        receipt = assembler.assemble_dashboard(
+            context,
+            output_dir=revision_root,
+            presentation_plan_ref=presentation_plan_ref,
+            revision_id=revision_id,
+            output_root_ref=output_root_ref,
+        )
+        manifest_path = revision_root / "product_manifest.json"
+        # The root manifest builder is also used for a revision-scoped bundle:
+        # it derives all values from the exact receipt and writes only the
+        # caller-bound target path.  The lifecycle-level product manifest is
+        # intentionally untouched until the revision is accepted/published.
+        with RunLifecycle._run_lock(context):  # noqa: SLF001 - revision artifact publication boundary
+            authoritative = RunLifecycle._load_unlocked(context)  # noqa: SLF001
+            _publish_root_product_manifest_locked(
+                context,
+                authoritative,
+                receipt,
+                manifest_path=manifest_path,
+            )
+        return receipt
+    metadata = lifecycle.generation_metadata
+    if metadata is None or metadata.generation_id == "G-0001":
+        manifest_path = lifecycle.product_manifest_path
+        existing_manifest: Mapping[str, Any] | None = None
+        rebuild_for_presentation = False
+        rebuild_for_rendering = False
+        assembler = _assembler()
+        rendering_identity = assembler._rendering_identity(context)
+        if manifest_path.exists() or manifest_path.is_symlink():
+            from auto_foundry_core.requirement_planning import inspect_product_manifest
+
+            inspected = inspect_product_manifest(
+                context,
+                "G-0001",
+                lifecycle.product_manifest_ref,
+                metadata=metadata,
+            )
+            if inspected.get("valid") is not True:
+                raise DashboardDeltaError("existing root product manifest is invalid")
+            manifest = inspected.get("manifest")
+            if not isinstance(manifest, Mapping):
+                raise DashboardDeltaError("existing root product manifest is invalid")
+            existing_manifest = dict(manifest)
+            dashboard = manifest.get("dashboard") if isinstance(manifest, Mapping) else None
+            existing_rendering_identity = dashboard.get("rendering_identity") if isinstance(dashboard, Mapping) else None
+            rebuild_for_rendering = existing_rendering_identity != rendering_identity
+            if presentation_plan_ref is not None:
+                resolved_plan_ref = assembler._presentation_plan_ref(
+                    context,
+                    "G-0001",
+                    presentation_plan_ref,
+                )
+                plan_path = _safe_run_path(
+                    context,
+                    resolved_plan_ref,
+                    label="business presentation plan",
+                )
+                if not plan_path.is_file() or plan_path.is_symlink():
+                    raise DashboardDeltaError("business presentation plan is missing or symlinked")
+                requested_binding = (
+                    resolved_plan_ref,
+                    _sha256_bytes(plan_path.read_bytes()),
+                )
+                existing_binding = (
+                    manifest.get("presentation_plan_ref"),
+                    manifest.get("presentation_plan_sha256"),
+                )
+                rebuild_for_presentation = existing_binding != requested_binding
+            if not rebuild_for_presentation and not rebuild_for_rendering:
+                receipt_ref = dashboard.get("receipt_ref") if isinstance(dashboard, Mapping) else None
+                if not isinstance(receipt_ref, str) or not receipt_ref.strip():
+                    raise DashboardDeltaError("existing root product manifest receipt binding is missing")
+                existing_receipt = _read_json(context, receipt_ref, label="existing root product receipt")
+                if existing_receipt.get("rendering_identity") != rendering_identity:
+                    rebuild_for_rendering = True
+                else:
+                    return dict(existing_receipt)
+        build_output_dir = output_dir or "repro_dashboard_v4"
+        if rebuild_for_presentation or rebuild_for_rendering:
+            # Keep the prior product namespace immutable and stage the new
+            # plan/renderer in a deterministic sibling namespace keyed by its
+            # immutable bindings.
+            # The assembler itself remains idempotent if this namespace was
+            # already completed for the same bindings.
+            requested = Path(build_output_dir)
+            suffixes: list[str] = []
+            if rebuild_for_presentation:
+                plan_path = _safe_run_path(
+                    context,
+                    assembler._presentation_plan_ref(context, "G-0001", presentation_plan_ref),
+                    label="business presentation plan",
+                )
+                plan_hash = _sha256_bytes(plan_path.read_bytes())
+                suffixes.append(f"plan-{plan_hash[:16]}")
+            if rebuild_for_rendering:
+                suffixes.append(f"render-{_json_hash(rendering_identity)[:16]}")
+            build_output_dir = requested.with_name(f"{requested.name}-{'-'.join(suffixes)}")
+        receipt = assembler.assemble_dashboard(
+            context,
+            output_dir=build_output_dir,
+            presentation_plan_ref=presentation_plan_ref,
+        )
+        _publish_root_product_manifest(
+            context,
+            lifecycle,
+            receipt,
+            replace_existing=rebuild_for_presentation or rebuild_for_rendering,
+            expected_existing=existing_manifest,
+        )
+        return receipt
+    return assemble_dashboard_delta(
+        context,
+        parent_receipt_ref=parent_receipt_ref,
+        route=route or {},
+        output_dir=output_dir,
+        failpoint=failpoint,
+        presentation_plan_ref=presentation_plan_ref,
+    )
+
+
+def assemble_generation_preview(
+    context: RunContext,
+    *,
+    item_ids: Sequence[str],
+    presentation_plan_ref: str | Path,
+    output_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Assemble the active generation's partial business preview.
+
+    Preview assembly is deliberately separate from
+    :func:`assemble_generation_product`: it consumes an explicitly selected
+    committed/terminal subset, writes only the canonical
+    ``generations/<G>/preview`` namespace, and never publishes the terminal
+    root product manifest.  The required V2 presentation plan is passed
+    through unchanged so the preflight -> plan -> Blueprint -> site/receipt
+    chain remains one source-bound transaction.  The ordinary assembler owns
+    the narrowly scoped same-generation preview refresh checks.
+    """
+
+    if not isinstance(context, RunContext):
+        raise TypeError("assemble_generation_preview requires a RunContext")
+    if isinstance(item_ids, (str, bytes)) or not isinstance(item_ids, Sequence):
+        raise DashboardDeltaError("preview item_ids must be an explicit sequence")
+    selected_ids = list(item_ids)
+    if not selected_ids:
+        raise DashboardDeltaError("preview item_ids must not be empty")
+    if presentation_plan_ref is None:
+        raise DashboardDeltaError("generation preview requires an explicit V2 presentation_plan_ref")
+    lifecycle = RunLifecycle.load(context)
+    if lifecycle.snapshot.mode != "requirement":
+        raise DashboardDeltaError("generation preview requires Requirement Mode")
+    metadata = lifecycle.generation_metadata
+    generation_id = _text(getattr(metadata, "generation_id", "")).strip() or "G-0001"
+    if not re.fullmatch(r"G-[0-9]{4}", generation_id):
+        raise DashboardDeltaError("generation preview has an invalid active generation")
+    canonical_ref = Path("generations") / generation_id / "preview"
+    canonical_root = _safe_product_path(
+        context,
+        canonical_ref,
+        label="generation preview namespace",
+    )
+    requested_ref = output_dir if output_dir is not None else canonical_ref
+    requested_root = _safe_product_path(
+        context,
+        requested_ref,
+        label="generation preview namespace",
+    )
+    if requested_root != canonical_root:
+        raise DashboardDeltaError(
+            "generation preview output_dir must be the canonical active-generation preview namespace"
+        )
+    assembler = _assembler()
+    # The sibling-loaded assembler owns the V2 plan validator and therefore
+    # has a private exception class identity.  Normalize only that expected
+    # plan-lineage failure at this public generation boundary so callers can
+    # catch one stable delta error without weakening any fail-closed checks.
+    plan_error_type = getattr(assembler, "BusinessPresentationPlanError", None)
+    try:
+        receipt = assembler.assemble_dashboard(
+            context,
+            output_dir=canonical_ref,
+            item_ids=selected_ids,
+            presentation_plan_ref=presentation_plan_ref,
+        )
+    except Exception as exc:
+        if plan_error_type is not None and isinstance(exc, plan_error_type):
+            raise DashboardDeltaError(str(exc)) from exc
+        raise
+    outputs = receipt.get("outputs") if isinstance(receipt, Mapping) else None
+    expected_prefix = f"products/{canonical_ref.as_posix()}"
+    expected_outputs = {
+        "fixture_ref": f"{expected_prefix}/dashboard_fixture_v4.json",
+        "chart_map_ref": f"{expected_prefix}/dashboard_chart_map_v4.json",
+        "chart_registry_ref": f"{expected_prefix}/dashboard_chart_registry_v4.json",
+        "blueprint_ref": f"{expected_prefix}/dashboard_blueprint_v2.json",
+        "site_ref": f"{expected_prefix}/site",
+        "receipt_ref": f"{expected_prefix}/build_receipt.json",
+    }
+    if not isinstance(outputs, Mapping) or any(outputs.get(key) != value for key, value in expected_outputs.items()):
+        raise DashboardDeltaError("generation preview did not produce the canonical output bindings")
+    if receipt.get("generation_id") != generation_id or receipt.get("status") != "complete":
+        raise DashboardDeltaError("generation preview receipt is not complete or bound to the active generation")
+    return dict(receipt)
 
 
 def _terminal_product_status(context: RunContext, lifecycle: RunLifecycle) -> str:
@@ -4345,10 +6423,43 @@ def _terminal_product_status(context: RunContext, lifecycle: RunLifecycle) -> st
             value = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise DashboardDeltaError(f"item state is invalid: {item_id}") from exc
-        if not isinstance(value, Mapping) or value.get("integration_state") != "integrated":
+        if not isinstance(value, Mapping):
+            raise DashboardDeltaError(f"item state is invalid: {item_id}")
+        integration_state = value.get("integration_state")
+        if value.get("lifecycle_state") == "technical_failure":
+            # Pre-acceptance recovery exhaustion is a validated no-integration
+            # terminal boundary.  Reuse the full assembler's strict manifest,
+            # state, hash, and residue checks; no answer/records are admitted.
+            try:
+                _assembler()._load_item_technical_failure_manifest(context, item_id, value)
+            except Exception as exc:
+                raise DashboardDeltaError(f"item technical failure boundary is invalid: {item_id}") from exc
+            limited = True
+            continue
+        if integration_state == "technical_failure":
+            failure_path = _safe_run_path(
+                context,
+                f"requirements/{item_id}/integration/technical_failure/manifest.json",
+                label=f"{item_id} technical failure manifest",
+            )
+            try:
+                failure = json.loads(failure_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise DashboardDeltaError(f"technical failure manifest is invalid: {item_id}") from exc
+            if (
+                not isinstance(failure, Mapping)
+                or failure.get("status") != "technical_failure"
+                or failure.get("recovery_exhausted") is not True
+                or value.get("integration_manifest_hash") != failure.get("manifest_hash")
+                or failure.get("manifest_hash") != _json_hash({key: item for key, item in failure.items() if key != "manifest_hash"})
+            ):
+                raise DashboardDeltaError(f"item technical failure boundary is invalid: {item_id}")
+            limited = True
+            continue
+        if integration_state != "integrated":
             raise DashboardDeltaError(f"item is not integrated: {item_id}")
-        terminal = value.get("terminal_outcome") if isinstance(value, Mapping) else None
-        outcome = terminal.get("outcome") if isinstance(terminal, Mapping) else value.get("lifecycle_state") if isinstance(value, Mapping) else None
+        terminal = value.get("terminal_outcome")
+        outcome = terminal.get("outcome") if isinstance(terminal, Mapping) else value.get("lifecycle_state")
         if outcome not in {"accepted", "accepted_with_limits", "technical_failure", "blocked_by_evidence"}:
             raise DashboardDeltaError(f"item is not terminal: {item_id}")
         if outcome in {"accepted_with_limits", "technical_failure", "blocked_by_evidence"}:
@@ -4400,23 +6511,51 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--parent-receipt", required=False)
-    parser.add_argument("--route", type=Path, required=True, help="run-relative JSON route object")
+    parser.add_argument(
+        "--route",
+        type=Path,
+        required=False,
+        help="run-relative JSON route object (required for cumulative successor generations)",
+    )
     parser.add_argument("--output-dir", required=False)
     parser.add_argument("--failpoint", required=False)
     parser.add_argument("--presentation-plan-ref", required=False, help="run-relative business presentation plan")
+    parser.add_argument("--revision-id", required=False, help="bound Product revision identifier")
+    parser.add_argument("--output-root-ref", required=False, help="run-relative immutable Product revision output root")
     args = parser.parse_args(argv)
     try:
         context = RunContext(run_id=args.run_id, run_root=args.run_root)
-        route = _read_json(context, args.route, label="dashboard delta route")
-        result = assemble_dashboard_delta(context, parent_receipt_ref=args.parent_receipt, route=route, output_dir=args.output_dir, failpoint=args.failpoint, presentation_plan_ref=args.presentation_plan_ref)
+        route = (
+            _read_json(context, args.route, label="dashboard generation route")
+            if args.route is not None
+            else None
+        )
+        result = assemble_generation_product(
+            context,
+            parent_receipt_ref=args.parent_receipt,
+            route=route,
+            output_dir=args.output_dir,
+            failpoint=args.failpoint,
+            presentation_plan_ref=args.presentation_plan_ref,
+            revision_id=args.revision_id,
+            output_root_ref=args.output_root_ref,
+        )
     except (OSError, ValueError, DashboardDeltaError, AllowedRootError, RuntimeError) as exc:
-        print(f"dashboard delta assembler: {exc}", file=sys.stderr)
+        print(f"dashboard generation assembler: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(result, sort_keys=True))
     return 0
 
 
-__all__ = ["DELTA_SCHEMA", "DashboardDeltaError", "assemble_dashboard_delta", "main"]
+__all__ = [
+    "DELTA_SCHEMA",
+    "DashboardDeltaError",
+    "assemble_dashboard_delta",
+    "assemble_generation_preview",
+    "assemble_generation_product",
+    "validate_generation_product",
+    "main",
+]
 
 
 if __name__ == "__main__":  # pragma: no cover

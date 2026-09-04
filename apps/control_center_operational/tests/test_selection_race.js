@@ -7,7 +7,7 @@ const {
   pollEvents,
   snapshotOwnershipIsCurrent,
   commitSnapshot,
-} = require("../../control_center/static/app.js");
+} = require("../../control_center_operational/static/app.js");
 
 function deferred() {
   let resolve;

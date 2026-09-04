@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Auto Foundry · Mission preview</title>
+    <link rel="stylesheet" href="styles.css">
+    <script defer src="app.js"></script>
+  </head>
+  <body>
+    <aside class="rail">
+      <div class="brand"><span class="brand-mark">◇<i>◇</i></span><strong>AUTO<small>FOUNDRY</small></strong></div>
+      <div class="rail-section"><span>MISSION MAP</span><button class="rail-main is-active" type="button">◇ <b>Mission</b></button></div>
+      <nav class="requirement-nav" id="requirementNav" aria-label="Requirement navigator"></nav>
+      <div class="rail-foot"><i></i><span>LOCAL · PREVIEW</span><small>READ ONLY</small></div>
+    </aside>
+
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <span class="eyebrow">CONTROL CENTER / MISSION / DESIGN PREVIEW</span>
+          <div class="title-row"><span class="af-badge">AF</span><div><h1 id="runTitle">Loading current run…</h1><p id="runMeta">Read-only live projection</p></div></div>
+        </div>
+        <div class="run-state"><span class="preview-pill">SEPARATE PREVIEW</span><span class="status-pill" id="runStatus"><i></i>LOADING</span><small id="observedAt">Observed —</small></div>
+      </header>
+
+      <section class="metrics" aria-label="Mission metrics">
+        <article><span>LIVE WORK</span><strong id="metricActive">—</strong><small>workers now</small></article>
+        <article><span>WAITING</span><strong id="metricWaiting">—</strong><small>dependencies</small></article>
+        <article><span>RECORDED</span><strong id="metricNodes">—</strong><small>visible nodes</small></article>
+        <article><span>COMPLETED</span><strong id="metricComplete">—</strong><small>durable steps</small></article>
+        <article><span>CAPACITY</span><strong id="metricCapacity">—</strong><small>Planner excluded</small></article>
+        <article class="metric-wide"><span>LAST DURABLE ACTIVITY</span><strong id="metricActivity">No event loaded</strong><small id="metricActivityDetail">Waiting for snapshot</small></article>
+      </section>
+
+      <section class="toolbar panel">
+        <div class="view-name"><span>MISSION MAP 2.0</span><strong>Requirement lanes</strong></div>
+        <div class="focus-controls" role="group" aria-label="Graph focus">
+          <button class="is-active" type="button" data-focus="all">All</button>
+          <button type="button" data-focus="active">Active</button>
+          <button type="button" data-focus="waiting">Waiting</button>
+          <button type="button" data-focus="issues">Issues</button>
+        </div>
+        <label class="search"><span>⌕</span><input id="searchInput" type="search" placeholder="Find REQ or agent" autocomplete="off"></label>
+        <button class="follow is-on" id="followActive" type="button"><i></i> Follow active</button>
+        <div class="map-controls">
+          <button id="zoomOut" type="button" title="Zoom out">−</button>
+          <button id="zoomIn" type="button" title="Zoom in">+</button>
+          <button id="fitMap" type="button">Fit all</button>
+          <button id="showActive" type="button">Show active</button>
+        </div>
+      </section>
+
+      <div class="content-grid">
+        <section class="mission-panel panel">
+          <div class="graph-legend">
+            <span><i class="dot active"></i>Active</span><span><i class="dot waiting"></i>Waiting</span>
+            <span><i class="dot review"></i>Review</span><span><i class="dot complete"></i>Complete</span>
+            <span><i class="dot historical"></i>Historical</span><span><i class="dot failed"></i>Failed</span>
+            <b id="nodeSummary">—</b>
+          </div>
+          <div class="viewport" id="viewport">
+            <div class="stage" id="stage">
+              <svg class="edges" id="edgeLayer" aria-hidden="true"></svg>
+              <div class="lanes" id="laneLayer"></div>
+              <div class="nodes" id="nodeLayer"></div>
+            </div>
+            <div class="view-context" id="viewContext"><span>LIVE VIEW</span><b id="viewContextTitle">Locating current work…</b><small id="viewContextDetail">Read-only durable projection</small></div>
+            <div class="offscreen" id="offscreen" hidden><span>●</span><b id="offscreenText">Active work is outside view</b><button type="button" id="offscreenShow">Show</button></div>
+            <div class="minimap-wrap"><span>OVERVIEW</span><svg id="minimap" viewBox="0 0 200 122" aria-label="Mission minimap"></svg></div>
+          </div>
+          <footer><span>Every recorded node stays available · select a card to trace its links</span><span>Drag to pan · scroll to zoom</span></footer>
+        </section>
+
+        <aside class="activity panel">
+          <header><div><span>DURABLE EVENTS</span><h2>Live activity</h2></div><button id="pauseFeed" type="button" title="Pause feed">Ⅱ</button></header>
+          <div class="activity-tabs"><button class="is-active" type="button" data-event="all">All</button><button type="button" data-event="file">Files</button><button type="button" data-event="review">Review</button><button type="button" data-event="error">Errors</button></div>
+          <div class="activity-list" id="activityList" aria-live="polite"></div>
+          <footer><i></i><span id="feedState">Polling read-only snapshot</span></footer>
+        </aside>
+      </div>
+    </main>
+
+    <aside class="inspector" id="inspector" aria-hidden="true">
+      <header><div><span>NODE DETAILS</span><h2 id="inspectorTitle">Agent</h2></div><button id="closeInspector" type="button">×</button></header>
+      <div id="inspectorBody"></div>
+    </aside>
+
+    <div class="fatal" id="fatal" hidden><strong>Preview unavailable</strong><p id="fatalMessage"></p></div>
+  </body>
+</html>

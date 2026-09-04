@@ -19,6 +19,8 @@ from auto_foundry_core import (
     DataAssetRef,
     ItemWorkspace,
     PreparedAssetRegistry,
+    RequirementAnalysisPlan,
+    RequirementAnalysisTask,
     RequirementExecutionGroup,
     RequirementExecutionPlan,
     RequirementRecord,
@@ -46,7 +48,23 @@ def _terminal_item(context: RunContext, item_id: str, text: str) -> ItemWorkspac
     item.write_draft({"answer": item_id})
     item.record_review("accept", reviewer_ref="reviewer")
     item.accept(accepted_refs=("draft.json",))
-    item.mark_integration_committed("a" * 64, "integration/manifest.json")
+    # Materialize the same typed committed-manifest boundary that production
+    # lifecycle reconciliation validates; a bare integration-state label is
+    # intentionally insufficient.
+    session = IntegrationSession.create(
+        context,
+        item,
+        PreparedAssetRegistry(context),
+        "integration-owner",
+        invocation_id=f"integration-{item_id}",
+    )
+    session.add_limitation(
+        {"statement": "The terminal extension fixture has no additional semantic change."},
+        scope="requirement",
+        evidence_refs=("draft.json",),
+    )
+    session.record_fidelity_review("accept", checked_record_ids=tuple(record.record_id for record in session.records))
+    session.commit()
     return item
 
 
@@ -571,6 +589,12 @@ def test_extension_requirement_context_reuses_prior_committed_lem_and_skips_pend
         context, DataAssetRef.from_path(archive), first, lifecycle
     )
     first_owner = AnalystWorkspace(first_bound, owner_ref="owner-REQ-01")
+    first_owner.plan_requirement(
+        RequirementAnalysisPlan(
+            tasks=(RequirementAnalysisTask(task_id="T-1", question="Inspect the supplied orders."),),
+            synthesis_intent="Reuse the committed semantic evidence for this requirement.",
+        )
+    )
     prepared = first_owner.prepare_data(
         "prior-asset",
         [{"id": "A", "value": 1}],
@@ -722,6 +746,15 @@ def test_active_generation_replan_is_loadable_and_next_append_binds_current_plan
     assert g3.lifecycle.parent_plan_hash == current_plan_hash
     manifest = json.loads((context.run_root / "extensions/G-0003/generation_manifest.json").read_text())
     assert manifest["parent_plan_hash"] == current_plan_hash
+
+
+def test_active_generation_replan_plan_tamper_fails_workspace_validation(tmp_path: Path) -> None:
+    context, parent, *_ = _fixture(tmp_path)
+    RequirementRunExtension.append(context, (_record("REQ-02"),), plan=_generation_plan(parent))
+    plan_path = RunLifecycle.load(context).plan_path
+    plan_path.write_text("{}", encoding="utf-8")
+    with pytest.raises((TypeError, ValueError, KeyError)):
+        RequirementSupervisorWorkspace(context).load()
 
 
 def test_planner_uses_generation_product_ref_in_final_product_action(tmp_path: Path) -> None:

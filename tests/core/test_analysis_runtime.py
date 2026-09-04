@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import subprocess
+import sys
 import textwrap
 import zipfile
 
@@ -42,6 +44,32 @@ def _write_script(item: ItemWorkspace, name: str, source: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(textwrap.dedent(source), encoding="utf-8")
     return path
+
+
+def test_isolated_analysis_child_does_not_require_coordinator_dependencies(tmp_path: Path) -> None:
+    """The stripped script runtime can import analysis without psutil/site packages."""
+
+    source_root = Path(__file__).resolve().parents[2] / "src"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            "-c",
+            "from auto_foundry_core.analysis import ControlledScriptRunner; print(ControlledScriptRunner.__name__)",
+        ],
+        cwd=tmp_path,
+        env={
+            "PYTHONPATH": str(source_root),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONNOUSERSITE": "1",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert result.stdout.strip() == "ControlledScriptRunner"
 
 
 def test_bound_context_manifest_and_environment_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

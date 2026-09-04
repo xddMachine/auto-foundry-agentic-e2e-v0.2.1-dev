@@ -60,6 +60,24 @@ def test_runtime_derives_cache_telemetry_and_products_from_context(tmp_path: Pat
     assert result.receipt.errors == ()
 
 
+def test_preview_capability_has_no_implicit_json_byte_cap(tmp_path: Path):
+    context, _, _ = _context(tmp_path)
+    source = context.input_roots[0] / "large.json"
+    value = "x" * (16 * 1024 * 1024 + 1024)
+    source.write_text(json.dumps({"value": value}), encoding="utf-8")
+    runtime = CoreRuntime(context)
+
+    default = runtime.execute(OperationSpec("sources.preview", parameters={"path": source.name, "limit": 1}))
+    assert default.value["sample"] == [{"value": value}]
+    with pytest.raises(ValueError, match="max_json_bytes"):
+        runtime.execute(
+            OperationSpec(
+                "sources.preview",
+                parameters={"path": source.name, "limit": 1, "max_json_bytes": 1024},
+            )
+        )
+
+
 def test_runtime_cache_miss_then_hit_and_passive_receipt_telemetry(tmp_path: Path):
     context, source, _ = _context(tmp_path)
     runtime = CoreRuntime(context)

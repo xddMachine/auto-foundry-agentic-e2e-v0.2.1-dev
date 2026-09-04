@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Auto Foundry — Mission Display Design Lab</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <div>
+          <strong>AUTO FOUNDRY</strong>
+          <span>MISSION DISPLAY LAB</span>
+        </div>
+      </div>
+      <div class="fixture-note">
+        <span class="fixture-dot"></span>
+        DESIGN FIXTURE · NOT CONNECTED TO A RUN
+      </div>
+      <div class="simulation-controls">
+        <label class="granularity-control" for="granularity-select">
+          <span>GRANULARITY</span>
+          <select id="granularity-select" aria-label="Graph granularity">
+            <option value="everything" selected>Everything</option>
+            <option value="signal">Signal</option>
+          </select>
+        </label>
+        <button class="quiet-button" id="reset-button" type="button">Reset</button>
+        <button class="quiet-button is-active" id="autoplay-button" type="button" aria-pressed="true">
+          <span class="live-dot"></span> Auto-play
+        </button>
+        <button class="primary-button" id="next-button" type="button">Simulate next event <span>→</span></button>
+      </div>
+    </header>
+
+    <aside class="concept-nav" aria-label="Design concepts">
+      <div class="nav-heading">
+        <span>12 DIRECTIONS</span>
+        <strong>Choose a concept</strong>
+      </div>
+      <div id="concept-list"></div>
+      <div class="nav-footer">
+        <span>Shared fixture</span>
+        <strong>13 requirements · shared event sequence · capacity 8</strong>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <section class="concept-header">
+        <div>
+          <span class="eyebrow" id="concept-kicker"></span>
+          <h1 id="concept-title"></h1>
+          <p id="concept-description"></p>
+        </div>
+        <div class="score-row" id="score-row"></div>
+      </section>
+
+      <section class="demo-frame">
+        <div class="frame-topline">
+          <div class="mission-title">
+            <span class="mission-avatar">AF</span>
+            <div>
+              <strong>Night Operations Mission</strong>
+              <span>13 requirements · live design simulation</span>
+            </div>
+          </div>
+          <div class="frame-status">
+            <span><i class="status-running"></i> RUNNING</span>
+            <span id="sim-clock">Observed just now</span>
+          </div>
+        </div>
+        <div class="concept-stage" id="concept-stage" aria-live="polite"></div>
+      </section>
+
+      <section class="concept-rationale">
+        <div>
+          <span class="eyebrow">WHY THIS WORKS</span>
+          <p id="concept-rationale"></p>
+        </div>
+        <div>
+          <span class="eyebrow">INTERACTION MODEL</span>
+          <p id="concept-interaction"></p>
+        </div>
+        <div>
+          <span class="eyebrow">PATTERN REFERENCES</span>
+          <p id="concept-reference"></p>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -54,6 +54,19 @@ def _run(tmp_path: Path, *records: RequirementRecord) -> tuple[RunContext, Requi
     return context, workspace
 
 
+def _advance_to_complete(lifecycle: RunLifecycle) -> None:
+    """Create a legal terminal snapshot for portfolio-revision tests."""
+
+    for target in (
+        "running",
+        "analytical_complete",
+        "integration_complete",
+        "products_complete",
+        "complete",
+    ):
+        lifecycle._advance(target)  # noqa: SLF001 - exercise the transition table
+
+
 def test_requirement_can_be_added_while_run_is_active_without_route_boilerplate(tmp_path: Path) -> None:
     first = _record("REQ-01")
     context, workspace = _run(tmp_path, first)
@@ -69,7 +82,7 @@ def test_requirement_can_be_added_while_run_is_active_without_route_boilerplate(
 
 def test_requirement_can_be_added_directly_after_run_completion(tmp_path: Path) -> None:
     context, _ = _run(tmp_path, _record("REQ-01"))
-    RunLifecycle.load(context)._advance("complete")  # noqa: SLF001 - model an existing completed run
+    _advance_to_complete(RunLifecycle.load(context))
 
     RequirementRunExtension.append(context, _record("REQ-17"))
 
@@ -144,7 +157,7 @@ def test_run_can_pause_resume_and_reopen_from_any_terminal_state(tmp_path: Path)
     assert workspace.next_actions() == ()
 
     assert lifecycle.resume().state == "running"
-    lifecycle._advance("complete")  # noqa: SLF001 - exercise reopen from an existing terminal snapshot
+    _advance_to_complete(lifecycle)
     assert lifecycle.reopen().state == "running"
 
 

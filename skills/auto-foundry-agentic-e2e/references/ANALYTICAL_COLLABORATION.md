@@ -41,11 +41,11 @@ intervention with `record_incident()`, and do not keep the owner idle while a
 later requirement is runnable. `scheduling_tick()` remains the compact
 dictionary view for callers that do not need typed actions.
 
-Default capacity is four entity-resolution workers, one Analytical Owner, and
-up to three owner specialists (eight active workers total); the Planner is not
-counted or leased. Hosts may configure lower or higher limits but never
-oversubscribe actual host capacity. Requested Run A and Run B executions remain
-sequential.
+Capacity is adaptive to the actual host: the scheduler leases the smallest
+useful set of workers for genuinely independent work and never oversubscribes
+available slots. Every requirement has exactly one Analytical Owner, reviewers
+remain fresh and independent, and the Planner is not counted or leased.
+Requested Run A and Run B executions remain sequential.
 
 Suggested Planner prompt:
 
@@ -55,8 +55,11 @@ exact RequirementRecords, compact physical catalog metadata, and current
 item/resolution outcomes. Recommend or revise advisory order/grouping while
 preserving explicit user priority/order. Do not predeclare runtime semantic
 dependencies; the Analytical Owner discovers them after understanding the
-requirement and the runtime resolution ledger owns semantic blocking. You may suggest zero to three bounded
-specialists per group. Preserve every RequirementRecord field and do not
+requirement and the runtime resolution ledger owns semantic blocking. Suggest
+only the smallest useful set of bounded specialists per group for genuinely
+independent uncertainty; zero is valid, host capacity bounds the set, and do
+not create one specialist per method or checklist item. Preserve every
+RequirementRecord field and do not
 calculate, write answers, mutate lifecycle state, or emit IDs, hashes, paths,
 receipts, or manifests. A technical failure does not create Planner dependency
 blocks; independent groups remain eligible. Use the public runtime snapshot and
@@ -85,12 +88,20 @@ answer. Ask that agent to:
 6. choose definitions, population, denominator, grain, period, and units;
 7. test material relationships, source authority, and data quality;
 8. use reproducible code for calculations when useful;
-9. request zero to three bounded specialist checks only when they improve the
-   answer;
+9. request the smallest useful set of bounded specialist checks only for
+   genuinely independent uncertainty that improves the answer;
 10. synthesize specialist memos with its own evidence;
 11. write the complete answer, limitations, and useful visuals;
 12. apply material business repairs, each followed by a targeted
-   recheck, if review requests them; a third request fails closed.
+   recheck, if review requests them.
+
+For supported tabular work, use the analytics toolkit first: `profile_data`,
+`compute_kpi_table`, `segment_customers` (deterministic k-means with optional
+agglomerative comparison), and `score_segments`. Choose and preserve the exact
+method and parameters. Use custom owner-authored code only for unsupported
+methods and run it through `ControlledScriptRunner`. Follow
+[ANALYTICS_TOOLKIT.md](ANALYTICS_TOOLKIT.md) for strict artifact JSON and the
+review/integration handoff.
 
 The owner loads exact persisted source IDs and a program-built typed identity
 mapping view when applicable. It does not generate source filenames or repeat
@@ -124,8 +135,10 @@ sidecar, operation manifest/hash inputs, accepted integration and registry, and
 later reuse; an omitted value remains valid with no period constraint.
 define the population and method, run reproducible calculations where useful,
 test important joins and limitations, and write one complete decision-ready
-answer. You may ask up to three specialists a narrow question. Treat their
-memos as evidence, not as an answer. Do not emit program state, JSON pointers,
+answer. Ask only for the smallest useful set of specialist checks for genuinely
+independent uncertainty, bounded by actual host capacity; do not create one
+specialist per method or checklist item. Treat their memos as evidence, not as
+an answer. Do not emit program state, JSON pointers,
 file paths, hashes, receipts, integration records, or lifecycle instructions.
 If evidence is insufficient, only you may originate a
 `DataInsufficiencyConclusion` naming the unanswerable component, missing
@@ -266,6 +279,23 @@ maps accepted content into small typed claims, metrics, limitations, evidence
 links, prepared assets, ontology definitions, relationships, and dashboard
 facts through `IntegrationSession` APIs.
 
+For toolkit outputs, `IntegrationSession.create/load` automatically stages the
+exact sealed, business-accepted typed `AnalyticalArtifact` handoff from the
+accepted bundle. Do not manually re-submit or re-declare that artifact.
+Preserve its artifact ID/type, schema version, content/envelope hashes, and
+requirement binding while using only the public session methods that exist; do
+not invent an integration method or write integration JSON directly.
+
+The accepted Analytical Owner answer bytes and `accepted_content_hash` are
+immutable. The records staged by IntegrationSession are a derived pre-commit
+projection: after fidelity authorization, the same Integration Agent must use
+`correct_record` for every authorized affected record (or `remove_record` when
+authorized), preserve the accepted hash and business meaning, rebuild the
+fidelity packet, and submit the targeted recheck before commit. A literal
+difference between normalized typed fields and the accepted prose/artifact is
+expected projection work, not a semantic conflict or a reason to refuse. Never
+edit the accepted answer or redo its analysis.
+
 This is the only agent-facing role that works with typed internal integration
 records. It does not repair the business answer or redo analytics. Mechanical
 validation and one item-only fidelity review protect this downstream mapping.
@@ -310,7 +340,7 @@ after implementation changes.
 
 ## When to use specialists
 
-Use no specialist when the owner can resolve the question directly. Use one
-when a single independent check is material. Use two or three only when the
-questions are genuinely independent and the owner can synthesize the memos.
-Never measure workflow quality by agent count.
+Use no specialist when the owner can resolve the question directly. Add the
+smallest useful set only when each check is a genuinely independent material
+uncertainty and the host has capacity; never create one specialist per method
+or checklist item, and never measure workflow quality by agent count.

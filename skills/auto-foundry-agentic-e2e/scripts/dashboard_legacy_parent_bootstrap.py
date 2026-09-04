@@ -74,15 +74,31 @@ _RECEIPT_KEYS = frozenset(
         "source_policy",
         "new_analytics",
         "input_items",
+        "analytical_artifacts",
         "plan_binding",
         "parent",
         "outputs",
         "output_hashes",
+        "blueprint_binding",
         "site_binding",
         "freeze_inputs",
         "widget_count",
         "ontology_counts",
         "retry",
+        "rendering_identity",
+    }
+)
+_RENDERING_IDENTITY_KEYS = frozenset(
+    {
+        "schema_version",
+        "skill_name",
+        "skill_version",
+        "core_name",
+        "core_version",
+        "skill_tree_sha256",
+        "skill_file_count",
+        "core_implementation_sha",
+        "core_implementation_tree",
     }
 )
 _ROOT_PARENT_KEYS = frozenset(
@@ -90,11 +106,12 @@ _ROOT_PARENT_KEYS = frozenset(
 )
 _ROOT_PLAN_BINDING_KEYS = frozenset({"ref", "sha256", "admission_sha256", "generation_id"})
 _RECEIPT_OUTPUT_KEYS = frozenset(
-    {"fixture_ref", "chart_map_ref", "chart_registry_ref", "site_ref", "receipt_ref"}
+    {"fixture_ref", "chart_map_ref", "chart_registry_ref", "blueprint_ref", "site_ref", "receipt_ref"}
 )
 _RECEIPT_HASH_KEYS = frozenset(
-    {"fixture_sha256", "chart_map_sha256", "chart_registry_sha256", "site_manifest_sha256"}
+    {"fixture_sha256", "chart_map_sha256", "chart_registry_sha256", "blueprint_sha256", "site_manifest_sha256"}
 )
+_BLUEPRINT_BINDING_KEYS = frozenset({"ref", "sha256", "schema_version", "status"})
 _FREEZE_INPUT_KEYS = frozenset(
     {
         "bindings",
@@ -108,6 +125,7 @@ _FREEZE_INPUT_KEYS = frozenset(
         "projection_hash",
         "summary",
         "telemetry",
+        "analytical_artifacts",
     }
 )
 _PREPARED_KEYS = frozenset({"ref", "present", "sha256", "descriptor_count"})
@@ -144,6 +162,7 @@ _BRIDGE_DASHBOARD_KEYS = frozenset(
         "widget_count",
         "receipt_ref",
         "receipt_sha256",
+        "rendering_identity",
     }
 )
 _BRIDGE_LINEAGE_KEYS = frozenset(
@@ -188,6 +207,33 @@ def _sha256_file(path: Path, *, label: str) -> str:
 
 def _is_sha256(value: Any) -> bool:
     return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{64}", value))
+
+
+def _is_sha1(value: Any) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{40}", value))
+
+
+def _validate_rendering_identity(value: Any) -> dict[str, Any]:
+    """Validate the renderer/core release identity carried by a receipt."""
+
+    if not isinstance(value, Mapping) or set(value) != _RENDERING_IDENTITY_KEYS:
+        raise LegacyParentBridgeError("legacy parent receipt rendering identity is incomplete")
+    if (
+        value.get("schema_version") != "dashboard.rendering_identity.v1"
+        or value.get("skill_name") != "auto-foundry-agentic-e2e"
+        or value.get("core_name") != "auto_foundry_core"
+        or not isinstance(value.get("skill_version"), str)
+        or not value.get("skill_version").strip()
+        or not isinstance(value.get("core_version"), str)
+        or not value.get("core_version").strip()
+        or not _is_sha256(value.get("skill_tree_sha256"))
+        or type(value.get("skill_file_count")) is not int
+        or value.get("skill_file_count") <= 0
+        or not _is_sha1(value.get("core_implementation_sha"))
+        or not _is_sha1(value.get("core_implementation_tree"))
+    ):
+        raise LegacyParentBridgeError("legacy parent receipt rendering identity is invalid")
+    return {key: value[key] for key in sorted(_RENDERING_IDENTITY_KEYS)}
 
 
 def _lexical_path(context: RunContext, reference: str | Path, *, product: bool, label: str) -> Path:
@@ -379,6 +425,7 @@ def _validate_receipt_outputs(
         raise LegacyParentBridgeError("legacy parent receipt schema fields are not exact")
     if receipt.get("schema_version") != ASSEMBLER_SCHEMA or receipt.get("status") != "complete" or receipt.get("run_id") != context.run_id or receipt.get("generation_id") != LEGACY_GENERATION_ID or receipt.get("source_policy") != "accepted_and_committed_only" or receipt.get("new_analytics") is not False:
         raise LegacyParentBridgeError("legacy parent receipt identity is invalid")
+    rendering_identity = _validate_rendering_identity(receipt.get("rendering_identity"))
     parent = receipt.get("parent")
     if (
         not isinstance(parent, Mapping)
@@ -405,9 +452,26 @@ def _validate_receipt_outputs(
         raise LegacyParentBridgeError("legacy parent receipt plan binding is stale")
     outputs = receipt.get("outputs")
     hashes = receipt.get("output_hashes")
+    blueprint_binding = receipt.get("blueprint_binding")
     freeze = receipt.get("freeze_inputs")
-    if not isinstance(outputs, Mapping) or set(outputs) != _RECEIPT_OUTPUT_KEYS or not isinstance(hashes, Mapping) or set(hashes) != _RECEIPT_HASH_KEYS or not isinstance(freeze, Mapping) or set(freeze) != _FREEZE_INPUT_KEYS:
+    if (
+        not isinstance(outputs, Mapping)
+        or set(outputs) != _RECEIPT_OUTPUT_KEYS
+        or not isinstance(hashes, Mapping)
+        or set(hashes) != _RECEIPT_HASH_KEYS
+        or not isinstance(blueprint_binding, Mapping)
+        or set(blueprint_binding) != _BLUEPRINT_BINDING_KEYS
+        or not isinstance(freeze, Mapping)
+        or set(freeze) != _FREEZE_INPUT_KEYS
+    ):
         raise LegacyParentBridgeError("legacy parent receipt output bindings are incomplete")
+    if (
+        blueprint_binding.get("ref") != outputs.get("blueprint_ref")
+        or blueprint_binding.get("schema_version") != "dashboard.business_presentation_plan.v2"
+        or blueprint_binding.get("status") != "Preview"
+        or not _is_sha256(blueprint_binding.get("sha256"))
+    ):
+        raise LegacyParentBridgeError("legacy parent receipt blueprint binding is invalid")
     if (
         not isinstance(freeze.get("prepared_registry"), Mapping)
         or set(freeze["prepared_registry"]) != _PREPARED_KEYS
@@ -418,6 +482,9 @@ def _validate_receipt_outputs(
         or not isinstance(freeze.get("summary"), Mapping)
         or not isinstance(freeze.get("bindings"), list)
         or not isinstance(freeze.get("item_order"), list)
+        or not isinstance(receipt.get("analytical_artifacts"), list)
+        or not isinstance(freeze.get("analytical_artifacts"), list)
+        or receipt.get("analytical_artifacts") != freeze.get("analytical_artifacts")
     ):
         raise LegacyParentBridgeError("legacy parent receipt freeze inputs are incomplete")
     if receipt.get("outputs", {}).get("receipt_ref") != _relative_run_ref(context, receipt_path):
@@ -426,7 +493,7 @@ def _validate_receipt_outputs(
         raise LegacyParentBridgeError("legacy parent receipt is not bound to the immutable root manifest")
     freeze_markers = _validate_freeze_markers(freeze.get("freeze_markers"), label="legacy parent receipt")
     receipt_path_ref = _relative_run_ref(context, receipt_path)
-    for key in ("fixture_ref", "chart_map_ref", "chart_registry_ref", "site_ref", "receipt_ref"):
+    for key in ("fixture_ref", "chart_map_ref", "chart_registry_ref", "blueprint_ref", "site_ref", "receipt_ref"):
         reference = outputs.get(key)
         if not isinstance(reference, str) or not reference.startswith("products/"):
             raise LegacyParentBridgeError(f"legacy parent receipt output reference is invalid: {key}")
@@ -435,7 +502,7 @@ def _validate_receipt_outputs(
             raise LegacyParentBridgeError(f"legacy parent output is missing or symlinked: {key}")
         if key == "site_ref" and (output_path.is_symlink() or not output_path.is_dir()):
             raise LegacyParentBridgeError("legacy parent site output is missing or symlinked")
-    for key in ("fixture_sha256", "chart_map_sha256", "chart_registry_sha256", "site_manifest_sha256"):
+    for key in ("fixture_sha256", "chart_map_sha256", "chart_registry_sha256", "blueprint_sha256", "site_manifest_sha256"):
         if not _is_sha256(hashes.get(key)):
             raise LegacyParentBridgeError(f"legacy parent output hash is invalid: {key}")
     fixture_path = _safe_run_path(context, outputs["fixture_ref"], label="legacy parent fixture")
@@ -443,6 +510,9 @@ def _validate_receipt_outputs(
     chart_registry_path = _safe_run_path(context, outputs["chart_registry_ref"], label="legacy parent chart registry")
     fixture = _read_json(fixture_path, label="legacy parent fixture", canonical=True)
     chart_map = _read_json(chart_map_path, label="legacy parent chart map", canonical=True)
+    fixture_artifacts = fixture.get("analytical_artifacts")
+    if not isinstance(fixture_artifacts, list) or fixture_artifacts != receipt.get("analytical_artifacts"):
+        raise LegacyParentBridgeError("legacy parent receipt analytical artifact bindings differ from fixture")
     # The renderer copies the chart registry from its registry source and may
     # preserve that source's human-readable indentation.  Its receipt hash is
     # the authority; unlike the generated fixture/map, registry formatting is
@@ -450,14 +520,21 @@ def _validate_receipt_outputs(
     chart_registry = _read_json(chart_registry_path, label="legacy parent chart registry", canonical=False)
     if fixture.get("schema_version") != FIXTURE_SCHEMA or chart_map.get("schema_version") != CHART_MAP_SCHEMA or chart_registry.get("schema_version") != CHART_REGISTRY_SCHEMA:
         raise LegacyParentBridgeError("legacy parent dashboard output schema is unsupported")
+    blueprint_path = _safe_run_path(context, outputs["blueprint_ref"], label="legacy parent blueprint")
     expected_files = {
         "fixture_sha256": fixture_path,
         "chart_map_sha256": chart_map_path,
         "chart_registry_sha256": chart_registry_path,
+        "blueprint_sha256": blueprint_path,
     }
     for key, output_path in expected_files.items():
         if _sha256_file(output_path, label=f"legacy parent {key}") != hashes[key]:
             raise LegacyParentBridgeError(f"legacy parent output hash mismatch: {key}")
+    blueprint = _read_json(blueprint_path, label="legacy parent blueprint", canonical=True)
+    if blueprint.get("schema_version") != "dashboard.business_presentation_plan.v2" or blueprint.get("review_status") != "Preview":
+        raise LegacyParentBridgeError("legacy parent blueprint schema/status is unsupported")
+    if _sha256_file(blueprint_path, label="legacy parent blueprint") != blueprint_binding["sha256"]:
+        raise LegacyParentBridgeError("legacy parent blueprint hash mismatch")
     site_path = _safe_run_path(context, outputs["site_ref"], label="legacy parent site")
     site_binding = _site_tree_binding(site_path)
     if site_binding != dict(receipt.get("site_binding") or {}):
@@ -468,7 +545,19 @@ def _validate_receipt_outputs(
     # The receipt itself is canonical and must not be replaced while a bridge
     # is being derived.  Its hash is intentionally not self-referential.
     receipt_hash = _sha256_file(receipt_path, label="legacy parent receipt")
-    return dict(outputs), dict(hashes), dict(freeze), {"freeze_markers": freeze_markers, "fixture": fixture, "chart_map": chart_map}, receipt_hash
+    return (
+        dict(outputs),
+        dict(hashes),
+        dict(freeze),
+        {
+            "freeze_markers": freeze_markers,
+            "fixture": fixture,
+            "chart_map": chart_map,
+            "blueprint_binding": dict(blueprint_binding),
+            "rendering_identity": rendering_identity,
+        },
+        receipt_hash,
+    )
 
 
 def _relative_run_ref(context: RunContext, path: Path) -> str:
@@ -478,13 +567,24 @@ def _relative_run_ref(context: RunContext, path: Path) -> str:
         raise LegacyParentBridgeError(f"path escapes run root: {path}") from exc
 
 
-def _bridge_assets(outputs: Mapping[str, Any], hashes: Mapping[str, Any], receipt_ref: str, receipt_hash: str) -> list[dict[str, str]]:
+def _bridge_assets(
+    outputs: Mapping[str, Any],
+    hashes: Mapping[str, Any],
+    blueprint_binding: Mapping[str, Any],
+    receipt_ref: str,
+    receipt_hash: str,
+) -> list[dict[str, str]]:
     assets = [
         {"ref": outputs[key], "role": role, "sha256": hashes[digest_key]}
         for key, role, digest_key in _PRODUCT_ASSET_ROLES
     ]
     assets.extend(
         [
+            {
+                "ref": str(outputs["blueprint_ref"]),
+                "role": "dashboard_blueprint_v2",
+                "sha256": str(blueprint_binding["sha256"]),
+            },
             {
                 "ref": str(outputs["site_ref"]).rstrip("/") + "/site_manifest.json",
                 "role": "dashboard_site_manifest",
@@ -549,9 +649,10 @@ def _build_bridge(
             "widget_count": widget_count,
             "receipt_ref": receipt_ref_rel,
             "receipt_sha256": receipt_hash,
+            "rendering_identity": dict(details["rendering_identity"]),
         },
         "lem": dict(summary),
-        "assets": _bridge_assets(outputs, hashes, receipt_ref_rel, receipt_hash),
+        "assets": _bridge_assets(outputs, hashes, details["blueprint_binding"], receipt_ref_rel, receipt_hash),
         "lineage": {
             "bridge_schema": BRIDGE_SCHEMA,
             "generation_id": LEGACY_GENERATION_ID,

@@ -34,7 +34,13 @@ from .contracts import (
     TableRef,
     TelemetryEvent,
 )
-from .workspace import AllowedRootError, RunContext, require_allowed_roots
+from .workspace import (
+    AllowedRootError,
+    DEFAULT_CORE_VERSION,
+    DEFAULT_SKILL_VERSION,
+    RunContext,
+    require_allowed_roots,
+)
 from .sources import discover, preview, register_source, read_rows
 from .profiling import profile_rows, profile_source
 from .normalization import normalize_rows, normalize_value, observation_as_of, parse_date, parse_number
@@ -71,11 +77,13 @@ from .coordinator import (
     COORDINATOR_LOCK_FILENAME,
     COORDINATOR_SPEC_FILENAME,
     COORDINATOR_STATE_FILENAME,
+    PRODUCT_REGENERATION_ORIGIN,
     CommandRoleAdapter,
     CodexExecConfig,
     CoordinatorConflictError,
     CoordinatorError,
     CoordinatorIntegrityError,
+    CoordinatorProductionBindingMismatch,
     CoordinatorPublicationError,
     CoordinatorRunSpec,
     CoordinatorStatus,
@@ -87,8 +95,30 @@ from .coordinator import (
     RoleExecution,
     RoleRunner,
     RunCoordinator,
+    ROLE_MODEL_CONTRACT,
+    ROLE_ACTION_CONTRACT,
+    ACTION_ROLE_CONTRACT,
+    PRODUCTION_ROLE_MODEL_CONTRACT,
+    PRODUCTION_ROLE_ACTION_CONTRACT,
     build_role_prompt,
+    logical_action_fingerprint,
+    production_role_routing,
+    role_model_route,
+    role_route_for_action,
     start_coordinator,
+    validate_role_action_contract,
+)
+from .supervisor import (
+    SUPERVISOR_ATTENTION_STATUSES,
+    SUPERVISOR_CLEAN_STATUSES,
+    SUPERVISOR_ROLE,
+    CodexSupervisorAdapter,
+    FoundrySupervisor,
+    SupervisorAgent,
+    SupervisorObservation,
+    SupervisorRepairResult,
+    SupervisorResult,
+    build_supervisor_prompt,
 )
 from .workbench import (
     CatalogCounts,
@@ -99,6 +129,21 @@ from .workbench import (
     PreparedAsset,
 )
 from .prepared import PreparedAssetRegistry
+from .product_review import (
+    ProductCandidate,
+    ProductReview,
+    ProductRevision,
+    ProductRevisionPointer,
+    ProductReviewStore,
+    PublishAuthorization,
+    activate_product_revision,
+    authorize_product_publish,
+    begin_product_revision,
+    canonical_hash as product_canonical_hash,
+    discard_stale_product_candidate,
+    record_product_candidate,
+    record_product_review,
+)
 from .semantic_store import (
     ContextPayloadRef,
     SemanticSelectionRef,
@@ -116,6 +161,33 @@ from .analysis import (
     ScriptValidationResult,
     load_bound_analysis_context,
     load_selected_source_ids,
+)
+from .analytical_artifacts import (
+    ANALYTICAL_ARTIFACT_SCHEMA_VERSION,
+    ANALYTICAL_ARTIFACT_TYPES,
+    AnalyticalArtifact,
+    AnalyticalArtifactError,
+    AnalyticalArtifactValidationError,
+    DataProfileArtifact,
+    KpiTableArtifact,
+    SegmentProfilesArtifact,
+    SegmentationModelArtifact,
+    artifact_from_dict,
+    canonical_content_hash,
+    canonical_json,
+)
+from .analytics_toolkit import (
+    AnalyticsDependencyError,
+    AnalyticsInputError,
+    MetricDefinition,
+    TabularInput,
+    compute_kpi_table,
+    fingerprint_source,
+    ingest_tabular,
+    load_tabular,
+    profile_data,
+    score_segments,
+    segment_customers,
 )
 from .analyst_workspace import (
     AnalystAnswer,
@@ -184,7 +256,37 @@ from .lifecycle import (
     classify_terminal_reason,
     recovery_classification,
 )
-from .run_extension import GenerationManifest, RequirementRunExtension, RequirementRunGeneration, RunExtension
+from .run_extension import (
+    DataRefreshNotSafeError,
+    DataRefreshSupersededError,
+    GenerationManifest,
+    RequirementRunExtension,
+    RequirementRunGeneration,
+    RunExtension,
+)
+from .data_revisions import (
+    CURRENT_POINTER_PATH,
+    DATA_REVISION_POINTER_SCHEMA_VERSION,
+    DATA_REVISION_SCHEMA_VERSION,
+    DATA_ROOM_ROOT,
+    PENDING_DATA_REFRESH_ARCHIVE_ROOT,
+    PENDING_DATA_REFRESH_PATH,
+    PENDING_DATA_REFRESH_SCHEMA_VERSION,
+    REVISION_TRANSACTION_PATH,
+    REVISION_TRANSACTION_SCHEMA_VERSION,
+    REVISION_ARCHIVE_FILENAME,
+    REVISION_CATALOG_FILENAME,
+    REVISION_MANIFEST_FILENAME,
+    REVISION_ROOT,
+    DataRevision,
+    DataRevisionError,
+    DataRevisionTransaction,
+    DataRevisionStore,
+    PendingDataRefresh,
+    PendingDataRefreshConflict,
+    RevisionCASMismatch,
+    RevisionConflictError,
+)
 from .product_contracts import (
     FREEZE_MARKER_FIELDS,
     FreezeMarkers,
@@ -212,14 +314,17 @@ from .references import (
     is_explicit_reference_mapping,
 )
 
-__version__ = "0.8.0"
+__version__ = DEFAULT_CORE_VERSION
 
 __all__ = [
     "CONTROL_PLANE_DIRNAME", "COORDINATOR_EVENTS_FILENAME", "COORDINATOR_LOCK_FILENAME", "COORDINATOR_SPEC_FILENAME", "COORDINATOR_STATE_FILENAME",
     "CommandRoleAdapter", "CodexExecConfig", "CodexRoleAdapter", "CoordinatorConflictError",
-    "CoordinatorError", "CoordinatorIntegrityError", "CoordinatorPublicationError", "CoordinatorRunSpec",
-    "CoordinatorStatus", "MappingRoleAdapter", "PlannerActionProvider", "RequirementPlannerProvider", "RoleAdapter", "RoleExecution", "RoleRunner", "RunCoordinator", "build_role_prompt", "start_coordinator",
-    "AggregationSpec", "AllowedRootError", "CanonicalMapping",
+    "CoordinatorError", "CoordinatorIntegrityError", "CoordinatorProductionBindingMismatch", "CoordinatorPublicationError", "CoordinatorRunSpec",
+    "CoordinatorStatus", "MappingRoleAdapter", "PlannerActionProvider", "RequirementPlannerProvider", "RoleAdapter", "RoleExecution", "RoleRunner", "RunCoordinator",
+    "ROLE_MODEL_CONTRACT", "ROLE_ACTION_CONTRACT", "ACTION_ROLE_CONTRACT", "PRODUCTION_ROLE_MODEL_CONTRACT", "PRODUCTION_ROLE_ACTION_CONTRACT",
+    "build_role_prompt", "logical_action_fingerprint", "production_role_routing", "role_model_route", "role_route_for_action", "start_coordinator", "validate_role_action_contract",
+    "SUPERVISOR_ROLE", "SUPERVISOR_ATTENTION_STATUSES", "SUPERVISOR_CLEAN_STATUSES", "CodexSupervisorAdapter", "FoundrySupervisor", "SupervisorAgent", "SupervisorObservation", "SupervisorRepairResult", "SupervisorResult", "build_supervisor_prompt",
+    "AggregationSpec", "AllowedRootError", "CanonicalMapping", "DEFAULT_CORE_VERSION", "DEFAULT_SKILL_VERSION",
     "ActionDispatcher", "AutopilotTick", "LocalRunAutopilot",
     "CapabilityDescriptor", "CatalogCounts", "CoreExecutionResult", "CoreRuntime", "DataAssetRef", "DataRoom",
     "DataRoomCatalogEntry", "DataRoomMember", "DataRoomWorkbench", "DocumentRef", "FieldRef",
@@ -245,6 +350,13 @@ __all__ = [
     "mapping_coverage", "measure_relationship", "normalize_rows",
     "normalize_value", "observation_as_of", "parse_date", "parse_number", "preview", "profile_rows",
     "profile_source", "read_rows", "register_source", "reproduce",
+    "CURRENT_POINTER_PATH", "DATA_REVISION_POINTER_SCHEMA_VERSION", "DATA_REVISION_SCHEMA_VERSION",
+    "DATA_ROOM_ROOT", "REVISION_ARCHIVE_FILENAME", "REVISION_CATALOG_FILENAME",
+    "REVISION_MANIFEST_FILENAME", "REVISION_ROOT", "DataRevision", "DataRevisionError",
+    "DataRevisionStore", "DataRevisionTransaction", "PendingDataRefresh", "PendingDataRefreshConflict",
+    "PENDING_DATA_REFRESH_ARCHIVE_ROOT", "PENDING_DATA_REFRESH_PATH", "PENDING_DATA_REFRESH_SCHEMA_VERSION",
+    "REVISION_TRANSACTION_PATH", "REVISION_TRANSACTION_SCHEMA_VERSION",
+    "RevisionCASMismatch", "RevisionConflictError",
     "write_artifact", "write_manifest", "require_allowed_roots",
     "DATA_ASSET_REFERENCE", "OPERATION_RESULT_REFERENCE", "REFERENCE_DISCRIMINATOR",
     "decode_explicit_reference", "decode_reference_value", "encode_explicit_reference",
@@ -253,6 +365,11 @@ __all__ = [
     "canonical_context_payload",
     "ScriptExecutionReceipt", "ScriptRunReport", "ScriptValidationResult", "load_bound_analysis_context", "load_selected_source_ids",
     "SemanticSelectionRef", "SemanticSnapshotRef", "SemanticSnapshotStore",
+    "ANALYTICAL_ARTIFACT_SCHEMA_VERSION", "ANALYTICAL_ARTIFACT_TYPES", "AnalyticalArtifact", "AnalyticalArtifactError",
+    "AnalyticalArtifactValidationError", "DataProfileArtifact", "KpiTableArtifact",
+    "SegmentProfilesArtifact", "SegmentationModelArtifact", "artifact_from_dict",
+    "canonical_content_hash", "canonical_json", "AnalyticsDependencyError", "AnalyticsInputError", "MetricDefinition",
+    "TabularInput", "compute_kpi_table", "ingest_tabular", "fingerprint_source", "load_tabular", "profile_data", "score_segments", "segment_customers",
     "AnalystAnswer", "AnalystBrief", "AnalystSource", "AnalystWorkspace",
     "BusinessReviewAdapter", "DataInsufficiencyConclusion", "EvidenceNote", "IdentityDomainProposal", "AnalyticalRelationshipEvidence", "ReviewFinding", "SpecialistMemo", "SpecialistTask",
     "AcceptedAnalysisBundle", "CurrentObservationFact", "IntegrationRecord", "IntegrationSession", "IntegrationValidation",
@@ -262,7 +379,7 @@ __all__ = [
     "ACTIVE_GENERATION_POINTER_FILENAME", "GENERATION_DIRECTORY", "GENERATION_MANIFEST_FILENAME",
     "GENERATION_PLAN_FILENAME", "GENERATION_STATE_FILENAME", "AgentInvocationReceipt", "InvocationReceiptLedger",
     "RunGenerationSnapshot", "RunLifecycle", "RunLifecycleSnapshot", "GenerationManifest", "RequirementRunGeneration",
-    "RequirementRunExtension", "RunExtension",
+    "DataRefreshNotSafeError", "DataRefreshSupersededError", "RequirementRunExtension", "RunExtension",
     "classify_invocation_terminal_reason", "classify_terminal_reason", "recovery_classification",
     "FREEZE_MARKER_FIELDS", "FreezeMarkers", "ProductContractError", "decode_freeze_markers",
     "validate_freeze_markers",

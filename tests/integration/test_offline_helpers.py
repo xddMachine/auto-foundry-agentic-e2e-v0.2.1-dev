@@ -171,7 +171,9 @@ def test_dashboard_v2_renders_focused_pages_and_keeps_business_tables_visible(tm
     assert 'class="viz viz-bar-list"' in first_domain
     assert '<table>' in first_domain
     assert '<details class="data-detail">' not in first_domain
-    assert "../evidence.html#trace-Q-008-final" in first_domain
+    # Manager domain pages keep the exact trace link on the separate evidence
+    # surface; technical anchors are not part of the visible decision canvas.
+    assert "../evidence.html#trace-Q-008-final" not in first_domain
     ontology = (dashboard / "ontology.html").read_text(encoding="utf-8")
     assert "Canonical mappings" in ontology
     assert "Customer order" in ontology
@@ -250,9 +252,10 @@ def test_site_keeps_default_visuals_nonempty_and_compacts_long_scalar_values() -
     scalar_article = _widget_article(all_domains, "kpi-1")
     scalar_visible = _without_details(scalar_article)
     assert "0.571429" in scalar_visible
-    # The manager card is compact, while the exact reviewed scalar remains in
-    # the requirement's collapsed Technical audit surface.
-    assert "0.571428571428" in all_domains
+    # The manager card is compact; exact technical scalar payloads stay off
+    # the business canvas (and are retained only when a separate audit payload
+    # is supplied).
+    assert "0.571428571428" not in all_domains
     bar_article = _widget_article(all_domains, "bar-1")
     assert "0.0000004" in bar_article
     assert 'aria-label="A: 0.0000004"' in bar_article
@@ -271,18 +274,23 @@ def test_large_audit_tables_keep_a_visible_preview_and_collapse_only_full_detail
     audit = fixture["widgets"][-1]
     audit["title"] = "Reviewed audit queue"
     audit["rows"] = [{"id": f"row-{index}", "status": "reviewed"} for index in range(20)]
+    # This fixture has no V2 plan; mark the deliberately omitted widget with
+    # the persisted audit admission used by a planless legacy fixture.
+    audit["manager_admission"] = {
+        "status": "audit_only",
+        "presentation_audience": "technical_audit",
+    }
+    audit["presentation_audience"] = "technical_audit"
+    audit["presentation_tier"] = "audit"
     pages, _manifest = dashboard_renderer.render_dashboard_site(fixture)
     domain = pages["domains/first.html"]
     domain_text = domain.decode("utf-8") if isinstance(domain, bytes) else domain
-    article = _widget_article(domain_text, "table-1")
-    assert '<div class="table-preview" data-preview-rows="8" data-total-rows="20">' in article
-    assert '<details class="data-detail"><summary>Open full reviewed detail (20 rows)</summary>' in article
-    visible = _without_details(article)
-    # Row identifiers are technical mechanics and remain only in the exact
-    # collapsed audit payload; the visible preview still carries the supplied
-    # reviewed status rows.
-    assert "row-0" not in visible and "reviewed" in visible and "row-19" not in visible
-    assert "row-19" in domain_text
+    # An explicitly audit-named table remains on the separate technical page;
+    # the manager domain never receives a full/raw audit projection.
+    assert 'id="widget-table-1"' not in domain_text
+    audit_page = pages["data-quality-audit.html"]
+    audit_text = audit_page.decode("utf-8") if isinstance(audit_page, bytes) else audit_page
+    assert "Reviewed audit queue" in audit_text and "row-19" in audit_text
 
 
 def test_progress_rows_have_mobile_safe_containment_for_long_relationship_labels() -> None:
@@ -291,6 +299,12 @@ def test_progress_rows_have_mobile_safe_containment_for_long_relationship_labels
         **fixture["widgets"][1],
         "type": "progress",
         "title": "Relationship coverage",
+        "manager_admission": {
+            "status": "audit_only",
+            "presentation_audience": "technical_audit",
+        },
+        "presentation_audience": "technical_audit",
+        "presentation_tier": "audit",
         "bars": [{
             "label": "Source endpoint coverage for the exceptionally long relationship label that must wrap safely",
             "value": "104/109",
@@ -303,9 +317,8 @@ def test_progress_rows_have_mobile_safe_containment_for_long_relationship_labels
     css = pages["assets/dashboard.css"].decode("utf-8")
 
     assert '<table>' in domain_text
-    # Relationship coverage is an audit-only projection under the manager
-    # admission contract.  It remains exact and clickable in the technical
-    # disclosure, while no empty relationship card is published by default.
+    # The omitted widget remains exact and clickable in the technical
+    # disclosure; the renderer does not infer this from its title.
     assert "104/109" not in _without_details(domain_text)
     audit_text = pages["data-quality-audit.html"]
     audit_text = audit_text.decode("utf-8") if isinstance(audit_text, bytes) else audit_text
@@ -345,7 +358,10 @@ def test_dashboard_v3_metadata_groups_requirements_and_keeps_sparse_line_honest(
     assert manifest["overview_widget_ids"] == ["kpi-1"]
     assert manifest["chart_map_ref"] == "products/decision_dashboard_chart_map_v3.json"
     assert "Priority signals" in overview
-    assert "requirement-REQ-01" in domain
+    # Internal requirement IDs remain runtime/audit metadata, not visible
+    # manager copy.  Strip markup before checking the business canvas text.
+    domain_visible_text = unescape(re.sub(r"<[^>]+>", " ", _without_details(domain)))
+    assert "REQ-01" not in domain_visible_text
     assert "Not enough reviewed points to infer a trend." in second_domain
     canonical_css = Path(dashboard_renderer.__file__).resolve().parent.parent / "assets" / "dashboard.css"
     assert (dashboard / "assets" / "dashboard.css").read_bytes() == canonical_css.read_bytes()
@@ -496,18 +512,36 @@ def test_dashboard_v3_req02_fixture_keeps_refund_matches_nonmonetary_and_currenc
             renderer_fn(payload)
     pages, production_manifest = dashboard_renderer.render_dashboard_site(fixture)
     rendered_html = "".join(value.decode("utf-8") if isinstance(value, bytes) else value for name, value in pages.items() if name.endswith(".html"))
+    manager_html = "".join(
+        value.decode("utf-8") if isinstance(value, bytes) else value
+        for name, value in pages.items()
+        if name == "index.html" or name.startswith("domains/")
+    )
+    audit_html = "".join(
+        value.decode("utf-8") if isinstance(value, bytes) else value
+        for name, value in pages.items()
+        if name in {"data-quality-audit.html", "ontology.html", "evidence.html"}
+    )
     assert len(production_manifest["items"]) == 57
     assert rendered_html.count('class="donut-ring"') == 8
-    # Relationship progress pairs are now one readable coverage matrix; the
-    # remaining six progress views retain their original chart geometry.
-    assert rendered_html.count('class="progress-fill"') == 6
+    # This legacy fixture has no Product plan.  All supplied progress bars are
+    # rendered as authored; no title-based source/join filter may change the
+    # count or strip their values.
+    expected_progress_bars = sum(
+        len(widget.get("bars") or [])
+        for widget in fixture["widgets"]
+        if widget.get("type") == "progress"
+    )
+    assert rendered_html.count('class="progress-fill"') == expected_progress_bars
     assert rendered_html.count('class="leaderboard-rank"') == 9
     assert rendered_html.count('class="metric-tile"') == 15
     assert rendered_html.count('class="stack-segment stack-segment-') == 8
     assert rendered_html.count('class="stack-legend"') == 1
-    assert rendered_html.count('class="technical-audit"') >= 1
-    assert "Technical audit &amp; evidence" in rendered_html
-    assert "requirements/REQ-03/accepted/manifest.json" in rendered_html
+    assert 'class="technical-audit"' not in manager_html
+    assert "Technical audit &amp; evidence" not in manager_html
+    assert "requirements/REQ-03/accepted/manifest.json" not in manager_html
+    assert "Technical audit records" in audit_html
+    assert "requirements/REQ-03/accepted/manifest.json" in audit_html
     assert all(total not in rendered_html for total in unsupported_totals)
     fill_start = rendered_html.index('id="widget-req07-fill-proxy"')
     fill_end = rendered_html.index("</article>", fill_start)

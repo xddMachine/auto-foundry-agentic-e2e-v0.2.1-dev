@@ -1,0 +1,30 @@
+{
+  "operations": {
+    "archive_full_hash": {
+      "bytes": 6394746743,
+      "count": 89
+    },
+    "catalog_created": {
+      "bytes": 0,
+      "count": 1
+    },
+    "central_directory_fingerprint": {
+      "bytes": 87824,
+      "count": 88
+    },
+    "member_content_hash": {
+      "bytes": 1767240326,
+      "count": 101
+    },
+    "selected_member_read": {
+      "bytes": 1433625123,
+      "count": 79
+    },
+    "verify_source_full": {
+      "bytes": 6322895656,
+      "count": 88
+    }
+  },
+  "run_id": "RUN-2192ca59eb4a4718",
+  "schema_version": "1"
+}

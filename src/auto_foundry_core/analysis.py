@@ -299,6 +299,9 @@ def _semantic_reuse_snapshot(
     Requirement items are an independent universe.  A target may therefore
     reuse committed records from any other item, regardless of lifecycle
     position, while work, blocked, and technical-failure items remain absent.
+    The projection is anchored *before* the target's current head: this keeps
+    an archived predecessor of a reopened item visible, but never exposes the
+    fresh uncommitted candidate that was created for the next attempt.
     Durable committed IntegrationSession manifests/records and run-level
     committed EntityResolutionWorkspace domains are accepted as semantic
     authority; claimed terminal integration with missing or malformed bytes
@@ -317,83 +320,67 @@ def _semantic_reuse_snapshot(
     if target_item_id not in item_ids:
         raise ValueError("semantic snapshot target is outside lifecycle item universe")
     mode = lifecycle.snapshot.mode
-    eligible_ids: list[str] = []
-    candidate_ids = (
-        item_ids
-        if mode == "requirement"
-        else item_ids[: item_ids.index(target_item_id)]
-    )
-    for item_id in candidate_ids:
-        if item_id == target_item_id:
-            continue
-        try:
-            workspace = ItemWorkspace.load(context, item_id, mode=mode)
-        except FileNotFoundError:
-            # A lifecycle item may be materialized lazily by its independent
-            # supervisor.  No workspace means no committed integration and
-            # therefore no reusable semantic authority.
-            continue
-        state = workspace.state
-        lifecycle_state = str(state.get("lifecycle_state", ""))
-        integration_state = str(state.get("integration_state", ""))
-        committed = IntegrationSession._committed_manifest(workspace)
-        if committed is not None:
-            # A committed manifest is usable only for an analytically
-            # accepted item whose integration outcome is still represented as
-            # pending (crash-safe committed bytes) or integrated.
-            if lifecycle_state != "accepted":
-                raise ValueError(f"committed integration item is not analytically accepted: {item_id}")
-            if integration_state not in {"pending", "integrated"}:
-                raise ValueError(f"committed integration item state is invalid: {item_id}")
+    if mode == "requirement":
+        # ``before_item_id`` is the durable frontier primitive.  The projector
+        # scans all current heads and archived generations, orders them by
+        # commit time, and excludes the target's current head while retaining
+        # its archived predecessors.  This is important after a
+        # data-refresh/reopen: the new head is work with no committed
+        # IntegrationSession yet, whereas the archived head remains valid
+        # semantic evidence for the resumed Analytical Owner.
+        projection = LivingEnterpriseModelProjector.project(
+            context,
+            before_item_id=target_item_id,
+            _lifecycle=lifecycle,
+        )
+    else:
+        # Question Mode retains its contiguous-prefix semantics.  Keep the
+        # strict accepted/integration validation here because this mode does
+        # not use the independent requirement frontier.
+        eligible_ids: list[str] = []
+        for item_id in item_ids[: item_ids.index(target_item_id)]:
+            try:
+                workspace = ItemWorkspace.load(context, item_id, mode=mode)
+            except FileNotFoundError:
+                continue
+            state = workspace.state
+            lifecycle_state = str(state.get("lifecycle_state", ""))
+            integration_state = str(state.get("integration_state", ""))
+            committed = IntegrationSession._committed_manifest(workspace)
+            if committed is not None:
+                if lifecycle_state != "accepted":
+                    raise ValueError(f"committed integration item is not analytically accepted: {item_id}")
+                if integration_state not in {"pending", "integrated"}:
+                    raise ValueError(f"committed integration item state is invalid: {item_id}")
+                if integration_state == "integrated":
+                    if workspace.integration_manifest_ref != "integration/committed/manifest.json":
+                        raise ValueError(f"integrated item manifest ref is invalid: {item_id}")
+                    if workspace.integration_manifest_hash != committed["manifest_hash"]:
+                        raise ValueError(f"integrated item manifest hash is stale: {item_id}")
+                bundle = AcceptedAnalysisBundle.load(workspace)
+                if committed.get("accepted_content_hash") != bundle.content_hash:
+                    raise ValueError("committed integration accepted content binding is stale")
+                if committed.get("accepted_manifest_hash") != bundle.manifest_hash:
+                    raise ValueError("committed integration accepted manifest binding is stale")
+                eligible_ids.append(item_id)
+                continue
             if integration_state == "integrated":
-                if workspace.integration_manifest_ref != "integration/committed/manifest.json":
-                    raise ValueError(f"integrated item manifest ref is invalid: {item_id}")
-                if workspace.integration_manifest_hash != committed["manifest_hash"]:
-                    raise ValueError(f"integrated item manifest hash is stale: {item_id}")
-            # Validate the accepted binding now; the projector repeats this
-            # check while replaying records and will fail closed on corruption.
-            bundle = AcceptedAnalysisBundle.load(workspace)
-            if committed.get("accepted_content_hash") != bundle.content_hash:
-                raise ValueError("committed integration accepted content binding is stale")
-            if committed.get("accepted_manifest_hash") != bundle.manifest_hash:
-                raise ValueError("committed integration accepted manifest binding is stale")
-            eligible_ids.append(item_id)
-            continue
-
-        if integration_state == "integrated":
-            raise ValueError(f"committed integration manifest is missing: {item_id}")
-        if integration_state == "technical_failure":
-            # Integration technical failures are explicitly non-reusable, but
-            # their failure manifest and state binding are still authoritative
-            # integrity records and must validate before being skipped.
-            bundle = AcceptedAnalysisBundle.load(workspace)
-            failure_manifest = IntegrationSession._technical_failure_manifest(workspace, bundle)
-            if failure_manifest is None:
-                raise ValueError(f"technical failure manifest is missing: {item_id}")
-            if workspace.integration_manifest_ref != "integration/technical_failure/manifest.json":
-                raise ValueError(f"integration technical failure manifest ref is invalid: {item_id}")
-            if workspace.integration_manifest_hash != failure_manifest["manifest_hash"]:
-                raise ValueError(f"integration technical failure manifest hash is stale: {item_id}")
-            continue
-        # Work, blocked, and pending/uncommitted integrations are intentionally
-        # invisible to the target's semantic context.
-        if mode != "requirement":
-            # Question Mode retains its contiguous-prefix semantics.  The
-            # independent-item relaxation is deliberately Requirement-only.
-            break
-        continue
-
-    # Project even when no item-local integration is eligible.  The LEM
-    # projector replays every run-level committed entity-resolution domain
-    # after the selected item records, so an early return here would hide
-    # reviewed mappings from the first item that starts after a resolution
-    # owner commits.  ``item_ids=()`` is an intentional empty item selection,
-    # not an instruction to skip the projection.
-    projection = LivingEnterpriseModelProjector.project(
-        context,
-        item_ids=eligible_ids,
-        _lifecycle=lifecycle,
-    )
+                raise ValueError(f"committed integration manifest is missing: {item_id}")
+            if integration_state == "technical_failure":
+                bundle = AcceptedAnalysisBundle.load(workspace)
+                failure_manifest = IntegrationSession._technical_failure_manifest(workspace, bundle)
+                if failure_manifest is None:
+                    raise ValueError(f"technical failure manifest is missing: {item_id}")
+                if workspace.integration_manifest_ref != "integration/technical_failure/manifest.json":
+                    raise ValueError(f"integration technical failure manifest ref is invalid: {item_id}")
+                if workspace.integration_manifest_hash != failure_manifest["manifest_hash"]:
+                    raise ValueError(f"integration technical failure manifest hash is stale: {item_id}")
+                continue
+        projection = LivingEnterpriseModelProjector.project(
+            context,
+            item_ids=eligible_ids,
+            _lifecycle=lifecycle,
+        )
     model = projection.model
     resolution_bindings = tuple(
         sorted(
@@ -424,10 +411,10 @@ def _semantic_reuse_snapshot(
         "source_resolution_domain_ids": resolution_domain_ids,
         "source_resolution_bindings": resolution_bindings,
         "ontology": [
-            item.to_dict() for item in sorted(model.ontology.values(), key=lambda value: value.item_id)
+            item.to_dict() for item in sorted(model.current_ontology.values(), key=lambda value: value.item_id)
         ],
         "relationships": {
-            key: model.relationships[key] for key in sorted(model.relationships)
+            key: model.current_relationships[key] for key in sorted(model.current_relationships)
         },
         # Identity decisions and canonical mappings are committed semantic
         # layers, not transient integration observations.  Expose them in a
@@ -439,11 +426,11 @@ def _semantic_reuse_snapshot(
         ],
         "canonical_mappings": [
             mapping.to_dict()
-            for mapping in sorted(model.canonical_mappings.values(), key=lambda value: value.canonical_id)
+            for mapping in sorted(model.current_canonical_mappings.values(), key=lambda value: value.canonical_id)
         ],
         "prepared_assets": [
             asset.to_dict()
-            for asset in sorted(model.prepared_assets.values(), key=lambda value: value.prepared_asset_id)
+            for asset in sorted(model.current_prepared_assets.values(), key=lambda value: value.prepared_asset_id)
         ],
     }
     unsigned["counts"] = {
@@ -631,6 +618,84 @@ def _inheritance_paths(manifest_path: Path) -> tuple[Path, Path, Path]:
     )
 
 
+def _active_data_revision_workbench(
+    context: RunContext,
+    lifecycle: Any,
+    *,
+    telemetry: Any = None,
+) -> tuple[DataRoomWorkbench, str] | None:
+    """Resolve one immutable physical binding for an active generation.
+
+    ``current_revision.json`` is an upload pointer, not an analytical
+    binding.  Requirement contexts therefore resolve through the shared
+    generation-aware resolver and, when a revision is available, reopen the
+    exact archived archive/catalog/inventory recorded by that revision.  The
+    caller's archive/workbench is only used by legacy contexts that have no
+    published revision yet.
+    """
+
+    from .data_revisions import DataRevisionStore
+
+    store = DataRevisionStore(context)
+    # Always pass the lifecycle generation explicitly.  The shared resolver
+    # handles the manifest-less G-0001 bootstrap as well as generation
+    # manifests, and keeps the binding decision in one program-owned path.
+    revision = store.active_generation_revision(
+        generation_id=lifecycle.generation_id,
+        generation_metadata=lifecycle.generation_metadata,
+    )
+    if revision is None:
+        return None
+
+    # DataRevisionStore.load() has already validated the canonical catalog,
+    # archive hash, source stat, central-directory fingerprint, and physical
+    # inventory.  Rehydrate only the catalog entries needed by the workbench;
+    # no mutable catalog path or current pointer is consulted here.
+    catalog_path = Path(revision.catalog_path)
+    if catalog_path.is_symlink() or not catalog_path.is_file():
+        raise ValueError("active data revision catalog is not a regular file")
+    try:
+        raw_catalog = catalog_path.read_bytes()
+    except OSError as exc:
+        raise ValueError("active data revision catalog is unreadable") from exc
+    if _sha256_bytes(raw_catalog) != revision.catalog_sha256:
+        raise ValueError("active data revision catalog hash does not match manifest")
+    try:
+        catalog_payload = json.loads(raw_catalog.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("active data revision catalog is unreadable") from exc
+    if not isinstance(catalog_payload, Mapping):
+        raise ValueError("active data revision catalog is invalid")
+    if (
+        catalog_payload.get("catalog_key") != revision.catalog_key
+        or catalog_payload.get("source_hash") != revision.archive_sha256
+        or catalog_payload.get("catalog_schema_version") != revision.catalog_schema_version
+        or catalog_payload.get("core_version") != revision.catalog_core_version
+    ):
+        raise ValueError("active data revision catalog identity does not match manifest")
+    raw_entries = catalog_payload.get("entries")
+    if not isinstance(raw_entries, list):
+        raise ValueError("active data revision catalog entries are invalid")
+    try:
+        entries = tuple(DataRoomCatalogEntry.from_dict(value) for value in raw_entries)
+        members = tuple(DataRoomMember.from_dict(value) for value in revision.physical_inventory)
+    except (TypeError, KeyError, ValueError) as exc:
+        raise ValueError("active data revision physical inventory is invalid") from exc
+    workbench = DataRoomWorkbench(
+        context,
+        revision.archive_path,
+        telemetry=telemetry,
+        _bound_members=members,
+        _bound_archive_hash=revision.archive_sha256,
+        _bound_source_stat=revision.archive_source_stat,
+        _bound_central_directory_fingerprint=revision.central_directory_fingerprint,
+        _bound_catalog_entries=entries,
+        _bound_catalog_path=catalog_path,
+        _bound_catalog_key=revision.catalog_key,
+    )
+    return workbench, revision.catalog_sha256
+
+
 @contextmanager
 def _transition_lock(manifest_path: Path):
     """Serialize context transition reconciliation and publication."""
@@ -756,11 +821,12 @@ def _implementation_transition_chain(
         raise ValueError("implementation transition item is not in the lifecycle")
     target_position = item_ids.index(target_item_id)
     if not transitions:
-        normalized_catalog_core = str(catalog_core)
-        if normalized_catalog_core.startswith("core"):
-            normalized_catalog_core = normalized_catalog_core[4:]
-        if normalized_catalog_core != str(target_core).removeprefix("core"):
-            raise ValueError("implementation transition chain is required for the catalog core")
+        # A persisted catalog's implementation version is lineage metadata,
+        # not a lock on later readers.  When there is no transition journal,
+        # the normal manifest/hash/schema/source-identity checks at the bound
+        # context boundary remain authoritative; requiring the catalog core to
+        # equal the currently running core would strand valid historical
+        # contexts after an ordinary core upgrade.
         return {}
 
     expected_catalog_core = str(catalog_core)
@@ -2850,19 +2916,48 @@ class CatalogSnapshot:
         return self.source_hash
 
     @classmethod
-    def from_workbench(cls, workbench: DataRoomWorkbench) -> "CatalogSnapshot":
+    def from_workbench(
+        cls,
+        workbench: DataRoomWorkbench,
+        *,
+        expected_content_hash: str | None = None,
+    ) -> "CatalogSnapshot":
         entries = workbench.catalog()
         room = workbench.data_room
-        path = room.catalog_path
-        if not path.is_file():
-            raise ValueError("canonical catalog was not materialized")
+        path = _regular_file(
+            room.catalog_path,
+            root=workbench.context.run_root,
+            label="canonical catalog",
+        )
+        try:
+            raw_catalog = path.read_bytes()
+        except OSError as exc:
+            raise ValueError("canonical catalog is unreadable") from exc
+        content_hash = _sha256_bytes(raw_catalog)
+        if expected_content_hash is not None and content_hash != expected_content_hash:
+            raise ValueError("canonical catalog content hash does not match data revision")
+        try:
+            payload = json.loads(raw_catalog.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("canonical catalog is unreadable") from exc
+        if not isinstance(payload, Mapping):
+            raise ValueError("canonical catalog must be an object")
+        if (
+            payload.get("catalog_schema_version") != room.catalog_schema_version
+            or payload.get("catalog_key") != room.catalog_key
+            or payload.get("source_hash") != room.archive_ref.content_hash
+        ):
+            raise ValueError("canonical catalog identity does not match bound source")
+        catalog_core_version = payload.get("core_version")
+        if not isinstance(catalog_core_version, str) or not catalog_core_version:
+            raise ValueError("canonical catalog core version is invalid")
         return cls(
             path=path,
-            content_hash=_sha256_file(path),
+            content_hash=expected_content_hash or content_hash,
             catalog_key=room.catalog_key,
             catalog_schema_version=room.catalog_schema_version,
             source_hash=room.archive_ref.content_hash or "",
-            core_version=workbench.context.core_version,
+            core_version=catalog_core_version,
             entries=tuple(entries),
             counts=room.catalog_counts(entries),
         )
@@ -3147,6 +3242,22 @@ class BoundAnalysisContext:
         if any(path.exists() or path.is_symlink() for path in journal_paths):
             raise ValueError("normal requirement context cannot use transition or inheritance artifacts")
 
+        if workbench is not None and workbench.context is not context:
+            raise ValueError("workbench must use the same RunContext")
+        # A generation-bound immutable revision is authoritative whenever one
+        # exists.  This intentionally ignores a caller's stale archive or
+        # workbench while preserving the legacy caller binding when the run
+        # predates the data-revision store.
+        active_binding = _active_data_revision_workbench(
+            context,
+            lifecycle,
+            telemetry=telemetry,
+        )
+        active_catalog_hash: str | None = None
+        if active_binding is not None:
+            workbench, active_catalog_hash = active_binding
+        elif workbench is None:
+            workbench = DataRoomWorkbench(context, archive, telemetry=telemetry)
         # This call only reads authoritative item state and committed
         # IntegrationSession manifests.  It must happen without loading a
         # predecessor BoundAnalysisContext or invoking any migration helper.
@@ -3156,12 +3267,11 @@ class BoundAnalysisContext:
             target_item_id=item_workspace.item_id,
         )
         semantic_snapshot_ref = _publish_semantic_snapshot(context, semantic_snapshot)
-        if workbench is None:
-            workbench = DataRoomWorkbench(context, archive, telemetry=telemetry)
-        elif workbench.context is not context:
-            raise ValueError("workbench must use the same RunContext")
         source_identity = workbench.data_room.archive_ref
-        snapshot = CatalogSnapshot.from_workbench(workbench)
+        snapshot = CatalogSnapshot.from_workbench(
+            workbench,
+            expected_content_hash=active_catalog_hash,
+        )
         physical_members = [member.to_dict() for member in workbench.data_room.members()]
         physical_inventory = {
             "source_stat": dict(workbench.data_room.source_stat_signature),

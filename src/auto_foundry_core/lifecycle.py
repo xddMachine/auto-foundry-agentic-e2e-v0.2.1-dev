@@ -166,12 +166,15 @@ _GENERATION_MANIFEST_FIELDS = frozenset(
         "parent_state_hash",
         "parent_plan_hash",
         "added_item_ids",
+        "reopened_item_ids",
         "cumulative_item_ids",
         "state_ref",
         "plan_ref",
         "state_manifest_hash",
         "plan_hash",
         "request_hash",
+        "data_revision_ref",
+        "data_revision_hash",
         "product_manifest_ref",
         "created_at",
         "manifest_hash",
@@ -742,6 +745,7 @@ class RunGenerationSnapshot:
     parent_state_hash: str
     parent_plan_hash: str
     added_item_ids: tuple[str, ...]
+    reopened_item_ids: tuple[str, ...]
     cumulative_item_ids: tuple[str, ...]
     state_path: str
     plan_path: str
@@ -749,6 +753,8 @@ class RunGenerationSnapshot:
     state_manifest_hash: str
     plan_hash: str
     request_hash: str
+    data_revision_ref: str | None
+    data_revision_hash: str | None
     product_manifest_ref: str
     created_at: str
     manifest_hash: str
@@ -982,18 +988,67 @@ class RunLifecycle:
             if not _is_sha256(manifest.get(field_name)):
                 raise ValueError(f"generation manifest {field_name} is invalid")
         added = manifest.get("added_item_ids")
+        reopened = manifest.get("reopened_item_ids")
         cumulative = manifest.get("cumulative_item_ids")
         if (
             not isinstance(added, list)
             or len(set(added)) != len(added)
             or any(not isinstance(item_id, str) for item_id in added)
+            or not isinstance(reopened, list)
+            or len(set(reopened)) != len(reopened)
+            or any(not isinstance(item_id, str) for item_id in reopened)
             or not isinstance(cumulative, list)
             or len(set(cumulative)) != len(cumulative)
             or any(not isinstance(item_id, str) for item_id in cumulative)
         ):
             raise ValueError("generation manifest item IDs are invalid")
+        for item_id in (*added, *reopened, *cumulative):
+            try:
+                _simple_component(item_id, "generation manifest item_id")
+            except (TypeError, ValueError) as exc:
+                raise ValueError("generation manifest item IDs are invalid") from exc
         if any(item_id not in cumulative for item_id in added):
             raise ValueError("generation manifest added IDs must be present in the current portfolio")
+        if any(item_id not in cumulative for item_id in reopened):
+            raise ValueError("generation manifest reopened IDs must be present in the current portfolio")
+        data_ref = manifest.get("data_revision_ref")
+        data_hash = manifest.get("data_revision_hash")
+        if data_ref is None:
+            if data_hash is not None:
+                raise ValueError("generation manifest data revision hash requires a manifest reference")
+        else:
+            if (
+                not isinstance(data_ref, str)
+                or not data_ref
+                or Path(data_ref).is_absolute()
+                or data_ref != Path(data_ref).as_posix()
+                or not data_ref.startswith("data_room/revisions/")
+                or not data_ref.endswith("/revision_manifest.json")
+            ):
+                raise ValueError("generation manifest data revision reference is invalid")
+            data_parts = Path(data_ref).parts
+            revision_id = data_parts[2] if len(data_parts) == 4 else ""
+            if (
+                len(data_parts) != 4
+                or data_parts[:2] != ("data_room", "revisions")
+                or not revision_id.startswith("D-")
+                or not revision_id[2:].isdigit()
+                or len(revision_id[2:]) < 4
+                or data_parts[3] != "revision_manifest.json"
+            ):
+                raise ValueError("generation manifest data revision reference is invalid")
+            data_path = _resolve_run_path_lexical(context, data_ref, label="generation data revision manifest")
+            _assert_no_symlink_components(data_path, root=context.run_root)
+            if data_path.is_symlink() or not data_path.is_file():
+                raise ValueError("generation manifest data revision manifest is missing")
+            if not _is_sha256(data_hash):
+                raise ValueError("generation manifest data revision hash is invalid")
+            try:
+                data_value = json.loads(data_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("generation manifest data revision manifest is invalid") from exc
+            if not isinstance(data_value, Mapping) or data_value.get("manifest_hash") != data_hash or _manifest_hash(data_value) != data_hash:
+                raise ValueError("generation manifest data revision hash does not match disk")
         parent_id = str(manifest["parent_generation_id"])
         parent_suffix = parent_id[2:] if parent_id.startswith("G-") else ""
         if not parent_suffix.isdigit() or len(parent_suffix) != 4 or int(parent_suffix) != int(manifest["generation_ordinal"]) - 1:
@@ -1031,6 +1086,7 @@ class RunLifecycle:
             parent_state_hash=str(manifest["parent_state_hash"]),
             parent_plan_hash=str(manifest["parent_plan_hash"]),
             added_item_ids=tuple(added),
+            reopened_item_ids=tuple(reopened),
             cumulative_item_ids=tuple(cumulative),
             state_path=str(state_path),
             plan_path=str(plan_path),
@@ -1038,6 +1094,8 @@ class RunLifecycle:
             state_manifest_hash=str(manifest["state_manifest_hash"]),
             plan_hash=str(manifest["plan_hash"]),
             request_hash=str(manifest["request_hash"]),
+            data_revision_ref=None if data_ref is None else str(data_ref),
+            data_revision_hash=None if data_hash is None else str(data_hash),
             product_manifest_ref=str(manifest["product_manifest_ref"]),
             created_at=str(manifest["created_at"]),
             manifest_hash=str(manifest["manifest_hash"]),
@@ -1254,6 +1312,18 @@ class RunLifecycle:
     @property
     def added_item_ids(self) -> tuple[str, ...]:
         return () if self._generation is None else self._generation.added_item_ids
+
+    @property
+    def reopened_item_ids(self) -> tuple[str, ...]:
+        return () if self._generation is None else self._generation.reopened_item_ids
+
+    @property
+    def data_revision_ref(self) -> str | None:
+        return None if self._generation is None else self._generation.data_revision_ref
+
+    @property
+    def data_revision_hash(self) -> str | None:
+        return None if self._generation is None else self._generation.data_revision_hash
 
     @property
     def cumulative_item_ids(self) -> tuple[str, ...]:
@@ -1480,6 +1550,8 @@ class RunLifecycle:
         current = self.state
         if current == target:
             return
+        if target not in _TRANSITIONS.get(current, ()):
+            raise ValueError(f"illegal lifecycle transition: {current} -> {target}")
         state = dict(self._state)
         state["status"] = target
         state.pop("resume_status", None)
@@ -1563,6 +1635,118 @@ class RunLifecycle:
             return value in {"complete", "complete_with_limits", "terminal", "accepted", "reviewed", "accepted_with_limits"}
         return value is True
 
+    def _validated_integration_boundary(
+        self,
+        item: Any,
+        state: Mapping[str, Any],
+        *,
+        blocked: bool = False,
+    ) -> bool:
+        """Require the same immutable integration boundary used by Planner.
+
+        Item labels are projections and are not sufficient evidence for a
+        lifecycle transition.  When an ``ItemWorkspace`` (or a run-local
+        item path) is available, use the pure committed-manifest inspector
+        so accepted bundle, records, artifact publication, and item-state
+        bindings are checked together.  Mapping-only callers may provide the
+        inspector's typed result explicitly; an unvalidated ``integrated``
+        label is intentionally not trusted.
+        """
+
+        item_id = str(state.get("item_id", ""))
+        if not item_id:
+            return False
+        expected_stage = "not_committed" if blocked else "committed"
+        expected_state = "pending" if blocked else "integrated"
+        terminal = state.get("terminal_outcome")
+        terminal_status = terminal.get("status") if isinstance(terminal, Mapping) else None
+        terminal_outcome = terminal.get("outcome") if isinstance(terminal, Mapping) else None
+        preacceptance_failure = not blocked and (
+            state.get("lifecycle_state") == "technical_failure"
+            or terminal_status == "technical_failure"
+            or terminal_outcome == "technical_failure"
+        )
+        if preacceptance_failure:
+            # A pre-acceptance failure is a no-integration terminal boundary.
+            # Mapping callers must carry the same typed proof that Planner
+            # projected; an item label or generic technical-failure state is
+            # never sufficient to advance the run lifecycle.
+            if (
+                state.get("lifecycle_state") != "technical_failure"
+                or terminal_status != "technical_failure"
+                or terminal_outcome != "technical_failure"
+                or state.get("integration_state") != "pending"
+            ):
+                return False
+            expected_stage = "technical_failure"
+            expected_state = "pending"
+        technical_boundary = (
+            not blocked
+            and not preacceptance_failure
+            and state.get("integration_state") == "technical_failure"
+        )
+        if technical_boundary:
+            expected_stage = "technical_failure"
+            expected_state = "technical_failure"
+        if state.get("integration_state", "pending") != expected_state:
+            return False
+
+        # Prefer the pure on-disk boundary whenever the caller supplies a
+        # workspace/context.  It is read-only and performs no projection or
+        # telemetry side effects.
+        context = getattr(item, "context", None)
+        item_root = getattr(item, "item_root", None)
+        if isinstance(context, RunContext):
+            try:
+                from .requirement_planning import inspect_committed_integration
+
+                view = inspect_committed_integration(context, item_id)
+            except Exception:
+                return False
+            return (
+                view.get("valid") is True
+                and view.get("stage") == expected_stage
+                and (
+                    not (technical_boundary or preacceptance_failure)
+                    or view.get("recovery_exhausted") is True
+                )
+                and (not preacceptance_failure or view.get("pre_acceptance") is True)
+            )
+        if isinstance(item_root, (str, Path)):
+            try:
+                from .requirement_planning import inspect_committed_integration
+
+                view = inspect_committed_integration(Path(item_root), item_id)
+            except Exception:
+                return False
+            return (
+                view.get("valid") is True
+                and view.get("stage") == expected_stage
+                and (
+                    not (technical_boundary or preacceptance_failure)
+                    or view.get("recovery_exhausted") is True
+                )
+                and (not preacceptance_failure or view.get("pre_acceptance") is True)
+            )
+
+        # A serialized reconciliation caller can carry the pure inspector
+        # view alongside its item state.  This remains a typed boundary (the
+        # view must explicitly prove validity and the expected stage), unlike
+        # trusting the weaker ``integration_state`` label by itself.
+        validation_key = "blocked_integration_validation" if blocked else "committed_integration_validation"
+        validation = state.get(validation_key)
+        return (
+            isinstance(validation, Mapping)
+            and validation.get("valid") is True
+            and validation.get("stage") == expected_stage
+            and (
+                not (technical_boundary or preacceptance_failure)
+                or validation.get("recovery_exhausted") is True
+            )
+            and (not preacceptance_failure or validation.get("pre_acceptance") is True)
+            and (not preacceptance_failure or state.get("integration_stage") == "technical_failure")
+        )
+
     @staticmethod
     def _optimizer_limit(value: Any) -> bool:
         if value is None:
@@ -1639,7 +1823,8 @@ class RunLifecycle:
             product_terminal_status = product_status
         if optimizer_terminal is None and optimizer_status is not None:
             optimizer_terminal = optimizer_status
-        item_states = [self._coerce_item_state(item) for item in items]
+        raw_items = tuple(items)
+        item_states = [self._coerce_item_state(item) for item in raw_items]
         if tuple(sorted(str(item.get("item_id")) for item in item_states)) != tuple(sorted(self.item_ids)):
             raise ValueError("reconcile item IDs do not match run lifecycle")
         outcomes = [self._outcome(item) for item in item_states]
@@ -1647,15 +1832,40 @@ class RunLifecycle:
             outcome in {"accepted", "accepted_with_limits", "technical_failure", "blocked_by_evidence"}
             for outcome in outcomes
         )
-        accepted_items = [item for item, outcome in zip(item_states, outcomes) if outcome in {"accepted", "accepted_with_limits"}]
+        accepted_items = [
+            (item, raw)
+            for item, raw, outcome in zip(item_states, raw_items, outcomes)
+            if outcome in {"accepted", "accepted_with_limits"}
+        ]
+        blocked_items = [
+            (item, raw)
+            for item, raw, outcome in zip(item_states, raw_items, outcomes)
+            if outcome == "blocked_by_evidence"
+        ]
+        technical_failure_items = [
+            (item, raw)
+            for item, raw, outcome in zip(item_states, raw_items, outcomes)
+            if outcome == "technical_failure"
+        ]
+        # Accepted business evidence is never discarded or reclassified as an
+        # integration success.  An explicit exhausted technical-failure
+        # manifest is a settled limited boundary; historical/recoverable
+        # failure evidence remains actionable.
         all_integrated = all(
-            item.get("integration_state") in {"integrated", "technical_failure"} for item in accepted_items
+            self._validated_integration_boundary(raw, item, blocked=False)
+            for item, raw in accepted_items
+        ) and all(
+            self._validated_integration_boundary(raw, item, blocked=True)
+            for item, raw in blocked_items
+        ) and all(
+            self._validated_integration_boundary(raw, item, blocked=False)
+            for item, raw in technical_failure_items
         )
         products_terminal = self._is_product_terminal(product_terminal_status)
         limited = any(
             outcome in {"accepted_with_limits", "technical_failure", "blocked_by_evidence"} for outcome in outcomes
         ) or any(
-            item.get("integration_state") == "technical_failure" for item in accepted_items
+            item.get("integration_state") == "technical_failure" for item, _raw in accepted_items
         ) or self._optimizer_limit(optimizer_terminal)
 
         if self.state == "initialized":

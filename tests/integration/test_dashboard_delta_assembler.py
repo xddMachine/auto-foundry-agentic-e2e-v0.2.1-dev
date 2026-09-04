@@ -22,6 +22,7 @@ import shutil
 import sys
 import time
 from typing import Any, Mapping
+import zipfile
 
 import pytest
 
@@ -56,16 +57,24 @@ dashboard_renderer = _load_script(
 
 from auto_foundry_core import (  # noqa: E402
     ItemWorkspace,
+    KnowledgeDelta,
+    LEMRef,
     PreparedAssetRegistry,
     RequirementExecutionGroup,
     RequirementExecutionPlan,
     RequirementRecord,
     RequirementRunExtension,
     RequirementSupervisorWorkspace,
+    ProductCandidate,
+    ProductReviewStore,
     RunContext,
     RunLifecycle,
 )
 from auto_foundry_core.integration import IntegrationSession  # noqa: E402
+from auto_foundry_core.data_revisions import DataRevisionStore  # noqa: E402
+from auto_foundry_core.lem_projection import LivingEnterpriseModelProjector  # noqa: E402
+from auto_foundry_core.analytical_artifacts import DataProfileArtifact  # noqa: E402
+from auto_foundry_core.product_review import canonical_hash  # noqa: E402
 
 
 def _record(item_id: str) -> RequirementRecord:
@@ -77,19 +86,58 @@ def _record(item_id: str) -> RequirementRecord:
     )
 
 
-def _complete_item(context: RunContext, item: ItemWorkspace, invocation: str) -> None:
+def _data_profile_artifact(item_id: str, *, marker: str = "default") -> DataProfileArtifact:
+    """Build one deterministic typed artifact for delta provenance tests."""
+
+    return DataProfileArtifact(
+        artifact_id=f"artifact-{item_id.lower()}-{marker}",
+        profile={"columns": [{"name": "customer_id", "nulls": 0}], "marker": marker},
+        requirement_id=item_id,
+        dataset_fingerprint=hashlib.sha256(f"dataset:{item_id}:{marker}".encode()).hexdigest(),
+        source_refs=("synthetic:dataset",),
+        method="reviewed_fixture",
+        created_at="2026-01-01T00:00:00+00:00",
+    )
+
+
+def _complete_item(
+    context: RunContext,
+    item: ItemWorkspace,
+    invocation: str,
+    *,
+    knowledge_delta: KnowledgeDelta | None = None,
+    analytical_artifact: DataProfileArtifact | None = None,
+    accepted_payload: Mapping[str, Any] | None = None,
+    accepted_files: Mapping[str, bytes] | None = None,
+) -> None:
     """Create the normal accepted bundle and one typed committed metric."""
 
     item.write_plan({"item_id": item.item_id, "offline": True})
-    item.write_draft(
-        {
-            "item_id": item.item_id,
-            "answer": "bounded",
-            "limitations": ["synthetic only"],
-        }
-    )
+    for relative, payload in (accepted_files or {}).items():
+        path = item.item_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+    draft_payload: dict[str, Any] = {
+        "item_id": item.item_id,
+        "answer": "bounded",
+        "limitations": ["synthetic only"],
+    }
+    if accepted_payload:
+        draft_payload.update(copy.deepcopy(dict(accepted_payload)))
+    item.write_draft(draft_payload)
+    artifact_ref = "work/analytical_artifact.json"
+    if analytical_artifact is not None:
+        # Simulate the Analytical Owner's canonical work-area output. The
+        # exact ref is accepted before the downstream integration agent reads
+        # it; this fixture must not bypass that handoff.
+        artifact_path = item.item_root / artifact_ref
+        artifact_path.write_bytes(analytical_artifact.to_json().encode("utf-8"))
     item.record_review("accept", reviewer_ref="synthetic-reviewer")
-    item.accept(accepted_refs=("work/plan.json",))
+    accepted_refs = ["work/plan.json"]
+    accepted_refs.extend(sorted((accepted_files or {}).keys()))
+    if analytical_artifact is not None:
+        accepted_refs.append(artifact_ref)
+    item.accept(accepted_refs=tuple(accepted_refs))
     session = IntegrationSession.create(
         context,
         item,
@@ -106,6 +154,18 @@ def _complete_item(context: RunContext, item: ItemWorkspace, invocation: str) ->
         value=7,
         population=10,
     )
+    if knowledge_delta is not None:
+        session.add_knowledge_delta(
+            knowledge_delta,
+            scope=item.item_id,
+            evidence_refs=("answer_content.json",),
+        )
+    if analytical_artifact is not None:
+        session.add_accepted_analytical_artifact(
+            artifact_ref,
+            scope=item.item_id,
+            evidence_refs=("answer_content.json",),
+        )
     if session.fidelity_result is None:
         session.record_fidelity_review(
             "accept",
@@ -149,8 +209,8 @@ def _rewrite_child_receipt_product_binding(context: RunContext, receipt_path: Pa
     _canonical_write(product_path, product)
 
 
-def test_planless_legacy_receipt_is_validated_before_plan_field_normalization(tmp_path: Path) -> None:
-    """The old canonical shape is valid only as an explicit migration target."""
+def test_planless_legacy_receipt_is_rejected_after_delta_schema_bump(tmp_path: Path) -> None:
+    """Receipts from the deprecated planless shape are no longer accepted."""
 
     context, parent_records, _parent_receipt, _parent_bytes = _seed_parent(tmp_path)
     _append(context, parent_records, ("REQ-B",), (("REQ-A", "REQ-B"),))
@@ -163,41 +223,8 @@ def test_planless_legacy_receipt_is_validated_before_plan_field_normalization(tm
         legacy.pop(field, None)
         legacy["request_binding"].pop(field, None)
     _rewrite_child_receipt_product_binding(context, receipt_path, legacy)
-    raw_bytes = receipt_path.read_bytes()
-    normalized = dashboard_delta._normalize_existing_presentation_receipt(legacy)
-    assert raw_bytes == dashboard_delta._canonical_bytes(legacy)
-    # This is the exact production failure mode: normalizing in memory adds
-    # fields that are absent from the historical raw receipt, so comparing the
-    # raw bytes against the normalized object is necessarily wrong.
-    assert raw_bytes != dashboard_delta._canonical_bytes(normalized)
-
-    dashboard_delta._validate_delta_output(
-        context,
-        receipt_path,
-        normalized,
-        legacy_raw_receipt=legacy,
-        legacy_raw_bytes=raw_bytes,
-    )
-    with pytest.raises(dashboard_delta.DashboardDeltaError, match="not canonical"):
-        dashboard_delta._validate_delta_output(context, receipt_path, normalized)
-
-    tampered = json.loads(json.dumps(legacy))
-    tampered["output_hashes"]["fixture_sha256"] = "0" * 64
-    tampered_bytes = dashboard_delta._canonical_bytes(tampered)
-    with pytest.raises(dashboard_delta.DashboardDeltaError, match="output hash mismatch"):
-        dashboard_delta._validate_delta_output(
-            context,
-            receipt_path,
-            dashboard_delta._normalize_existing_presentation_receipt(tampered),
-            legacy_raw_receipt=tampered,
-            legacy_raw_bytes=tampered_bytes,
-        )
-
-    plan_bearing = json.loads(json.dumps(legacy))
-    plan_bearing["presentation_plan_ref"] = None
-    plan_bearing_bytes = dashboard_delta._canonical_bytes(plan_bearing)
-    with pytest.raises(dashboard_delta.DashboardDeltaError, match="schema is not exact"):
-        dashboard_delta._validate_planless_legacy_receipt_shape(plan_bearing, raw_bytes=plan_bearing_bytes)
+    with pytest.raises(dashboard_delta.DashboardDeltaError, match="schema fields are not exact"):
+        _assemble(context, {"kind": "existing", "group_id": "group-01"})
 
 
 def _tree_bytes(root: Path) -> dict[str, bytes]:
@@ -241,11 +268,11 @@ def _tree_state(root: Path) -> dict[str, tuple[str, int, int, bytes | str | None
     return state
 
 
-def test_v1_presentation_receipt_migrates_to_v2_and_exact_retry_is_stable(
+def test_v1_presentation_plan_is_rejected_after_delta_schema_bump(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A bound V1 child upgrades once to V2 without touching an exact retry."""
+    """A legacy V1 presentation plan is rejected by the current V2 contract."""
 
     context, parent_records, _parent_receipt, _parent_bytes = _seed_parent(tmp_path)
     _append(context, parent_records, ("REQ-B",), (("REQ-A", "REQ-B"),))
@@ -256,7 +283,6 @@ def test_v1_presentation_receipt_migrates_to_v2_and_exact_retry_is_stable(
     # a real V1 plan.  The parent generation manifest is needed by the public
     # presentation inventory lineage check in this synthetic run.
     _assemble(context, route)
-    generation_root = context.resolve_product_path("generations/G-0002")
     generation_manifest = context.resolve_product_path("generations/G-0001/product_manifest.json")
     generation_manifest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(context.resolve_product_path("product_manifest.json"), generation_manifest)
@@ -276,7 +302,6 @@ def test_v1_presentation_receipt_migrates_to_v2_and_exact_retry_is_stable(
         ),
     )
     fixture_ref = "products/generations/G-0002/dashboard/dashboard_fixture_v4.json"
-    chart_map_ref = "products/generations/G-0002/dashboard/dashboard_chart_map_v4.json"
     inventory = dashboard_assembler.business_presentation_inventory(
         context,
         fixture_ref=fixture_ref,
@@ -297,7 +322,7 @@ def test_v1_presentation_receipt_migrates_to_v2_and_exact_retry_is_stable(
     }
     v1_ref = "extensions/G-0002/predecessor.json"
     v1 = {
-        "schema_version": dashboard_assembler.PRESENTATION_PLAN_SCHEMA,
+        "schema_version": "dashboard.business_presentation_plan.v1",
         "run_id": context.run_id,
         "generation_id": "G-0002",
         "supervisor_plan_ref": inventory["supervisor_plan_ref"],
@@ -309,84 +334,13 @@ def test_v1_presentation_receipt_migrates_to_v2_and_exact_retry_is_stable(
         "manager_widget_ids": [v1_entry["widget_id"]],
         "manager_entries": [v1_entry],
     }
-    dashboard_assembler._validate_presentation_plan_shape(v1)
     v1_path = context.resolve_run_path(v1_ref)
     _canonical_write(v1_path, v1)
-    v1_receipt = _assemble(context, route, presentation_plan_ref=v1_ref)
-    assert v1_receipt["presentation_plan_ref"] == v1_ref
-    assert v1_receipt["presentation_plan_sha256"] == hashlib.sha256(v1_path.read_bytes()).hexdigest()
-    v1_fixture = json.loads((generation_root / "dashboard/dashboard_fixture_v4.json").read_text(encoding="utf-8"))
-    assert v1_fixture.get("presentation_plan_schema") is None
-    assert v1_fixture["manager_entries"] == [v1_entry]
-
-    # Construct a shape-valid V2 successor that explicitly preserves the V1
-    # predecessor envelope and partitions the real fixture's visual universe.
-    visual_inventory = dashboard_assembler.business_presentation_visual_inventory(
-        context,
-        fixture_ref=fixture_ref,
-        chart_map_ref=chart_map_ref,
-    )
-    first_id = v1_entry["widget_id"]
-    first_visual = next(entry for entry in visual_inventory["visual_entries"] if entry["widget_id"] == first_id)
-    audit_visual = next(entry for entry in visual_inventory["visual_entries"] if entry["widget_id"] != first_id)
-    v2_manager_entry = dashboard_assembler._v2_manager_entry_from_visual(first_visual)
-    v2_manager_entry.update(copy.deepcopy(v1_entry))
-    v2_ref = "extensions/G-0002/business_presentation_plan.json"
-    v2 = {
-        "schema_version": dashboard_assembler.PRESENTATION_PLAN_V2_SCHEMA,
-        "run_id": context.run_id,
-        "generation_id": "G-0002",
-        "supervisor_plan_ref": inventory["supervisor_plan_ref"],
-        "supervisor_plan_sha256": inventory["supervisor_plan_sha256"],
-        "item_order": inventory["item_order"],
-        "input_items": inventory["input_items"],
-        "parent": inventory["parent"],
-        "reviewer_ref": "synthetic-v2-reviewer",
-        "manager_widget_ids": [first_id],
-        "manager_entries": [v2_manager_entry],
-        "manager_visual_widget_ids": [first_id],
-        "audit_visual_widget_ids": [audit_visual["widget_id"]],
-        "visual_entries": [first_visual, audit_visual],
-        "source_bindings": {
-            "fixture_ref": visual_inventory["fixture_ref"],
-            "fixture_sha256": visual_inventory["fixture_sha256"],
-            "chart_map_ref": visual_inventory["chart_map_ref"],
-            "chart_map_sha256": visual_inventory["chart_map_sha256"],
-            "previous_plan_ref": v1_ref,
-            "previous_plan_sha256": hashlib.sha256(v1_path.read_bytes()).hexdigest(),
-            "previous_manager_widget_ids": [first_id],
-            "previous_manager_entries": [v1_entry],
-            "previous_manager_visual_widget_ids": [first_id],
-            "previous_audit_visual_widget_ids": [audit_visual["widget_id"]],
-            "previous_visual_entries": [first_visual, audit_visual],
-        },
-    }
-    dashboard_assembler._validate_presentation_plan_v2_shape(v2)
-    v2_path = context.resolve_run_path(v2_ref)
-    _canonical_write(v2_path, v2)
-
-    migrated = _assemble(context, route, presentation_plan_ref=v2_ref)
-    assert migrated["presentation_plan_ref"] == v2_ref
-    assert migrated["presentation_plan_sha256"] == hashlib.sha256(v2_path.read_bytes()).hexdigest()
-    migrated_fixture = json.loads((generation_root / "dashboard/dashboard_fixture_v4.json").read_text(encoding="utf-8"))
-    assert migrated_fixture["presentation_plan_schema"] == dashboard_assembler.PRESENTATION_PLAN_V2_SCHEMA
-    assert migrated_fixture["manager_visual_widget_ids"] == [first_id]
-    assert migrated_fixture["audit_visual_widget_ids"] == [audit_visual["widget_id"]]
-
-    product_tree = context.resolve_product_path("")
-    before_retry = _tree_state(product_tree)
-    retry = _assemble(context, route, presentation_plan_ref=v2_ref)
-    assert retry == migrated
-    assert _tree_state(product_tree) == before_retry
-    assert not any(
-        name.endswith(".dashboard_transaction.json")
-        or name == ".dashboard_transaction.previous"
-        or name == ".dashboard.staging"
-        or name == ".dashboard.previous"
-        or ".product.staging-" in name
-        or ".product.previous-" in name
-        for name in (path.name for path in product_tree.rglob("*"))
-    )
+    # The prior V1 presentation receipt/plan shape is intentionally not
+    # migrated.  Current delta v2 requires the exact per-item artifact
+    # bindings and only accepts one canonical contract.
+    with pytest.raises((dashboard_delta.DashboardDeltaError, dashboard_delta._assembler().BusinessPresentationPlanError), match="accepted/committed input bindings drifted"):
+        _assemble(context, route, presentation_plan_ref=v1_ref)
 
 
 def _seed_parent(
@@ -394,6 +348,8 @@ def _seed_parent(
     *,
     item_ids: tuple[str, ...] = ("REQ-A",),
     groups: tuple[tuple[str, ...], ...] | None = None,
+    initial_knowledge: KnowledgeDelta | None = None,
+    artifact_item_ids: tuple[str, ...] = (),
 ) -> tuple[RunContext, tuple[RequirementRecord, ...], dict[str, Any], dict[str, bytes]]:
     """Return a terminal parent run, parent receipt, and immutable parent bytes."""
 
@@ -407,7 +363,13 @@ def _seed_parent(
             mode="requirement",
             original_text=record.original_text,
         )
-        _complete_item(context, item, f"parent-{item_id}")
+        _complete_item(
+            context,
+            item,
+            f"parent-{item_id}",
+            knowledge_delta=initial_knowledge if item_id == item_ids[0] else None,
+            analytical_artifact=_data_profile_artifact(item_id, marker="parent") if item_id in artifact_item_ids else None,
+        )
     group_values = groups or (tuple(item_ids),)
     plan = RequirementExecutionPlan(
         input_records=records,
@@ -471,6 +433,9 @@ def _append(
     groups: tuple[tuple[str, ...], ...],
     *,
     revision: int = 2,
+    artifact_item_ids: tuple[str, ...] = (),
+    accepted_payloads: Mapping[str, Mapping[str, Any]] | None = None,
+    accepted_source_files: Mapping[str, Mapping[str, bytes]] | None = None,
 ) -> tuple[RequirementRecord, ...]:
     new_records = tuple(_record(item_id) for item_id in new_ids)
     plan = RequirementExecutionPlan(
@@ -489,8 +454,53 @@ def _append(
             context,
             ItemWorkspace.load(context, item_id, mode="requirement"),
             f"delta-{item_id}",
+            analytical_artifact=_data_profile_artifact(item_id, marker="delta") if item_id in artifact_item_ids else None,
+            accepted_payload=(accepted_payloads or {}).get(item_id),
+            accepted_files=(accepted_source_files or {}).get(item_id),
         )
     return new_records
+
+
+def _append_preacceptance_failure(
+    context: RunContext,
+    parent_records: tuple[RequirementRecord, ...],
+    item_id: str,
+    *,
+    revision: int = 2,
+) -> tuple[RequirementRecord, ...]:
+    """Admit one child requirement and terminalize it before acceptance."""
+
+    record = _record(item_id)
+    current = RequirementSupervisorWorkspace(context).load()
+    plan = RequirementExecutionPlan(
+        input_records=parent_records + (record,),
+        groups=current.groups + (RequirementExecutionGroup((item_id,), "Pre-acceptance failure"),),
+        planner_ref=current.planner_ref,
+        portfolio_strategy=current.portfolio_strategy,
+        revision=revision,
+    )
+    RequirementRunExtension.append(context, (record,), plan=plan)
+    ItemWorkspace.load(context, item_id, mode="requirement").technical_failure(
+        "analytical owner transport exhausted",
+        recovery_exhausted=True,
+    )
+    return (record,)
+
+
+def _data_revision(context: RunContext) -> Any:
+    """Create a valid two-revision data chain inside the synthetic run root."""
+
+    incoming = context.run_root / "incoming"
+    incoming.mkdir(parents=True, exist_ok=True)
+    first_archive = incoming / "first.zip"
+    with zipfile.ZipFile(first_archive, "w", compression=zipfile.ZIP_STORED) as output:
+        output.writestr("records.csv", "id,value\n1,one\n")
+    store = DataRevisionStore(context)
+    store.initialize_legacy(first_archive)
+    second_archive = incoming / "second.zip"
+    with zipfile.ZipFile(second_archive, "w", compression=zipfile.ZIP_STORED) as output:
+        output.writestr("records.csv", "id,value\n1,two\n")
+    return store.append(second_archive, expected_current_revision_id="D-0001")
 
 
 def _assemble(
@@ -508,6 +518,686 @@ def _assemble(
         failpoint=failpoint,
         presentation_plan_ref=presentation_plan_ref,
     )
+
+
+def test_delta_rebuild_copies_hash_bound_accepted_visual_source(tmp_path: Path) -> None:
+    """Successor assembly carries requirement-local JSONL visual evidence."""
+
+    context, parent_records, _parent_receipt, _parent_bytes = _seed_parent(tmp_path)
+    source_ref = "work/watchlist.jsonl"
+    source_bytes = (
+        b'{"customer_name":"Customer A","baseline_orders":20,"recent_orders":8}\n'
+        b'{"customer_name":"Customer B","baseline_orders":14,"recent_orders":7}\n'
+    )
+    _append(
+        context,
+        parent_records,
+        ("REQ-B",),
+        (("REQ-A", "REQ-B"),),
+        accepted_payloads={
+            "REQ-B": {
+                "headline_findings": ["Customer A shows the largest reviewed order decline."],
+                "evidence_refs": [source_ref],
+                "visuals": [{
+                    "type": "paired_bar",
+                    "title": "Baseline versus recent orders",
+                    "evidence_ref": source_ref,
+                    "dimension": "customer_name",
+                    "series": ["baseline_orders", "recent_orders"],
+                }],
+            }
+        },
+        accepted_source_files={"REQ-B": {source_ref: source_bytes}},
+    )
+    _telemetry(context)
+    receipt = _assemble(context, {"kind": "existing", "group_id": "group-01"})
+    fixture = json.loads(
+        context.resolve_product_path("generations/G-0002/dashboard/dashboard_fixture_v4.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    accepted = [
+        widget
+        for widget in fixture["widgets"]
+        if widget.get("requirement_id") == "REQ-B" and widget.get("accepted_visual")
+    ]
+    assert receipt["status"] == "complete"
+    assert accepted
+    paired = next(widget for widget in accepted if widget.get("accepted_visual_type") == "paired_bar")
+    assert paired["type"] == "grouped_bar"
+    assert paired["bars"][1]["series"][0]["size"] == "70%"
+
+
+def test_generation_product_validator_validates_delta_manifest_lineage_and_links(tmp_path: Path) -> None:
+    """Validate a published delta through the candidate-facing boundary.
+
+    The validator must enforce the complete delta receipt/product-manifest
+    contract, while retaining the two intentional site-tree domains: the
+    receipt binds every file (including ``site_manifest.json``), and the
+    nested manifest binds the other files only.  Tampered lineage, product
+    assets, symlinks, and HTML links all fail closed before candidate use.
+    """
+
+    context, parent_records, _parent_receipt, _parent_bytes = _seed_parent(tmp_path)
+    _append(context, parent_records, ("REQ-B",), (("REQ-A", "REQ-B"),))
+    _telemetry(context)
+    receipt = _assemble(context, {"kind": "existing", "group_id": "group-01"})
+    manifest_ref = "products/generations/G-0002/product_manifest.json"
+
+    validated = dashboard_delta.validate_generation_product(
+        context,
+        receipt=receipt,
+        product_manifest_ref=manifest_ref,
+    )
+    assert validated["valid"] is True
+    assert validated["generation_id"] == "G-0002"
+    assert validated["site_binding"]["file_count"] == 8
+    assert validated["site_manifest_binding"]["file_count"] == 7
+    assert validated["artifact_bindings"]["manifest"]["ref"] == manifest_ref
+
+    manifest_path = context.resolve_product_path("generations/G-0002/product_manifest.json")
+    valid_manifest_bytes = manifest_path.read_bytes()
+    manifest = json.loads(valid_manifest_bytes.decode("utf-8"))
+    malformed_manifest = copy.deepcopy(manifest)
+    malformed_manifest["product_type"] = "forged_product"
+    _canonical_write(manifest_path, malformed_manifest)
+    with pytest.raises(dashboard_delta.DashboardDeltaError, match="manifest"):
+        dashboard_delta.validate_generation_product(
+            context,
+            receipt=receipt,
+            product_manifest_ref=manifest_ref,
+        )
+    manifest_path.write_bytes(valid_manifest_bytes)
+
+    tampered_assets_manifest = copy.deepcopy(manifest)
+    tampered_assets_manifest["assets"][0]["sha256"] = "0" * 64
+    _canonical_write(manifest_path, tampered_assets_manifest)
+    with pytest.raises(dashboard_delta.DashboardDeltaError, match="asset (?:bindings|list)"):
+        dashboard_delta.validate_generation_product(
+            context,
+            receipt=receipt,
+            product_manifest_ref=manifest_ref,
+        )
+    manifest_path.write_bytes(valid_manifest_bytes)
+
+    receipt_path = context.resolve_product_path("generations/G-0002/dashboard/build_receipt.json")
+    valid_receipt_bytes = receipt_path.read_bytes()
+    for field, value, message in (
+        ("status", "incomplete", "not complete"),
+        ("run_id", "FORGED-RUN", "run identity"),
+        ("generation_id", "G-0001", "generation_id"),
+        ("new_analytics", True, "new analytics"),
+    ):
+        tampered_receipt = copy.deepcopy(receipt)
+        tampered_receipt[field] = value
+        _canonical_write(receipt_path, tampered_receipt)
+        with pytest.raises(dashboard_delta.DashboardDeltaError, match=message):
+            dashboard_delta.validate_generation_product(context, receipt=tampered_receipt)
+        receipt_path.write_bytes(valid_receipt_bytes)
+
+    traversal_receipt = copy.deepcopy(receipt)
+    traversal_receipt["outputs"] = {
+        **dict(traversal_receipt["outputs"]),
+        "fixture_ref": "../outside-fixture.json",
+    }
+    _canonical_write(receipt_path, traversal_receipt)
+    with pytest.raises(dashboard_delta.DashboardDeltaError, match="traversal|boundary"):
+        dashboard_delta.validate_generation_product(context, receipt=traversal_receipt)
+    receipt_path.write_bytes(valid_receipt_bytes)
+
+    site_root = context.resolve_product_path("generations/G-0002/dashboard/site")
+    symlink = site_root / "symlinked-page.html"
+    symlink.symlink_to(site_root / "index.html")
+    with pytest.raises(dashboard_delta.DashboardDeltaError, match="site"):
+        dashboard_delta.validate_generation_product(context, receipt=receipt)
+    symlink.unlink()
+
+    # Rebind the receipt to the modified page and its updated self-excluding
+    # manifest.  The tree/hash checks now pass, leaving the canonical link
+    # validator as the failing boundary for a broken internal href.
+    index_path = site_root / "index.html"
+    index_original = index_path.read_bytes()
+    index_path.write_bytes(index_original + b'<a href="missing.html">broken</a>\n')
+    dashboard_delta._site_manifest_update(
+        site_root,
+        context.resolve_product_path("generations/G-0002/dashboard/dashboard_chart_map_v4.json"),
+    )
+    broken_receipt = copy.deepcopy(receipt)
+    broken_receipt["output_hashes"] = {
+        **dict(broken_receipt["output_hashes"]),
+        "site_manifest_sha256": hashlib.sha256((site_root / "site_manifest.json").read_bytes()).hexdigest(),
+    }
+    broken_receipt["site_binding"] = dashboard_assembler._site_tree_binding(site_root)
+    _canonical_write(receipt_path, broken_receipt)
+    with pytest.raises(dashboard_delta.DashboardDeltaError, match="links"):
+        dashboard_delta.validate_generation_product(context, receipt=broken_receipt)
+
+
+def test_g2_product_revision_assembly_uses_active_generation_and_preserves_prior(tmp_path: Path) -> None:
+    """A revision target in an appended generation never falls back to G-0001."""
+
+    context, parent_records, _parent_receipt, _parent_bytes = _seed_parent(tmp_path)
+    _append(context, parent_records, ("REQ-B",), (("REQ-A", "REQ-B"),))
+    _telemetry(context)
+    route = {"kind": "existing", "group_id": "group-01"}
+    prior = _assemble(context, route)
+    prior_generation_root = context.resolve_product_path("generations/G-0002")
+    prior_product_manifest = context.resolve_product_path("generations/G-0002/product_manifest.json").read_bytes()
+    prior_dashboard = _tree_bytes(prior_generation_root / "dashboard")
+
+    store = ProductReviewStore(context, "G-0002")
+    target = store.begin_revision(
+        request_id="g2-regeneration",
+        input_fingerprint="a" * 64,
+        implementation_identity="b" * 64,
+    )
+    assert target.revision_id == "rev-0001"
+    assert target.output_root_ref == store.revision_artifacts_ref(target.revision_id)
+
+    regenerated = dashboard_delta.assemble_generation_product(
+        context,
+        revision_id=target.revision_id,
+        output_root_ref=target.output_root_ref,
+        output_dir=target.output_root_ref,
+    )
+    assert regenerated["generation_id"] == "G-0002"
+    assert all(
+        str(value).startswith(target.output_root_ref)
+        for key, value in regenerated["outputs"].items()
+        if key != "receipt_ref" or isinstance(value, str)
+    )
+    validated = dashboard_delta.validate_generation_product(
+        context,
+        receipt=regenerated,
+        product_manifest_ref=f"{target.output_root_ref}/product_manifest.json",
+        revision_id=target.revision_id,
+        output_root_ref=target.output_root_ref,
+    )
+    assert validated["valid"] is True
+    target_manifest = json.loads(
+        context.resolve_run_path(f"{target.output_root_ref}/product_manifest.json").read_text(encoding="utf-8")
+    )
+    assert target_manifest["lifecycle"]["generation_id"] == "G-0002"
+    assert target_manifest["lineage"]["parent_generation_id"] == "G-0001"
+    assert target_manifest["lineage"]["parent_manifest_ref"] == "products/product_manifest.json"
+    # The pre-existing G2 generation product remains untouched while the
+    # revision bundle is staged and validated under its own namespace.
+    assert context.resolve_product_path("generations/G-0002/product_manifest.json").read_bytes() == prior_product_manifest
+    assert _tree_bytes(prior_generation_root / "dashboard") == prior_dashboard
+    assert prior["generation_id"] == "G-0002"
+
+
+def test_delta_mixed_preacceptance_failure_is_terminal_limit_without_analytics(
+    tmp_path: Path,
+) -> None:
+    """A pre-acceptance child failure appears as a limitation, not a fake record."""
+
+    context, parent_records, _parent_receipt, _parent_bytes = _seed_parent(tmp_path)
+    _append_preacceptance_failure(context, parent_records, "REQ-FAILED")
+    _telemetry(context)
+
+    receipt = _assemble(
+        context,
+        {
+            "routes": {
+                "REQ-FAILED": {
+                    "kind": "new",
+                    "group_id": "group-failed",
+                    "title": "Pre-acceptance failure",
+                    "order": 2,
+                }
+            }
+        },
+    )
+    product_manifest = json.loads(
+        context.resolve_product_path("generations/G-0002/product_manifest.json").read_text(encoding="utf-8")
+    )
+    assert product_manifest["status"] == "complete_with_limits"
+    fixture = json.loads(
+        context.resolve_product_path("generations/G-0002/dashboard/dashboard_fixture_v4.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert {entry["item_id"] for entry in fixture["failed_items"]} == {"REQ-FAILED"}
+    assert {widget["requirement_id"] for widget in fixture["widgets"]} == {"REQ-A"}
+    assert all(record.get("scope") != "REQ-FAILED" for record in fixture["audit_records"])
+    assert all(item["item_id"] != "REQ-FAILED" or item["record_count"] == 0 for item in receipt["input_items"])
+
+
+def test_delta_full_rebuild_accepts_preacceptance_failure_without_committed_input(tmp_path: Path) -> None:
+    """A reopened current head may be terminal-failed without fake integration bytes."""
+
+    context, parent_records, _parent_receipt, _parent_bytes = _seed_parent(
+        tmp_path,
+        item_ids=("REQ-A", "REQ-B"),
+    )
+    plan = RequirementExecutionPlan(
+        input_records=parent_records,
+        groups=(RequirementExecutionGroup(("REQ-A", "REQ-B"), "Current route"),),
+        planner_ref="synthetic-planner",
+        portfolio_strategy="synthetic-strategy",
+        revision=1,
+    )
+    revision = _data_revision(context)
+    RequirementRunExtension.refresh_data(
+        context,
+        plan,
+        data_revision=revision,
+        reopened_item_ids=("REQ-A",),
+    )
+    ItemWorkspace.load(context, "REQ-A", mode="requirement").technical_failure(
+        "reopened analytical owner exhausted",
+        recovery_exhausted=True,
+    )
+    _telemetry(context)
+
+    _assemble(context, {})
+    product_manifest = json.loads(
+        context.resolve_product_path("generations/G-0002/product_manifest.json").read_text(encoding="utf-8")
+    )
+    assert product_manifest["status"] == "complete_with_limits"
+    fixture = json.loads(
+        context.resolve_product_path("generations/G-0002/dashboard/dashboard_fixture_v4.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert {entry["item_id"] for entry in fixture["failed_items"]} == {"REQ-A"}
+    assert {widget["requirement_id"] for widget in fixture["widgets"]} == {"REQ-B"}
+    assert all(record.get("scope") != "REQ-A" for record in fixture["audit_records"])
+
+
+def test_delta_append_preserves_cumulative_artifact_provenance_and_retry_is_stable(tmp_path: Path) -> None:
+    """An appended artifact is bound identically in fixture, receipt, and freeze."""
+
+    context, parent_records, _parent_receipt, _parent_bytes = _seed_parent(tmp_path)
+    _append(
+        context,
+        parent_records,
+        ("REQ-B",),
+        (("REQ-A", "REQ-B"),),
+        artifact_item_ids=("REQ-B",),
+    )
+    _telemetry(context)
+    route = {"kind": "existing", "group_id": "group-01"}
+    receipt = _assemble(context, route)
+    fixture_path = context.resolve_product_path("generations/G-0002/dashboard/dashboard_fixture_v4.json")
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    expected = receipt["analytical_artifacts"]
+    assert expected and {value["item_id"] for value in expected} == {"REQ-B"}
+    assert fixture["analytical_artifacts"] == expected
+    assert receipt["freeze_inputs"]["analytical_artifacts"] == expected
+    assert receipt["input_items"][-1]["analytical_artifacts"] == expected
+    assert any(widget.get("analytical_artifact_id") == expected[0]["artifact_id"] for widget in fixture["widgets"])
+
+    product_root = context.resolve_product_path("")
+    before_retry = _tree_state(product_root)
+    assert _assemble(context, route) == receipt
+    assert _tree_state(product_root) == before_retry
+
+    # A receipt that is canonical but disagrees with its fixture/freeze/input
+    # bindings is rejected before any replacement transaction can start.
+    receipt_path = context.resolve_product_path("generations/G-0002/dashboard/build_receipt.json")
+    tampered = json.loads(receipt_path.read_text(encoding="utf-8"))
+    tampered["analytical_artifacts"] = []
+    _canonical_write(receipt_path, tampered)
+    with pytest.raises(dashboard_delta.DashboardDeltaError, match="artifact bindings differ"):
+        _assemble(context, route)
+
+
+def test_delta_forced_full_rebuild_carries_current_head_artifact_bindings(tmp_path: Path) -> None:
+    """Reopened/full-rebuild generations publish only their current artifacts."""
+
+    context, parent_records, _parent_receipt, _parent_bytes = _seed_parent(
+        tmp_path,
+        artifact_item_ids=("REQ-A",),
+    )
+    plan = RequirementExecutionPlan(
+        input_records=parent_records,
+        groups=(RequirementExecutionGroup(("REQ-A",), "Current route"),),
+        planner_ref="synthetic-planner",
+        portfolio_strategy="synthetic-strategy",
+        revision=1,
+    )
+    revision = _data_revision(context)
+    RequirementRunExtension.refresh_data(
+        context,
+        plan,
+        data_revision=revision,
+        reopened_item_ids=("REQ-A",),
+    )
+    _complete_item(
+        context,
+        ItemWorkspace.load(context, "REQ-A", mode="requirement"),
+        "refresh-REQ-A-artifact",
+        analytical_artifact=_data_profile_artifact("REQ-A", marker="refresh"),
+    )
+    receipt = _assemble(context, {})
+    assert receipt["generation_id"] == "G-0002"
+    fixture = json.loads(
+        context.resolve_product_path("generations/G-0002/dashboard/dashboard_fixture_v4.json").read_text(encoding="utf-8")
+    )
+    expected = receipt["analytical_artifacts"]
+    assert expected and expected[0]["artifact_id"] == "artifact-req-a-refresh"
+    assert fixture["analytical_artifacts"] == expected
+    assert receipt["freeze_inputs"]["analytical_artifacts"] == expected
+    assert receipt["input_items"][0]["analytical_artifacts"] == expected
+
+def test_cli_dispatches_generation_aware_entry_point_and_accepts_root_without_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The host CLI uses one generation-aware dispatch for root and successors."""
+
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    route_path = run_root / "route.json"
+    _canonical_write(route_path, {"kind": "existing", "group_id": "group-01"})
+    calls: list[dict[str, Any]] = []
+
+    def fake_assemble_generation_product(context: RunContext, **kwargs: Any) -> dict[str, Any]:
+        calls.append({"context": context, **kwargs})
+        return {"generation_id": "G-0001", "status": "complete"}
+
+    monkeypatch.setattr(dashboard_delta, "assemble_generation_product", fake_assemble_generation_product)
+
+    assert dashboard_delta.main(
+        [
+            "--run-root",
+            str(run_root),
+            "--run-id",
+            "RUN-CLI",
+            "--route",
+            "route.json",
+            "--parent-receipt",
+            "products/parent-dashboard/build_receipt.json",
+            "--output-dir",
+            "products/cli-dashboard",
+            "--presentation-plan-ref",
+            "extensions/G-0001/business_presentation_plan.json",
+        ]
+    ) == 0
+    assert calls[0]["context"].run_id == "RUN-CLI"
+    assert calls[0]["route"] == {"kind": "existing", "group_id": "group-01"}
+    assert calls[0]["parent_receipt_ref"] == "products/parent-dashboard/build_receipt.json"
+    assert calls[0]["output_dir"] == "products/cli-dashboard"
+    assert json.loads(capsys.readouterr().out) == {"generation_id": "G-0001", "status": "complete"}
+
+    # A root generation does not need a successor route.  The same entry point
+    # receives ``None`` and chooses the full assembler from lifecycle metadata.
+    assert dashboard_delta.main(
+        [
+            "--run-root",
+            str(run_root),
+            "--run-id",
+            "RUN-CLI",
+        ]
+    ) == 0
+    assert calls[1]["route"] is None
+
+
+def test_reopened_generation_uses_full_current_head_rebuild_without_parent_visual_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A D-bound reopen renders all current heads and never loads parent visuals."""
+
+    context, parent_records, _parent_receipt, _parent_bytes = _seed_parent(tmp_path)
+    plan = RequirementExecutionPlan(
+        input_records=parent_records,
+        groups=(RequirementExecutionGroup(tuple(record.requirement_id for record in parent_records), "Current route"),),
+        planner_ref="synthetic-planner",
+        portfolio_strategy="synthetic-strategy",
+        revision=1,
+    )
+    revision = _data_revision(context)
+    RequirementRunExtension.refresh_data(
+        context,
+        plan,
+        data_revision=revision,
+        reopened_item_ids=("REQ-A",),
+    )
+    _complete_item(
+        context,
+        ItemWorkspace.load(context, "REQ-A", mode="requirement"),
+        "refresh-REQ-A",
+    )
+
+    original_read_json = dashboard_delta._read_json
+
+    def reject_parent_visuals(inner_context: RunContext, reference: str | Path, *, label: str) -> Any:
+        if label in {"parent dashboard fixture", "parent chart map"}:
+            raise AssertionError("reopened full rebuild must not read parent visual assets")
+        return original_read_json(inner_context, reference, label=label)
+
+    monkeypatch.setattr(dashboard_delta, "_read_json", reject_parent_visuals)
+    receipt = _assemble(context, {})
+    assert receipt["generation_id"] == "G-0002"
+    assert receipt["source_policy"] == "accepted_and_committed_only"
+    child_fixture = json.loads(
+        context.resolve_product_path("generations/G-0002/dashboard/dashboard_fixture_v4.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert child_fixture["run_id"] == context.run_id
+    assert receipt["input_items"][0]["item_id"] == "REQ-A"
+
+
+def test_reopened_full_rebuild_replays_semantic_successors_from_reviewed_history(
+    tmp_path: Path,
+) -> None:
+    """A reopened product sees the successor while keeping its predecessor replayable."""
+
+    predecessor = KnowledgeDelta(
+        "supplier-v1",
+        "add_ontology_item",
+        {"item_id": "supplier-v1", "item_type": "entity", "label": "Supplier"},
+        accepted=True,
+    )
+    context, parent_records, _parent_receipt, _parent_bytes = _seed_parent(
+        tmp_path,
+        initial_knowledge=predecessor,
+    )
+    plan = RequirementExecutionPlan(
+        input_records=parent_records,
+        groups=(RequirementExecutionGroup(("REQ-A",), "Current route"),),
+        planner_ref="synthetic-planner",
+        portfolio_strategy="synthetic-strategy",
+        revision=1,
+    )
+    revision = _data_revision(context)
+    RequirementRunExtension.refresh_data(
+        context,
+        plan,
+        data_revision=revision,
+        reopened_item_ids=("REQ-A",),
+    )
+    successor = KnowledgeDelta(
+        "supplier-v2",
+        "add_ontology_item",
+        {"item_id": "supplier-v2", "item_type": "entity", "label": "Supplier (canonical)"},
+        supersedes=(LEMRef("ontology", "supplier-v1"),),
+        accepted=True,
+    )
+    _complete_item(
+        context,
+        ItemWorkspace.load(context, "REQ-A", mode="requirement"),
+        "refresh-REQ-A-successor",
+        knowledge_delta=successor,
+    )
+
+    # Unrelated audit material is outside the product authority.  It may be
+    # present (including as a symlink) without becoming a new rebuild gate;
+    # the copier never traverses this direct child.
+    live_history_root = context.run_root / "history/requirements/REQ-A/G-0002"
+    (live_history_root / "audit-notes").mkdir()
+    (live_history_root / "audit-notes" / "operator.txt").write_text("ignored", encoding="utf-8")
+    audit_target = tmp_path / "audit-target.txt"
+    audit_target.write_text("outside product authority", encoding="utf-8")
+    (live_history_root / "audit-alias").symlink_to(audit_target)
+
+    live_projection = LivingEnterpriseModelProjector.project(context, item_ids=("REQ-A",))
+    assert live_projection.model.current_ontology["supplier-v2"].label == "Supplier (canonical)"
+    assert live_projection.model.ontology["supplier-v1"].status == "superseded"
+
+    metadata = RunLifecycle.load(context).generation_metadata
+    assert metadata is not None
+    scratch_root = tmp_path / "semantic-history-scratch"
+    scratch_context = dashboard_delta._copy_full_rebuild_inputs(
+        context,
+        scratch_root,
+        metadata,
+        ("REQ-A",),
+        plan_path=RunLifecycle.load(context).plan_path,
+    )
+    history_root = scratch_root / "history/requirements/REQ-A/G-0002"
+    assert (history_root / "item_state.json").is_file()
+    assert (history_root / "accepted/manifest.json").is_file()
+    assert (history_root / "accepted/answer_content.json").is_file()
+    assert (history_root / "accepted/acceptance_envelope.json").is_file()
+    assert (history_root / "integration/committed/manifest.json").is_file()
+    assert (history_root / "integration/committed/records.jsonl").is_file()
+    assert not (history_root / "work").exists()
+    assert not (history_root / "draft.json").exists()
+    assert not (history_root / "integration/staging").exists()
+    assert not (history_root / "integration/review").exists()
+    assert not (history_root / "audit-notes").exists()
+    assert not (history_root / "audit-alias").exists()
+    bound_revision_root = scratch_root / "data_room/revisions/D-0002"
+    assert (bound_revision_root / "revision_manifest.json").is_file()
+    for forbidden in ("archive.zip", "catalog.json", "data_room.zip"):
+        assert not (bound_revision_root / forbidden).exists()
+    assert not (scratch_root / "data_room/current_revision.json").exists()
+    assert not any(
+        part in {"raw", "work", "calculations"}
+        for path in scratch_root.rglob("*")
+        for part in path.relative_to(scratch_root).parts
+    )
+    assert not (scratch_root / "products/generations/G-0001/dashboard").exists()
+    assert not any(
+        path.name in {"dashboard_fixture_v4.json", "dashboard_chart_map_v4.json", "dashboard_chart_registry_v4.json"}
+        or path.name == "site"
+        for path in (scratch_root / "products").rglob("*")
+    )
+    scratch_projection = LivingEnterpriseModelProjector.project(scratch_context, item_ids=("REQ-A",))
+    assert scratch_projection.projection_hash == live_projection.projection_hash
+    assert scratch_projection.model.current_ontology["supplier-v2"].label == "Supplier (canonical)"
+    assert scratch_projection.model.ontology["supplier-v1"].status == "superseded"
+
+    receipt = _assemble(context, {})
+    fixture = json.loads(
+        (context.resolve_product_path("generations/G-0002/dashboard/dashboard_fixture_v4.json")).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert receipt["freeze_inputs"]["projection_hash"] == live_projection.projection_hash
+    assert fixture["lem_projection_hash"] == live_projection.projection_hash
+
+    # Selected envelope tampering remains fail-closed even though unrelated
+    # audit material is intentionally ignored.
+    accepted_content = live_history_root / "accepted/answer_content.json"
+    accepted_content_bytes = accepted_content.read_bytes()
+    accepted_content.unlink()
+    accepted_content.symlink_to(audit_target)
+    try:
+        with pytest.raises(dashboard_delta.DashboardDeltaError, match="(?:symlinked|LEM projection|accepted)"):
+            dashboard_delta._copy_full_rebuild_inputs(
+                context,
+                tmp_path / "tampered-history-scratch",
+                metadata,
+                ("REQ-A",),
+                plan_path=RunLifecycle.load(context).plan_path,
+            )
+    finally:
+        accepted_content.unlink()
+        accepted_content.write_bytes(accepted_content_bytes)
+
+    accepted_manifest = live_history_root / "accepted/manifest.json"
+    accepted_manifest_bytes = accepted_manifest.read_bytes()
+    accepted_manifest.write_bytes(accepted_manifest_bytes + b"tampered")
+    try:
+        with pytest.raises(dashboard_delta.DashboardDeltaError, match="LEM projection|accepted"):
+            _assemble(context, {})
+    finally:
+        accepted_manifest.write_bytes(accepted_manifest_bytes)
+
+
+def test_bound_data_revision_survives_later_current_revision_append(
+    tmp_path: Path,
+) -> None:
+    """G2 remains bound to D2 when D3 becomes the store's pending current revision."""
+
+    context, parent_records, _parent_receipt, _parent_bytes = _seed_parent(tmp_path)
+    plan = RequirementExecutionPlan(
+        input_records=parent_records,
+        groups=(RequirementExecutionGroup(tuple(record.requirement_id for record in parent_records), "Current route"),),
+        planner_ref="synthetic-planner",
+        portfolio_strategy="synthetic-strategy",
+        revision=1,
+    )
+    revision_d2 = _data_revision(context)
+    extension = RequirementRunExtension.refresh_data(
+        context,
+        plan,
+        data_revision=revision_d2,
+        reopened_item_ids=("REQ-A",),
+    )
+    _complete_item(
+        context,
+        ItemWorkspace.load(context, "REQ-A", mode="requirement"),
+        "refresh-REQ-A",
+    )
+
+    incoming = context.run_root / "incoming"
+    third_archive = incoming / "third.zip"
+    with zipfile.ZipFile(third_archive, "w", compression=zipfile.ZIP_STORED) as output:
+        output.writestr("records.csv", "id,value\n1,three\n")
+    revision_d3 = DataRevisionStore(context).append(
+        third_archive,
+        expected_current_revision_id=revision_d2.revision_id,
+    )
+    receipt = _assemble(context, {})
+
+    metadata = RunLifecycle.load(context).generation_metadata
+    assert metadata is not None
+    assert extension.generation_id == receipt["generation_id"] == "G-0002"
+    assert metadata.data_revision_ref == "data_room/revisions/D-0002/revision_manifest.json"
+    assert metadata.data_revision_hash == revision_d2.manifest_hash
+    assert DataRevisionStore(context).current().revision_id == revision_d3.revision_id == "D-0003"
+
+
+@pytest.mark.parametrize("artifact", ("manifest", "archive"))
+def test_bound_data_revision_tamper_rejects_product_assembly(
+    tmp_path: Path,
+    artifact: str,
+) -> None:
+    context, parent_records, _parent_receipt, _parent_bytes = _seed_parent(tmp_path)
+    plan = RequirementExecutionPlan(
+        input_records=parent_records,
+        groups=(RequirementExecutionGroup(tuple(record.requirement_id for record in parent_records), "Current route"),),
+        planner_ref="synthetic-planner",
+        portfolio_strategy="synthetic-strategy",
+        revision=1,
+    )
+    revision = _data_revision(context)
+    RequirementRunExtension.refresh_data(
+        context,
+        plan,
+        data_revision=revision,
+        reopened_item_ids=("REQ-A",),
+    )
+    _complete_item(
+        context,
+        ItemWorkspace.load(context, "REQ-A", mode="requirement"),
+        "refresh-REQ-A",
+    )
+    revision_root = context.run_root / "data_room/revisions/D-0002"
+    target = revision_root / ("revision_manifest.json" if artifact == "manifest" else "archive.zip")
+    target.write_bytes(target.read_bytes() + b"tampered")
+
+    with pytest.raises(dashboard_delta.DashboardDeltaError, match="(?:generation data revision|active lifecycle cannot be loaded)"):
+        _assemble(context, {})
+    assert not context.resolve_product_path("generations/G-0002/dashboard").exists()
 
 
 def _process_delta_publish(args: tuple[str, str, Mapping[str, Any]]) -> tuple[str, str]:
@@ -733,8 +1423,8 @@ def test_presentation_plan_change_during_scratch_render_rejects_before_staging(
     _telemetry(context)
     route = {"kind": "existing", "group_id": "group-01"}
     # Build a real cumulative fixture/visual inventory once, then remove the
-    # product target so the guarded call exercises first publication without a
-    # V1->V2 migration.  The plan bytes themselves remain fully V2-shape-valid.
+    # product target so the guarded call exercises first publication with a
+    # fully V2-shaped predecessor/successor chain.
     _assemble(context, route)
     generation_root = context.resolve_product_path("generations/G-0002")
     child_fixture_ref = "products/generations/G-0002/dashboard/dashboard_fixture_v4.json"
@@ -758,7 +1448,7 @@ def test_presentation_plan_change_during_scratch_render_rejects_before_staging(
     first_id = first_visual["widget_id"]
     second_id = audit_visual["widget_id"]
     candidate = next(value for value in inventory["candidates"] if value["widget_id"] == first_id)
-    v1_entry = {
+    predecessor_manager_entry = {
         key: candidate[key]
         for key in (
             "widget_id",
@@ -770,9 +1460,9 @@ def test_presentation_plan_change_during_scratch_render_rejects_before_staging(
             "display_projection",
         )
     }
-    v1_ref = "extensions/G-0002/predecessor.json"
-    v1 = {
-        "schema_version": dashboard_assembler.PRESENTATION_PLAN_SCHEMA,
+    predecessor_ref = "extensions/G-0002/predecessor.json"
+    predecessor = {
+        "schema_version": dashboard_assembler.PRESENTATION_PLAN_V2_SCHEMA,
         "run_id": context.run_id,
         "generation_id": "G-0002",
         "supervisor_plan_ref": inventory["supervisor_plan_ref"],
@@ -780,15 +1470,29 @@ def test_presentation_plan_change_during_scratch_render_rejects_before_staging(
         "item_order": inventory["item_order"],
         "input_items": inventory["input_items"],
         "parent": inventory["parent"],
-        "reviewer_ref": "synthetic-v1-predecessor",
+        "reviewer_ref": "synthetic-v2-predecessor",
         "manager_widget_ids": [first_id],
-        "manager_entries": [v1_entry],
+        "manager_entries": [
+            {
+                **dashboard_assembler._v2_manager_entry_from_visual(first_visual),
+                **predecessor_manager_entry,
+            }
+        ],
+        "manager_visual_widget_ids": [first_id],
+        "audit_visual_widget_ids": [second_id],
+        "visual_entries": [first_visual, audit_visual],
+        "source_bindings": {
+            "fixture_ref": visual_inventory["fixture_ref"],
+            "fixture_sha256": visual_inventory["fixture_sha256"],
+            "chart_map_ref": visual_inventory["chart_map_ref"],
+            "chart_map_sha256": visual_inventory["chart_map_sha256"],
+        },
     }
-    dashboard_assembler._validate_presentation_plan_shape(v1)
-    v1_path = context.resolve_run_path(v1_ref)
-    _canonical_write(v1_path, v1)
+    dashboard_assembler._validate_presentation_plan_v2_shape(predecessor)
+    predecessor_path = context.resolve_run_path(predecessor_ref)
+    _canonical_write(predecessor_path, predecessor)
     v2_manager_entry = dashboard_assembler._v2_manager_entry_from_visual(first_visual)
-    v2_manager_entry.update(v1_entry)
+    v2_manager_entry.update(predecessor_manager_entry)
     v2_ref = "extensions/G-0002/business_presentation_plan.json"
     v2 = {
         "schema_version": dashboard_assembler.PRESENTATION_PLAN_V2_SCHEMA,
@@ -810,10 +1514,10 @@ def test_presentation_plan_change_during_scratch_render_rejects_before_staging(
             "fixture_sha256": visual_inventory["fixture_sha256"],
             "chart_map_ref": visual_inventory["chart_map_ref"],
             "chart_map_sha256": visual_inventory["chart_map_sha256"],
-            "previous_plan_ref": v1_ref,
-            "previous_plan_sha256": hashlib.sha256(v1_path.read_bytes()).hexdigest(),
-            "previous_manager_widget_ids": [first_id],
-            "previous_manager_entries": [v1_entry],
+            "previous_plan_ref": predecessor_ref,
+            "previous_plan_sha256": hashlib.sha256(predecessor_path.read_bytes()).hexdigest(),
+            "previous_plan_manager_widget_ids": [first_id],
+            "previous_plan_manager_entries": [copy.deepcopy(predecessor["manager_entries"][0])],
             "previous_manager_visual_widget_ids": [first_id],
             "previous_audit_visual_widget_ids": [second_id],
             "previous_visual_entries": [first_visual, audit_visual],
@@ -1892,12 +2596,12 @@ def test_product_gate_does_not_reuse_parent_terminal_marker_and_read_boundary_is
     original_read_text = Path.read_text
 
     def guarded_read_bytes(path: Path) -> bytes:
-        if any(part.lower() in {"work", "calculations", "source", "raw", "data-room"} for part in path.parts):
+        if any(part.lower() in {"work", "calculations", "source", "raw", "data-room", "data_room"} for part in path.parts):
             raise AssertionError(f"delta attempted forbidden read: {path}")
         return original_read_bytes(path)
 
     def guarded_read_text(path: Path, *args: object, **kwargs: object) -> str:
-        if any(part.lower() in {"work", "calculations", "source", "raw", "data-room"} for part in path.parts):
+        if any(part.lower() in {"work", "calculations", "source", "raw", "data-room", "data_room"} for part in path.parts):
             raise AssertionError(f"delta attempted forbidden read: {path}")
         return original_read_text(path, *args, **kwargs)
 

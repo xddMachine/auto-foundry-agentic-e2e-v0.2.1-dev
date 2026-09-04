@@ -17,7 +17,7 @@ RunContext
   -> immutable BoundAnalysisContext
   -> AnalystWorkspace -> one Analytical Owner
        -> investigate -> calculate -> interpret -> complete answer
-       -> optional 0-3 bounded specialist memos
+       -> adaptive, evidence-triggered specialist checks (possibly none)
        -> controlled script receipts and prepared candidates
   -> one Independent Business Reviewer -> semantic findings
   -> BusinessReviewAdapter -> iterative material repairs/rechecks
@@ -130,18 +130,22 @@ order and grouping are advisory and preserve explicit user priority/order; the
 Planner never declares runtime semantic dependencies. The Analytical Owner
 discovers those after understanding the requirement, and the runtime
 `waiting_on_resolution`/`ready_to_resume` ledger is the sole semantic block.
-Planner may suggest zero to three owner specialists, does not calculate or write
-answers, and is not a deterministic ID/hash or lifecycle authority.
+The Planner may admit only the smallest useful set of owner-specialist checks
+when the Analytical Owner identifies genuine uncertainty; zero specialists is
+valid, and no specialist is created per method or checklist item. Specialists
+do not calculate or write the owner answer, and the Planner is not a
+deterministic ID/hash or lifecycle authority.
 `RequirementExecutionPlan` and `RequirementExecutionGroup` are revisionable
 scheduling recommendations, not catalog-hash or lifecycle authority. A
 technical failure does not create Planner dependency blocks; independent groups
 remain eligible and runtime resolution state controls waiting and resume.
 
-The default capacity is four entity-resolution workers, one Analytical Owner,
-up to three owner specialists, and eight active workers total; the Planner is
-not counted. Host configuration may lower or raise limits but must never
-oversubscribe actual host capacity. Requested Run A and Run B executions remain
-sequential.
+Each requirement has exactly one Analytical Owner. Specialist checks are
+admitted adaptively only for genuine uncertainty and are bounded by the actual
+host capacity; zero specialists is valid. Entity-resolution and analytical
+workers share that runtime ceiling, while the Planner is not counted. There is
+no fixed role split or default worker total, and scheduling never oversubscribes
+the host. Requested Run A and Run B executions remain sequential.
 
 Every Requirement Mode item binds directly to the same `RunContext` and shared
 `DataRoomWorkbench`; no previous item context, transition, rebind, inheritance,

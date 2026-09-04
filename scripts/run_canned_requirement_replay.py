@@ -392,7 +392,7 @@ def _run_cycle(
         attempt_id=attempt.attempt_id,
         conclusion="Accept with explicit synthetic-population and denominator limits.",
     )
-    accepted = analyst.accept(
+    accepted = item.accept(
         accepted_refs=(
             "work/requirement_plan.json",
             "work/plan.json",
@@ -468,7 +468,10 @@ def _run_cycle(
         attempt_id=attempt.attempt_id,
         conclusion="The metric and dashboard fact match the accepted parent answer.",
     )
-    lifecycle_snapshot = lifecycle.reconcile([persisted.state])
+    # Reconcile through the public workspace so the reducer verifies the
+    # committed integration boundary instead of trusting an ``integrated``
+    # item-state label.
+    lifecycle_snapshot = lifecycle.reconcile([persisted])
     if lifecycle_snapshot.state != "integration_complete":
         raise AssertionError(f"unexpected requirement lifecycle state: {lifecycle_snapshot.state}")
     calls = _derive_call_counters(ledger, runtime, guard)

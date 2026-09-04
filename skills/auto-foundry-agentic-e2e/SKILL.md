@@ -3,14 +3,14 @@ name: auto-foundry-agentic-e2e
 description: Runs reviewed enterprise analytics for supplied questions or analytics requirements. Use it when one Analytical Owner should investigate evidence, optionally delegate bounded specialist checks, produce the final business answer, and build a traceable offline dashboard while deterministic program code owns data access, execution, state, review normalization, integration, and recovery.
 metadata:
   author: auto-foundry
-  version: "0.7.1"
+  version: "0.7.2"
   core_name: auto_foundry_core
-  core_version: "0.8.0"
+  core_version: "0.8.1"
   architecture: analytical-owner-deterministic-workbench
-  release: entity-resolution-and-analytical-relationships
+  release: universal-data-room-ingestion
 ---
 
-# Auto Foundry Agentic E2E — v0.7.1
+# Auto Foundry Agentic E2E — v0.7.2
 
 ## 1. Objective
 
@@ -28,9 +28,9 @@ Record these release markers in program metadata and the final report:
 
 ```text
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.7.1
+skill_version: 0.7.2
 core_name: auto_foundry_core
-core_version: 0.8.0
+core_version: 0.8.1
 ```
 
 ## 2. One Analytical Owner
@@ -74,13 +74,25 @@ For the detailed analytical loop, read
 [QUESTION_ANALYSIS_PLAYBOOK.md](references/QUESTION_ANALYSIS_PLAYBOOK.md).
 For concrete owner, specialist, reviewer, and integration prompts, read
 [ANALYTICAL_COLLABORATION.md](references/ANALYTICAL_COLLABORATION.md).
+For the supported profile, KPI, segmentation, and scoring workflow, read
+[ANALYTICS_TOOLKIT.md](references/ANALYTICS_TOOLKIT.md). The package installs
+the core analytics dependencies (pandas, NumPy, SciPy, scikit-learn, and
+PyArrow); use the optional `io` extra only for XLSX (`openpyxl`).
+
+The Data Room admits every safe regular file. CSV/TSV/JSON, native Parquet,
+and SQLite databases (`.db`, `.sqlite`, `.sqlite3`) receive bounded catalog
+and read support; SQLite contributes one table entry per user table. Unknown,
+extensionless, notebook, and other auxiliary files remain catalogable opaque
+members for explicit materialization, but are not analytically parsed by the
+core.
 
 ## 3. Optional specialist spokes
 
-Use zero to three specialists only when independent bounded investigations can
-materially improve the active answer. Keep the Analytical Owner at the center.
-Parallelize specialist work when scopes do not overlap; do not create a role per
-checklist item.
+Use the smallest useful set of specialists only when genuinely independent
+bounded investigations can materially improve the active answer. The set may
+be empty and must be bounded by actual host capacity; never create one
+specialist per method or checklist item. Keep the Analytical Owner at the
+center and parallelize only disjoint scopes.
 
 Supported specialist shapes include:
 
@@ -114,13 +126,17 @@ before routing a specialist.
 ## 4. Program-owned analyst interface
 
 Before the Analytical Owner starts, let the program create one `RunContext`,
-one shared `DataRoomWorkbench`, one `ItemWorkspace`, and one item-bound
+one logical run-local data room, one `ItemWorkspace`, and one item-bound
 analysis context for the item. In normal Requirement Mode every item binds
-directly to that same run context and shared data room. Persisted contexts and
-their business artifacts remain loadable after core or skill changes. The
-host/router records the current owner for audit; a replacement owner may
-continue any nonterminal item. Analytical agents never emit internal
-paths/hashes. Use `AnalystWorkspace` as the normal agent-facing interface.
+directly to the same run context and shared data room logically, while the program binds its physical inputs to
+the active generation's immutable data revision and catalog. A context is
+immutable within its attempt; a later upload publishes a successor D revision
+at a safe generation boundary rather than changing an active context. Old
+exact D/G bindings remain loadable for replay. Persisted contexts and their
+business artifacts remain loadable after core or skill changes. The host/router
+records the current owner for audit; a replacement owner may continue any
+nonterminal item. Analytical agents never emit internal paths/hashes. Use
+`AnalystWorkspace` as the normal agent-facing interface.
 
 The supervisor must not pre-create analysis contexts for every requirement at
 bootstrap. Create the ordinary context when an item starts; if a waiting item
@@ -155,6 +171,14 @@ Run custom Python, SQL, shell, notebook, spreadsheet, or chart code through the
 bound deterministic execution boundary when useful. Compile or runtime coding
 errors return to the same Analytical Owner and attempt. Do not treat a coding
 error as an analytical conclusion or as permission to transfer ownership.
+For supported tabular work, use the analytics toolkit first: `profile_data` for
+descriptive profiles, `compute_kpi_table` for explicit KPI aggregations,
+`segment_customers` for deterministic k-means with optional agglomerative
+comparison, and `score_segments` for assigning new rows with the serialized
+k-means model. Choose and record the exact method and parameters. Use custom
+owner-authored code only for a method the toolkit does not support, still
+through `ControlledScriptRunner`; read [ANALYTICS_TOOLKIT.md](references/ANALYTICS_TOOLKIT.md)
+for the artifact and evidence handoff.
 Use `ControlledScriptRunner.validate_script()` for bytecode-free syntax and
 dependency preflight; do not run `py_compile` inside a run root. Load exact
 source IDs from the persisted selection with `selected_sources()` or
@@ -277,11 +301,13 @@ Use exactly one mode per run.
   records one current-snapshot semantic decision: exact reusable IDs or an
   explicit `no_reuse_reason`. An empty semantic store does not waive this
   decision, and recovery keeps the same gate.
-- The default capacity contract is four parallel entity-resolution workers,
-  one Analytical Owner, and up to three owner specialists: eight active
-  workers total. The Planner is not counted or leased. A host may configure
-  lower or higher limits, but the scheduler must never oversubscribe the actual
-  host. If a caller requests Run A and Run B, those runs remain sequential.
+- Capacity is adaptive: the host reports its actual available worker slots and
+  the scheduler leases the smallest useful set for the current work without
+  oversubscription. Every requirement has exactly one Analytical Owner;
+  reviewers remain fresh and independent. Entity-resolution jobs and bounded
+  specialists use only capacity that is available, and the Planner is not
+  counted or leased. If a caller requests Run A and Run B, those runs remain
+  sequential.
 - Bind every requirement directly to the same `RunContext` and shared data
   room. Each item creates an item-local `RequirementAnalysisPlan` with one or
   more internal `RequirementAnalysisTask` values, then follows the ordinary
@@ -425,6 +451,23 @@ Keep integration downstream:
 - an integration defect is technical and must not erase a valid accepted
   answer.
 
+For toolkit results, `IntegrationSession.create/load` automatically stages the
+exact sealed, business-accepted typed `AnalyticalArtifact` handoff and its
+evidence references. The Integration Agent must not manually re-submit or
+re-declare those artifacts; it uses the existing validation/fidelity review
+and commit APIs and does not invent an integration method or write integration
+JSON directly.
+
+Keep the accepted business answer and its `accepted_content_hash` immutable.
+Integration records are a derived pre-commit projection, so the same
+Integration Agent may correct or remove only the record IDs authorized by the
+fidelity review. Preserve the accepted hash and business meaning, rebuild the
+fidelity packet, and submit the targeted recheck before committing. Differences
+between normalized typed fields and the accepted prose/artifact are ordinary
+projection work, not a semantic conflict or a reason to refuse; never edit the
+accepted answer or redo the analysis.
+See [ANALYTICS_TOOLKIT.md](references/ANALYTICS_TOOLKIT.md).
+
 Run mechanical validation, then one fresh item-only **Integration Fidelity
 Reviewer**. Allow the same Integration Agent one affected-record repair and one
 targeted recheck. Apply only reviewed accepted records to the LEM and Prepared
@@ -475,25 +518,91 @@ answer references, LEM, prepared registry, and telemetry. Build a local static
 dashboard from reviewed outputs only. Do not perform new analytics during
 rendering.
 
-The Product Agent must invoke the deterministic V4 assembler for
-`build_final_product`; manual fixture authoring is not the normal path. The
-Planner emits the action only, the host dispatches it after accepted/integrated
-results are terminal, and the Product Agent validates the assembler receipt and
-site before continuing through the existing terminal product manifest,
-optimizer, and lifecycle boundaries. Read
+Every business-accepted Analytical Owner answer is a presentation input,
+whether or not its separate integration projection committed successfully.
+Use the answer's reviewed ``visuals``, headline findings, and limitations as
+source-bound presentation candidates; integration remains an ontology and
+machine-reuse concern, never a prerequisite for showing an accepted business
+view. Ensure every accepted requirement receives a meaningful decision surface
+or an explicit limitation. Select one semantic representative per
+requirement/business metric/scope, prefer a richer eligible source-bound chart
+over a table when the exact reviewed geometry supports it, and record a
+concise data/decision rationale when a table is deliberately selected.
+Populate the executive overview from admitted reviewed business signals when
+available, demote integration echoes/support cards instead of duplicating an
+accepted visual, and keep technical source/join/count evidence in the audit
+surface unless the Product Agent deliberately presents an explicit
+source-bound business consequence. Use concise manager-facing titles and never
+expose raw failure reasons or internal paths in manager HTML.
+
+All Product Agent presentation actions use the same generation-scoped flow;
+manual fixture authoring is not the normal path:
+
+1. Call the public
+   `dashboard_assembler.business_presentation_preflight(context,
+   item_ids=..., generation_id=...)` to build or validate the deterministic
+   accepted/committed V2 design inventory under
+   `extensions/<G>/dashboard_preflight/`.
+2. Compare eligible local chart recipes by question, grain, dimensions,
+   measures, temporal shape, coverage, and limitations. Choose a coherent
+   multi-section layout with explicit `recipe_id`, `layout`, and
+   `renderer_type`; this is grounded selection from accepted business evidence,
+   never network design research or analytical recomputation.
+3. Distinguish initial creation from same-source regeneration. If
+   `extensions/<G>/business_presentation_plan.json` is absent, call the public
+   `dashboard_assembler.write_business_presentation_plan(...)` (or the explicit
+   V2 record route when required) with a complete ordered `manager_entries`
+   selection. If it already contains a V2 plan, call
+   `dashboard_assembler.write_business_presentation_plan_v2(...)` with a
+   complete new ordered selection, then
+   `dashboard_assembler.revise_business_presentation_plan_v2(...)` with exact
+   predecessor/successor SHA CAS, even when preflight/input hashes are
+   unchanged. Presentation audience, manager membership/order, recipe, layout,
+   and renderer may change; accepted facts, pointers, values, and provenance
+   bindings must remain exact. `record_business_presentation_plan_v2` is an
+   absent-target recorder only.
+4. For `refresh_product_preview`, call
+   `dashboard_delta_assembler.assemble_generation_preview(context, item_ids=...,
+   presentation_plan_ref=..., output_dir="generations/<G>/preview")` exactly
+   once. It renders accepted answer visuals together with any committed
+   integration facts, writes no terminal product
+   manifest, and does not gate later requirements. For a final Product Agent
+   action after all requirements are terminal, call
+   `dashboard_delta_assembler.assemble_generation_product(context, ...)` once
+   with the same plan ref; the entry point selects the root or successor path
+   from lifecycle metadata. Then validate the receipt, Blueprint, hashes, and
+   site before continuing through the existing candidate → independent review
+   → publication and lifecycle boundaries.
+
+The low-level full and delta assembly functions are program-owned internals of
+these generation entry points; Product Agents must not call them directly,
+edit fixture/chart/manifest bytes, or infer a route from requirement prose.
+Terminal technical-failure, blocked, unsupported, or no-record requirements
+remain explicit limitations. If every terminal input is limited, the preflight
+and plan choose a reviewed limited/empty-state view without fabricating metrics.
+When a new item is accepted in the same generation, its canonical input
+fingerprint changes: rerun preflight and refresh only the generation-scoped
+extension inventory/plan. Stale item bindings, source hashes, or plan refs fail
+closed, and once all requirements are terminal no incremental refresh is
+offered. Read
 [PRODUCT_AGENT_ASSEMBLER_CONTRACT.md](references/PRODUCT_AGENT_ASSEMBLER_CONTRACT.md)
-for the exact CLI/API, frozen-input binding, retry, and incident contract.
+for the frozen-input binding, retry, and incident contract.
 
 If requirements are added, updated, or removed while a Requirement Mode run is
 active, paused, or complete, keep the same logical `run_id`. Resume analytical
 work immediately; dispatch a cumulative generation delta after the current
-items are accepted and their integrations are committed:
+items are accepted and their integrations are committed or terminally failed.
+First run the shared
+preflight and explicit V2 plan flow above for the cumulative item set, then
+call the generation entry point once:
 
-```text
-python3 skills/auto-foundry-agentic-e2e/scripts/dashboard_delta_assembler.py \
-  --run-root <run-root> --run-id <run-id> \
-  --parent-receipt products/parent-dashboard/build_receipt.json \
-  --route route.json
+```python
+dashboard_delta_assembler.assemble_generation_product(
+    context,
+    parent_receipt_ref="products/<parent>/build_receipt.json",
+    route=route,
+    presentation_plan_ref="extensions/<G>/business_presentation_plan.json",
+)
 ```
 
 The route JSON must explicitly select an existing fixture domain, for example
@@ -536,9 +645,9 @@ field (inputs/outputs, parent and plan/state lineage, projections/freeze,
 affected/unchanged paths, rollback parent, and counts) rather than trusting
 the stored JSON.
 
-The ordinary V4 assembler remains the authority for a fresh root product
-manifest handoff, while the delta assembler alone writes the active
-generation's `products/generations/<generation-id>/product_manifest.json`.
+The generation entry point hands off a fresh root product manifest for G-0001;
+only its internal delta path writes the active generation's
+`products/generations/<generation-id>/product_manifest.json`.
 Run-local references are lexically symlink-free before resolution/open, the
 immediate parent manifest must bind the exact receipt hash and generation, and
 the child manifest's schema/assets/lineage are exact retry bindings.

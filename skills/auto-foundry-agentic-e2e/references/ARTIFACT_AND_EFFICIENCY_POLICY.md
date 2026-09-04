@@ -136,8 +136,11 @@ Requirement Mode preserves exact records and explicit user priority. One
 run-level event-driven Planner receives exact records, compact physical catalog
 metadata, and current item/resolution outcomes. Initial order/grouping is
 advisory; it does not predeclare runtime semantic dependencies, which the
-Analytical Owner discovers after understanding the requirement. It may suggest
-zero to three owner specialists. Its `RequirementExecutionPlan` and
+Analytical Owner discovers after understanding the requirement. It recommends
+only the smallest useful set of owner specialists for genuinely independent
+uncertainty, bounded by actual host capacity; zero is valid and it never
+creates one specialist per method or checklist item. Its
+`RequirementExecutionPlan` and
 `RequirementExecutionGroup` values are revisionable scheduling recommendations,
 not catalog-hash or lifecycle authority. A technical failure does not create
 Planner dependency blocks; independent groups remain eligible and runtime
@@ -145,10 +148,10 @@ resolution state controls waiting and resume. Every item
 binds directly to the same `RunContext` and shared Data Room, follows the
 ordinary owner loop, and reuses only committed integration semantics or
 prepared assets. Independent groups may run when host capacity permits; within
-a group one owner remains per requirement. The default capacity is four
-entity-resolution workers, one owner, up to three specialists, and eight active
-workers total; Planner capacity is not counted. Hosts may configure lower or
-higher limits but never oversubscribe actual host capacity. Requested Run A/B
+a group one owner remains per requirement. Capacity is adaptive to the actual
+host: the scheduler leases the smallest useful set without oversubscription.
+Every requirement has exactly one Analytical Owner, reviewers remain fresh and
+independent, and Planner capacity is not counted or leased. Requested Run A/B
 executions remain sequential.
 
 The Planner consumes typed runtime snapshots and public next actions until the

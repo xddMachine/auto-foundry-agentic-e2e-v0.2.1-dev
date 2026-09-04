@@ -4,8 +4,10 @@ import base64
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
+import inspect
 import json
 from pathlib import Path
+import shutil
 import threading
 import zlib
 
@@ -25,6 +27,7 @@ from auto_foundry_core import (
     StaleIdentityScopeError,
 )
 from auto_foundry_core.durable import ItemWorkspace
+from auto_foundry_core.entity_resolution import _iter_replay_batches
 from auto_foundry_core.integration import IntegrationSession
 from auto_foundry_core.lem_projection import LivingEnterpriseModelProjector
 from auto_foundry_core.lifecycle import RunLifecycle
@@ -190,78 +193,17 @@ def _materialize_g5_legacy_state(tmp_path: Path) -> tuple[RunContext, dict[str, 
     return context, legacy, state_path
 
 
-def test_actual_g5_legacy_state_upgrades_once_preserves_authority_and_wakes_waiters(
+def test_actual_g5_legacy_state_without_published_artifacts_fails_closed(
     tmp_path: Path,
 ) -> None:
     context, legacy, state_path = _materialize_g5_legacy_state(tmp_path)
-
-    workspace = EntityResolutionWorkspace.load(context)
-    migrated = json.loads(state_path.read_text(encoding="utf-8"))
-    assert migrated["schema_version"] == "auto_foundry.entity_resolution.state.v2"
-    assert migrated["capacity"] == legacy["capacity"]
-    assert migrated["leases"] == legacy["leases"]
-    assert migrated["waits"] == legacy["waits"]
-    assert set(migrated["domains"]) == set(legacy["domains"])
-    for domain_id, old_domain in legacy["domains"].items():
-        new_domain = migrated["domains"][domain_id]
-        # Every pre-existing owner/result/review/repair/commit/history field
-        # remains byte-for-value equivalent in the upgraded mapping.
-        for key, value in old_domain.items():
-            assert new_domain[key] == value
-        discovered = old_domain["discovered_by_item_id"]
-        assert new_domain["requested_by"] == [discovered]
-        assert new_domain["requests"] == [
-            {
-                "item_id": discovered,
-                "object_type": old_domain["object_type"],
-                "rationale": old_domain["rationale"],
-                "source_hints": old_domain["source_hints"],
-                "representation_item_ids": old_domain["representation_item_ids"],
-            }
-        ]
-        assert "owner_ref" not in new_domain["requests"][0]
-
-    # A new-format load is read-only and byte/mtime idempotent.
-    migrated_bytes = state_path.read_bytes()
-    migrated_mtime = state_path.stat().st_mtime_ns
-    reloaded = EntityResolutionWorkspace.load(context)
-    assert state_path.read_bytes() == migrated_bytes
-    assert state_path.stat().st_mtime_ns == migrated_mtime
-    assert len(reloaded.domains()) == 13
-
-    # A second requirement attaches to the existing canonical domain without
-    # creating another reservation or owner.  Exact retries do not write.
-    customer = reloaded.get_domain("customer")
-    with pytest.raises(ValueError, match="committed.*expand material scope"):
-        reloaded.reserve_identity_domain(
-            "customer",
-            customer.object_type,
-            "REQ-G5-SECOND",
-            "second requirement needs the same canonical customer domain",
-            source_hints=("second-source.csv",),
-            representation_item_ids=("second-customer-id",),
-            request_owner_ref="ao-REQ-G5-SECOND",
-        )
-    assert len(reloaded.domains()) == 13
-
-    # A ready domain wakes every waiter that names it; no resolution owner is
-    # launched or duplicated by the wakeup check.
-    reloaded.mark_waiting_on_resolution(
-        "REQ-G5-WAIT-1",
-        ("customer",),
-        "awaiting the shared customer domain",
-        owner_ref="ao-REQ-G5-WAIT-1",
-    )
-    reloaded.mark_waiting_on_resolution(
-        "REQ-G5-WAIT-2",
-        ("customer",),
-        "awaiting the shared customer domain",
-        owner_ref="ao-REQ-G5-WAIT-2",
-    )
-    statuses = reloaded.requirement_runtime_statuses()
-    assert statuses["REQ-G5-WAIT-1"]["state"] == "ready_to_resume"
-    assert statuses["REQ-G5-WAIT-2"]["state"] == "ready_to_resume"
-    assert reloaded.active_resolution_count == 0
+    before_bytes = state_path.read_bytes()
+    before_mtime = state_path.stat().st_mtime_ns
+    assert any(domain.get("state") == "ready" for domain in legacy["domains"].values())
+    with pytest.raises(ValueError, match="published artifact chain is missing"):
+        EntityResolutionWorkspace.load(context)
+    assert state_path.read_bytes() == before_bytes
+    assert state_path.stat().st_mtime_ns == before_mtime
 
 
 def test_malformed_near_legacy_state_fails_without_mutation(tmp_path: Path) -> None:
@@ -331,6 +273,250 @@ def _accepted_result() -> EntityResolutionResult:
     )
 
 
+def _accepted_result_for(prefix: str) -> EntityResolutionResult:
+    """Build a collision-free result for multi-domain integrity fixtures."""
+    result = _accepted_result()
+    decision = replace(
+        result.identity_decisions[0],
+        candidate_id=f"{prefix}-candidate",
+        decision_id=f"{prefix}-decision",
+    )
+    mapping = replace(
+        result.canonical_mappings[0],
+        canonical_id=f"{prefix}-mapping",
+        decision_id=decision.decision_id,
+    )
+    ontology = replace(result.ontology_items[0], item_id=f"{prefix}-customer")
+    relationship = dict(result.representation_relationships[0])
+    relationship.update(
+        {
+            "relationship_id": f"{prefix}-representation",
+            "source_id": ontology.item_id,
+            "target_id": mapping.canonical_id,
+        }
+    )
+    return replace(
+        result,
+        ontology_items=(ontology,),
+        identity_decisions=(decision,),
+        canonical_mappings=(mapping,),
+        representation_relationships=(relationship,),
+    )
+
+
+def test_resolution_result_reuses_and_extends_existing_ontology_item() -> None:
+    model = LivingEnterpriseModel(run_id="RUN-ER-ONTOLOGY-MERGE")
+    model.add_ontology_item(
+        OntologyItem(
+            item_id="erp_transactions.parquet",
+            item_type="entity",
+            label="ERP sales transactions",
+            properties={"analytical_role": "distinct-sales-document customer activity", "columns": ["SALESDOCUMENT"]},
+            source_refs=("erp_transactions.parquet",),
+            effective_period="2019-07-06/2020-06-29",
+        )
+    )
+    result = EntityResolutionResult(
+        ontology_items=(
+            OntologyItem(
+                item_id="erp_transactions.parquet",
+                item_type="entity",
+                label="ERP transaction rows",
+                properties={
+                    "analytical_role": "ERP line-level reference target",
+                    "columns": ["SALESDOCUMENT", "SALESDOCUMENTITEM"],
+                    "row_count": 1916685,
+                },
+                source_refs=("erp_transactions.parquet", "erp_transactions.schema.json"),
+                limitations=("Line-level fan-out",),
+                effective_period=None,
+            ),
+        ),
+        source_hash=SOURCE_HASH,
+    )
+
+    EntityResolutionWorkspace._apply_result(model, result)
+    item = model.ontology["erp_transactions.parquet"]
+    assert len(model.ontology) == 1
+    assert item.label == "ERP sales transactions"
+    assert item.properties["analytical_role"] == "distinct-sales-document customer activity"
+    assert item.properties["columns"] == ["SALESDOCUMENT", "SALESDOCUMENTITEM"]
+    assert item.properties["row_count"] == 1916685
+    assert item.source_refs == ("erp_transactions.parquet", "erp_transactions.schema.json")
+    assert item.effective_period == "2019-07-06/2020-06-29"
+    assert item.limitations == ("Line-level fan-out",)
+
+
+def test_resolution_result_reuses_existing_relationship_before_endpoint_validation() -> None:
+    model = LivingEnterpriseModel(run_id="RUN-ER-RELATIONSHIP-ID-FIRST")
+    model.add_ontology_item(OntologyItem(item_id="source", item_type="entity", label="Source"))
+    model.add_ontology_item(OntologyItem(item_id="target", item_type="entity", label="Target"))
+    model.add_relationship(
+        {
+            "relationship_id": "source-target",
+            "source_id": "source",
+            "target_id": "target",
+            "relationship_type": "represents",
+        }
+    )
+    result = EntityResolutionResult(
+        representation_relationships=(
+            {
+                "relationship_id": "source-target",
+                # Existing edge IDs are authoritative even when a duplicate
+                # result omits endpoints and carries malformed shape fields.
+                "analysis_relationship_id": "malformed-analysis",
+                "join_keys": "not-a-list",
+            },
+        ),
+        source_hash=SOURCE_HASH,
+    )
+
+    EntityResolutionWorkspace._apply_result(model, result)
+
+    assert set(model.relationships) == {"source-target"}
+    assert model.relationships["source-target"]["source_id"] == "source"
+    assert model.relationships["source-target"]["target_id"] == "target"
+    assert model.relationships["source-target"]["relationship_type"] == "represents"
+
+
+def test_two_resolution_domains_replay_shared_ontology_and_relationship_ids(tmp_path: Path) -> None:
+    context = RunContext("RUN-ER-SHARED-SEMANTICS", tmp_path / "run")
+    workspace = EntityResolutionWorkspace.create(context)
+
+    def result_for(domain: str, *, richer: bool) -> EntityResolutionResult:
+        decision = IdentityDecision(
+            candidate_id=f"candidate-{domain}",
+            decision="same_object",
+            decision_id=f"decision-{domain}",
+            review_status="accepted",
+            reviewer_ref=f"reviewer-{domain}",
+        )
+        mapping = CanonicalMapping(
+            canonical_id=f"mapping-{domain}",
+            object_type="customer",
+            source_identities=(f"source-{domain}",),
+            decision_id=decision.decision_id,
+        )
+        source = OntologyItem(
+            item_id="shared-source",
+            item_type="entity" if not richer else "representation",
+            label="Canonical source" if not richer else "Requirement wording",
+            properties={
+                "columns": ["id"] if not richer else ["id", "created_at"],
+                "date_field": None if not richer else "created_at",
+                "nested": {"first": True} if not richer else {"second": True},
+            },
+            source_refs=("shared.csv",) if not richer else ("shared.csv", "schema.json"),
+            limitations=("Initial limitation",) if not richer else ("Second limitation",),
+            effective_period="2020" if not richer else None,
+        )
+        target = OntologyItem(
+            item_id="shared-target",
+            item_type="entity",
+            label="Canonical target",
+        )
+        return EntityResolutionResult(
+            ontology_items=(source, target),
+            identity_decisions=(decision,),
+            canonical_mappings=(mapping,),
+            representation_relationships=(
+                {
+                    "relationship_id": "shared-relationship",
+                    # The second domain intentionally carries malformed
+                    # endpoint/shape details.  The relationship ID is
+                    # already canonical, so replay must retain the first
+                    # edge without validating this incoming duplicate.
+                    **({} if richer else {"source_id": "shared-source", "target_id": "shared-target"}),
+                    "relationship_type": "represents" if not richer else None,
+                    "join_keys": "not-a-list" if richer else None,
+                },
+            ),
+            coverage={"source_count": 1, "mapped_count": 1},
+            population={"source_ids": [f"source-{domain}"]},
+            source_hash=SOURCE_HASH,
+        )
+
+    # Commit in reverse lexical order.  The first committed scalar remains
+    # canonical while the later domain contributes only additive facts.
+    for domain, richer in (("z-domain", False), ("a-domain", True)):
+        workspace.reserve_identity_domain(
+            domain,
+            "customer",
+            f"REQ-{domain}",
+            "shared semantic publication",
+            source_hints=(f"{domain}.csv",),
+        )
+        workspace.claim_resolution_owner(domain, f"owner-{domain}")
+        workspace.submit_result(
+            domain,
+            f"owner-{domain}",
+            result_for(domain, richer=richer),
+            expected_scope_hash=workspace.current_scope(domain).scope_hash,
+        )
+        workspace.record_review(domain, "accept", f"independent-{domain}")
+        workspace.commit(domain)
+
+    # Loading the authoritative entity-resolution ledger must accept the two
+    # domain-local audit rows even though their semantic object IDs repeat.
+    reloaded = EntityResolutionWorkspace.load(context)
+    assert {domain.state for domain in reloaded.domains()} == {"ready"}
+    first_replay = replay_ready_commits(context, LivingEnterpriseModel(run_id=context.run_id))
+    second_replay = replay_ready_commits(context, LivingEnterpriseModel(run_id=context.run_id))
+    assert first_replay.export() == second_replay.export()
+    assert set(first_replay.ontology) == {"shared-source", "shared-target", "shared-relationship"}
+    assert set(first_replay.relationships) == {"shared-relationship"}
+    source = first_replay.ontology["shared-source"]
+    assert source.item_type == "entity"
+    assert source.label == "Canonical source"
+    assert source.properties["columns"] == ["id", "created_at"]
+    assert source.properties["date_field"] == "created_at"
+    assert source.properties["nested"] == {"first": True, "second": True}
+    assert source.source_refs == ("shared.csv", "schema.json")
+    assert source.limitations == ("Initial limitation", "Second limitation")
+    assert source.effective_period == "2020"
+    assert first_replay.relationships["shared-relationship"]["relationship_type"] == "represents"
+    # Requirement-mode projection can replay run-level resolution commits
+    # without item-local integrations; materialize the empty lifecycle after
+    # publishing so reservation remains independent of a missing item root.
+    RunLifecycle.create(context, (), mode="requirement")
+    projection = LivingEnterpriseModelProjector.project(context)
+    projected = projection.model
+    assert projected.export() == first_replay.export()
+    assert {binding["domain_id"] for binding in projection.resolution_bindings} == {
+        "z-domain",
+        "a-domain",
+    }
+    # Resolution authority is cumulative; the projection API no longer has an
+    # exclusion parameter that could return bindings for unapplied semantics.
+    assert not any(
+        name.startswith("exclude")
+        for name in inspect.signature(LivingEnterpriseModelProjector.project).parameters
+    )
+
+
+def test_equal_timestamp_replay_order_uses_deterministic_domain_tie_break() -> None:
+    timestamp = "2026-01-01T00:00:00+00:00"
+    grouped = {
+        "z-domain": {
+            "batches": (
+                ({"committed_at": timestamp, "revision": 1, "manifest_hash": "z" * 64}, ()),
+            ),
+        },
+        "a-domain": {
+            "batches": (
+                ({"committed_at": timestamp, "revision": 1, "manifest_hash": "a" * 64}, ()),
+            ),
+        },
+    }
+
+    replay_order = [
+        (domain_id, manifest["revision"])
+        for domain_id, manifest, _records in _iter_replay_batches(grouped)
+    ]
+    assert replay_order == [("a-domain", 1), ("z-domain", 1)]
+
+
 def test_capacity_and_idempotent_recovery_leases(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="cannot exceed total_active"):
         ResolutionCapacity(total_active=1, entity_resolution=2, analytical_owner=1, specialist=1)
@@ -346,6 +532,26 @@ def test_capacity_and_idempotent_recovery_leases(tmp_path: Path) -> None:
     workspace.release_worker(first, recovery=True)
     assert workspace.active_resolution_count == 0
     assert EntityResolutionWorkspace.load(context).capacity.total_active == 2
+
+
+def test_resolution_domain_leases_do_not_duplicate_coordinator_capacity_checks(tmp_path: Path) -> None:
+    """Domain ownership remains exclusive while Coordinator owns physical caps."""
+
+    context = RunContext("RUN-ER-CAPACITY-AUTHORITY", tmp_path / "run")
+    workspace = EntityResolutionWorkspace.create(
+        context,
+        capacity=ResolutionCapacity(total_active=1, entity_resolution=1, analytical_owner=1, specialist=1),
+    )
+    for domain_id in ("domain-1", "domain-2"):
+        workspace.reserve_identity_domain(domain_id, "customer", "REQ-1", "shared identity domain")
+
+    first = workspace.claim_resolution_owner("domain-1", "resolution-owner-1")
+    second = workspace.claim_resolution_owner("domain-2", "resolution-owner-2")
+    assert first.subject_id == "domain-1"
+    assert second.subject_id == "domain-2"
+    assert len(workspace.active_leases) == 2
+    with pytest.raises(ValueError, match="total active worker capacity"):
+        workspace.claim_worker("specialist", "specialist-owner", "task-1")
 
 
 def test_reserve_review_commit_and_replay(tmp_path: Path) -> None:
@@ -393,6 +599,445 @@ def test_reserve_review_commit_and_replay(tmp_path: Path) -> None:
     assert {path.name for path in committed_root.iterdir()} == {"manifest.json", "records.jsonl"}
 
 
+def test_committed_domain_additive_revision_preserves_v1_and_merges_facts(tmp_path: Path) -> None:
+    context = RunContext("RUN", tmp_path / "run")
+    RunLifecycle.create(context, ("REQ-LINK",))
+    workspace = _workspace(tmp_path)
+    workspace.reserve_identity_domain(
+        "customer-domain",
+        "customer",
+        "REQ-1",
+        "identity required",
+        source_hints=("customers.csv",),
+        representation_item_ids=("customer-id",),
+    )
+    workspace.claim_resolution_owner("customer-domain", "owner-v1")
+    v1_result = _accepted_result()
+    workspace.submit_result(
+        "customer-domain",
+        "owner-v1",
+        v1_result,
+        expected_scope_hash=workspace.current_scope("customer-domain").scope_hash,
+    )
+    workspace.record_review("customer-domain", "accept", "review-v1")
+    v1 = workspace.commit("customer-domain")
+    v1_manifest = (workspace.root / v1.manifest_path).read_bytes()
+    v1_records = (workspace.root / v1.records_path).read_bytes()
+
+    # An accepted item relationship may depend on an endpoint published by
+    # the predecessor revision.  Candidate validation keeps the full
+    # projection while the integration edge is published independently.
+    item = ItemWorkspace.create(context, "REQ-LINK", original_text="customer link")
+    item.bind_analysis_owner("analytical-owner")
+    item.write_plan({"item_id": "REQ-LINK", "offline": True})
+    item.write_draft({"answer": "customer link"})
+    relationship = {
+        "record_kind": "analytical_relationship",
+        "relationship_id": "accepted-customer-link",
+        "source_id": "customer",
+        "target_id": "customer-1",
+        "cardinality": "one_to_one",
+        "join_keys": [{"source_field": "id", "target_field": "id"}],
+        "matched_pairs": 1,
+        "source_population": 1,
+        "target_population": 1,
+        "matched_source_count": 1,
+        "matched_target_count": 1,
+        "source_coverage": 1.0,
+        "target_coverage": 1.0,
+        "date_authority": "fixture-controlled snapshot",
+        "as_of": None,
+        "limitations": ["synthetic fixture"],
+        "evidence_refs": ["work/plan.json"],
+        "publishable": True,
+        "no_relationship_reason": None,
+        "audit_id": None,
+        "owner_ref": "analytical-owner",
+    }
+    item.append_analytical_relationship(relationship)
+    item.record_review("accept", reviewer_ref="reviewer")
+    item.accept(accepted_refs=("work/plan.json", "work/analytical_relationships.jsonl"))
+    session = IntegrationSession.create(
+        context,
+        item,
+        PreparedAssetRegistry(context),
+        "integration-owner",
+        invocation_id="inv-REQ-LINK",
+    )
+    session.add_relationship(
+        {
+            "relationship_id": "accepted-customer-link",
+            "analysis_relationship_id": "accepted-customer-link",
+            "source_id": "customer",
+            "target_id": "customer-1",
+            "cardinality": "one_to_one",
+            "join_keys": [{"source_field": "id", "target_field": "id"}],
+            "matched_pairs": 1,
+            "source_population": 1,
+            "target_population": 1,
+            "matched_source_count": 1,
+            "matched_target_count": 1,
+            "source_coverage": 1.0,
+            "target_coverage": 1.0,
+            "date_authority": "fixture-controlled snapshot",
+            "as_of": None,
+            "limitations": ["synthetic fixture"],
+            "evidence_refs": ["work/plan.json"],
+        },
+        scope="question",
+        evidence_refs=("work/plan.json",),
+    )
+    assert session.validate().valid
+    session.record_fidelity_review("accept", checked_record_ids=tuple(record.record_id for record in session.records))
+    session.commit()
+
+    # A material AO proposal opens revision 2 without replacing the v1
+    # authority.  The same-domain v2 result adds reviewed structured facts;
+    # repeated identity/mapping/relationship IDs remain canonical no-ops.
+    expanded = workspace.reserve_identity_domain(
+        "customer-domain",
+        "customer",
+        "REQ-2",
+        "returns representation requires additive identity scope",
+        source_hints=("returns.csv",),
+        representation_item_ids=("returns-customer-id",),
+    )
+    assert expanded.domain_id == "customer-domain"
+    assert expanded.revision == 2
+    assert expanded.published_revision == 1
+    assert expanded.commit_manifest_hash == v1.manifest_hash
+    assert workspace.get_domain("customer-domain").state == "reserved"
+    assert set(replay_ready_commits(context).ontology) == {"customer", "customer-representation"}
+
+    workspace.claim_resolution_owner("customer-domain", "owner-v2")
+    discovered = workspace.record_scope_discovery(
+        "customer-domain",
+        "owner-v2",
+        source_hints=("returns-detail.csv",),
+        representation_item_ids=("returns-detail-id",),
+    )
+    assert discovered["status"] == "added"
+    v2_result = replace(
+        v1_result,
+        ontology_items=(
+            replace(
+                v1_result.ontology_items[0],
+                label="Customer wording from returns requirement",
+                properties={
+                    "columns": ["customer_id", "return_id"],
+                    "key": "customer_id",
+                    "row_count": 3,
+                },
+                source_refs=("returns.csv",),
+                limitations=("returns extract is partial",),
+            ),
+        ),
+        representation_relationships=(
+            {
+                "relationship_id": "customer-representation",
+                # The requirement-local audit payload may be incomplete or
+                # differently worded; the committed edge remains canonical.
+                "source_id": "unknown-source",
+                "target_id": "unknown-target",
+                "relationship_type": "returns-representation",
+            },
+        ),
+    )
+    workspace.submit_result(
+        "customer-domain",
+        "owner-v2",
+        v2_result,
+        expected_scope_hash=workspace.current_scope("customer-domain").scope_hash,
+    )
+    workspace.record_review("customer-domain", "accept", "review-v2")
+    v2 = workspace.commit("customer-domain")
+    assert v2.revision == 2
+    assert v2.supersedes_manifest_hash == v1.manifest_hash
+    assert v2.scope_hash == workspace.get_domain("customer-domain").published_scope_hash
+    assert (workspace.root / v1.manifest_path).read_bytes() == v1_manifest
+    assert (workspace.root / v1.records_path).read_bytes() == v1_records
+
+    current = replay_ready_commits(context).export()
+    customer = current["ontology"][0]
+    assert customer["label"] == "Customer"
+    assert customer["properties"] == {
+        "columns": ["customer_id", "return_id"],
+        "key": "customer_id",
+        "row_count": 3,
+    }
+    assert customer["source_refs"] == ["returns.csv"]
+    assert customer["limitations"] == ["returns extract is partial"]
+    assert current["canonical_mappings"][0]["source_identities"] == [
+        "account-a",
+        "account-b",
+        "account-c",
+    ]
+    assert current["relationships"]["customer-representation"]["source_id"] == "customer"
+    assert current["relationships"]["customer-representation"]["target_id"] == "customer-1"
+    assert EntityResolutionWorkspace.committed_bindings(context)[0]["revision"] == 2
+    projected = LivingEnterpriseModelProjector.project(context).model.export()
+    assert "accepted-customer-link" in projected["relationships"]
+
+
+def test_waiters_are_bound_to_required_revision_across_late_additive_publish_and_failure(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    workspace.reserve_identity_domain(
+        "customer-domain",
+        "customer",
+        "REQ-V1",
+        "initial identity request",
+        source_hints=("customers.csv",),
+    )
+    workspace.mark_waiting_on_resolution(
+        "REQ-V1",
+        ("customer-domain",),
+        "awaiting v1",
+        owner_ref="ao-v1",
+    )
+    workspace.claim_resolution_owner("customer-domain", "owner-v1")
+    result = _accepted_result()
+    workspace.submit_result(
+        "customer-domain",
+        "owner-v1",
+        result,
+        expected_scope_hash=workspace.current_scope("customer-domain").scope_hash,
+    )
+    workspace.record_review("customer-domain", "accept", "review-v1")
+    workspace.commit("customer-domain")
+
+    # Open v2 before the original v1 wait is polled.  Each request keeps its
+    # first-admission boundary; the exact retry must not churn its bytes.
+    workspace.reserve_identity_domain(
+        "customer-domain",
+        "customer",
+        "REQ-V2",
+        "wider identity scope",
+        source_hints=("returns.csv",),
+    )
+    workspace.mark_waiting_on_resolution(
+        "REQ-V2",
+        ("customer-domain",),
+        "awaiting v2",
+        owner_ref="ao-v2",
+    )
+    before_retry = workspace.state_path.read_bytes()
+    workspace.mark_waiting_on_resolution(
+        "REQ-V2",
+        ("customer-domain",),
+        "awaiting v2",
+        owner_ref="ao-v2",
+    )
+    assert workspace.state_path.read_bytes() == before_retry
+    statuses = workspace.requirement_runtime_statuses()
+    assert statuses["REQ-V1"]["state"] == "ready_to_resume"
+    assert statuses["REQ-V2"]["state"] == "waiting_on_resolution"
+    assert statuses["REQ-V1"]["required_revisions"] == {"customer-domain": 1}
+    assert statuses["REQ-V2"]["required_revisions"] == {"customer-domain": 2}
+
+    workspace.claim_resolution_owner("customer-domain", "owner-v2")
+    workspace.submit_result(
+        "customer-domain",
+        "owner-v2",
+        result,
+        expected_scope_hash=workspace.current_scope("customer-domain").scope_hash,
+    )
+    workspace.record_review("customer-domain", "fail", "review-v2")
+    statuses = workspace.requirement_runtime_statuses()
+    assert statuses["REQ-V1"]["state"] == "ready_to_resume"
+    assert statuses["REQ-V2"]["state"] == "waiting_on_resolution"
+
+
+def _committed_two_revision_domain(tmp_path: Path) -> tuple[EntityResolutionWorkspace, object, object]:
+    workspace = _workspace(tmp_path)
+    workspace.reserve_identity_domain("customer-domain", "customer", "REQ-V1", "initial", source_hints=("a.csv",))
+    workspace.claim_resolution_owner("customer-domain", "owner-v1")
+    result = _accepted_result()
+    workspace.submit_result(
+        "customer-domain",
+        "owner-v1",
+        result,
+        expected_scope_hash=workspace.current_scope("customer-domain").scope_hash,
+    )
+    workspace.record_review("customer-domain", "accept", "review-v1")
+    first = workspace.commit("customer-domain")
+    workspace.reserve_identity_domain("customer-domain", "customer", "REQ-V2", "expanded", source_hints=("b.csv",))
+    workspace.claim_resolution_owner("customer-domain", "owner-v2")
+    workspace.submit_result(
+        "customer-domain",
+        "owner-v2",
+        result,
+        expected_scope_hash=workspace.current_scope("customer-domain").scope_hash,
+    )
+    workspace.record_review("customer-domain", "accept", "review-v2")
+    second = workspace.commit("customer-domain")
+    return workspace, first, second
+
+
+def test_revision_manifest_path_swap_and_stale_pointer_fail_closed(tmp_path: Path) -> None:
+    workspace, first, second = _committed_two_revision_domain(tmp_path)
+    root_manifest = workspace.root / first.manifest_path
+    child_manifest = workspace.root / second.manifest_path
+    root_bytes = root_manifest.read_bytes()
+    child_bytes = child_manifest.read_bytes()
+    root_manifest.write_bytes(child_bytes)
+    child_manifest.write_bytes(root_bytes)
+    before_state = workspace.state_path.read_bytes()
+    with pytest.raises(ValueError, match="revision 1 root path"):
+        EntityResolutionWorkspace.load(workspace.context)
+    assert workspace.state_path.read_bytes() == before_state
+
+    workspace, first, second = _committed_two_revision_domain(tmp_path / "stale-pointer")
+    with workspace._locked():
+        workspace._refresh()
+        entry = dict(workspace._state["domains"]["customer-domain"])
+        entry["commit_manifest_hash"] = first.manifest_hash
+        workspace._state["domains"]["customer-domain"] = entry
+        workspace._persist()
+    before_state = workspace.state_path.read_bytes()
+    with pytest.raises(ValueError, match="published revision is stale|published scope is stale"):
+        EntityResolutionWorkspace.load(workspace.context)
+    assert workspace.state_path.read_bytes() == before_state
+
+
+def test_existing_revision_manifest_wrong_source_hash_fails_cas_reconciliation(tmp_path: Path) -> None:
+    workspace, _first, second = _committed_two_revision_domain(tmp_path)
+    manifest_path = workspace.root / second.manifest_path
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["source_hash"] = "f" * 64
+    unsigned = {key: value for key, value in manifest.items() if key != "manifest_hash"}
+    manifest["manifest_hash"] = hashlib.sha256(
+        (json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    ).hexdigest()
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    with workspace._locked():
+        workspace._refresh()
+        entry = dict(workspace._state["domains"]["customer-domain"])
+        entry["commit_manifest_hash"] = manifest["manifest_hash"]
+        workspace._state["domains"]["customer-domain"] = entry
+        workspace._persist()
+    with pytest.raises(ValueError, match="source_hash does not match"):
+        EntityResolutionWorkspace.load(workspace.context)
+
+
+def _committed_v1_domain_with_wait(tmp_path: Path) -> tuple[EntityResolutionWorkspace, object]:
+    workspace = _workspace(tmp_path)
+    workspace.reserve_identity_domain(
+        "customer-domain",
+        "customer",
+        "REQ-V1",
+        "initial",
+        source_hints=("a.csv",),
+    )
+    workspace.mark_waiting_on_resolution(
+        "REQ-V1",
+        ("customer-domain",),
+        "awaiting v1",
+        owner_ref="ao-v1",
+    )
+    workspace.claim_resolution_owner("customer-domain", "owner-v1")
+    result = _accepted_result()
+    workspace.submit_result(
+        "customer-domain",
+        "owner-v1",
+        result,
+        expected_scope_hash=workspace.current_scope("customer-domain").scope_hash,
+    )
+    workspace.record_review("customer-domain", "accept", "review-v1")
+    return workspace, workspace.commit("customer-domain")
+
+
+@pytest.mark.parametrize("active_v2_state", ("reserved", "failed"))
+def test_missing_published_v1_artifacts_fail_closed_while_v2_is_unpublished(
+    tmp_path: Path,
+    active_v2_state: str,
+) -> None:
+    workspace, v1 = _committed_v1_domain_with_wait(tmp_path / active_v2_state)
+    workspace.reserve_identity_domain(
+        "customer-domain",
+        "customer",
+        "REQ-V2",
+        "expanded",
+        source_hints=("b.csv",),
+    )
+    if active_v2_state == "failed":
+        workspace.claim_resolution_owner("customer-domain", "owner-v2")
+        result = _accepted_result()
+        workspace.submit_result(
+            "customer-domain",
+            "owner-v2",
+            result,
+            expected_scope_hash=workspace.current_scope("customer-domain").scope_hash,
+        )
+        workspace.record_review("customer-domain", "fail", "review-v2")
+    published_root = (workspace.root / v1.manifest_path).parent
+    shutil.rmtree(published_root)
+    before_state = workspace.state_path.read_bytes()
+    with pytest.raises(ValueError, match="published artifact chain is missing"):
+        EntityResolutionWorkspace.load(workspace.context)
+    assert workspace.state_path.read_bytes() == before_state
+
+
+def test_missing_published_v1_artifacts_fail_closed_for_ready_v1(tmp_path: Path) -> None:
+    workspace, v1 = _committed_v1_domain_with_wait(tmp_path)
+    shutil.rmtree((workspace.root / v1.manifest_path).parent)
+    before_state = workspace.state_path.read_bytes()
+    with pytest.raises(ValueError, match="published artifact chain is missing"):
+        EntityResolutionWorkspace.load(workspace.context)
+    assert workspace.state_path.read_bytes() == before_state
+
+
+def test_loaded_workspace_runtime_statuses_fail_when_published_artifacts_are_deleted(
+    tmp_path: Path,
+) -> None:
+    workspace, v1 = _committed_v1_domain_with_wait(tmp_path)
+    loaded = EntityResolutionWorkspace.load(workspace.context)
+    shutil.rmtree((loaded.root / v1.manifest_path).parent)
+    before_state = loaded.state_path.read_bytes()
+    with pytest.raises(ValueError, match="published artifact chain is missing"):
+        loaded.requirement_runtime_statuses()
+    assert loaded.state_path.read_bytes() == before_state
+
+
+def test_intact_v1_remains_readable_for_pending_and_failed_v2_waiters(tmp_path: Path) -> None:
+    workspace, _v1 = _committed_v1_domain_with_wait(tmp_path)
+    workspace.reserve_identity_domain(
+        "customer-domain",
+        "customer",
+        "REQ-V2",
+        "expanded",
+        source_hints=("b.csv",),
+    )
+    workspace.mark_waiting_on_resolution(
+        "REQ-V2",
+        ("customer-domain",),
+        "awaiting v2",
+        owner_ref="ao-v2",
+    )
+    loaded = EntityResolutionWorkspace.load(workspace.context)
+    statuses = loaded.requirement_runtime_statuses()
+    assert statuses["REQ-V1"]["state"] == "ready_to_resume"
+    assert statuses["REQ-V2"]["state"] == "waiting_on_resolution"
+
+    loaded.claim_resolution_owner("customer-domain", "owner-v2")
+    result = _accepted_result()
+    loaded.submit_result(
+        "customer-domain",
+        "owner-v2",
+        result,
+        expected_scope_hash=loaded.current_scope("customer-domain").scope_hash,
+    )
+    loaded.record_review("customer-domain", "fail", "review-v2")
+    reloaded = EntityResolutionWorkspace.load(workspace.context)
+    statuses = reloaded.requirement_runtime_statuses()
+    assert statuses["REQ-V1"]["state"] == "ready_to_resume"
+    assert statuses["REQ-V2"]["state"] == "waiting_on_resolution"
+
+
 def test_shared_domain_requests_attach_idempotently_without_merging_distinct_keys(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     first = workspace.reserve_identity_domain(
@@ -436,6 +1081,142 @@ def test_shared_domain_requests_attach_idempotently_without_merging_distinct_key
         "customer-domain-alias",
     }
     assert alias.requested_by == ("REQ-3",)
+
+
+def test_reopened_request_binds_generation_and_data_revision_without_reusing_ready_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path)
+    lineage = ["G-0001", "D-0001"]
+    monkeypatch.setattr(workspace, "_authoritative_lineage", lambda: tuple(lineage))
+
+    first = workspace.reserve_identity_domain(
+        "customer-domain",
+        "customer",
+        "REQ-1",
+        "identity required",
+        source_hints=("customers.csv",),
+    )
+    assert first.generation_id == "G-0001"
+    assert first.data_revision_id == "D-0001"
+    assert first.request_records[0]["generation_id"] == "G-0001"
+    assert first.request_records[0]["data_revision_id"] == "D-0001"
+    workspace.claim_resolution_owner("customer-domain", "owner-v1")
+    workspace.submit_result(
+        "customer-domain",
+        "owner-v1",
+        _accepted_result(),
+        expected_scope_hash=workspace.current_scope("customer-domain").scope_hash,
+    )
+    workspace.record_review("customer-domain", "accept", "review-v1")
+    workspace.commit("customer-domain")
+
+    # A refreshed G/D lineage can attach the same requirement again.  The
+    # additional hint opens v2 and clears the ready candidate rather than
+    # mutating the immutable v1 publication.
+    lineage[:] = ["G-0002", "D-0002"]
+    second = workspace.reserve_identity_domain(
+        "customer-domain",
+        "customer",
+        "REQ-1",
+        "identity required",
+        source_hints=("customers.csv", "returns.csv"),
+    )
+    assert second.revision == 2
+    assert second.published_revision == 1
+    assert second.state == "reserved"
+    assert second.result_hash is None
+    assert second.request_records[-1]["generation_id"] == "G-0002"
+    assert second.request_records[-1]["data_revision_id"] == "D-0002"
+    authoritative = workspace.authoritative_request_for_requirement("REQ-1", "customer-domain")
+    assert authoritative is not None
+    assert authoritative.generation_id == "G-0002"
+    assert authoritative.data_revision_id == "D-0002"
+    state_before_retry = workspace.state_path.read_bytes()
+    assert workspace.reserve_identity_domain(
+        "customer-domain",
+        "customer",
+        "REQ-1",
+        "identity required",
+        source_hints=("customers.csv", "returns.csv"),
+    ) == second
+    assert workspace.state_path.read_bytes() == state_before_retry
+
+    with pytest.raises(ValueError, match="conflicts with prior request"):
+        workspace.reserve_identity_domain(
+            "customer-domain",
+            "customer",
+            "REQ-1",
+            "mutated same-lineage request",
+            source_hints=("customers.csv", "returns.csv"),
+        )
+
+    workspace.claim_resolution_owner("customer-domain", "owner-v2")
+    workspace.submit_result(
+        "customer-domain",
+        "owner-v2",
+        _accepted_result(),
+        expected_scope_hash=workspace.current_scope("customer-domain").scope_hash,
+    )
+    workspace.record_review("customer-domain", "accept", "review-v2")
+    workspace.commit("customer-domain")
+
+    # Identical semantic bytes on a changed D are still a successor request;
+    # stale v2 readiness is never reused.
+    lineage[:] = ["G-0002", "D-0003"]
+    third = workspace.reserve_identity_domain(
+        "customer-domain",
+        "customer",
+        "REQ-1",
+        "identity required",
+        source_hints=("customers.csv", "returns.csv"),
+    )
+    assert third.revision == 3
+    assert third.published_revision == 2
+    assert third.state == "reserved"
+    assert third.result_hash is None
+    assert third.request_records[-1]["generation_id"] == "G-0002"
+    assert third.request_records[-1]["data_revision_id"] == "D-0003"
+
+
+def test_lineage_bound_request_retry_is_deterministic_under_concurrency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = _workspace(tmp_path)
+    monkeypatch.setattr(workspace, "_authoritative_lineage", lambda: ("G-0001", "D-0001"))
+    barrier = threading.Barrier(2)
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def reserve() -> None:
+        try:
+            barrier.wait(timeout=5)
+            results.append(
+                workspace.reserve_identity_domain(
+                    "customer-domain",
+                    "customer",
+                    "REQ-1",
+                    "identity required",
+                    source_hints=("customers.csv",),
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 - worker evidence is asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=reserve) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert errors == []
+    assert len(results) == 2
+    assert results[0] == results[1]
+    domain = workspace.get_domain("customer-domain")
+    assert len(domain.request_records) == 1
+    assert domain.request_records[0]["generation_id"] == "G-0001"
+    assert domain.request_records[0]["data_revision_id"] == "D-0001"
 
 
 def test_owner_scope_discovery_is_lease_bound_idempotent_and_materially_hashed(tmp_path: Path) -> None:
@@ -681,7 +1462,7 @@ def test_scope_discovery_invalidates_review_pending_candidate(
     assert (workspace.root / "state.json").read_bytes() == state_after
 
 
-def test_published_old_scope_commit_cannot_be_reconciled_over_expanded_scope(tmp_path: Path) -> None:
+def test_published_old_scope_commit_reconciles_then_opens_additive_revision(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     workspace.reserve_identity_domain(
         "customer-domain",
@@ -700,7 +1481,7 @@ def test_published_old_scope_commit_cannot_be_reconciled_over_expanded_scope(tmp
     )
     workspace.record_review("customer-domain", "accept", "independent-reviewer")
     precommit = json.loads((workspace.root / "state.json").read_text(encoding="utf-8"))
-    workspace.commit("customer-domain")
+    prior_commit = workspace.commit("customer-domain")
 
     # Simulate a crash after the immutable commit directory was published but
     # before its state binding was persisted, then an intervening scope
@@ -728,20 +1509,22 @@ def test_published_old_scope_commit_cannot_be_reconciled_over_expanded_scope(tmp
     state_path = workspace.root / "state.json"
     state_path.write_bytes(crashed_bytes)
 
-    with pytest.raises(ValueError, match="commit scope does not match"):
-        workspace.reserve_identity_domain(
-            "customer-domain",
-            "customer",
-            "REQ-3",
-            "another expanded scope",
-            source_hints=("refunds.csv",),
-            representation_item_ids=("refund-customer-id",),
-        )
-    assert state_path.read_bytes() == crashed_bytes
+    expanded = workspace.reserve_identity_domain(
+        "customer-domain",
+        "customer",
+        "REQ-3",
+        "another expanded scope",
+        source_hints=("refunds.csv",),
+        representation_item_ids=("refund-customer-id",),
+    )
+    assert state_path.read_bytes() != crashed_bytes
     persisted = json.loads(state_path.read_text(encoding="utf-8"))
-    assert persisted["domains"]["customer-domain"]["state"] == "review_pending"
-    assert persisted["domains"]["customer-domain"]["accepted_pending_commit"] is True
-    assert persisted["domains"]["customer-domain"]["requested_by"] == ["REQ-1", "REQ-2"]
+    assert persisted["domains"]["customer-domain"]["state"] == "reserved"
+    assert persisted["domains"]["customer-domain"]["accepted_pending_commit"] is False
+    assert persisted["domains"]["customer-domain"]["revision"] == 2
+    assert persisted["domains"]["customer-domain"]["published_revision"] == 1
+    assert persisted["domains"]["customer-domain"]["requested_by"] == ["REQ-1", "REQ-2", "REQ-3"]
+    assert expanded.commit_manifest_hash == prior_commit.manifest_hash
 
 
 def test_requirement_mode_reservation_requires_materialized_exact_owner_proposal(tmp_path: Path) -> None:
@@ -814,7 +1597,7 @@ def test_commit_reconciliation_is_all_or_nothing_across_multiple_directories(tmp
         workspace.submit_result(
             domain_id,
             f"owner-{domain_id}",
-            _accepted_result(),
+            _accepted_result_for(domain_id),
             expected_scope_hash=workspace.current_scope(domain_id).scope_hash,
         )
         workspace.record_review(domain_id, "accept", f"reviewer-{domain_id}")
@@ -851,7 +1634,7 @@ def test_commit_reconciliation_is_all_or_nothing_across_multiple_directories(tmp
     with workspace._locked():
         workspace._refresh()
         repaired = dict(workspace._state["domains"]["second"])
-        repaired["result_hash"] = _accepted_result().result_hash
+        repaired["result_hash"] = _accepted_result_for("second").result_hash
         workspace._state["domains"]["second"] = repaired
         workspace._persist()
     reconciled = EntityResolutionWorkspace.load(context)
@@ -903,7 +1686,7 @@ def test_scope_discovery_persists_prior_reconciliation_before_already_present_re
     assert persisted["domains"]["second"]["requested_by"] == ["Q-second"]
 
 
-def test_reserve_rejection_persists_prior_reconciliation_without_material_mutation(tmp_path: Path) -> None:
+def test_reserve_expansion_persists_prior_reconciliation_and_opens_revision(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     workspace.reserve_identity_domain(
         "first",
@@ -930,26 +1713,28 @@ def test_reserve_rejection_persists_prior_reconciliation_without_material_mutati
         unbound["commit_manifest_hash"] = None
         workspace._state["domains"]["first"] = unbound
         workspace._persist()
-    before_rejected_call = workspace.root.joinpath("state.json").read_bytes()
+    before_expansion = workspace.root.joinpath("state.json").read_bytes()
 
-    with pytest.raises(ValueError, match="committed and cannot expand material scope"):
-        workspace.reserve_identity_domain(
-            "first",
-            "customer",
-            "Q-second",
-            "new source",
-            source_hints=("new.csv",),
-            representation_item_ids=("new-id",),
-        )
+    expanded = workspace.reserve_identity_domain(
+        "first",
+        "customer",
+        "Q-second",
+        "new source",
+        source_hints=("new.csv",),
+        representation_item_ids=("new-id",),
+    )
 
-    assert workspace.root.joinpath("state.json").read_bytes() != before_rejected_call
+    assert workspace.root.joinpath("state.json").read_bytes() != before_expansion
     domain = workspace.get_domain("first")
     assert domain.commit_manifest_hash == manifest_hash
-    assert domain.requested_by == ("Q-first",)
-    assert len(domain.request_records) == 1
+    assert domain.revision == 2
+    assert domain.published_revision == 1
+    assert domain.state == "reserved"
+    assert expanded.requested_by == ("Q-first", "Q-second")
+    assert len(domain.request_records) == 2
     persisted = json.loads(workspace.state_path.read_text(encoding="utf-8"))
     assert persisted["domains"]["first"]["commit_manifest_hash"] == manifest_hash
-    assert persisted["domains"]["first"]["requested_by"] == ["Q-first"]
+    assert persisted["domains"]["first"]["requested_by"] == ["Q-first", "Q-second"]
 
 
 def test_submit_requires_active_resolution_owner_lease(tmp_path: Path) -> None:
@@ -1360,7 +2145,7 @@ def test_commit_refreshes_after_nested_reconciliation(tmp_path: Path, monkeypatc
     workspace.submit_result(
         "new",
         "owner-new",
-        _accepted_result(),
+        _accepted_result_for("new"),
         expected_scope_hash=workspace.current_scope("new").scope_hash,
     )
     workspace.record_review("new", "accept", "reviewer-new")
@@ -1409,6 +2194,24 @@ def test_requirement_wait_releases_analytical_owner_and_resumes(tmp_path: Path) 
     workspace.claim_worker("analytical_owner", "ao", "Q-001")
     workspace.mark_waiting_on_resolution("Q-001", ("domain",), "waiting for reviewed identities", owner_ref="ao")
     assert workspace.requirement_runtime_statuses()["Q-001"]["state"] == "waiting_on_resolution"
+    assert not any(lease.worker_type == "analytical_owner" for lease in workspace.active_leases)
+
+    # A real owner result, independent review, and immutable publication
+    # release the wait.  Resume is not an Analytical Owner lease transition;
+    # it must not recreate a released AO lease.
+    workspace.claim_resolution_owner("domain", "resolution-owner")
+    result = _accepted_result()
+    workspace.submit_result(
+        "domain",
+        "resolution-owner",
+        result,
+        expected_scope_hash=workspace.current_scope("domain").scope_hash,
+    )
+    workspace.record_review("domain", "accept", "independent-reviewer")
+    workspace.commit("domain")
+    assert workspace.requirement_runtime_statuses()["Q-001"]["state"] == "ready_to_resume"
+    resumed = workspace.acknowledge_requirement_resume("Q-001", owner_ref="ao")
+    assert resumed["state"] == "resumed"
     assert not any(lease.worker_type == "analytical_owner" for lease in workspace.active_leases)
 
 

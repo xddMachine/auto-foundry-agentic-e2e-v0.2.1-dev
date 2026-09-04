@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
+import inspect
 import json
 import os
 from pathlib import Path
@@ -35,6 +37,65 @@ def _synthetic_release(root: Path) -> tuple[Path, str]:
     payload = installer._deterministic_zip_bytes(skill)
     archive.write_bytes(payload)
     return archive, hashlib.sha256(payload).hexdigest()
+
+
+def test_official_release_binds_without_digest_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The packaged v0.7.2 ZIP must satisfy the production installer identity."""
+
+    repository_root = Path(__file__).resolve().parents[2]
+    archive = repository_root / "dist" / "auto-foundry-agentic-e2e-v0.7.2.zip"
+    if not archive.is_file():
+        pytest.skip("official release artifact is not built in this checkout")
+
+    # Keep discovery fully isolated from any real user installation.
+    home = tmp_path / "home"
+    code_home = home / "codex-home"
+    skills_root = code_home / "skills"
+    home.mkdir()
+    code_home.mkdir()
+    skills_root.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CODEX_HOME", str(code_home))
+    result = installer.install_skill_release(archive, skills_root)
+    assert result["installed"] is True
+    inspection = installer.inspect_release(archive)
+    assert inspection["zip_sha256"] == installer.PRODUCTION_PACKAGE_SHA256
+    assert inspection["file_count"] == installer.PRODUCTION_FILE_COUNT
+
+    # A production binding is only useful when the archive carries the
+    # Product Agent's current preflight/preview entrypoints.  Load the
+    # extracted files directly so this regression cannot pass by importing a
+    # same-named module from the repository or an ambient installation.
+    installed_scripts = skills_root / installer.SKILL_NAME / "scripts"
+
+    def load_script(module_name: str):
+        script = installed_scripts / f"{module_name}.py"
+        spec = importlib.util.spec_from_file_location(f"_release_{module_name}", script)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    assembler = load_script("dashboard_assembler")
+    delta_assembler = load_script("dashboard_delta_assembler")
+    assert callable(getattr(assembler, "business_presentation_preflight", None))
+    assert callable(getattr(delta_assembler, "assemble_generation_preview", None))
+    assert {"context", "item_ids", "generation_id"}.issubset(
+        inspect.signature(assembler.business_presentation_preflight).parameters
+    )
+    assert {"context", "item_ids", "presentation_plan_ref", "output_dir"}.issubset(
+        inspect.signature(delta_assembler.assemble_generation_preview).parameters
+    )
+
+    import auto_foundry_core.coordinator as coordinator_module
+
+    binding = coordinator_module.resolve_production_skill_binding(
+        repo_root=repository_root,
+        role_cwd=repository_root,
+    )
+    assert binding["skill_sha256"] == installer.PRODUCTION_PACKAGE_SHA256
+    assert binding["skill_version"] == installer.SKILL_VERSION
+    assert binding["core_version"] == installer.CORE_VERSION
 
 
 def test_synthetic_release_stages_and_moves_backups_outside_discovery() -> None:
@@ -129,6 +190,52 @@ def test_process_death_after_archive_recovers_from_intent_journal() -> None:
         assert (active / "SKILL.md").is_file()
         assert not (active / "old.txt").exists()
         assert not (transaction / "swap.intent.json").exists()
+
+
+def test_tampered_intent_archive_root_is_rejected_before_recovery_moves() -> None:
+    with TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        archive, digest = _synthetic_release(root)
+        skills = root / "skills"
+        active = skills / installer.SKILL_NAME
+        active.mkdir(parents=True)
+        (active / "old.txt").write_text("old", encoding="utf-8")
+        script = (
+            "import os, sys\n"
+            "from pathlib import Path\n"
+            "from scripts import install_skill_release as i\n"
+            "i.install_skill_release(Path(sys.argv[1]), Path(sys.argv[2]), "
+            "expected_sha256=sys.argv[3], expected_file_count=2, "
+            "failpoint=lambda name: os._exit(23) if name == 'after_archive' else None)\n"
+        )
+        environment = {
+            **os.environ,
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+        }
+        child = subprocess.run(
+            [sys.executable, "-c", script, str(archive), str(skills), digest],
+            env=environment,
+            check=False,
+        )
+        assert child.returncode == 23
+        transaction = root / f".{installer.SKILL_NAME}-installer"
+        intent_path = transaction / "swap.intent.json"
+        intent = json.loads(intent_path.read_text(encoding="utf-8"))
+        malicious_root = root / "attacker-archives"
+        malicious_root.mkdir()
+        intent["archive_root"] = str(malicious_root)
+        intent_path.write_text(json.dumps(intent), encoding="utf-8")
+
+        with pytest.raises(installer.ReleaseInstallError, match="archive root is not approved"):
+            installer.install_skill_release(
+                archive,
+                skills,
+                expected_sha256=digest,
+                expected_file_count=2,
+            )
+        assert not list(malicious_root.iterdir())
+        assert intent_path.is_file()
 
 
 def test_two_process_install_is_locked_and_idempotent() -> None:

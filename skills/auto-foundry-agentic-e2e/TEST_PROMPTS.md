@@ -7,9 +7,9 @@ Record these current markers in program metadata:
 
 ```text
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.7.1
+skill_version: 0.7.2
 core_name: auto_foundry_core
-core_version: 0.8.0
+core_version: 0.8.1
 ```
 
 ## Question Mode: analytical-owner queue
@@ -42,10 +42,13 @@ the candidate sidecar, operation manifest/hash, accepted integration and
 registry, and later reuse; an omitted value remains valid with no period
 constraint.
 
-The owner may request zero to three independent specialist memos. Specialists
-receive only a bounded question, selected source IDs, expected output, and
-minimum context. They return conclusion, method, evidence, limitations, open
-questions, and confidence. They do not write the final answer or program state.
+The owner may request the smallest useful set of independent specialist memos
+when each memo addresses a material uncertainty and the host has capacity.
+Zero is valid; never create one specialist per method or checklist item.
+Specialists receive only a bounded question, selected source IDs, expected
+output, and minimum context. They return conclusion, method, evidence,
+limitations, open questions, and confidence. They do not write the final answer
+or program state.
 
 Use AnalystWorkspace methods rather than asking analytical agents to author
 JSON, paths, hashes, receipts, manifests, lifecycle state, or integration
@@ -91,18 +94,20 @@ grouping are advisory and preserve explicit user priority/order; it never
 declares runtime semantic dependencies. The Analytical Owner discovers those
 after understanding the requirement, and the runtime resolution ledger owns
 semantic blocking. The
-Planner may suggest zero to three bounded specialists per group and revise the
-recommendation after outcomes. It does not calculate or write answers and is
+Planner recommends only the smallest useful set of bounded specialists per
+group for genuinely independent uncertainty, bounded by actual host capacity;
+zero is valid and it never creates one specialist per method or checklist
+item. It revises the recommendation after outcomes. It does not calculate or write answers and is
 not a deterministic ID/hash or lifecycle authority.
 
 Represent the recommendation with revisionable `RequirementExecutionPlan` and
 `RequirementExecutionGroup` values. They are scheduling recommendations, not
 catalog-hash or lifecycle authority. Do not pass rows, samples, prior-run
-state, or internal paths/hashes to analytical roles. The default capacity is
-four entity-resolution workers, one Analytical Owner, up to three owner
-specialists, and eight active workers total; the Planner is not counted. Host
-configuration may lower or raise these limits but must never oversubscribe the
-actual host. Requested Run A and Run B executions remain sequential.
+state, or internal paths/hashes to analytical roles. Capacity is adaptive to
+the actual host: the scheduler leases the smallest useful set without
+oversubscription. Every requirement has exactly one Analytical Owner,
+reviewers remain fresh and independent, and the Planner is not counted or
+leased. Requested Run A and Run B executions remain sequential.
 
 Preserve this exact requirement as one parent record:
 “Dashboard should show the ratio of milk fat content to the procurement price of

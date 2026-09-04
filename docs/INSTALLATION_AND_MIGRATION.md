@@ -4,7 +4,7 @@ These instructions describe a local replacement. The package/validator smoke
 uses a temporary offline install target only; it never installs into this
 repository's Python environment or the Codex runtime automatically.
 
-The current contract is skill `0.7.1` with core `0.8.0`. Benchmark A remains
+The current contract is skill `0.7.2` with core `0.8.1`. Benchmark A remains
 prepared but unexecuted; this document does not authorize a run, installation,
 or remote operation.
 
@@ -94,6 +94,11 @@ oversubscribe actual host capacity. Requested Run A and Run B executions remain
 sequential.
 
 Every requirement binds directly to the same `RunContext` and shared Data Room.
+The Data Room admits every safe regular file. Parquet is a native table source;
+SQLite (`.db`, `.sqlite`, `.sqlite3`) is opened read-only and contributes one
+catalog entry per user table. Unknown, extensionless, notebook, and auxiliary
+files remain catalogable opaque members for explicit materialization and are
+not analytically parsed by the core.
 Each item creates an item-local `RequirementAnalysisPlan` and follows the
 ordinary loop: analysis, review, iterative material repairs, accept or
 `technical_failure`, then integration. Within a group one Analytical Owner
@@ -202,7 +207,7 @@ active attempt and lane; unpersisted or mismatched references fail closed.
 
 ## Skill replacement (same name)
 
-Build and validate `dist/auto-foundry-agentic-e2e-v0.7.1.zip` locally. The
+Build and validate `dist/auto-foundry-agentic-e2e-v0.7.2.zip` locally. The
 replacement must be staged and validated before it enters a discovery root;
 never unzip directly over the active directory. The repository provides a
 stdlib-only atomic installer with a dry-run mode:
@@ -211,7 +216,7 @@ stdlib-only atomic installer with a dry-run mode:
 python3 scripts/package_release.py
 python3 scripts/validate_release.py
 python3 scripts/install_skill_release.py \
-  --zip dist/auto-foundry-agentic-e2e-v0.7.1.zip \
+  --zip dist/auto-foundry-agentic-e2e-v0.7.2.zip \
   --skills-root "${CODEX_HOME:-$HOME/.codex}/skills" \
   --dry-run
 ```
@@ -225,12 +230,12 @@ invocation recovers the recorded transaction before doing anything else.
 The previous active tree and any old `*.backup`/`*.previous-backup` trees are
 moved to a timestamped archive root outside `skills/`; existing active or
 archive paths are never overwritten. The CLI accepts no hash/count/version
-override: the v0.7.1 production manifest is authoritative. The installer never
+override: the v0.7.2 production manifest is authoritative. The installer never
 changes the real user runtime as part of this repository task; use a temporary
 `--skills-root` in tests.
 
 After a successful replacement, verify the installed `SKILL.md` markers are
-`0.7.1` with core `0.8.0`, then start a **fresh Codex task**. Skill discovery is
+`0.7.2` with core `0.8.1`, then start a **fresh Codex task**. Skill discovery is
 refreshed at task start; do not assume the current task sees a changed skill.
 Keep exactly one discoverable `auto-foundry-agentic-e2e` entrypoint: retained
 archives belong outside the discovery root.
@@ -238,7 +243,7 @@ archives belong outside the discovery root.
 ## Core wheel replacement (same package name)
 
 `scripts/package_release.py` would create
-`dist/auto_foundry_core-0.8.0-*.whl`; run `scripts/validate_release.py` and
+`dist/auto_foundry_core-0.8.1-*.whl`; run `scripts/validate_release.py` and
 confirm validation passes before installing it. This repository task does not
 claim that a wheel already exists or has been validated; current evidence is
 offline tests and static checks only. After that conditional validation,
@@ -247,7 +252,7 @@ not install into the repository or a user runtime as part of this deliverable:
 
 ```bash
 TARGET="$(mktemp -d)"
-python3 -m pip install --no-index --no-deps --target "$TARGET" dist/auto_foundry_core-0.8.0-*.whl
+python3 -m pip install --no-index --no-deps --target "$TARGET" dist/auto_foundry_core-0.8.1-*.whl
 PYTHONPATH="$TARGET" python3 -c 'import auto_foundry_core; print(auto_foundry_core.__version__)'
 PYTHONPATH="$TARGET" python3 -m auto_foundry_core catalog list
 ```
@@ -265,7 +270,7 @@ do not fetch packages or use a remote index.
 ## Release candidate status
 
 After the complete offline vertical proofs and full suite pass, use the status
-label **v0.7.1 / core 0.8.0 — offline program validation complete for later
+label **v0.7.2 / core 0.8.1 — offline program validation complete for later
 Benchmark A**. Benchmark A is prepared but not run by this repository task. This remains an experimental
 release candidate, not a production-hardened sandbox.
 

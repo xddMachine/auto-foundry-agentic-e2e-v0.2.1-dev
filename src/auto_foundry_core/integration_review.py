@@ -290,7 +290,7 @@ class FidelityResult:
 
     @property
     def accepted(self) -> bool:
-        return self.verdict == "accept"
+        return self.verdict in {"accept", "accept_with_limits"}
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "FidelityResult":
@@ -299,7 +299,7 @@ class FidelityResult:
             raise ValueError("fidelity result fields are invalid")
         if value.get("schema_version") != _SCHEMA_VERSION or value.get("review_kind") not in {"initial", "targeted"}:
             raise ValueError("fidelity result identity is invalid")
-        if value.get("verdict") not in {"accept", "repair_once", "unavailable", "fail"}:
+        if value.get("verdict") not in {"accept", "accept_with_limits", "repair_once", "unavailable", "fail"}:
             raise ValueError("fidelity result verdict is invalid")
         for name in ("item_id", "session_id", "invocation_id", "created_at"):
             _safe_id(value.get(name), f"fidelity result {name}")

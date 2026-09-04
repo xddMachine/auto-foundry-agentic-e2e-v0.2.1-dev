@@ -3,30 +3,93 @@
 The Planner remains pure. Its `build_final_product` action is a routing
 instruction, not permission to calculate, accept, freeze, or author a fixture.
 After every supplied requirement has a terminal accepted/integrated result,
-the host dispatches that action to the Product Agent.
+the host dispatches that action to the Product Agent. Before that final
+boundary, `refresh_product_preview` is an advisory low-priority Product Agent
+action that may render the currently usable committed subset while later
+requirements continue independently.
 
-## Host dispatch
+The program-owned Auto Foundry Control Center theme and presentation shell are
+canonical and invariant across newly generated dashboards. The Product Agent
+supplies only reviewed content and requirement/evidence-driven chart
+composition; it must not author arbitrary CSS or force a fixed chart set.
 
-The Product Agent invokes the program-owned assembler with the current run
-context and a new run-local output namespace:
+## Product Agent flow
 
-```text
-python3 skills/auto-foundry-agentic-e2e/scripts/dashboard_assembler.py \
-  --run-root <run-root> \
-  --run-id <run-id> \
-  --output-dir repro_dashboard_v4
-```
+Preview and final Product Agent actions use one durable, generation-scoped
+presentation sequence. The Product Agent does not choose a low-level renderer
+or a full-versus-delta route:
 
-The equivalent `assemble_dashboard(RunContext, ...)` API is allowed when the
-host already has a bound `RunContext`. Explicit fixture, chart-map, registry,
-site, and receipt refs, when supplied, must remain inside that output namespace.
+1. Call the public
+   `dashboard_assembler.business_presentation_preflight(context,
+   item_ids=..., generation_id=...)`. This is a read-only source inventory
+   over accepted answer and committed-integration boundaries. It atomically
+   refreshes only `extensions/<G>/dashboard_preflight/` when the source
+   bindings change and returns fixture, chart-map, registry refs/hashes, and a
+   V2 design inventory.
+2. Compare the eligible local V2 chart recipes by question, grain, dimensions,
+   measures, temporal shape, coverage, and limitations. Choose one coherent
+   multi-section layout with explicit `recipe_id`, `layout`, and
+   `renderer_type`; prefer a richer eligible source-bound chart over a table
+   when the exact reviewed geometry supports it, and record a concise
+   data/decision rationale when a table is deliberately selected. Choose one
+   semantic representative per requirement/business metric/scope, keep
+   integration echoes as drill-down/audit support, and populate the overview
+   from admitted reviewed business signals. This is grounded choice from
+   accepted business evidence, not network design research or analytical
+   recomputation.
+   The public inventory labels hash-bound accepted-evidence candidates with
+   `accepted_evidence: true`, `accepted_evidence_candidate_kind` (`table` or
+   `fact_sheet`), `accepted_evidence_pointer`, and source ref/hash metadata;
+   use these fields directly rather than interpreting opaque evidence IDs.
+3. Distinguish initial plan creation from same-source regeneration. When no
+   accepted V2 plan exists, call the public
+   `dashboard_assembler.write_business_presentation_plan(...)` (or its
+   explicit V2 record route when the host supplies that route) with the
+   preflight fixture/map refs, item IDs, reviewer ref, and a complete ordered
+   manager selection. When the target already contains a V2 plan, call
+   `dashboard_assembler.write_business_presentation_plan_v2(...)` with the
+   complete new ordered `manager_entries` selection and then
+   `dashboard_assembler.revise_business_presentation_plan_v2(...)` with the
+   exact predecessor/successor SHA compare-and-swap bindings. This successor
+   path is required even when preflight/input hashes are unchanged: presentation
+   audience, manager membership/order, recipe, layout, and renderer may change,
+   while every accepted fact, value, pointer, and provenance/hash binding must
+   remain exact. The plan is the sole presentation-admission authority; do not
+   inherit predecessor membership.
+4. For `refresh_product_preview`, call
+   `dashboard_delta_assembler.assemble_generation_preview(context, item_ids=...,
+   presentation_plan_ref=..., output_dir="generations/<G>/preview")` exactly
+   once. This preview entry selects only the committed subset and never
+   publishes a terminal product. For a final action, call
+   `dashboard_delta_assembler.assemble_generation_product(context, ...)`
+   exactly once with that `presentation_plan_ref`; for a successor generation,
+   pass the program-owned parent receipt and explicit route. The final entry
+   selects the full root implementation or generation delta internally from
+   lifecycle metadata.
+5. Validate the returned receipt, Blueprint binding, output hashes, site
+   manifest, offline links, and complete site tree. A preview then calls
+   `persist_preview_manifest(...)`; a final build hands refs to the existing
+   refs-only candidate/review/publication lifecycle.
+
+The low-level full and delta assembly functions are program-owned internals of
+the two generation entry points; the Product Agent must never call them
+directly, author fixture/chart/manifest bytes, or infer a route from requirement
+prose.
+
+Technical source, join, coverage, and method cards default to the audit gallery.
+They may enter the manager surface only with an explicit source-bound business
+consequence or rationale. Every accepted requirement still receives a
+meaningful decision surface or an explicit limitation, including when its
+integration projection is terminally failed.
 
 The assembler loads accepted answer bundles through public core validators,
 committed integration manifests/records, the read-only public LEM projection,
 the prepared registry metadata, the supervisor plan, and frozen telemetry or
-product metadata needed to prove presentation preconditions. It never reads
-raw sources, `work/` or calculation outputs, re-runs analytics, calls a model,
-or treats accepted prose/visual descriptors as calculation authority.
+product metadata needed to prove presentation preconditions. Public accepted-
+bundle validation may read only the hash-bound `work/evidence.jsonl` ledger
+named by the accepted manifest; it never scans arbitrary `work/` or
+calculation files, re-runs analytics, calls a model, or treats accepted
+prose/visual descriptors as calculation authority.
 
 ## Same-run cumulative generation delta
 
@@ -34,21 +97,20 @@ When a terminal Requirement Mode generation admits additional requirements,
 the host keeps the same `run_id` and active lifecycle generation. It does not
 reopen an accepted item or rebuild the parent product namespace. Complete the
 normal acceptance and committed-integration barrier for every newly admitted
-item, then dispatch the generation-specific delta assembler once with an
-explicit route file:
+item, then call the same generation entry point once with the program-owned
+parent receipt and explicit route:
 
-```text
-python3 skills/auto-foundry-agentic-e2e/scripts/dashboard_delta_assembler.py \
-  --run-root <run-root> \
-  --run-id <run-id> \
-  --parent-receipt products/parent-dashboard/build_receipt.json \
-  --route route.json
+```python
+dashboard_delta_assembler.assemble_generation_product(
+    context,
+    parent_receipt_ref="products/<parent>/build_receipt.json",
+    route=route,
+    presentation_plan_ref="extensions/<G>/business_presentation_plan.json",
+)
 ```
 
-The equivalent `assemble_dashboard_delta(RunContext, parent_receipt_ref=...,
-route=...)` API is allowed only with the same bindings. `route.json` is
-program-owned metadata, never inferred from requirement prose. An existing
-business section uses its stable fixture domain ID:
+`route` is program-owned metadata, never inferred from requirement prose. An
+existing business section uses its stable fixture domain ID:
 
 ```json
 {"kind":"existing","group_id":"group-01"}
@@ -146,6 +208,67 @@ create or bind that QA directory during the build; the receipt therefore does
 not claim a nonexistent QA artifact. A host may expose an advisory
 `qa_output_ref` after QA is actually present, but it must not be treated as a
 site-tree input or freeze authority.
+
+## Incremental preview lifecycle
+
+The Planner offers `refresh_product_preview` when at least one requirement has
+a validated committed integration boundary, the cumulative requirements are
+not all terminal, and the canonical preview input fingerprint differs from
+the durable preview manifest (or that manifest is missing or malformed). The
+action does not change run lifecycle state and can coexist with the next
+runnable requirement. It is resumable in the same
+`product_agent:<run_id>:<generation_id>` session as
+`build_product_candidate`.
+
+The Product Agent first calls
+`dashboard_assembler.business_presentation_preflight(...)` with the deterministic
+item IDs and generation metadata, then reads its V2 design inventory and
+eligible chart recipes. It compares question, grain, dimensions, measures,
+temporal shape, coverage, and limitations, choosing explicit `recipe_id`,
+`layout`, and `renderer_type` from the local chart library and accepted business
+evidence only. Network design research and analytical recomputation are
+forbidden. It persists that choice with
+`dashboard_assembler.write_business_presentation_plan(...)` for an initial
+plan, or with the explicit V2 successor/CAS sequence above when a plan already
+exists, binding the preflight fixture and chart-map hashes. A same-source
+successor is valid and may change presentation choices, but not the exact
+accepted fact/provenance bindings. Only then does it call
+`dashboard_delta_assembler.assemble_generation_preview(...)` once with that
+plan ref, the committed item IDs, and `output_dir="generations/<G>/preview"`.
+The preview entry never terminal-publishes a product; the Product Agent never
+calls the low-level full or delta functions directly.
+
+The assembler alone writes `dashboard_fixture_v4.json`,
+`dashboard_blueprint_v2.json`, `site/`, and its receipt. After validating those
+outputs, the Product Agent calls `persist_preview_manifest(...)`, which
+atomically writes `products/generations/<G>/preview/preview_manifest.json`
+with schema `dashboard.preview.v1`: `run_id`, `generation_id`,
+`finalizable:false`, `input_fingerprint`, sorted `item_ids`, accepted/committed
+public refs and hashes, assembly receipt/blueprint/site refs and hashes, and
+`site_tree_sha256`. Optional `failed_items` and `limitations` are sorted string
+lists. `site_tree_sha256` is the assembler's canonical hash of the direct
+sorted `{relative_path: sha256}` `site_binding.files` map (including
+`site_manifest.json`); the receipt `site_binding.tree_sha256` must match it.
+The manifest never contains a ProductCandidate/ProductReview,
+authorization, publication/freeze marker, raw/work ref, or volatile timestamp.
+
+Terminal technical-failure, blocked, or unsupported requirements are retained as
+sorted `failed_items`/`limitations` and do not block the usable subset. If every
+terminal requirement is limited and no committed records remain, the preflight
+and plan select a reviewed limited/empty-state layout; the resulting dashboard
+is still non-blank and clearly marks its evidence limitation.
+
+Malformed or stale preview output only re-enables this refresh. A failed
+preview consumes the ordinary retry budget for that exact input fingerprint,
+but exhaustion remains presentation-local and never emits run-level rethink or
+lifecycle repair. A newly committed requirement in the same generation changes
+the canonical fingerprint; preflight and the plan are refreshed in their
+extension namespace, and stale item bindings, source hashes, or plan refs fail
+closed rather than being silently reused. The preview namespace may then be
+rebuilt atomically from the new plan. Once all requirements have terminal
+product boundaries, incremental refresh is suppressed and the existing one-time
+candidate → independent review → publication flow remains authoritative;
+accepted candidate bytes are not regenerated after review.
 
 ## Retry and incident behavior
 

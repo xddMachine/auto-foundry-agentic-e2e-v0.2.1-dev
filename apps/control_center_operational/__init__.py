@@ -1,8 +1,7 @@
-"""Operational, loopback-only Auto Foundry Control Center.
+"""The single supported, loopback-only Operational Control Center runtime.
 
-The operational application is intentionally separate from the read-only
-prototype under :mod:`apps.control_center`.  Its launch adapter is guarded by
-an explicit server flag and a second, fingerprint-bound confirmation.
+Its launch adapter is guarded by an explicit server flag and a second,
+fingerprint-bound confirmation.
 """
 
 from .launch import (

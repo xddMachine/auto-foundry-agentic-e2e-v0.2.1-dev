@@ -906,7 +906,7 @@ def _run_item(
     accepted_refs = ["work/plan.json", "work/source_map.json", "work/evidence.jsonl"]
     if specialist_count:
         accepted_refs.extend(("work/specialist_tasks.jsonl", "work/specialist_memos.jsonl"))
-    analyst.accept(accepted_refs=tuple(accepted_refs))
+    item.accept(accepted_refs=tuple(accepted_refs))
     persisted_item = ItemWorkspace.load(context, item_id)
     persisted_packet = json.loads(persisted_item.business_review_path.read_text(encoding="utf-8"))
     business_record = {
@@ -1421,11 +1421,14 @@ def _run_cycle(
     # Reconciliation derives every currently valid transition in one locked
     # pass, so terminal business facts advance through analytical_complete to
     # integration_complete before products are published.
-    if lifecycle.reconcile([item.state for item in items]).state != "integration_complete":
+    # Pass the public ItemWorkspace objects so lifecycle reconciliation can
+    # inspect each committed integration manifest/record boundary.  A bare
+    # ``integration_state=integrated`` label is intentionally insufficient.
+    if lifecycle.reconcile(items).state != "integration_complete":
         raise AssertionError("analytical/integration lifecycle reconciliation failed")
     dashboard_manifest, optimizer = _build_product_and_optimizer(context, lifecycle, items, ledger, fixture)
     product_snapshot = lifecycle.reconcile(
-        [item.state for item in items],
+        items,
         product_status={"status": "complete"},
         optimizer_status=optimizer,
     )
@@ -1435,7 +1438,7 @@ def _run_cycle(
     if product_snapshot.state != "complete_with_limits":
         raise AssertionError("product lifecycle reconciliation failed")
     lifecycle.reconcile(
-        [item.state for item in items],
+        items,
         product_status={"status": "complete"},
         optimizer_status=optimizer,
     )

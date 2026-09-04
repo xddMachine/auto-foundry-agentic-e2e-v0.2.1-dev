@@ -8,6 +8,14 @@ import os
 from typing import Iterable
 
 
+# The current release binding is defined at the workspace boundary so every
+# public RunContext constructor (including Product Agent helpers) records the
+# same production lineage by default.  Coordinator exports these values as
+# its production constants rather than maintaining a second copy.
+DEFAULT_CORE_VERSION = "0.8.1"
+DEFAULT_SKILL_VERSION = "0.7.2"
+
+
 class AllowedRootError(ValueError):
     """Raised when a source or output escapes the configured local roots."""
 
@@ -73,8 +81,8 @@ class RunContext:
     run_id: str
     run_root: Path | str
     input_roots: tuple[Path | str, ...] = ()
-    core_version: str = "0.8.0"
-    skill_version: str | None = "0.7.1"
+    core_version: str = DEFAULT_CORE_VERSION
+    skill_version: str | None = DEFAULT_SKILL_VERSION
 
     def __post_init__(self) -> None:
         run_id = str(self.run_id).strip()
@@ -181,4 +189,11 @@ class RunContext:
         return destination
 
 
-__all__ = ["AllowedRootError", "RunContext", "require_allowed_roots", "validate_allowed_path"]
+__all__ = [
+    "AllowedRootError",
+    "DEFAULT_CORE_VERSION",
+    "DEFAULT_SKILL_VERSION",
+    "RunContext",
+    "require_allowed_roots",
+    "validate_allowed_path",
+]

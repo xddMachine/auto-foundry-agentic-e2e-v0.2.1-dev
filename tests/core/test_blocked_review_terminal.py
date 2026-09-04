@@ -366,12 +366,31 @@ def test_run_lifecycle_and_reporting_treat_blocked_as_limited_business_terminal(
         "lifecycle_state": "blocked_by_evidence",
         "terminal_outcome": {"outcome": "blocked_by_evidence"},
         "integration_state": "pending",
+        # A blocked item has no committed records, but its no-op integration
+        # boundary is still explicit and typed rather than inferred from the
+        # pending label.
+        "blocked_integration_validation": {
+            "valid": True,
+            "stage": "not_committed",
+            "verdict": None,
+            "diagnostics": [],
+        },
     }
     accepted = {
         "item_id": "Q-002",
         "lifecycle_state": "accepted",
         "terminal_outcome": {"outcome": "accepted"},
         "integration_state": "integrated",
+        "committed_integration_validation": {
+            "valid": True,
+            "stage": "committed",
+            "verdict": "committed",
+            "diagnostics": [],
+            "session_id": "session-Q-002",
+            "records_count": 1,
+            "records_hash": "b" * 64,
+            "manifest_hash": "c" * 64,
+        },
     }
     assert lifecycle.reconcile((blocked, accepted), product_terminal_status=True).state == "complete_with_limits"
     report = project_run_report(
