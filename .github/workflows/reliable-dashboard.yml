@@ -1,4 +1,4 @@
-name: Reliable dashboard offline validation
+name: Reliable analytics and dashboard acceptance
 on:
   push:
     branches: [feat/reliable-analytics-dashboard]
@@ -10,13 +10,17 @@ concurrency:
   group: reliable-dashboard-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  offline:
+  acceptance:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
+    env:
+      PYTHONPATH: src
+      PYTHONUNBUFFERED: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           sparse-checkout: |
             src
             skills
@@ -27,26 +31,54 @@ jobs:
             docs
             pyproject.toml
             README.md
+            AGENTS.md
+            .github
+            .gitignore
           sparse-checkout-cone-mode: false
-      - name: Archive the exact source under test (no run data or credentials)
+      - name: Record exact source under test, without business runs or credentials
         run: |
           mkdir -p validation
           git rev-parse HEAD > validation/source-sha.txt
-          tar -czf validation/source.tar.gz src skills apps scripts tests benchmarks docs pyproject.toml README.md
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: source-under-test
-          path: validation/source*
-          retention-days: 7
-      - name: Install existing project dependencies
-        run: python -m pip install -e . pytest
-      - name: Offline tests (no model credentials, calls or business runs)
-        env:
-          PYTHONPATH: src
-        run: python -m pytest -q --junitxml=validation/pytest.xml
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+          python --version > validation/python-version.txt
+          node --version > validation/node-version.txt
+          tar -czf validation/source.tar.gz src skills apps scripts tests benchmarks docs pyproject.toml README.md AGENTS.md .github .gitignore
+      - name: Install project and validation dependencies (no model credentials)
+        run: |
+          python -m pip install -e . pytest wheel setuptools playwright
+          python -m pip freeze > validation/dependencies.txt
+      - name: Package the paired core and skill release
+        run: python scripts/package_release.py > validation/package.json
+      - name: Validate release bytes, wheel contents and offline installation
+        run: python scripts/validate_release.py > validation/release-validation.json
+      - name: Complete deterministic core, integration and skill suite
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          python -m pytest -q --junitxml=validation/pytest.xml 2>&1 | tee validation/pytest.log
+      - name: Control Center Python suite
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          python -m unittest discover -s apps/control_center_operational/tests -p 'test_*.py' 2>&1 | tee validation/control-center.log
+      - name: Control Center JavaScript contracts
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          node --test apps/control_center_operational/tests/test_*.js 2>&1 | tee validation/javascript.log
+      - name: Install test browser
+        if: ${{ !cancelled() }}
+        run: python -m playwright install --with-deps chromium
+      - name: Real HTTP-served dashboard, interactions, evidence pages and mobile layout
+        if: ${{ !cancelled() }}
+        run: python scripts/validate_dashboard_browser.py --output validation/browser > validation/browser.log
+      - name: Upload source, verification evidence and synthetic dashboard
         if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: offline-test-results
-          path: validation/pytest.xml
+          name: verified-dashboard-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            validation/
+            dist/*.zip
+            dist/*.whl
           retention-days: 7
+          if-no-files-found: error
