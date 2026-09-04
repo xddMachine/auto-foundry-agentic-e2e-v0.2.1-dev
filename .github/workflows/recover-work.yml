@@ -1,0 +1,31 @@
+name: Recover prior review bundle
+on:
+  push:
+    branches: [feat/reliable-analytics-dashboard]
+    paths: [.github/workflows/recover-work.yml]
+permissions:
+  contents: read
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Retrieve known repository blob without executing its content
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import urllib.request, json, base64, pathlib
+          url = 'https://api.github.com/repos/xddMachine/auto-foundry-agentic-e2e-v0.2.1-dev/git/blobs/0cc69726ea8876d0f365a728cce9847176969c7d'
+          import os
+          req=urllib.request.Request(url,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','User-Agent':'review-bundle-recovery'})
+          data=json.load(urllib.request.urlopen(req,timeout=60))
+          blob=base64.b64decode(data['content'])
+          pathlib.Path('prior-review-bundle.bin').write_bytes(blob)
+          print('Recovered repository blob bytes:',len(blob),'magic:',blob[:8].hex())
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: recovered-review-bundle
+          path: prior-review-bundle.bin
+          retention-days: 3
