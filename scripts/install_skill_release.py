@@ -27,14 +27,14 @@ import zipfile
 
 
 SKILL_NAME = "auto-foundry-agentic-e2e"
-SKILL_VERSION = "0.7.2"
-CORE_VERSION = "0.8.1"
-RELEASE_SLUG = "universal-data-room-ingestion"
+SKILL_VERSION = "0.8.0"
+CORE_VERSION = "0.9.0"
+RELEASE_SLUG = "reliable-analytics-dashboard"
 # Provisioning updates this tracked value after the deterministic package is
 # built. API callers may inject an expected hash/count for self-contained
 # tests; the production CLI has no such override.
-PRODUCTION_PACKAGE_SHA256 = "ab73f92778616f40908120cf0f711781417e6af5595a1c1f7d081dbd58c3e30b"
-PRODUCTION_FILE_COUNT = 30
+PRODUCTION_PACKAGE_SHA256 = "320c6950a2d910beb3bf7f2e2986d1fd60bbb0a2601240a08b9b03bce4b384ab"
+PRODUCTION_FILE_COUNT = 31
 
 _TRANSACTION_DIRNAME = f".{SKILL_NAME}-installer"
 _LOCK_FILENAME = "install.lock"

@@ -12,8 +12,8 @@ from typing import Iterable
 # public RunContext constructor (including Product Agent helpers) records the
 # same production lineage by default.  Coordinator exports these values as
 # its production constants rather than maintaining a second copy.
-DEFAULT_CORE_VERSION = "0.8.1"
-DEFAULT_SKILL_VERSION = "0.7.2"
+DEFAULT_CORE_VERSION = "0.9.0"
+DEFAULT_SKILL_VERSION = "0.8.0"
 
 
 class AllowedRootError(ValueError):

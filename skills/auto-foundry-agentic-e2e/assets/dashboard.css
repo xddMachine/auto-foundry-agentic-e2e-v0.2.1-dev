@@ -276,3 +276,40 @@ details.data-detail summary { max-width: 100%; cursor: pointer; color: var(--blu
 @media (max-width: 720px) { .shell { display: block; } .rail { position: static; height: auto; padding: 16px; } .brand { margin-bottom: 14px; } .nav { grid-template-columns: repeat(2, minmax(0, 1fr)); } .rail-note { margin-top: 14px; } .content { padding: 20px 16px; } .hero { display: block; } .status { display: inline-block; margin-top: 12px; } .requirement-header { display: block; } .takeaway { margin-top: 10px; } .overview-kpi, .kpi-strip .widget, .kpi-strip .overview-kpi, .widget, .widget-kpi { grid-column: span 12; } .viz-row { grid-template-columns: 1fr auto; } .viz-track { grid-column: 1 / -1; } .domain-card { min-height: 0; } }
 @media (max-width: 720px) { .ontology-card { grid-column: span 12; } }
 @media (max-width: 720px) { .viz-donut, .viz-waffle { grid-template-columns: 1fr; } .donut-visual, .waffle-grid { width: min(190px, 78vw); margin: 0 auto; } .leaderboard-row { grid-template-columns: 26px minmax(0, 1fr) auto; } .leaderboard-row .viz-track { grid-column: 2 / -1; grid-row: 2; } .lollipop-row { grid-template-columns: 1fr auto; } .lollipop-track { grid-column: 1 / -1; } .viz-column { gap: 7px; padding-inline: 2px; } .column-label { font-size: 12px; } }
+
+/* Chart-led layout: the explicit plan chooses content; CSS only lays it out. */
+[hidden] { display: none !important; }
+.overview-surface { grid-column:span 6; min-width:0; padding:20px; background:var(--panel); border:1px solid var(--line); border-radius:10px; box-shadow:var(--panel-shadow); }
+.overview-surface.layout-full,.overview-surface.layout-wide { grid-column:1/-1; }
+.overview-surface h2 { margin:6px 0 20px; font-size:17px; font-weight:600; letter-spacing:-.02em; }
+.overview-surface .eyebrow { font-size:12px; }
+.overview-surface>a { display:inline-block; margin-top:14px; font-size:12px; text-decoration:none; }
+.overview-surface svg { display:block; width:100%; height:auto; max-height:340px; }
+.chart-context { margin-top:14px; border-top:1px solid var(--line); padding-top:10px; color:var(--muted); font-size:12px; }
+.chart-context summary, .line-data summary, .viz details summary { cursor:pointer; padding:4px 0; color:var(--muted); font-size:12px; }
+.chart-context .manager-meta { margin-top:10px; }
+.chart-context ul { margin:8px 0; padding-left:18px; }
+.line-data { margin-top:12px; }
+.line-legend { display:flex; flex-wrap:wrap; justify-content:center; gap:12px; margin:6px 0; padding:0; list-style:none; }
+.line-legend li { display:flex; align-items:center; gap:6px; color:var(--muted); font-size:12px; }
+.line-key { width:16px; height:3px; display:inline-block; }
+.viz-scatter { display:block; }
+.viz-scatter text { fill:var(--muted); font-size:12px; }
+.scatter-point { cursor:crosshair; stroke:var(--panel); stroke-width:1.5px; }
+.scatter-point:hover,.scatter-point:focus { fill:#7457a5; fill-opacity:1; r:7; }
+.viz-pie .donut-center,.viz-pie .donut-track { display:none; }
+.viz-donut { align-items:center; grid-template-columns:minmax(150px,1fr) minmax(140px,1fr); }
+.donut-visual { width:100%; max-width:240px; justify-self:center; }
+.donut-key-1 { background:#7457a5; }
+.evidence-link { color:var(--teal); }
+.overview-kpi { min-width:0; border-radius:10px; }
+.overview-kpi strong { font-family:inherit; font-weight:600; }
+.overview-kpi .eyebrow { font-size:12px; }
+.viz table { width:100%; }
+.table-wrap, .line-data { max-width:100%; overflow-x:auto; }
+.hero h1 { font-size:clamp(28px,3.4vw,42px); }
+@media(max-width:1100px){ .shell{grid-template-columns:190px minmax(0,1fr)} .content{padding:26px 24px 60px} .overview-kpi{grid-column:span 6} }
+@media(max-width:760px){ .shell{display:block} .rail{position:static;height:auto;padding:14px 16px} .rail .brand{margin-bottom:10px} .rail-note{display:none} .nav{display:flex;flex-wrap:wrap;gap:4px} .nav a{padding:6px 8px} .content{padding:20px 16px 48px} .hero{align-items:flex-start;flex-direction:column;gap:10px} .overview-surface,.overview-surface.layout-half,.overview-surface.layout-full,.overview-surface.layout-wide,.domain-card{grid-column:1/-1} .overview-kpi{grid-column:span 6} .viz-donut{grid-template-columns:minmax(0,1fr)} .donut-visual{max-width:210px} .section-head{align-items:flex-start;flex-direction:column;gap:4px} }
+@media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+
+.donut-key-0{background:#076f75}.donut-key-1{background:#7457a5}.donut-key-2{background:#217452}.donut-key-3{background:#c17125}.donut-key-4{background:#b55c86}

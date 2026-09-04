@@ -335,8 +335,8 @@ def build_supervisor_prompt(
         "The ordinary RunCoordinator and Requirement Planner remain authoritative. You are not a Planner, "
         "Analytical Owner, Business Reviewer, integration reviewer, or business-answer authority.\n"
         "Inspect the verified run state/event tail, phase projection, repository status, and relevant source. "
-        "If a root technical cause is supported, make one minimal technical repair to repository source, tests, or "
-        "configuration and run focused tests. Preserve all pre-existing dirty changes and untracked files; "
+        "If a root technical cause is supported, make one minimal technical repair through the existing public runtime APIs and verify its postcondition. "
+        "Repository source, tests, installed skills and configuration are read-only. Never modify the running engine. Preserve all pre-existing dirty changes and untracked files; "
         "never reset, stash, checkout, clean, or overwrite unrelated work. Run-local state may change only "
         "through the public APIs below, never by editing JSON/state/artifact files directly.\n"
         "Never fabricate business semantics or rewrite run-owned JSON/state/artifacts directly, including run_state.json, "
@@ -352,14 +352,14 @@ def build_supervisor_prompt(
         "Identity conflicts, analytical acceptance, and other semantic disagreements must remain explicit "
         "blocked/rethink outcomes for the owning Planner/reviewer role; a Supervisor may only report the "
         "verified evidence and repair the mechanical boundary around them.\n"
-        "If no safe repair is supported, report that and leave the checkout/run unchanged. After code repair and "
-        "focused tests, you MUST start a fresh Python process using the repository src (for example, "
+        "If no safe repair is supported, report that and leave the checkout/run unchanged. After runtime recovery and "
+        "focused boundary checks, you MUST start a fresh Python process using the repository src (for example, "
         "PYTHONPATH=<repository-root>/src python3 -c ...), load the public RunContext and RunLifecycle, "
         "call lifecycle.resume() when the run is paused, then load the persisted RunCoordinator, call public "
         "coordinator.reopen(...) and then coordinator.run(...), and continue "
         "observing public status in that fresh process until a clean terminal or a genuine semantic/evidence "
         "block. Do not use stale in-memory coordinator objects. Exit nonzero when no safe repair, tests, or "
-        "durable progress is available; exit 0 only after an actual minimal repair, focused tests, and durable "
+        "durable progress is available; exit 0 only after an actual runtime repair, focused boundary checks, and durable "
         "run progress/clean terminal. Your final response MUST be exactly one JSON object with only these keys: "
         "repaired (boolean), tests_passed (boolean), durable_progress (boolean), and message (string). Set all "
         "three booleans to true only when the repair and focused tests completed and the fresh public process "
@@ -704,23 +704,37 @@ class FoundrySupervisor:
         return SupervisorResult(status=status, observation=observation, repair=repair, action="repair_completed")
 
     @staticmethod
-    def _incident_fingerprint(status: CoordinatorStatus) -> tuple[str, str, str, str, str]:
-        next_action = json.dumps(status.next_action or {}, sort_keys=True, ensure_ascii=False)
-        latest_diagnostic: Mapping[str, Any] = {}
-        if status.diagnostics and isinstance(status.diagnostics[-1], Mapping):
-            latest_diagnostic = status.diagnostics[-1]
-        diagnostic = json.dumps(
-            {
-                key: latest_diagnostic.get(key)
-                for key in ("kind", "reason", "error", "message", "action")
-                if latest_diagnostic.get(key) is not None
-            },
-            sort_keys=True,
-            ensure_ascii=False,
-        )
-        # Event hashes change whenever the fresh Supervisor process reopens;
-        # they are evidence, not a stable semantic incident identity.
-        return (status.generation_id, status.status, status.phase, next_action, diagnostic)
+    def _incident_fingerprint(status: CoordinatorStatus) -> tuple[str, str, str]:
+        """Stable operational identity, excluding diagnostics and event hashes."""
+        action = status.next_action or {}
+        return (status.generation_id, status.status,
+                json.dumps({k: action.get(k) for k in ("action", "role", "subject_id")}, sort_keys=True))
+
+    @staticmethod
+    def _progress_fingerprint(observation: SupervisorObservation) -> str:
+        """Progress is a changed verified artifact boundary, not changed prose."""
+        phase = observation.phase_snapshot
+        boundaries: dict[str, Any] = {}
+        items = phase.get("items", {}) if isinstance(phase, Mapping) else {}
+        for item_id, item in items.items() if isinstance(items, Mapping) else ():
+            if not isinstance(item, Mapping):
+                continue
+            selected = {}
+            for field in ("accepted_business_validation", "committed_integration_validation", "blocked_integration_validation", "integration_validation"):
+                value = item.get(field)
+                if isinstance(value, Mapping) and value.get("valid") is True:
+                    selected[field] = {k: value[k] for k in ("stage", "content_hash", "manifest_hash", "records_hash", "packet_hash", "verdict") if k in value}
+            if selected:
+                boundaries[str(item_id)] = selected
+        for key in ("product", "report", "preview"):
+            value = phase.get(key) if isinstance(phase, Mapping) else None
+            if not isinstance(value, Mapping):
+                continue
+            for field in ("validation", "candidate_validation", "review_validation"):
+                proof = value.get(field)
+                if isinstance(proof, Mapping) and proof.get("valid") is True:
+                    boundaries[f"{key}.{field}"] = {k: proof[k] for k in ("stage", "manifest_hash", "candidate_hash", "review_hash", "receipt_hash") if k in proof}
+        return json.dumps(boundaries, sort_keys=True, ensure_ascii=False)
 
     def _refresh_status_from_disk(self) -> CoordinatorStatus:
         """Reload the coordinator projection without executing lifecycle work."""
@@ -758,7 +772,7 @@ class FoundrySupervisor:
             return SupervisorResult(status=status, observation=observation, action="dormant")
         if not observation.needs_attention and run_error is None:
             return SupervisorResult(status=status, observation=observation, action="dormant")
-        fingerprint = self._incident_fingerprint(status)
+        fingerprint = self._progress_fingerprint(observation)
         result = self._invoke_agent(status, observation=observation, force=run_error is not None)
         if result.repair is None or not result.repair.accepted or result.action != "repair_completed":
             diagnostics = list(result.diagnostics)
@@ -785,10 +799,15 @@ class FoundrySupervisor:
                 diagnostics=(diagnostic,),
             )
         refreshed_observation = self.observe(refreshed_status)
-        refreshed_fingerprint = self._incident_fingerprint(refreshed_status)
+        refreshed_fingerprint = self._progress_fingerprint(refreshed_observation)
         # Event hashes are intentionally excluded from the fingerprint.  A
         # fresh reopen may append events without making any semantic progress.
         progressed = refreshed_fingerprint != fingerprint
+        # The normal coordinator validates terminal output before exposing this
+        # status. Test adapters without an artifact projection keep this narrow
+        # terminal transition, never a waiting/phase/message transition.
+        progressed = progressed or (refreshed_status.status in {"complete", "complete_with_limits"}
+                                    and status.status != refreshed_status.status)
         if not progressed:
             return SupervisorResult(
                 status=refreshed_status,

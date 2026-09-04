@@ -58,6 +58,8 @@ _EXACT_FIELD_KEYS = (
     "dimensions",
     "measures",
     "time",
+    "x_label",
+    "y_label",
     "coverage",
     "limitations",
     "filters",
@@ -132,6 +134,7 @@ SUPPORTED_RENDERER_TYPES = frozenset(
         "stacked_area",
         "lollipop",
         "donut",
+        "pie",
         "metric_grid",
         "table",
     }
@@ -187,7 +190,7 @@ _RECIPE_RENDERER_TYPES: dict[str, tuple[str, ...]] = {
     "heatmap_matrix": ("heatmap",),
     "scatter_bubble": ("scatter",),
     "lollipop": ("lollipop",),
-    "donut_pie": ("donut",),
+    "donut_pie": ("donut", "pie"),
     "metric_grid": ("metric_grid",),
     "table": ("table",),
 }
@@ -262,11 +265,9 @@ def renderer_types_for_recipe(
             and _has_value(row, "size", "share", "percent")
             for row in segments
         ):
-            # The committed registry uses one composition recipe for both
-            # horizontal stacked bars and stacked-area strips.  The exact
-            # renderer type remains a Product Agent choice, while the
-            # selection is still bounded to these supplied segments.
-            return ("stacked_bar", "stacked_area")
+            # Composition segments are not a temporal stacked area. Offer
+            # only a renderer faithful to the supplied geometry.
+            return ("stacked_bar",)
         return ()
     return _RECIPE_RENDERER_TYPES.get(family, ())
 
@@ -634,14 +635,7 @@ def _recipe_shape_reason(family: str, widget: Mapping[str, Any], chart: Mapping[
             return "requires same-unit metadata"
         return None
     if family == "stacked_area":
-        segments = _rows_from(widget, "segments", "rows", "values", "data")
-        if not segments:
-            return "requires explicit area segments"
-        if not _has_value(widget, "unit"):
-            return "requires same-unit metadata"
-        if not _shares_rows_reconcile(segments, widget):
-            return "requires reconciled area segments and denominator"
-        return None if all(_geometry_row_valid(row, geometry_keys=("size", "share", "percent")) for row in segments) else "requires segment labels, values, and supplied geometry"
+        return "stacked time-series area is not supported; choose a faithful line, area or composition view"
     if family == "funnel":
         # ``rows`` is accepted as the source-local alias when each row still
         # carries explicit stage labels/populations; no ordering is inferred
@@ -1138,3 +1132,34 @@ __all__ = [
     "sha256",
     "is_partition_visual",
 ]
+
+
+def validate_presentation_copy(value: Mapping[str, Any], *, widget_ids: Sequence[str],
+                               requirement_ids: Sequence[str]) -> dict[str, Any]:
+    """Validate explicit presentation-only choices; never admit data through copy.
+
+    HTML is escaped by the renderer. IDs bind copy to already selected results.
+    Unit, period, population, denominator and all values stay in reviewed facts.
+    """
+    if not isinstance(value, Mapping):
+        raise ValueError("presentation must be an object")
+    allowed = {"title", "subtitle", "section_titles", "widget_titles", "overview_widget_ids"}
+    if set(value) - allowed:
+        raise ValueError("presentation has unsupported fields")
+    result = copy.deepcopy(dict(value))
+    for key, limit in (("title", 160), ("subtitle", 400)):
+        if key in result and (not isinstance(result[key], str) or not result[key].strip() or len(result[key]) > limit):
+            raise ValueError(f"presentation {key} must be nonempty text of at most {limit} characters")
+    for key, known in (("section_titles", set(requirement_ids)), ("widget_titles", set(widget_ids))):
+        if key not in result:
+            continue
+        titles = result[key]
+        if not isinstance(titles, Mapping) or set(titles) - known:
+            raise ValueError(f"presentation {key} references unknown results")
+        if any(not isinstance(title, str) or not title.strip() or len(title) > 160 for title in titles.values()):
+            raise ValueError(f"presentation {key} needs bounded nonempty text")
+    if "overview_widget_ids" in result:
+        ids = result["overview_widget_ids"]
+        if not isinstance(ids, list) or any(not isinstance(i, str) for i in ids) or len(ids) != len(set(ids)) or set(ids) - set(widget_ids):
+            raise ValueError("overview_widget_ids must be a unique subset of manager widgets")
+    return result

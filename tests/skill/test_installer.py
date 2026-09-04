@@ -40,10 +40,10 @@ def _synthetic_release(root: Path) -> tuple[Path, str]:
 
 
 def test_official_release_binds_without_digest_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The packaged v0.7.2 ZIP must satisfy the production installer identity."""
+    """The packaged v0.8.0 ZIP must satisfy the production installer identity."""
 
     repository_root = Path(__file__).resolve().parents[2]
-    archive = repository_root / "dist" / "auto-foundry-agentic-e2e-v0.7.2.zip"
+    archive = repository_root / "dist" / "auto-foundry-agentic-e2e-v0.8.0.zip"
     if not archive.is_file():
         pytest.skip("official release artifact is not built in this checkout")
 

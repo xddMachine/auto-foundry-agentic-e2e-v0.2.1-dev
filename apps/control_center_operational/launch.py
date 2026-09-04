@@ -1123,7 +1123,10 @@ def _process_group_has_token(process_group_id: int, process_group_token: str) ->
         return False
     try:
         completed = subprocess.run(
-            ["ps", "-Eww", "-axo", "pgid=,stat=,command="],
+            # Darwin's -E is not a GNU ps option. Both variants expose the
+            # same PGID/status/environment evidence; unknown probes fail closed.
+            (["ps", "eww", "-eo", "pgid=,stat=,args="] if sys.platform.startswith("linux")
+             else ["ps", "-Eww", "-axo", "pgid=,stat=,command="]),
             check=False,
             capture_output=True,
             text=True,

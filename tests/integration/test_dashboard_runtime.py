@@ -11,6 +11,8 @@ import hashlib
 import importlib.util
 import json
 import sys
+
+import pytest
 from pathlib import Path
 from typing import Any
 
@@ -523,7 +525,6 @@ def test_supported_chart_families_render_and_bad_visual_falls_back_locally() -> 
 
     variants: dict[str, dict[str, Any]] = {
         "area": {"type": "area", "rows": [{"label": "Jan", "value": 4}, {"label": "Feb", "value": 6}]},
-        "stacked_area": {"type": "stacked_area", "rows": [{"label": "A", "value": 4, "size": "40%"}, {"label": "B", "value": 6, "size": "60%"}]},
         "grouped_bar": {"type": "grouped_bar", "rows": [{"label": "North", "value": 4, "size": "40%"}]},
         "funnel": {"type": "funnel", "rows": [{"label": "Entered", "value": 10, "size": "100%"}, {"label": "Won", "value": 4, "size": "40%"}]},
         "histogram": {"type": "histogram", "rows": [{"label": "0-10", "count": 3, "size": "30%"}]},
@@ -537,7 +538,6 @@ def test_supported_chart_families_render_and_bad_visual_falls_back_locally() -> 
     }
     expected_markers = {
         "area": "Jan",
-        "stacked_area": "A",
         "grouped_bar": "North",
         "funnel": "Entered",
         "histogram": "0-10",
@@ -553,6 +553,12 @@ def test_supported_chart_families_render_and_bad_visual_falls_back_locally() -> 
         rendered = dashboard_renderer._render_visual(widget)
         assert rendered.strip(), family
         assert expected_markers[family] in rendered, family
+
+    with pytest.raises(ValueError, match="stacked_area requires"):
+        dashboard_renderer._render_visual({
+            "type": "stacked_area",
+            "segments": [{"label": "A", "value": 4, "size": "40%"}],
+        })
 
     rows = [{"label": "Kept exact", "value": 7}]
     fallback = dashboard_renderer._render_visual_fallback({"type": "unsupported_exotic", "rows": rows})
@@ -574,7 +580,6 @@ def test_every_executable_recipe_has_a_positive_exact_renderer_shape() -> None:
         ("column", {"type": "column", "rows": [{"label": "North", "value": 7, "height": "70%"}]}, "column", "North"),
         ("grouped_bar", {"type": "grouped_bar", "bars": [{"label": "North", "series": [{"label": "Open", "value": 7, "size": "70%"}]}], "unit": "cases"}, "grouped_bar", "North"),
         ("stacked_bar", {"type": "stacked_bar", "segments": [{"label": "Open", "value": 6, "size": "60%"}, {"label": "Closed", "value": 4, "size": "40%"}], "unit": "cases", "denominator": 10}, "stacked_bar", "Open"),
-        ("stacked_bar", {"type": "stacked_area", "segments": [{"label": "Open", "value": 6, "size": "60%"}, {"label": "Closed", "value": 4, "size": "40%"}], "unit": "cases", "denominator": 10}, "stacked_area", "Open"),
         ("lollipop", {"type": "lollipop", "bars": [{"label": "North", "value": 7, "size": "70%"}]}, "lollipop", "North"),
         ("diverging_bar", {"type": "diverging_bar", "bars": [{"label": "Delta", "value": -2, "signed_size": "-20%"}]}, "diverging_bar", "Delta"),
         ("waterfall", {"type": "waterfall", "steps": [{"label": "Opening", "start": 10, "change": 2, "end": 12}]}, "waterfall", "Opening"),

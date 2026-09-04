@@ -1,4 +1,4 @@
-"""Offline contract checks for the v0.7.2 universal-ingestion skill tree.
+"""Offline contract checks for the v0.8.0 universal-ingestion skill tree.
 
 These tests intentionally inspect owned text and templates only. Core loading
 of the item-state template is covered by the offline integration vertical;
@@ -50,28 +50,13 @@ def _owned_text() -> str:
 
 
 def test_product_docs_enforce_single_product_agent_assembly_flow() -> None:
-    """Reference docs must match the public Product Agent routing seam."""
-
-    for path in (
-        SKILL / "references" / "PRODUCT_AGENT_ASSEMBLER_CONTRACT.md",
-        SKILL / "references" / "FINAL_PRODUCT_AND_AUTOMATION.md",
-    ):
+    for path in (SKILL / "references/PRODUCT_AGENT_ASSEMBLER_CONTRACT.md", SKILL / "references/FINAL_PRODUCT_AND_AUTOMATION.md"):
         text = _read(path)
-        steps = [
-            text.index("business_presentation_preflight"),
-            text.index("write_business_presentation_plan"),
-            text.index("assemble_generation_product"),
-        ]
-        assert steps == sorted(steps), path
-        assert "assemble_generation_preview" in text
-        assert text.index("assemble_generation_preview") < text.index("assemble_generation_product"), path
-        assert "Terminal technical-failure" in text
-        assert "limited/empty-state" in text
-        assert "stale item bindings" in text
-        # Full/delta implementations are program-owned internals; executable
-        # direct calls would contradict the coordinator's public seam.
+        for marker in ("ProductWorkspace", "workspace.inventory()", "workspace.build(choices", "Terminal technical-failure", "limited/empty-state", "Stale item bindings"):
+            assert marker in text, (path, marker)
         assert "assemble_dashboard(" not in text
         assert "assemble_dashboard_delta(" not in text
+        assert "cannot grant itself" in text
 
 
 def test_product_docs_keep_accepted_visuals_independent_of_integration() -> None:
@@ -92,10 +77,10 @@ def test_frontmatter_and_run_markers_are_v072() -> None:
     assert skill.startswith("---\n")
     frontmatter = skill.split("---\n", 2)[1]
     assert "name: auto-foundry-agentic-e2e" in frontmatter
-    assert 'version: "0.7.2"' in frontmatter
+    assert 'version: "0.8.0"' in frontmatter
     assert "core_name: auto_foundry_core" in frontmatter
-    assert 'core_version: "0.8.1"' in frontmatter
-    assert "release: universal-data-room-ingestion" in frontmatter
+    assert 'core_version: "0.9.0"' in frontmatter
+    assert "release: reliable-analytics-dashboard" in frontmatter
     assert "release: cognitive-requirement-supervisor-and-simple-item-flow" not in frontmatter
     assert "release: monotonic-accepted-preservation-and-context-root-rebind" not in frontmatter
     assert "release: visual-repair-evidence-reference-scope" not in frontmatter
@@ -106,9 +91,9 @@ def test_frontmatter_and_run_markers_are_v072() -> None:
     assert "release: inherited-catalog-context-audit-and-active-repair-context-rebase" not in frontmatter
     for marker in (
         "skill_name: auto-foundry-agentic-e2e",
-        "skill_version: 0.7.2",
+        "skill_version: 0.8.0",
         "core_name: auto_foundry_core",
-        "core_version: 0.8.1",
+        "core_version: 0.9.0",
     ):
         assert marker in skill
     assert "One Analytical Owner" in skill
@@ -121,25 +106,13 @@ def test_frontmatter_and_run_markers_are_v072() -> None:
     assert "ANALYTICS_TOOLKIT.md" in skill
 
 
-def test_v072_changelog_has_exactly_one_release_entry() -> None:
+def test_current_release_changelog_preserves_historical_release() -> None:
     changelog = _read(SKILL / "CHANGELOG.md")
-    top_entry = changelog.split("## 0.7.1 / core 0.8.0", 1)[0]
-    normalized = " ".join(top_entry.split())
-    assert "## 0.7.2 / core 0.8.1 — universal Data Room ingestion" in top_entry
-    assert "release" in normalized.lower()
-    assert "No new run was launched." in top_entry
-    assert top_entry.count("\n1. ") == 1
-    assert top_entry.count("\n2. ") == 1
-    assert top_entry.count("\n3. ") == 1
-    for phrase in (
-        "every safe regular file",
-        "native Parquet",
-        "SQLite databases",
-        "opaque",
-        "PyArrow",
-        "No benchmark or run success claim",
-    ):
-        assert phrase in normalized
+    top = changelog.split("## 0.7.2 / core 0.8.1", 1)[0]
+    assert "## 0.8.0 / core 0.9.0" in top
+    for marker in ("ProductWorkspace", "snapshot recovery", "offline", "No live-agent"):
+        assert marker in top
+    assert "## 0.7.2 / core 0.8.1 — universal Data Room ingestion" in changelog
 
 
 def test_run_state_template_is_exact_lifecycle_authority() -> None:

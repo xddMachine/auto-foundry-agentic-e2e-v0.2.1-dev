@@ -284,7 +284,7 @@ def test_supervisor_invokes_one_agent_even_when_fresh_status_is_a_distinct_atten
     ).run()
 
     assert calls == ["waiting"]
-    assert result.action == "repaired_and_refreshed"
+    assert result.action == "repair_no_progress"
     assert result.status.status == "limited"
 
 

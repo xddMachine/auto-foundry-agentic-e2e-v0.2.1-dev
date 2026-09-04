@@ -618,136 +618,47 @@ def test_role_guidance_finalization_precedes_business_reviewer() -> None:
 
 
 def test_role_guidance_build_product_candidate_uses_public_refs_sequence() -> None:
-    action = PlannerAction("build_product_candidate", "product_agent", "PRODUCT", "build")
+    guidance = coordinator_module._role_guidance(_action("build_product_candidate", "PRODUCT"))
+    names = ["ProductWorkspace(context, action)", "workspace.feedback()", "workspace.inventory(offset=...)", "workspace.detail(widget_id)", "workspace.build(choices, presentation={...})"]
+    assert [guidance.index(name) for name in names] == sorted(guidance.index(name) for name in names)
+    assert "Never calculate these by hand" in guidance
+    assert "never accept your own product" in guidance
 
-    guidance = coordinator_module._role_guidance(action)
-
-    expected_order = [
-        "read PRODUCT_AGENT_ASSEMBLER_CONTRACT.md once",
-        "metadata['presentation_inventory_ref']",
-        "metadata['presentation_plan_ref']",
-        "business_presentation_preflight(context, item_ids=..., generation_id=...) once",
-        "business_presentation_inventory and business_presentation_visual_inventory once per attempt",
-        "assemble_generation_product(context, ...)",
-        "Only after canonical assembly",
-        "validate_generation_product",
-        "create ProductCandidate",
-        "ProductReviewStore.record_candidate",
-    ]
-    positions = [guidance.index(value) for value in expected_order]
-    assert positions == sorted(positions)
-    assert "when the business presentation plan is absent" in guidance
-    assert "discard_stale_product_candidate" in guidance
-    assert "if the target exists and is a v2 plan" in guidance.lower()
-    assert "revise_business_presentation_plan_v2" in guidance
-    assert "expected_current_plan_sha256" in guidance
-    assert "If the target is absent" in guidance
-    assert "Never call both routes or all three plan APIs serially" in guidance
 
 
 def test_role_guidance_build_product_candidate_is_direct_and_history_bounded() -> None:
-    action = PlannerAction("build_product_candidate", "product_agent", "PRODUCT", "build")
+    guidance = coordinator_module._role_guidance(_action("build_product_candidate", "PRODUCT"))
+    for phrase in ("Do not call index_repository", "recursive run-root searches", "~/.codex/sessions/history", "idempotent re-entry", "Use public metadata"):
+        assert phrase in guidance
 
-    guidance = coordinator_module._role_guidance(action)
-    guidance_lower = guidance.lower()
-
-    assert "Use public metadata and the contract/API definitions only" in guidance
-    for direct_path in (
-        "artifact-assembly execution, not code-discovery or repository-exploration",
-        "start immediately from supplied action metadata",
-        "public accepted-artifact/assembler apis",
-        "do not call index_repository or search code",
-        "inspect git status or env",
-        "inventory/list the run root",
-        "inspect control center or launch manifests",
-    ):
-        assert direct_path in guidance_lower
-    for forbidden_search in (
-        "control_plane/coordinator_events.jsonl",
-        "role_sessions.json",
-        "~/.codex/sessions/history",
-        "recursive run-root searches",
-    ):
-        assert forbidden_search in guidance
-    assert "call exactly one canonical dashboard generation entry point" in guidance
-    assert "create ProductCandidate and call ProductReviewStore.record_candidate" in guidance
-    assert "idempotent re-entry after a process interruption" in guidance
-    assert "reuse or refresh public preflight/inventory results as appropriate" in guidance
-    assert "public receipt is reused idempotently rather than rebuilt" in guidance
 
 
 def test_role_guidance_product_uses_generation_aware_assembler_entry_point() -> None:
-    for action_name in ("build_product_candidate", "build_final_product", "publish_final_product"):
-        action = PlannerAction(action_name, "product_agent", "PRODUCT", "build")
+    for name in ("build_product_candidate", "build_final_product", "refresh_product_preview"):
+        guidance = coordinator_module._role_guidance(PlannerAction(name,"product_agent","PRODUCT","build"))
+        assert "ProductWorkspace(context, action)" in guidance
+        assert "generation routes, immutable revision paths" in guidance
+        assert "workspace.build" in guidance
+        assert "expected_current_plan_sha256" not in guidance
+    publish = coordinator_module._role_guidance(_action("publish_final_product", "PRODUCT"))
+    assert "not a new build" in publish and "independently reviewed" in publish
 
-        guidance = coordinator_module._role_guidance(action)
-
-        for phrase in (
-            "business_presentation_preflight",
-            "presentation_inventory_ref",
-            "presentation_plan_ref",
-            "explicit recipe_id, layout, and renderer_type",
-            "exactly one",
-        ):
-            assert phrase in guidance, (action_name, phrase, guidance)
-        assert "assemble_generation_product(context, ...)" in guidance
-        assert "full assembler for G-0001" in guidance
-        assert "successor-generation path" in guidance or "generation-aware successor path" in guidance
-        assert "parent_receipt_ref and explicit route" in guidance
-        assert "Do not call assemble_dashboard or assemble_dashboard_delta directly" in guidance
-        assert "never infer a route from requirement prose" in guidance
-        assert "validate_generation_product" in guidance
-        assert "artifact_bindings" in guidance
-        assert "never manually recompute" in guidance
 
 
 def test_role_guidance_product_composes_views_from_all_admissible_facts() -> None:
-    """Product roles must use the reviewed inventory, not a KPI-only default."""
+    guidance = coordinator_module._role_guidance(_action("build_product_candidate", "PRODUCT")).lower()
+    for phrase in ("every accepted answer visual and committed candidate visual fact", "decision surface or explicit limitation", "do not invent metrics or run new analytics", "semantic defect", "denominator", "pie", "histogram", "scatter", "audit"):
+        assert phrase in guidance
 
-    for action_name in ("build_product_candidate", "build_final_product", "publish_final_product"):
-        action = PlannerAction(action_name, "product_agent", "PRODUCT", "build")
-        guidance = coordinator_module._role_guidance(action).lower()
-
-        for phrase in (
-            "business_presentation_inventory",
-            "business_presentation_visual_inventory",
-            "every accepted answer visual and committed candidate visual fact",
-            "integration success is not a presentation prerequisite",
-            "decision surface or explicit limitation",
-            "execution traces, files/inventory, pipeline/source-process diagnostics",
-            "funnel",
-            "table",
-            "callout",
-            "explicit reviewed empty state",
-            "do not invent metrics",
-            "run new analytics",
-            "do not edit fixture, chart, or manifest bytes directly",
-            "write_business_presentation_plan_v2",
-            "record_business_presentation_plan_v2",
-        ):
-            assert phrase in guidance, (action_name, phrase, guidance)
 
 
 def test_role_guidance_preview_uses_preflight_inventory_and_single_assembly() -> None:
-    action = PlannerAction("refresh_product_preview", "product_agent", "PRODUCT", "preview")
+    guidance = coordinator_module._role_guidance(PlannerAction("refresh_product_preview", "product_agent", "PRODUCT", "preview"))
+    assert "ProductWorkspace(context, action)" in guidance
+    assert "workspace.build(choices, presentation={...}) once" in guidance
+    assert "preview manifest and candidate registration" in guidance
+    assert "never accept your own product" in guidance
 
-    guidance = coordinator_module._role_guidance(action).lower()
-
-    for phrase in (
-        "business_presentation_preflight",
-        "presentation_inventory_ref",
-        "presentation_plan_ref",
-        "recipe_id",
-        "renderer_type",
-        "assemble_generation_preview",
-        "output_dir='generations/<g>/preview'",
-        "call the public preview entry exactly once",
-    ):
-        assert phrase in guidance, (phrase, guidance)
-    assert "assemble_dashboard(" not in guidance
-    assert "validate_generation_product" in guidance
-    assert "complete site binding includes site_manifest.json" in guidance
-    assert "manifest's internal binding excludes" in guidance
 
 
 def test_role_guidance_product_reviewer_checks_accepted_coverage_and_limits() -> None:
@@ -4278,15 +4189,25 @@ def test_live_pid_claim_allows_exactly_one_multiprocess_submit(tmp_path: Path) -
     ]
     for process in processes:
         process.start()
-    deadline = time.time() + 5
-    while time.time() < deadline and not marker.exists():
-        time.sleep(0.02)
-    assert marker.exists()
-    assert len(marker.read_text().splitlines()) == 1
-    release.set()
-    for process in processes:
-        process.join(timeout=5)
-        assert process.exitcode == 0
+    # Opening the append file precedes the worker's write. Wait for the
+    # submission, not merely the directory entry, and always release workers
+    # even when an assertion fails so the test cannot leak blocked processes.
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if marker.exists() and marker.read_text().splitlines():
+                break
+            time.sleep(0.02)
+        assert marker.exists()
+        assert len(marker.read_text().splitlines()) == 1
+    finally:
+        release.set()
+        for process in processes:
+            process.join(timeout=10)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+    assert all(process.exitcode == 0 for process in processes)
     submissions = marker.read_text().splitlines()
     assert len(submissions) == 1
     assert submissions[0].split(":", 1)[1] == key

@@ -1861,7 +1861,7 @@ def test_public_ontology_add_reuses_and_merges_same_id() -> None:
     repeated = model.add_ontology_item(
         {
             "item_id": "shared-source",
-            "item_type": "different-type",
+            "item_type": "entity",
             "label": "Requirement wording",
             "properties": {
                 "columns": ["id", "created_at"],
@@ -1982,25 +1982,13 @@ def test_same_id_additive_ontology_keeps_scalars_and_unions_reviewed_facts(tmp_p
         "integration-owner",
         invocation_id="inv-Q-002",
     )
-    second.add_ontology_item(second_payload, scope="question", evidence_refs=("work/plan.json",))
-    _commit(second)
-
-    item = second.lem.ontology["erp_transactions.parquet"]
-    assert item.label == "ERP sales transactions"
-    assert item.effective_period == "2019-07-06/2020-06-29"
-    assert item.properties["analytical_role"] == "distinct-sales-document customer activity"
-    assert item.properties["columns"] == ["SALESDOCUMENT", "SALESDOCUMENTITEM", "CREATIONDATE"]
-    assert item.properties["key_fields"] == ["SALESDOCUMENT", "SALESDOCUMENTITEM"]
-    assert item.properties["row_count"] == 1916685
-    assert item.properties["row_count_exact"] is True
-    assert item.source_refs == ("erp_transactions.parquet", "erp_transactions.schema.json")
-    assert item.limitations == (
-        "Line-item rows are reduced to distinct sales documents.",
-        "Matched rows are line-level fan-out, not distinct order counts.",
-        "The selected ERP schema has no comparable amount field for NETAMOUNT reconciliation.",
-    )
-    projected = LivingEnterpriseModelProjector.project(context).model
-    assert projected.export() == second.lem.export()
+    # Conflicting source meaning is rejected at staging, before fidelity or
+    # commit. No merged candidate or partial columns enter the shared model.
+    with pytest.raises(ValueError, match="ontology definition conflict"):
+        second.add_ontology_item(second_payload, scope="question", evidence_refs=("work/plan.json",))
+    projected = LivingEnterpriseModelProjector.project(context, before_item_id="Q-002").model
+    assert projected.ontology["erp_transactions.parquet"].properties == first_payload["properties"]
+    assert second_workspace.integration_state == "pending"
 
 
 def test_same_session_repeated_ontology_records_merge_deterministically(tmp_path: Path) -> None:

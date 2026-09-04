@@ -315,6 +315,15 @@ def _public_preview_fixture(root: Path):
 
 class RunControlTests(unittest.TestCase):
     @patch("apps.control_center_operational.launch.subprocess.run")
+    def test_process_probe_uses_host_ps_dialect(self, run):
+        run.return_value = SimpleNamespace(returncode=0, stdout="")
+        for platform, expected in (("linux", ["ps", "eww", "-eo", "pgid=,stat=,args="]),
+                                   ("darwin", ["ps", "-Eww", "-axo", "pgid=,stat=,command="])):
+            with patch("apps.control_center_operational.launch.sys.platform", platform):
+                self.assertFalse(CoordinatorProcessController.group_alive(7777, "token-match"))
+                self.assertEqual(run.call_args.args[0], expected)
+
+    @patch("apps.control_center_operational.launch.subprocess.run")
     def test_group_alive_requires_matching_private_token(self, run):
         run.return_value = SimpleNamespace(
             returncode=0,

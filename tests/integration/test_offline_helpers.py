@@ -171,9 +171,10 @@ def test_dashboard_v2_renders_focused_pages_and_keeps_business_tables_visible(tm
     assert 'class="viz viz-bar-list"' in first_domain
     assert '<table>' in first_domain
     assert '<details class="data-detail">' not in first_domain
-    # Manager domain pages keep the exact trace link on the separate evidence
-    # surface; technical anchors are not part of the visible decision canvas.
-    assert "../evidence.html#trace-Q-008-final" not in first_domain
+    # The readable evidence control must navigate to its actual frozen
+    # evidence target, without putting technical IDs in its visible label.
+    assert 'href="../evidence.html#trace-Q-008-final">Evidence and definitions</a>' in first_domain
+    assert 'id="trace-Q-008-final"' in (dashboard / "evidence.html").read_text(encoding="utf-8")
     ontology = (dashboard / "ontology.html").read_text(encoding="utf-8")
     assert "Canonical mappings" in ontology
     assert "Customer order" in ontology
@@ -372,6 +373,8 @@ def test_dashboard_v3_req02_fixture_keeps_refund_matches_nonmonetary_and_currenc
     dashboard_root = Path(__file__).resolve().parents[3]
     run_root = dashboard_root / "benchmark_a_requirement_v070_entity_run_a_rerun_1"
     fixture_path = run_root / "reviewed_dashboard_fixture_v3.json"
+    if not fixture_path.is_file():
+        pytest.skip("optional historical benchmark is not shipped; current hermetic dashboard tests run separately")
     chart_map_path = run_root / "products" / "decision_dashboard_chart_map_v3.json"
     fixture_text = fixture_path.read_text(encoding="utf-8")
     chart_map_text = chart_map_path.read_text(encoding="utf-8")
@@ -560,6 +563,8 @@ def test_dashboard_v4_chart_vocabulary_graph_and_baseline_integrity() -> None:
     dashboard_root = Path(__file__).resolve().parents[3]
     run_root = dashboard_root / "benchmark_a_requirement_v070_entity_run_a_rerun_1"
     fixture_path = run_root / "reviewed_dashboard_fixture_v4.json"
+    if not fixture_path.is_file():
+        pytest.skip("optional historical benchmark is not shipped; current hermetic dashboard tests run separately")
     chart_map_path = run_root / "products" / "decision_dashboard_chart_map_v4.json"
     registry_path = run_root / "products" / "decision_dashboard_chart_registry_v4.json"
     fixture = json.loads(fixture_path.read_text(encoding="utf-8"))

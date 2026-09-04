@@ -3,14 +3,14 @@ name: auto-foundry-agentic-e2e
 description: Runs reviewed enterprise analytics for supplied questions or analytics requirements. Use it when one Analytical Owner should investigate evidence, optionally delegate bounded specialist checks, produce the final business answer, and build a traceable offline dashboard while deterministic program code owns data access, execution, state, review normalization, integration, and recovery.
 metadata:
   author: auto-foundry
-  version: "0.7.2"
+  version: "0.8.0"
   core_name: auto_foundry_core
-  core_version: "0.8.1"
+  core_version: "0.9.0"
   architecture: analytical-owner-deterministic-workbench
-  release: universal-data-room-ingestion
+  release: reliable-analytics-dashboard
 ---
 
-# Auto Foundry Agentic E2E — v0.7.2
+# Auto Foundry Agentic E2E — v0.8.0
 
 ## 1. Objective
 
@@ -28,9 +28,9 @@ Record these release markers in program metadata and the final report:
 
 ```text
 skill_name: auto-foundry-agentic-e2e
-skill_version: 0.7.2
+skill_version: 0.8.0
 core_name: auto_foundry_core
-core_version: 0.8.1
+core_version: 0.9.0
 ```
 
 ## 2. One Analytical Owner
@@ -535,90 +535,31 @@ surface unless the Product Agent deliberately presents an explicit
 source-bound business consequence. Use concise manager-facing titles and never
 expose raw failure reasons or internal paths in manager HTML.
 
-All Product Agent presentation actions use the same generation-scoped flow;
-manual fixture authoring is not the normal path:
+All Product Agent presentation actions use `ProductWorkspace(context, action)`.
+Inspect `inventory()` with pagination, inspect selected `detail(widget_id)` and
+independent `feedback()`, and call `build(choices, presentation=...)` once with
+complete ordered business choices. The workspace derives source bindings, CAS,
+revision namespaces, generation routes, candidate receipts and retry identity.
+Do not manually operate the lower-level assembler/plan APIs or edit artifacts.
 
-1. Call the public
-   `dashboard_assembler.business_presentation_preflight(context,
-   item_ids=..., generation_id=...)` to build or validate the deterministic
-   accepted/committed V2 design inventory under
-   `extensions/<G>/dashboard_preflight/`.
-2. Compare eligible local chart recipes by question, grain, dimensions,
-   measures, temporal shape, coverage, and limitations. Choose a coherent
-   multi-section layout with explicit `recipe_id`, `layout`, and
-   `renderer_type`; this is grounded selection from accepted business evidence,
-   never network design research or analytical recomputation.
-3. Distinguish initial creation from same-source regeneration. If
-   `extensions/<G>/business_presentation_plan.json` is absent, call the public
-   `dashboard_assembler.write_business_presentation_plan(...)` (or the explicit
-   V2 record route when required) with a complete ordered `manager_entries`
-   selection. If it already contains a V2 plan, call
-   `dashboard_assembler.write_business_presentation_plan_v2(...)` with a
-   complete new ordered selection, then
-   `dashboard_assembler.revise_business_presentation_plan_v2(...)` with exact
-   predecessor/successor SHA CAS, even when preflight/input hashes are
-   unchanged. Presentation audience, manager membership/order, recipe, layout,
-   and renderer may change; accepted facts, pointers, values, and provenance
-   bindings must remain exact. `record_business_presentation_plan_v2` is an
-   absent-target recorder only.
-4. For `refresh_product_preview`, call
-   `dashboard_delta_assembler.assemble_generation_preview(context, item_ids=...,
-   presentation_plan_ref=..., output_dir="generations/<G>/preview")` exactly
-   once. It renders accepted answer visuals together with any committed
-   integration facts, writes no terminal product
-   manifest, and does not gate later requirements. For a final Product Agent
-   action after all requirements are terminal, call
-   `dashboard_delta_assembler.assemble_generation_product(context, ...)` once
-   with the same plan ref; the entry point selects the root or successor path
-   from lifecycle metadata. Then validate the receipt, Blueprint, hashes, and
-   site before continuing through the existing candidate → independent review
-   → publication and lifecycle boundaries.
+This hybrid strategy publishes cumulative nonfinal previews from accepted
+requirements as work finishes, and composes a final cross-requirement dashboard
+once all boundaries are terminal. Reuse accepted numbers and analytical artifacts;
+never rerun analytics to render, invent statistics, or re-author identical results.
+Integration remains the separate ontology/machine-reuse boundary, not a condition
+for a technically limited accepted answer to be visible. Semantic review defects
+must be repaired by the analytical owner; presentation is not an escape hatch.
 
-The low-level full and delta assembly functions are program-owned internals of
-these generation entry points; Product Agents must not call them directly,
-edit fixture/chart/manifest bytes, or infer a route from requirement prose.
-Terminal technical-failure, blocked, unsupported, or no-record requirements
-remain explicit limitations. If every terminal input is limited, the preflight
-and plan choose a reviewed limited/empty-state view without fabricating metrics.
-When a new item is accepted in the same generation, its canonical input
-fingerprint changes: rerun preflight and refresh only the generation-scoped
-extension inventory/plan. Stale item bindings, source hashes, or plan refs fail
-closed, and once all requirements are terminal no incremental refresh is
-offered. Read
-[PRODUCT_AGENT_ASSEMBLER_CONTRACT.md](references/PRODUCT_AGENT_ASSEMBLER_CONTRACT.md)
-for the frozen-input binding, retry, and incident contract.
+Use the reference design's visual principles: compact KPI strip, readable cards,
+responsive multi-section chart grid, meaningful legends/units, and an evidence
+surface separate from the manager overview. Select diverse chart types only when
+the evidence supports them. Preserve missing-value gaps and independent scales.
+The renderer renders accepted answer visuals together with any committed facts.
+No externally loaded assets, analytics trackers, or invented decorative data.
 
-If requirements are added, updated, or removed while a Requirement Mode run is
-active, paused, or complete, keep the same logical `run_id`. Resume analytical
-work immediately; dispatch a cumulative generation delta after the current
-items are accepted and their integrations are committed or terminally failed.
-First run the shared
-preflight and explicit V2 plan flow above for the cumulative item set, then
-call the generation entry point once:
-
-```python
-dashboard_delta_assembler.assemble_generation_product(
-    context,
-    parent_receipt_ref="products/<parent>/build_receipt.json",
-    route=route,
-    presentation_plan_ref="extensions/<G>/business_presentation_plan.json",
-)
-```
-
-The route JSON must explicitly select an existing fixture domain, for example
-`{"kind":"existing","group_id":"group-01"}`, or a new stable domain,
-for example `{"kind":"new","group_id":"fulfilment","title":"Fulfilment decisions","order":3}`.
-Use `{"routes":{"REQ-09":...,"REQ-10":...}}` when siblings share one new
-plan group. The active plan and route must agree; missing or ambiguous routing
-fails closed. The delta copies the receipt-bound parent tree into
-`products/generations/<generation-id>/dashboard`, appends only new typed
-widgets/entries, records exact affected/unchanged paths, and atomically writes
-the generation-specific terminal product manifest only after cumulative
-integration and all freeze markers pass. The parent product remains unchanged
-and is the rollback target. Exact retries are hash-bound; post-swap recovery
-must not rewrite the child site. This path performs no source/work/calculation
-reads, model calls, analytics, publication, or optimizer collection; QA remains
-a sibling under the product output root.
+Read [PRODUCT_AGENT_ASSEMBLER_CONTRACT.md](references/PRODUCT_AGENT_ASSEMBLER_CONTRACT.md)
+for the single interface and the candidate → independent review → authorization
+boundary. Frozen accepted generations are never overwritten by a new design.
 
 The portfolio revision is explicit program API work before this dispatch. Use
 `RequirementRunExtension.append(context, new_records)` for a simple add, or

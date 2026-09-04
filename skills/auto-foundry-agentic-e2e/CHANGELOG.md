@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.0 / core 0.9.0 — reliable analytics dashboard
+
+1. One ProductWorkspace binds accepted answers to preview/candidate outputs;
+   the agent chooses presentation while program code owns hashes, CAS and paths.
+2. Canonical integration snapshot recovery, conflict-safe ontology admission,
+   meaningful recovery progress, and fixed-generation runtime-only repair.
+3. Responsive offline manager dashboard with actual scatter/area/pie geometry,
+   scoped legends, preserved missing values, source context and hermetic tests.
+
+This release uses synthetic offline replay and browser checks. No live-agent
+benchmark or unseen-data analytical success is claimed; no saved run is modified.
+
 ## 0.7.2 / core 0.8.1 — universal Data Room ingestion
 
 This release binds skill `0.7.2` to core `0.8.1` under the
