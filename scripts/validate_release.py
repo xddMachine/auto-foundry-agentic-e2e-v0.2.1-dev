@@ -209,7 +209,10 @@ def _validate_wheel(wheel_path: Path, source_root: Path) -> dict[str, object]:
         if metadata_name is None:
             raise ValueError("wheel METADATA missing")
         metadata = _metadata(archive.read(metadata_name).decode("utf-8"))
-        if metadata.get("Name") != "auto_foundry_core" or metadata.get("Version") != "0.9.0":
+        # PyPA distribution-name normalization: hyphens, underscores and periods
+        # are equivalent. Keep the original name in the verification receipt.
+        normalized_name = re.sub(r"[-_.]+", "-", metadata.get("Name", "")).lower()
+        if normalized_name != "auto-foundry-core" or metadata.get("Version") != "0.9.0":
             raise ValueError(f"wheel metadata mismatch: {metadata.get('Name')} {metadata.get('Version')}")
         missing = sorted(REQUIRED_CORE_MODULES - set(names))
         if missing:
